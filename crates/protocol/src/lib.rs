@@ -648,6 +648,14 @@ where
     }
 
     pub async fn read<T: for<'de> Deserialize<'de>>(&mut self) -> Result<T> {
+        self.read_limited(MAX_FRAME_LEN).await
+    }
+
+    pub async fn read_limited<T: for<'de> Deserialize<'de>>(
+        &mut self,
+        max_len: usize,
+    ) -> Result<T> {
+        let max_len = max_len.min(MAX_FRAME_LEN);
         let mut expected_total = None;
         let mut plain_message = Vec::new();
         loop {
@@ -658,7 +666,7 @@ where
                 .read_message(&encrypted, &mut segment)
                 .map_err(|err| ProtocolError::Noise(format!("{err:?}")))?;
             let (total_len, offset, chunk) = parse_noise_segment(&segment[..len])?;
-            if total_len > MAX_FRAME_LEN {
+            if total_len > max_len {
                 return Err(ProtocolError::FrameTooLarge(total_len));
             }
             match expected_total {
@@ -778,6 +786,13 @@ mod tests {
     }
 
     async fn read_client_message_segments(segments: Vec<Vec<u8>>) -> Result<ClientMessage> {
+        read_client_message_segments_limited(segments, MAX_FRAME_LEN).await
+    }
+
+    async fn read_client_message_segments_limited(
+        segments: Vec<Vec<u8>>,
+        max_len: usize,
+    ) -> Result<ClientMessage> {
         let (mut writer, reader) = tokio::io::duplex(4096);
         let (mut initiator, responder) = noise_transport_pair();
         let send = tokio::spawn(async move {
@@ -790,7 +805,7 @@ mod tests {
             }
         });
         let mut socket = NoiseSocket::new(reader, responder);
-        let result = socket.read::<ClientMessage>().await;
+        let result = socket.read_limited::<ClientMessage>(max_len).await;
         send.await.unwrap();
         result
     }
@@ -1151,6 +1166,16 @@ mod tests {
         assert!(matches!(
             read_client_message_segments(vec![segment]).await,
             Err(ProtocolError::MalformedFrame)
+        ));
+    }
+
+    #[tokio::test]
+    async fn noise_socket_applies_caller_specific_message_limits_before_allocation() {
+        let message = postcard::to_stdvec(&ClientMessage::Ping { now_ms: 7 }).unwrap();
+        let segment = noise_segment(message.len(), 0, &message).unwrap();
+        assert!(matches!(
+            read_client_message_segments_limited(vec![segment], message.len() - 1).await,
+            Err(ProtocolError::FrameTooLarge(length)) if length == message.len()
         ));
     }
 

@@ -213,10 +213,30 @@ struct ServerMetrics {
 }
 
 fn load_server_config(path: &PathBuf) -> Result<ServerConfig> {
-    if !path.exists() {
-        return Ok(ServerConfig::default());
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ServerConfig::default());
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("inspecting server config {}", path.display()));
+        }
     }
-    let raw = std::fs::read_to_string(path)
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("opening server config {}", path.display()))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
+        anyhow::bail!(
+            "server config {} must be a private regular file with mode 0600",
+            path.display()
+        );
+    }
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)
         .with_context(|| format!("reading server config {}", path.display()))?;
     toml::from_str(&raw).with_context(|| format!("parsing server config {}", path.display()))
 }
@@ -477,9 +497,6 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
     if !args.ingest_addr.ip().is_loopback() && !config.ingest.require_token {
         anyhow::bail!("a non-loopback ingest listener requires ingest.require_token = true");
     }
-    if internet_mode {
-        validate_private_config_file(&args.config)?;
-    }
     tokio::fs::create_dir_all(&args.data_dir)
         .await
         .with_context(|| format!("creating data dir {}", args.data_dir.display()))?;
@@ -661,18 +678,6 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
     })
     .await?;
     let _ = shutdown_tx.send(true);
-    Ok(())
-}
-
-fn validate_private_config_file(path: &FsPath) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(path)
-        .with_context(|| format!("inspecting server config {}", path.display()))?;
-    if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o077 != 0 {
-        anyhow::bail!(
-            "Internet-mode server config {} must be a private regular file with mode 0600",
-            path.display()
-        );
-    }
     Ok(())
 }
 
@@ -914,7 +919,12 @@ async fn login(
         .metrics
         .login_successes
         .fetch_add(1, Ordering::Relaxed);
-    info!(principal = %principal.name, role = ?principal.role, "viewer login succeeded");
+    info!(
+        principal = %principal.name,
+        role = ?principal.role,
+        %remote_ip,
+        "viewer login succeeded"
+    );
     Ok((
         [(header::SET_COOKIE, state.sessions.session_cookie(&cookie))],
         Json(SessionResponse {
@@ -929,6 +939,7 @@ async fn login(
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, AppError> {
     let request = request_identity(&state, &headers)?;
     require_mutation_authority(&state, &headers, &request)?;
+    info!(principal = %request.principal.name, "viewer logged out");
     Ok((
         [(header::SET_COOKIE, state.sessions.expired_cookie())],
         StatusCode::NO_CONTENT,
@@ -1045,6 +1056,11 @@ async fn delete_stream(
     if state.store.delete_stream(stream_id)? {
         state.dash_store.delete_stream(stream_id)?;
         publish_stream_event(&state, "stream_deleted", stream_id);
+        info!(
+            principal = %identity.principal.name,
+            %stream_id,
+            "administrator deleted stream"
+        );
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NotFound)
@@ -1537,17 +1553,17 @@ async fn handle_ingest(
     let mut socket = glacialcast_protocol::NoiseSocket::new(stream, transport);
     let hello = match tokio::time::timeout(
         state.ingest_handshake_timeout,
-        socket.read::<ClientMessage>(),
+        socket.read_limited::<ClientMessage>(16 * 1024),
     )
     .await
     .context("publisher hello timed out")??
     {
         ClientMessage::Hello(hello) => hello,
-        other => {
+        _ => {
             socket
                 .write(&ServerMessage::HelloAck {
                     accepted: false,
-                    reason: Some(format!("expected hello, got {other:?}")),
+                    reason: Some("expected publisher hello".to_string()),
                     stream_id: None,
                     last_sequence: 0,
                     server_time_ms: now_ms(),
@@ -1814,6 +1830,38 @@ mod tests {
         limits = LimitsConfig::default();
         limits.ingest_idle_timeout_seconds = 29;
         assert!(validate_limits(&limits).is_err());
+    }
+
+    #[test]
+    fn server_config_must_be_private_regular_and_rejects_unknown_keys() {
+        let root =
+            std::env::temp_dir().join(format!("glacialcast-server-config-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("server.toml");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"[ingest]\nrequire_token = false\n")
+            .unwrap();
+        drop(file);
+        assert!(!load_server_config(&path).unwrap().ingest.require_token);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_server_config(&path).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&path, "unknown_security_setting = true\n").unwrap();
+        assert!(load_server_config(&path).is_err());
+
+        let link = root.join("server-link.toml");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(load_server_config(&link).is_err());
+        let dangling = root.join("server-dangling.toml");
+        std::os::unix::fs::symlink(root.join("missing.toml"), &dangling).unwrap();
+        assert!(load_server_config(&dangling).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

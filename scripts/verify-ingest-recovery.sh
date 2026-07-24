@@ -25,6 +25,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
+umask 077
 cat >"${work_dir}/server.toml" <<'TOML'
 [ingest]
 require_token = true

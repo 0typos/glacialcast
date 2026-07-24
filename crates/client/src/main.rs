@@ -71,6 +71,7 @@ const PIPEWIRE_CURSOR_DEFAULT_BITMAP_SIDE: usize = 64;
 const PIPEWIRE_CURSOR_MAX_BITMAP_SIDE: usize = 512;
 const CURSOR_BITMAP_REFRESH_TICKS: u64 = MEDIA_TIMESCALE as u64 * 60;
 const PIPEWIRE_CURSOR_METADATA_GRACE: Duration = Duration::from_secs(5);
+const MAX_SERVER_CONTROL_MESSAGE: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CursorBitmap {
@@ -443,7 +444,10 @@ async fn run_dash_connection(
             resend_high: high,
         }))
         .await?;
-    let (stream_id, server_last_sequence) = match socket.read::<ServerMessage>().await? {
+    let (stream_id, server_last_sequence) = match socket
+        .read_limited::<ServerMessage>(MAX_SERVER_CONTROL_MESSAGE)
+        .await?
+    {
         ServerMessage::HelloAck {
             accepted: true,
             stream_id: Some(stream_id),
@@ -985,7 +989,10 @@ async fn wait_for_dash_ack(
     expected_sequence: u64,
 ) -> Result<u64> {
     loop {
-        match socket.read::<ServerMessage>().await? {
+        match socket
+            .read_limited::<ServerMessage>(MAX_SERVER_CONTROL_MESSAGE)
+            .await?
+        {
             ServerMessage::Ack { through_seq } => {
                 resend.ack(through_seq);
                 if through_seq >= expected_sequence {
@@ -1088,8 +1095,15 @@ fn non_empty_trimmed(field: &str, value: String) -> Result<String> {
 }
 
 fn load_client_config(path: &PathBuf) -> Result<ClientConfig> {
-    if !path.exists() {
-        return Ok(ClientConfig::default());
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ClientConfig::default());
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("inspecting client config {}", path.display()));
+        }
     }
     let mut file = std::fs::OpenOptions::new()
         .read(true)
@@ -4544,6 +4558,9 @@ mod tests {
         let link = root.join("client-link.toml");
         std::os::unix::fs::symlink(&path, &link).unwrap();
         assert!(load_client_config(&link).is_err());
+        let dangling = root.join("client-dangling.toml");
+        std::os::unix::fs::symlink(root.join("missing.toml"), &dangling).unwrap();
+        assert!(load_client_config(&dangling).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 

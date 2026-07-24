@@ -64,6 +64,9 @@ enum Command {
         input: PathBuf,
         #[arg(long, default_value = "127.0.0.1:8910")]
         listen: SocketAddr,
+        /// Explicitly permit exposing the key-entry viewer beyond this machine.
+        #[arg(long)]
+        allow_non_loopback: bool,
     },
 }
 
@@ -106,7 +109,11 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::Serve { input, listen } => serve(input, listen).await,
+        Command::Serve {
+            input,
+            listen,
+            allow_non_loopback,
+        } => serve(input, listen, allow_non_loopback).await,
     }
 }
 
@@ -286,7 +293,17 @@ fn read_portable_object(path: &FsPath) -> Result<DashObject> {
         .with_context(|| format!("decoding portable object {}", path.display()))
 }
 
-async fn serve(input: PathBuf, listen: SocketAddr) -> Result<()> {
+fn validate_offline_listener(listen: SocketAddr, allow_non_loopback: bool) -> Result<()> {
+    if !listen.ip().is_loopback() && !allow_non_loopback {
+        bail!(
+            "refusing to expose the offline viewer on {listen}; use --allow-non-loopback only on a trusted network"
+        );
+    }
+    Ok(())
+}
+
+async fn serve(input: PathBuf, listen: SocketAddr, allow_non_loopback: bool) -> Result<()> {
+    validate_offline_listener(listen, allow_non_loopback)?;
     if !input.is_dir() {
         bail!("offline input is not a directory: {}", input.display());
     }
@@ -495,6 +512,10 @@ async fn viewer(Path(_stream_id): Path<Uuid>) -> Response {
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .header(header::CACHE_CONTROL, "no-store")
+        .header(
+            "content-security-policy",
+            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+        )
         .header("x-content-type-options", "nosniff")
         .header("referrer-policy", "no-referrer")
         .body(Body::from(VIEWER_HTML))
@@ -1089,6 +1110,14 @@ mod tests {
     #[tokio::test]
     async fn embedded_viewer_serves_core_before_runtime() {
         let html = viewer(Path(Uuid::new_v4())).await;
+        assert!(
+            html.headers()
+                .get("content-security-policy")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("frame-ancestors 'none'")
+        );
         let body = axum::body::to_bytes(html.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -1104,5 +1133,12 @@ mod tests {
             .await
             .unwrap();
         assert!(body.windows(16).any(|window| window == b"parseCursorBatch"));
+    }
+
+    #[test]
+    fn offline_viewer_requires_explicit_non_loopback_exposure() {
+        assert!(validate_offline_listener("127.0.0.1:8910".parse().unwrap(), false).is_ok());
+        assert!(validate_offline_listener("0.0.0.0:8910".parse().unwrap(), false).is_err());
+        assert!(validate_offline_listener("0.0.0.0:8910".parse().unwrap(), true).is_ok());
     }
 }

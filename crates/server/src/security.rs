@@ -21,6 +21,7 @@ const SESSION_KEY_MAGIC: &[u8; 5] = b"GCSK1";
 const SESSION_KEY_LEN: usize = 32;
 const SESSION_NONCE_LEN: usize = 16;
 const SESSION_COOKIE: &str = "glacialcast_session";
+const SECURE_SESSION_COOKIE: &str = "__Host-glacialcast_session";
 const MIN_ACCESS_TOKEN_LEN: usize = 32;
 const MAX_ACCESS_TOKEN_LEN: usize = 512;
 const MAX_PRINCIPAL_NAME_LEN: usize = 64;
@@ -292,7 +293,7 @@ impl SessionSigner {
                 });
         }
 
-        let cookie = cookie_value(headers, SESSION_COOKIE)?;
+        let cookie = cookie_value(headers, self.cookie_name())?;
         let (principal_name, auth_version) = self.verify_session(cookie)?;
         let principal = access.principal(&principal_name)?;
         if !bool::from(principal.auth_version.ct_eq(&auth_version)) {
@@ -308,17 +309,28 @@ impl SessionSigner {
     pub fn session_cookie(&self, value: &str) -> String {
         let secure = if self.secure_cookie { "; Secure" } else { "" };
         format!(
-            "{SESSION_COOKIE}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
-            self.ttl_seconds, secure
+            "{}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
+            self.cookie_name(),
+            self.ttl_seconds,
+            secure
         )
     }
 
     pub fn expired_cookie(&self) -> String {
         let secure = if self.secure_cookie { "; Secure" } else { "" };
         format!(
-            "{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
-            secure
+            "{}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
+            self.cookie_name(),
+            secure,
         )
+    }
+
+    fn cookie_name(&self) -> &'static str {
+        if self.secure_cookie {
+            SECURE_SESSION_COOKIE
+        } else {
+            SESSION_COOKIE
+        }
     }
 
     pub fn verify_csrf(&self, request: &AuthenticatedRequest, headers: &HeaderMap) -> bool {
@@ -674,20 +686,29 @@ mod tests {
         let principal = access.authenticate_token(TOKEN).unwrap();
         let (signer, path) = signer();
         let (cookie, csrf) = signer.create_session(&principal).unwrap();
+        let set_cookie = signer.session_cookie(&cookie);
+        assert!(set_cookie.starts_with("__Host-glacialcast_session="));
+        assert!(set_cookie.contains("; Secure"));
+        assert!(!set_cookie.contains("Domain="));
         let mut headers = HeaderMap::new();
         headers.insert(
             header::COOKIE,
-            format!("{SESSION_COOKIE}={cookie}").parse().unwrap(),
+            format!("{}={cookie}", signer.cookie_name())
+                .parse()
+                .unwrap(),
         );
         headers.insert("x-glacialcast-csrf", csrf.parse().unwrap());
-        let request = signer.authenticate(&headers, &access).unwrap();
+        let reloaded = SessionSigner::load_or_create(&path, 3600, true).unwrap();
+        let request = reloaded.authenticate(&headers, &access).unwrap();
         assert_eq!(request.principal.name, "viewer-one");
-        assert!(signer.verify_csrf(&request, &headers));
+        assert!(reloaded.verify_csrf(&request, &headers));
 
         let mut tampered = headers.clone();
         tampered.insert(
             header::COOKIE,
-            format!("{SESSION_COOKIE}={cookie}x").parse().unwrap(),
+            format!("{}={cookie}x", signer.cookie_name())
+                .parse()
+                .unwrap(),
         );
         assert!(signer.authenticate(&tampered, &access).is_none());
         std::fs::remove_file(path).unwrap();
@@ -702,7 +723,9 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::COOKIE,
-            format!("{SESSION_COOKIE}={cookie}").parse().unwrap(),
+            format!("{}={cookie}", signer.cookie_name())
+                .parse()
+                .unwrap(),
         );
         assert!(signer.authenticate(&headers, &access).is_some());
 
