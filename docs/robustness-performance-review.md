@@ -39,8 +39,9 @@ The hardening pass addressed the highest-risk defects found in the review:
   connection gaps, bounds media/cursor history, caches cursor surfaces, and
   proves paint/move/hide/restore behavior in Firefox and Chromium.
 - Noise segments reject inconsistent totals, gaps, replayed offsets,
-  zero-progress chunks, oversized declarations, and noncanonical Postcard
-  messages. Portable files reject every tested truncation and trailing data.
+  zero-progress chunks, oversized declarations, caller-specific control-message
+  limits, and noncanonical Postcard messages. Portable files reject every
+  tested truncation and trailing data.
 - Relay storage confines catalog entries to exact per-stream object paths,
   rejects symlinks, corruption, size mismatches, media chunk gaps/overlap, and
   no-clobber publication conflicts. Cursor-only groups now obey retention.
@@ -57,17 +58,20 @@ MediaMTX, WebRTC, or third-party DASH-player dependency in the runtime.
 
 ## Test and Coverage State
 
-The normal Rust suite increased from 60 to 112 tests:
+The normal Rust suite increased from 60 to 130 defined tests, of which 129 run
+in the ordinary debug profile and one performance test runs explicitly in
+release mode:
 
-| Area | Tests | Line coverage |
-| --- | ---: | ---: |
-| Client and Wayland/cursor capture | 41 | 36.43% |
-| DASH, fMP4, CENC, and cursor format | 16 | 96.80% |
-| Offline mirror/viewer | 9 | 67.33% |
-| Protocol and daemon control | 23 | 95.41% protocol, 66.42% daemon |
-| Relay and storage | 23 | 90.71% DASH store, 96.10% stream catalog |
-| Whole Rust workspace | 112 | 58.51% |
+| Area | Tests |
+| --- | ---: |
+| Client and Wayland/cursor capture | 42 |
+| DASH, fMP4, CENC, and cursor format | 16 |
+| Offline mirror/viewer | 10 |
+| Protocol and daemon control | 24 |
+| Relay, authorization, and storage | 38 |
+| Whole Rust workspace | 130 |
 
+The last pre-Internet-hardening coverage run measured 58.51% line coverage.
 The browser core has another 14 JavaScript tests. Multi-process gates cover
 live ingest, portable mirroring, offline serving, authentication, crash/restart,
 and optional Firefox/Chromium playback. The lower client and server-main
@@ -127,11 +131,13 @@ history is pruned with relay retention.
 cargo fmt --all -- --check
 cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo deny check
+cargo deny -L error check
 cargo doc --workspace --no-deps
 node scripts/test-viewer-core.mjs
 scripts/verify-dash-e2e.sh
 scripts/verify-ingest-recovery.sh
+scripts/verify-internet-security.sh
+scripts/verify-internet-browser.sh
 scripts/verify-performance.sh
 cargo llvm-cov --workspace --summary-only
 ```

@@ -10,9 +10,9 @@ publish the relay's plaintext HTTP port.
 - Caddy terminates TLS, renews the public certificate, overwrites
   `X-Forwarded-For`, and proxies HTTP and WebSocket traffic to
   `127.0.0.1:8899`.
-- The relay authenticates browser access itself. Viewer sessions are signed,
-  `HttpOnly`, `Secure`, and `SameSite=Strict`; state changes additionally
-  require an exact origin and a session-bound CSRF value.
+- The relay authenticates browser access itself. Viewer sessions use a signed
+  `__Host-` cookie with `HttpOnly`, `Secure`, and `SameSite=Strict`; state
+  changes additionally require an exact origin and a session-bound CSRF value.
 - Viewer principals can read only streams published by configured ingest
   identities. Administrators can read and delete every stream and inspect
   relay counters.
@@ -37,7 +37,7 @@ sudo useradd --system --home-dir /var/lib/glacialcast --shell /usr/sbin/nologin 
 sudo install -D -o root -g root -m 0755 \
   target/release/glacialcast-server /usr/local/bin/glacialcast-server
 sudo install -d -o glacialcast -g glacialcast -m 0700 /var/lib/glacialcast
-sudo install -d -o glacialcast -g glacialcast -m 0700 /etc/glacialcast
+sudo install -d -o root -g glacialcast -m 0750 /etc/glacialcast
 sudo install -o glacialcast -g glacialcast -m 0600 \
   deploy/server.internet.toml.example /etc/glacialcast/server.toml
 sudo install -o root -g root -m 0644 \
@@ -171,9 +171,10 @@ restart the relay, confirm readiness, and run:
 
 ```sh
 scripts/verify-internet-security.sh
+scripts/verify-internet-browser.sh
 scripts/verify-ingest-recovery.sh
 scripts/verify-dash-e2e.sh
-cargo deny check
+cargo deny -L error check
 ```
 
 ## Fail-closed behavior
@@ -182,8 +183,8 @@ Internet mode refuses to start when:
 
 - `public_origin` is not a path-free HTTPS origin;
 - the HTTP backend is not loopback;
-- the credential configuration is not a non-symlinked regular file with mode
-  `0600`;
+- the credential configuration is not a non-symlinked, owner-private regular
+  file with mode `0600`;
 - no access token exists;
 - ingest authentication is optional;
 - a token is weak, duplicated, or malformed; or

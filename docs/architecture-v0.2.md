@@ -32,7 +32,7 @@ The MVP is complete when all of the following are true:
    age and a maximum byte count per stream.
 8. A reconnecting viewer can begin at the newest retained random-access point
    and scrub through the retained window.
-9. A self-contained `glacialcast-viewer` executable serves a copied stream
+9. A self-contained `glacialcast-offline` executable serves a copied stream
    bundle on loopback for playback by an installed Firefox or Chromium without
    Internet access.
 10. The runtime does not depend on FFmpeg, GStreamer, MediaMTX, or a third-party
@@ -218,6 +218,9 @@ needs only that binary, the object files, and an installed Firefox or Chromium
 browser; it does not need Internet access or third-party JavaScript. The
 offline catalog accepts only bounded regular `.gco` files, rejects duplicate
 stream/sequence identities, and ignores symlinks and incomplete transfer files.
+The service binds to loopback by default and requires an explicit
+`--allow-non-loopback` override before exposing the key-entry viewer to a
+trusted network.
 
 ## Runtime Dependency Boundary
 

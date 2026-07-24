@@ -196,9 +196,9 @@ CPU-readable buffers for VA-API upload or OpenH264.
 Mirror the relay's opaque objects into independently transferable files:
 
 ```sh
+export GLACIALCAST_ACCESS_TOKEN='<viewer-access-token>'
 ./target/release/glacialcast-offline mirror \
   --server https://cast.example.com \
-  --access-token "$GLACIALCAST_ACCESS_TOKEN" \
   --stream-id <stream-uuid> \
   --output glacialcast-transfer \
   --follow
@@ -218,7 +218,9 @@ glacialcast-offline serve \
 Open `http://127.0.0.1:8910`, select the stream, and enter the out-of-band
 viewer key. The binary embeds the local HTTP service, DASH endpoints, and
 viewer assets; only it, the `.gco` files, and an installed Firefox or Chromium
-are required.
+are required. The offline viewer refuses a non-loopback listener unless
+`--allow-non-loopback` is supplied explicitly; use that escape hatch only on a
+trusted network.
 
 ## Daemon mode
 
@@ -269,10 +271,11 @@ For niri portal routing helpers and an upstream diagnostic template, see
 cargo fmt --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo deny check
+cargo deny -L error check
 node scripts/test-viewer-core.mjs
 scripts/verify-ingest-recovery.sh
 scripts/verify-internet-security.sh
+scripts/verify-internet-browser.sh
 scripts/verify-performance.sh
 ```
 
@@ -281,10 +284,12 @@ against a temporary relay and portable offline viewer. The recovery gate
 crashes and restarts an authenticated relay under an active publisher. The
 Internet gate exercises session and bearer authentication, authorization,
 origin and CSRF enforcement, throttling, security headers, protected mirroring,
-monitoring, and fail-closed configuration. The performance gate runs
-conservative release-mode throughput and durable-object floors. Hardware and
-browser checks require the corresponding host capabilities and are described
-in `docs/completion-audit.md`.
+monitoring, and fail-closed configuration. The Internet browser gate places
+the relay behind a real Caddy HTTPS proxy and verifies authenticated playback
+and cursor behavior in both Firefox and Chromium. The performance gate runs
+conservative release-mode throughput and durable-object floors. Hardware
+checks require the corresponding host capabilities and are described in
+`docs/completion-audit.md`.
 
 The protocol and compatibility contract is in `docs/architecture-v0.2.md`.
 The latest robustness, code-quality, and performance assessment is in
