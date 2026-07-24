@@ -184,6 +184,15 @@ and cursor-only groups are subject to the same age and byte limits.
 Acknowledgement means an object is durably written and indexed, not merely
 queued in memory.
 
+The durable index uses an independent mutex and checksummed append journal per
+stream. A newly accepted object is acknowledged only after both its immutable
+payload file and catalog transaction have been synchronized. Atomic catalog
+snapshots periodically compact the journal; recovery tolerates and truncates
+only an incomplete final record, rejects corrupt complete records, and safely
+ignores transactions already represented by a completed snapshot. Independent
+streams do not serialize their filesystem work through one global catalog
+mutex.
+
 ## Cursor Timing
 
 Video and cursor events use the same monotonic capture clock. Live cursor

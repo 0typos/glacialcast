@@ -112,10 +112,11 @@ history is pruned with relay retention.
   and niri targets; this shell has no `WAYLAND_DISPLAY`.
 - The direct VA-API/DMA-BUF path needs the hardware gate on representative
   Intel and AMD render nodes; this shell has no `/dev/dri`.
-- The relay rewrites a JSON catalog after each durable object and protects the
-  in-memory stream map with one mutex. It passes the current low-rate gate, but
-  an append journal or transactional per-stream index and per-stream locking
-  should replace it before long-retention, high-rate, or multi-tenant service.
+- The relay now uses checksummed, fsynced per-stream append journals, periodic
+  atomic catalog snapshots, truncated-final-record recovery, and independent
+  per-stream mutexes. Long-retention deployments still need soak evidence on
+  their target filesystem, but no longer rewrite the complete JSON catalog or
+  serialize unrelated streams for every accepted object.
 - Client and server executables contain substantial logic directly in
   `main.rs`. Moving orchestration into library modules would enable focused
   HTTP/ingest state-machine tests and improve coverage without process spawning.

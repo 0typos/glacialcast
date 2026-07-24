@@ -138,7 +138,10 @@ Rotate the E2EE viewer key by restarting the publisher with a new
 long as access to its retained or exported objects is required. An authorized
 viewer can extract any key provided to the browser; Clear Key is not DRM.
 
-Back up the Noise identity and session key with the data directory. A lost
+Back up the Noise identity and session key with the complete data directory.
+The per-stream `catalog.json` snapshots, `catalog.journal` files, and object
+directories form one recovery unit and must not be copied independently while
+the service is writing. Stop the service or use a filesystem snapshot. A lost
 Noise identity requires repinning every publisher. Never copy an ingest token,
 access token, viewer key, session key, or Noise private key into logs or URLs.
 

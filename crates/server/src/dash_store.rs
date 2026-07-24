@@ -3,25 +3,32 @@
 //! An acknowledgement is issued only after an object and its catalog state are
 //! durable. Sequences are contiguous and immutable, publication never clobbers
 //! an untracked file, and retention removes complete decodable segment groups
-//! while preserving required epoch metadata. Catalog reload revalidates paths,
-//! hashes, sizes, media chunk continuity, and symlink boundaries.
+//! while preserving required epoch metadata. Each stream has an independent
+//! catalog mutex and a checksummed, fsynced append journal; periodic atomic
+//! snapshots bound replay time. Catalog reload revalidates paths, hashes,
+//! sizes, media chunk continuity, journal records, and symlink boundaries.
 
 use anyhow::{Context, Result};
 use glacialcast_dash::{EpochDescriptor, MpdConfig, SegmentTimelineEntry, build_mpd};
 use glacialcast_protocol::{DashObject, DashObjectHeader, DashObjectKind};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs::{File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 use uuid::Uuid;
 
 const CATALOG_VERSION: u16 = 2;
 const MAX_CATALOG_FILE_LEN: u64 = 64 * 1024 * 1024;
+const JOURNAL_VERSION: u16 = 1;
+const MAX_JOURNAL_FILE_LEN: u64 = 128 * 1024 * 1024;
+const MAX_JOURNAL_RECORD_LEN: usize = 1024 * 1024;
+const JOURNAL_COMPACTION_RECORDS: usize = 1024;
 
 #[derive(Clone)]
 pub struct DashStore {
@@ -32,7 +39,7 @@ struct DashStoreInner {
     root: PathBuf,
     retention_bytes: u64,
     retention_age: Duration,
-    streams: Mutex<HashMap<Uuid, StreamCatalog>>,
+    streams: RwLock<HashMap<Uuid, Arc<Mutex<StreamCatalog>>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,17 +52,33 @@ struct PersistedCatalog {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct CatalogTransaction {
+    version: u16,
+    stream_id: Uuid,
+    last_sequence: u64,
+    put: StoredDashObject,
+    removed_sequences: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JournalRecord {
+    transaction: CatalogTransaction,
+    checksum: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredDashObject {
     pub header: DashObjectHeader,
     pub received_at_ms: i64,
     relative_path: PathBuf,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct StreamCatalog {
     objects: BTreeMap<u64, StoredDashObject>,
     bytes: u64,
     last_sequence: Option<u64>,
+    journal_entries: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -74,7 +97,7 @@ impl DashStore {
                 root,
                 retention_bytes,
                 retention_age,
-                streams: Mutex::new(HashMap::new()),
+                streams: RwLock::new(HashMap::new()),
             }),
         };
         store.load_catalogs()?;
@@ -84,8 +107,10 @@ impl DashStore {
     pub fn store(&self, object: DashObject) -> Result<StoredDashObject> {
         object.validate().context("validating DASH object")?;
         let stream_id = object.header.stream_id;
-        let mut streams = self.streams()?;
-        let catalog = streams.entry(stream_id).or_default();
+        let catalog_handle = self.catalog_or_create(stream_id)?;
+        let mut catalog = catalog_handle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("DASH stream catalog mutex poisoned"))?;
 
         if let Some(existing) = catalog.objects.get(&object.header.sequence) {
             if existing.header == object.header {
@@ -108,8 +133,14 @@ impl DashStore {
                 object.header.sequence
             );
         }
-        validate_media_progression(catalog, &object.header)?;
+        validate_media_progression(&catalog, &object.header)?;
 
+        let catalog_path = self.stream_dir(stream_id).join("catalog.json");
+        if !catalog_path.exists() {
+            self.persist_catalog(stream_id, &catalog)
+                .context("creating initial DASH catalog snapshot")?;
+            catalog.journal_entries = 0;
+        }
         let object_dir = self.stream_dir(stream_id).join("objects");
         std::fs::create_dir_all(&object_dir)
             .with_context(|| format!("creating object directory {}", object_dir.display()))?;
@@ -140,16 +171,53 @@ impl DashStore {
             received_at_ms: glacialcast_protocol::now_ms(),
             relative_path,
         };
-        catalog.bytes = catalog
+        let mut next_catalog = catalog.clone();
+        next_catalog.bytes = next_catalog
             .bytes
             .saturating_add(u64::from(stored.header.payload_len));
-        catalog
+        next_catalog
             .objects
             .insert(stored.header.sequence, stored.clone());
-        catalog.last_sequence = Some(stored.header.sequence);
+        next_catalog.last_sequence = Some(stored.header.sequence);
 
-        let evicted = self.enforce_retention(catalog, stored.received_at_ms);
-        self.persist_catalog(stream_id, catalog)?;
+        let evicted = self.enforce_retention(&mut next_catalog, stored.received_at_ms);
+        let mut removed_sequences = catalog
+            .objects
+            .keys()
+            .filter(|sequence| !next_catalog.objects.contains_key(sequence))
+            .copied()
+            .collect::<Vec<_>>();
+        if !next_catalog.objects.contains_key(&stored.header.sequence) {
+            removed_sequences.push(stored.header.sequence);
+        }
+        let persistence = self.append_catalog_transaction(
+            stream_id,
+            &CatalogTransaction {
+                version: JOURNAL_VERSION,
+                stream_id,
+                last_sequence: stored.header.sequence,
+                put: stored.clone(),
+                removed_sequences,
+            },
+        );
+        if let Err(error) = persistence {
+            let _ = std::fs::remove_file(&final_path);
+            return Err(error).context("persisting DASH catalog transaction");
+        }
+        next_catalog.journal_entries = next_catalog.journal_entries.saturating_add(1);
+        *catalog = next_catalog;
+        if catalog.journal_entries >= JOURNAL_COMPACTION_RECORDS {
+            match self.persist_catalog(stream_id, &catalog) {
+                Ok(()) => catalog.journal_entries = 0,
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        %stream_id,
+                        "failed to compact DASH catalog journal; durable journal remains authoritative"
+                    );
+                }
+            }
+        }
         for path in evicted {
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
@@ -163,18 +231,25 @@ impl DashStore {
     }
 
     pub fn list(&self, stream_id: Uuid) -> Result<Vec<StoredDashObject>> {
-        Ok(self
-            .streams()?
-            .get(&stream_id)
-            .map(|catalog| catalog.objects.values().cloned().collect())
-            .unwrap_or_default())
+        let Some(handle) = self.catalog(stream_id)? else {
+            return Ok(Vec::new());
+        };
+        let catalog = handle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("DASH stream catalog mutex poisoned"))?;
+        Ok(catalog.objects.values().cloned().collect())
     }
 
     pub fn get(&self, stream_id: Uuid, sequence: u64) -> Result<Option<DashObject>> {
-        let stored = self
-            .streams()?
-            .get(&stream_id)
-            .and_then(|catalog| catalog.objects.get(&sequence).cloned());
+        let stored = match self.catalog(stream_id)? {
+            Some(handle) => handle
+                .lock()
+                .map_err(|_| anyhow::anyhow!("DASH stream catalog mutex poisoned"))?
+                .objects
+                .get(&sequence)
+                .cloned(),
+            None => None,
+        };
         let Some(stored) = stored else {
             return Ok(None);
         };
@@ -197,24 +272,17 @@ impl DashStore {
         epoch_id: Uuid,
         segment_number: u64,
     ) -> Result<Option<Vec<u8>>> {
-        let sequences = self
-            .streams()?
-            .get(&stream_id)
-            .map(|catalog| {
-                let mut chunks = catalog
-                    .objects
-                    .values()
-                    .filter(|object| {
-                        object.header.epoch_id == epoch_id
-                            && object.header.kind == DashObjectKind::Media
-                            && object.header.segment_number == segment_number
-                    })
-                    .map(|object| (object.header.chunk_index, object.header.sequence))
-                    .collect::<Vec<_>>();
-                chunks.sort_unstable();
-                chunks
+        let mut sequences = self
+            .list(stream_id)?
+            .into_iter()
+            .filter(|object| {
+                object.header.epoch_id == epoch_id
+                    && object.header.kind == DashObjectKind::Media
+                    && object.header.segment_number == segment_number
             })
-            .unwrap_or_default();
+            .map(|object| (object.header.chunk_index, object.header.sequence))
+            .collect::<Vec<_>>();
+        sequences.sort_unstable();
         if sequences.is_empty() {
             return Ok(None);
         }
@@ -285,43 +353,62 @@ impl DashStore {
     }
 
     pub fn last_sequence(&self, stream_id: Uuid) -> Result<Option<u64>> {
-        Ok(self
-            .streams()?
-            .get(&stream_id)
-            .and_then(|catalog| catalog.last_sequence))
+        let Some(handle) = self.catalog(stream_id)? else {
+            return Ok(None);
+        };
+        let last_sequence = handle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("DASH stream catalog mutex poisoned"))?
+            .last_sequence;
+        Ok(last_sequence)
     }
 
     pub fn summaries(&self) -> Result<HashMap<Uuid, DashSummary>> {
-        Ok(self
-            .streams()?
-            .iter()
-            .map(|(stream_id, catalog)| {
-                (
-                    *stream_id,
-                    DashSummary {
-                        bytes: catalog.bytes,
-                        last_sequence: catalog.last_sequence,
-                        last_timestamp: catalog
-                            .objects
-                            .values()
-                            .filter(|object| object.header.kind == DashObjectKind::Media)
-                            .map(|object| object.header.timestamp)
-                            .max(),
-                    },
-                )
-            })
-            .collect())
+        let handles = self.catalogs()?;
+        let mut summaries = HashMap::with_capacity(handles.len());
+        for (stream_id, handle) in handles {
+            let catalog = handle
+                .lock()
+                .map_err(|_| anyhow::anyhow!("DASH stream catalog mutex poisoned"))?;
+            summaries.insert(
+                stream_id,
+                DashSummary {
+                    bytes: catalog.bytes,
+                    last_sequence: catalog.last_sequence,
+                    last_timestamp: catalog
+                        .objects
+                        .values()
+                        .filter(|object| object.header.kind == DashObjectKind::Media)
+                        .map(|object| object.header.timestamp)
+                        .max(),
+                },
+            );
+        }
+        Ok(summaries)
     }
 
     pub fn delete_stream(&self, stream_id: Uuid) -> Result<bool> {
-        let removed = self.streams()?.remove(&stream_id).is_some();
+        let removed = self
+            .inner
+            .streams
+            .write()
+            .map_err(|_| anyhow::anyhow!("DASH stream map lock poisoned"))?
+            .remove(&stream_id);
+        let _catalog_guard = match &removed {
+            Some(handle) => Some(
+                handle
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("DASH stream catalog mutex poisoned"))?,
+            ),
+            None => None,
+        };
         let stream_dir = self.stream_dir(stream_id);
         if stream_dir.exists() {
             std::fs::remove_dir_all(&stream_dir)
                 .with_context(|| format!("removing DASH stream {}", stream_dir.display()))?;
             return Ok(true);
         }
-        Ok(removed)
+        Ok(removed.is_some())
     }
 
     fn latest_payload(
@@ -330,14 +417,12 @@ impl DashStore {
         epoch_id: Uuid,
         kind: DashObjectKind,
     ) -> Result<Option<Vec<u8>>> {
-        let sequence = self.streams()?.get(&stream_id).and_then(|catalog| {
-            catalog
-                .objects
-                .values()
-                .rev()
-                .find(|object| object.header.epoch_id == epoch_id && object.header.kind == kind)
-                .map(|object| object.header.sequence)
-        });
+        let sequence = self
+            .list(stream_id)?
+            .into_iter()
+            .rev()
+            .find(|object| object.header.epoch_id == epoch_id && object.header.kind == kind)
+            .map(|object| object.header.sequence);
         match sequence {
             Some(sequence) => Ok(self.get(stream_id, sequence)?.map(|object| object.payload)),
             None => Ok(None),
@@ -511,6 +596,7 @@ impl DashStore {
                     );
                 }
             }
+            self.replay_catalog_journal(stream_id, &mut catalog)?;
             let retained_last_sequence = catalog.objects.last_key_value().map(|(seq, _)| *seq);
             if catalog
                 .last_sequence
@@ -525,6 +611,7 @@ impl DashStore {
             let removed = self.enforce_retention(&mut catalog, glacialcast_protocol::now_ms());
             if !removed.is_empty() {
                 self.persist_catalog(stream_id, &catalog)?;
+                catalog.journal_entries = 0;
                 for path in removed {
                     match std::fs::remove_file(&path) {
                         Ok(()) => {}
@@ -537,9 +624,13 @@ impl DashStore {
                     }
                 }
             }
-            loaded.insert(stream_id, catalog);
+            loaded.insert(stream_id, Arc::new(Mutex::new(catalog)));
         }
-        *self.streams()? = loaded;
+        *self
+            .inner
+            .streams
+            .write()
+            .map_err(|_| anyhow::anyhow!("DASH stream map lock poisoned"))? = loaded;
         Ok(())
     }
 
@@ -566,7 +657,196 @@ impl DashStore {
                 catalog_path.display()
             )
         })?;
+        sync_directory(&stream_dir)?;
+        let journal_path = stream_dir.join("catalog.journal");
+        let journal_temp = stream_dir.join(format!(".catalog-journal-{}.tmp", Uuid::new_v4()));
+        write_durable_file(&journal_temp, &[])?;
+        std::fs::rename(&journal_temp, &journal_path).with_context(|| {
+            format!(
+                "resetting DASH catalog journal {} as {}",
+                journal_temp.display(),
+                journal_path.display()
+            )
+        })?;
         sync_directory(&stream_dir)
+    }
+
+    fn append_catalog_transaction(
+        &self,
+        stream_id: Uuid,
+        transaction: &CatalogTransaction,
+    ) -> Result<()> {
+        if transaction.stream_id != stream_id {
+            anyhow::bail!("DASH catalog transaction stream does not match journal");
+        }
+        let transaction_bytes =
+            serde_json::to_vec(transaction).context("serializing DASH catalog transaction")?;
+        let record = JournalRecord {
+            checksum: Sha256::digest(&transaction_bytes).into(),
+            transaction: transaction.clone(),
+        };
+        let mut bytes =
+            serde_json::to_vec(&record).context("serializing DASH catalog journal record")?;
+        if bytes.len() > MAX_JOURNAL_RECORD_LEN {
+            anyhow::bail!("DASH catalog journal record exceeds its size limit");
+        }
+        bytes.push(b'\n');
+        let stream_dir = self.stream_dir(stream_id);
+        let journal_path = stream_dir.join("catalog.journal");
+        let existing_len = std::fs::metadata(&journal_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or_default();
+        if existing_len.saturating_add(bytes.len() as u64) > MAX_JOURNAL_FILE_LEN {
+            anyhow::bail!("DASH catalog journal exceeds its size limit");
+        }
+        let mut journal = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&journal_path)
+            .with_context(|| format!("opening {}", journal_path.display()))?;
+        journal
+            .write_all(&bytes)
+            .with_context(|| format!("appending {}", journal_path.display()))?;
+        journal
+            .sync_all()
+            .with_context(|| format!("syncing {}", journal_path.display()))
+    }
+
+    fn replay_catalog_journal(&self, stream_id: Uuid, catalog: &mut StreamCatalog) -> Result<()> {
+        let journal_path = self.stream_dir(stream_id).join("catalog.journal");
+        let metadata = match std::fs::symlink_metadata(&journal_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading metadata for {}", journal_path.display()));
+            }
+        };
+        if !metadata.file_type().is_file() || metadata.len() > MAX_JOURNAL_FILE_LEN {
+            anyhow::bail!(
+                "DASH catalog journal is not a bounded regular file: {}",
+                journal_path.display()
+            );
+        }
+        let bytes = std::fs::read(&journal_path)
+            .with_context(|| format!("reading {}", journal_path.display()))?;
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let Some(relative_end) = bytes[offset..].iter().position(|byte| *byte == b'\n') else {
+                tracing::warn!(
+                    path = %journal_path.display(),
+                    trailing_bytes = bytes.len() - offset,
+                    "ignoring an incomplete trailing DASH catalog journal record"
+                );
+                break;
+            };
+            let end = offset + relative_end;
+            if end == offset || end - offset > MAX_JOURNAL_RECORD_LEN {
+                anyhow::bail!(
+                    "DASH catalog journal contains an empty or oversized complete record"
+                );
+            }
+            let record: JournalRecord = serde_json::from_slice(&bytes[offset..end])
+                .with_context(|| format!("parsing {}", journal_path.display()))?;
+            self.apply_catalog_transaction(stream_id, catalog, record)?;
+            offset = end + 1;
+        }
+        if offset < bytes.len() {
+            let journal = OpenOptions::new()
+                .write(true)
+                .open(&journal_path)
+                .with_context(|| format!("opening {} for recovery", journal_path.display()))?;
+            journal
+                .set_len(offset as u64)
+                .with_context(|| format!("truncating {}", journal_path.display()))?;
+            journal
+                .sync_all()
+                .with_context(|| format!("syncing recovered {}", journal_path.display()))?;
+        }
+        Ok(())
+    }
+
+    fn apply_catalog_transaction(
+        &self,
+        stream_id: Uuid,
+        catalog: &mut StreamCatalog,
+        record: JournalRecord,
+    ) -> Result<()> {
+        let transaction_bytes = serde_json::to_vec(&record.transaction)
+            .context("serializing replayed DASH catalog transaction")?;
+        let expected_checksum: [u8; 32] = Sha256::digest(&transaction_bytes).into();
+        if record.checksum != expected_checksum {
+            anyhow::bail!("DASH catalog journal checksum mismatch");
+        }
+        let transaction = record.transaction;
+        if transaction.version != JOURNAL_VERSION
+            || transaction.stream_id != stream_id
+            || transaction.put.header.stream_id != stream_id
+            || transaction.put.relative_path
+                != object_relative_path(transaction.put.header.sequence)
+            || transaction.last_sequence != transaction.put.header.sequence
+        {
+            anyhow::bail!("DASH catalog journal transaction is inconsistent");
+        }
+        if catalog
+            .last_sequence
+            .is_some_and(|sequence| transaction.last_sequence <= sequence)
+        {
+            if let Some(existing) = catalog.objects.get(&transaction.put.header.sequence)
+                && existing != &transaction.put
+            {
+                anyhow::bail!("stale DASH catalog journal redefines a retained sequence");
+            }
+            catalog.journal_entries = catalog.journal_entries.saturating_add(1);
+            return Ok(());
+        }
+        let put_was_removed = transaction
+            .removed_sequences
+            .contains(&transaction.put.header.sequence);
+        if let Some(existing) = catalog.objects.get(&transaction.put.header.sequence) {
+            if existing != &transaction.put {
+                anyhow::bail!("DASH catalog journal redefines an existing sequence");
+            }
+        } else {
+            let expected_sequence = catalog
+                .last_sequence
+                .map(|sequence| sequence.saturating_add(1))
+                .unwrap_or(1);
+            if transaction.put.header.sequence != expected_sequence {
+                anyhow::bail!("DASH catalog journal skips a sequence");
+            }
+            validate_media_progression(catalog, &transaction.put.header)?;
+            if !put_was_removed {
+                let payload = self.read_stored_payload(stream_id, &transaction.put)?;
+                DashObject {
+                    header: transaction.put.header.clone(),
+                    payload,
+                }
+                .validate()
+                .context("validating journaled DASH object")?;
+                catalog.bytes = catalog
+                    .bytes
+                    .saturating_add(u64::from(transaction.put.header.payload_len));
+                catalog
+                    .objects
+                    .insert(transaction.put.header.sequence, transaction.put);
+            }
+        }
+        catalog.last_sequence = Some(
+            catalog
+                .last_sequence
+                .unwrap_or_default()
+                .max(transaction.last_sequence),
+        );
+        for sequence in transaction.removed_sequences {
+            if let Some(removed) = catalog.objects.remove(&sequence) {
+                catalog.bytes = catalog
+                    .bytes
+                    .saturating_sub(u64::from(removed.header.payload_len));
+            }
+        }
+        catalog.journal_entries = catalog.journal_entries.saturating_add(1);
+        Ok(())
     }
 
     fn stream_dir(&self, stream_id: Uuid) -> PathBuf {
@@ -597,11 +877,39 @@ impl DashStore {
         })
     }
 
-    fn streams(&self) -> Result<MutexGuard<'_, HashMap<Uuid, StreamCatalog>>> {
-        self.inner
+    fn catalog(&self, stream_id: Uuid) -> Result<Option<Arc<Mutex<StreamCatalog>>>> {
+        Ok(self
+            .inner
             .streams
-            .lock()
-            .map_err(|_| anyhow::anyhow!("DASH store mutex poisoned"))
+            .read()
+            .map_err(|_| anyhow::anyhow!("DASH stream map lock poisoned"))?
+            .get(&stream_id)
+            .cloned())
+    }
+
+    fn catalog_or_create(&self, stream_id: Uuid) -> Result<Arc<Mutex<StreamCatalog>>> {
+        if let Some(catalog) = self.catalog(stream_id)? {
+            return Ok(catalog);
+        }
+        Ok(self
+            .inner
+            .streams
+            .write()
+            .map_err(|_| anyhow::anyhow!("DASH stream map lock poisoned"))?
+            .entry(stream_id)
+            .or_insert_with(|| Arc::new(Mutex::new(StreamCatalog::default())))
+            .clone())
+    }
+
+    fn catalogs(&self) -> Result<Vec<(Uuid, Arc<Mutex<StreamCatalog>>)>> {
+        Ok(self
+            .inner
+            .streams
+            .read()
+            .map_err(|_| anyhow::anyhow!("DASH stream map lock poisoned"))?
+            .iter()
+            .map(|(stream_id, catalog)| (*stream_id, Arc::clone(catalog)))
+            .collect())
     }
 }
 
@@ -816,6 +1124,157 @@ mod tests {
     }
 
     #[test]
+    fn append_journal_avoids_per_object_snapshot_rewrites() {
+        let (root, store) = test_store(1024);
+        let stream_id = Uuid::from_u128(7);
+        let epoch_id = Uuid::from_u128(8);
+        let keys = EpochKeys::derive(&[4; 32], stream_id, epoch_id).unwrap();
+        let media = |sequence| {
+            object(
+                &keys,
+                stream_id,
+                epoch_id,
+                ObjectSpec {
+                    kind: DashObjectKind::Media,
+                    sequence,
+                    segment_number: sequence,
+                    chunk_index: 0,
+                    random_access: true,
+                    payload: vec![sequence as u8],
+                },
+            )
+        };
+
+        store.store(media(1)).unwrap();
+        let catalog_path = store.stream_dir(stream_id).join("catalog.json");
+        let snapshot_after_first = std::fs::read(&catalog_path).unwrap();
+        store.store(media(2)).unwrap();
+        assert_eq!(std::fs::read(&catalog_path).unwrap(), snapshot_after_first);
+        let journal_path = store.stream_dir(stream_id).join("catalog.journal");
+        assert_eq!(
+            std::fs::read(&journal_path)
+                .unwrap()
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count(),
+            2
+        );
+        drop(store);
+
+        let reopened = DashStore::open(root.clone(), 1024, Duration::from_secs(1800)).unwrap();
+        assert_eq!(reopened.last_sequence(stream_id).unwrap(), Some(2));
+        assert_eq!(reopened.list(stream_id).unwrap().len(), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_recovery_truncates_an_incomplete_final_journal_record() {
+        let (root, store) = test_store(1024);
+        let stream_id = Uuid::from_u128(9);
+        let epoch_id = Uuid::from_u128(10);
+        let keys = EpochKeys::derive(&[5; 32], stream_id, epoch_id).unwrap();
+        store
+            .store(object(
+                &keys,
+                stream_id,
+                epoch_id,
+                ObjectSpec {
+                    kind: DashObjectKind::Media,
+                    sequence: 1,
+                    segment_number: 1,
+                    chunk_index: 0,
+                    random_access: true,
+                    payload: vec![1],
+                },
+            ))
+            .unwrap();
+        let journal_path = store.stream_dir(stream_id).join("catalog.journal");
+        let valid_len = std::fs::metadata(&journal_path).unwrap().len();
+        let mut journal = OpenOptions::new().append(true).open(&journal_path).unwrap();
+        journal.write_all(br#"{"incomplete":"#).unwrap();
+        journal.sync_all().unwrap();
+        drop(journal);
+        drop(store);
+
+        let reopened = DashStore::open(root.clone(), 1024, Duration::from_secs(1800)).unwrap();
+        assert_eq!(reopened.last_sequence(stream_id).unwrap(), Some(1));
+        assert_eq!(std::fs::metadata(&journal_path).unwrap().len(), valid_len);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_recovery_rejects_a_corrupt_complete_journal_record() {
+        let (root, store) = test_store(1024);
+        let stream_id = Uuid::from_u128(13);
+        let epoch_id = Uuid::from_u128(14);
+        let keys = EpochKeys::derive(&[6; 32], stream_id, epoch_id).unwrap();
+        store
+            .store(object(
+                &keys,
+                stream_id,
+                epoch_id,
+                ObjectSpec {
+                    kind: DashObjectKind::Media,
+                    sequence: 1,
+                    segment_number: 1,
+                    chunk_index: 0,
+                    random_access: true,
+                    payload: vec![1],
+                },
+            ))
+            .unwrap();
+        let journal_path = store.stream_dir(stream_id).join("catalog.journal");
+        let mut journal = OpenOptions::new().append(true).open(&journal_path).unwrap();
+        journal.write_all(b"{}\n").unwrap();
+        journal.sync_all().unwrap();
+        drop(journal);
+        drop(store);
+
+        assert!(DashStore::open(root.clone(), 1024, Duration::from_secs(1800)).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_recovery_ignores_transactions_already_in_a_compacted_snapshot() {
+        let (root, store) = test_store(0);
+        let stream_id = Uuid::from_u128(15);
+        let epoch_id = Uuid::from_u128(16);
+        let keys = EpochKeys::derive(&[7; 32], stream_id, epoch_id).unwrap();
+        store
+            .store(object(
+                &keys,
+                stream_id,
+                epoch_id,
+                ObjectSpec {
+                    kind: DashObjectKind::Media,
+                    sequence: 1,
+                    segment_number: 1,
+                    chunk_index: 0,
+                    random_access: true,
+                    payload: vec![1],
+                },
+            ))
+            .unwrap();
+        let journal_path = store.stream_dir(stream_id).join("catalog.journal");
+        let stale_journal = std::fs::read(&journal_path).unwrap();
+        {
+            let handle = store.catalog(stream_id).unwrap().unwrap();
+            let catalog = handle.lock().unwrap();
+            store.persist_catalog(stream_id, &catalog).unwrap();
+        }
+        let mut journal = OpenOptions::new().append(true).open(&journal_path).unwrap();
+        journal.write_all(&stale_journal).unwrap();
+        journal.sync_all().unwrap();
+        drop(journal);
+        drop(store);
+
+        let reopened = DashStore::open(root.clone(), 0, Duration::from_secs(1800)).unwrap();
+        assert_eq!(reopened.last_sequence(stream_id).unwrap(), Some(1));
+        assert!(reopened.list(stream_id).unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn byte_retention_evicts_complete_oldest_segment() {
         let (root, store) = test_store(30);
         let stream_id = Uuid::from_u128(11);
@@ -959,10 +1418,10 @@ mod tests {
             ))
             .unwrap();
         {
-            let mut streams = store.streams().unwrap();
-            let catalog = streams.get_mut(&stream_id).unwrap();
+            let handle = store.catalog(stream_id).unwrap().unwrap();
+            let mut catalog = handle.lock().unwrap();
             catalog.objects.get_mut(&1).unwrap().received_at_ms = 0;
-            store.persist_catalog(stream_id, catalog).unwrap();
+            store.persist_catalog(stream_id, &catalog).unwrap();
         }
         drop(store);
 
@@ -1157,6 +1616,11 @@ mod tests {
                     },
                 ))
                 .unwrap();
+            {
+                let handle = store.catalog(stream_id).unwrap().unwrap();
+                let catalog = handle.lock().unwrap();
+                store.persist_catalog(stream_id, &catalog).unwrap();
+            }
             let catalog_path = store.stream_dir(stream_id).join("catalog.json");
             let mut persisted: PersistedCatalog =
                 serde_json::from_slice(&std::fs::read(&catalog_path).unwrap()).unwrap();
@@ -1305,6 +1769,61 @@ mod tests {
         }
         reader.join().unwrap();
         assert_eq!(store.list(stream_id).unwrap().len(), 10);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn independent_streams_do_not_share_a_catalog_mutex() {
+        let (root, store) = test_store(1024);
+        let first_stream = Uuid::from_u128(57);
+        let second_stream = Uuid::from_u128(58);
+        let first_epoch = Uuid::from_u128(59);
+        let second_epoch = Uuid::from_u128(60);
+        let first_keys = EpochKeys::derive(&[11; 32], first_stream, first_epoch).unwrap();
+        let second_keys = EpochKeys::derive(&[12; 32], second_stream, second_epoch).unwrap();
+        store
+            .store(object(
+                &first_keys,
+                first_stream,
+                first_epoch,
+                ObjectSpec {
+                    kind: DashObjectKind::Media,
+                    sequence: 1,
+                    segment_number: 1,
+                    chunk_index: 0,
+                    random_access: true,
+                    payload: vec![1],
+                },
+            ))
+            .unwrap();
+
+        let first_handle = store.catalog(first_stream).unwrap().unwrap();
+        let first_guard = first_handle.lock().unwrap();
+        let writer_store = store.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let result = writer_store.store(object(
+                &second_keys,
+                second_stream,
+                second_epoch,
+                ObjectSpec {
+                    kind: DashObjectKind::Media,
+                    sequence: 1,
+                    segment_number: 1,
+                    chunk_index: 0,
+                    random_access: true,
+                    payload: vec![2],
+                },
+            ));
+            done_tx.send(result).unwrap();
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second stream was blocked by the first stream catalog")
+            .unwrap();
+        drop(first_guard);
+        writer.join().unwrap();
+        assert_eq!(store.last_sequence(second_stream).unwrap(), Some(1));
         std::fs::remove_dir_all(root).unwrap();
     }
 
