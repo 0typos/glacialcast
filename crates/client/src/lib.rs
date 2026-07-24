@@ -695,9 +695,7 @@ async fn run_dash_connection(
                     capture.capture_dash_frame(args.max_frame_width, args.max_frame_height).await?,
                     Some((width, height)),
                 );
-                let fingerprint = (capture.change == FrameChange::Unknown)
-                    .then(|| capture.frame.content_fingerprint())
-                    .flatten();
+                let fingerprint = capture.frame.content_fingerprint();
                 let changed = frame_changed(
                     capture.change,
                     last_frame_fingerprint.as_ref(),
@@ -898,13 +896,13 @@ fn frame_changed(
     previous_fingerprint: Option<&[u8; 32]>,
     current_fingerprint: Option<&[u8; 32]>,
 ) -> bool {
+    if let (Some(previous), Some(current)) = (previous_fingerprint, current_fingerprint) {
+        return previous != current;
+    }
     match change {
         FrameChange::Changed => true,
         FrameChange::Unchanged => false,
-        FrameChange::Unknown => match (previous_fingerprint, current_fingerprint) {
-            (Some(previous), Some(current)) => previous != current,
-            _ => true,
-        },
+        FrameChange::Unknown => true,
     }
 }
 
@@ -2216,6 +2214,33 @@ fn frame_change_from_damage(damage: Option<bool>) -> FrameChange {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum AccumulatedFrameDamage {
+    #[default]
+    Empty,
+    Unchanged,
+    Unknown,
+    Changed,
+}
+
+impl AccumulatedFrameDamage {
+    fn observe(&mut self, damage: Option<bool>) {
+        *self = match (*self, damage) {
+            (Self::Changed, _) | (_, Some(true)) => Self::Changed,
+            (Self::Unknown, _) | (_, None) => Self::Unknown,
+            (Self::Empty | Self::Unchanged, Some(false)) => Self::Unchanged,
+        };
+    }
+
+    fn take(&mut self) -> Option<bool> {
+        match std::mem::take(self) {
+            Self::Changed => Some(true),
+            Self::Unchanged => Some(false),
+            Self::Empty | Self::Unknown => None,
+        }
+    }
+}
+
 fn pipewire_video_damage(buffer: *const spa::sys::spa_buffer) -> Option<bool> {
     if buffer.is_null() {
         return None;
@@ -3018,6 +3043,7 @@ fn run_pipewire_loop(
         last_cursor_state: None,
         cursor_meta_missing_since: None,
         cursor_meta_verified: false,
+        pending_video_damage: AccumulatedFrameDamage::default(),
         mainloop_ptr,
         unmapped_buffer_logged: false,
         cursor_meta_logged: false,
@@ -3128,7 +3154,9 @@ fn run_pipewire_loop(
             ) {
                 return;
             }
-            let damage = pipewire_video_damage(buffer.spa_buffer_ptr());
+            user_data
+                .pending_video_damage
+                .observe(pipewire_video_damage(buffer.spa_buffer_ptr()));
             let datas = buffer.datas_mut();
             if datas.is_empty() {
                 return;
@@ -3272,7 +3300,7 @@ fn run_pipewire_loop(
             user_data.serial = user_data.serial.wrapping_add(1);
             let frame = RawFrame {
                 serial: user_data.serial,
-                damage,
+                damage: user_data.pending_video_damage.take(),
                 width: video_size.width,
                 height: video_size.height,
                 stride,
@@ -3376,6 +3404,7 @@ fn run_pipewire_video_loop(
         last_cursor_state: None,
         cursor_meta_missing_since: None,
         cursor_meta_verified: false,
+        pending_video_damage: AccumulatedFrameDamage::default(),
         mainloop_ptr,
         first_frame_logged: false,
         cursor_meta_logged: false,
@@ -3499,7 +3528,9 @@ fn run_pipewire_video_loop(
             ) {
                 return;
             }
-            let damage = pipewire_video_damage(buffer.spa_buffer_ptr());
+            user_data
+                .pending_video_damage
+                .observe(pipewire_video_damage(buffer.spa_buffer_ptr()));
             let datas = buffer.datas_mut();
             if datas.is_empty() {
                 return;
@@ -3576,7 +3607,7 @@ fn run_pipewire_video_loop(
                 });
                 let frame = DmaBufFrame {
                     serial: user_data.serial,
-                    damage,
+                    damage: user_data.pending_video_damage.take(),
                     width: video_size.width,
                     height: video_size.height,
                     fd: Arc::new(owned_fd),
@@ -3624,7 +3655,7 @@ fn run_pipewire_video_loop(
             }
             let frame = RawFrame {
                 serial: user_data.serial,
-                damage,
+                damage: user_data.pending_video_damage.take(),
                 width: video_size.width,
                 height: video_size.height,
                 stride,
@@ -4600,6 +4631,7 @@ struct PipewireUserData {
     last_cursor_state: Option<PipewireCursorState>,
     cursor_meta_missing_since: Option<Instant>,
     cursor_meta_verified: bool,
+    pending_video_damage: AccumulatedFrameDamage,
     mainloop_ptr: usize,
     unmapped_buffer_logged: bool,
     cursor_meta_logged: bool,
@@ -4620,6 +4652,7 @@ struct PipewireVideoUserData {
     last_cursor_state: Option<PipewireCursorState>,
     cursor_meta_missing_since: Option<Instant>,
     cursor_meta_verified: bool,
+    pending_video_damage: AccumulatedFrameDamage,
     mainloop_ptr: usize,
     first_frame_logged: bool,
     cursor_meta_logged: bool,
@@ -5141,7 +5174,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_change_hints_override_rgb_fingerprint_fallback() {
+    fn rgb_fingerprint_defends_against_incorrect_change_hints() {
         let first = [1; 32];
         let second = [2; 32];
         assert!(!frame_changed(
@@ -5154,13 +5187,36 @@ mod tests {
             Some(&first),
             Some(&second)
         ));
-        assert!(!frame_changed(
+        assert!(frame_changed(
             FrameChange::Unchanged,
             Some(&first),
             Some(&second)
         ));
+        assert!(!frame_changed(
+            FrameChange::Changed,
+            Some(&first),
+            Some(&first)
+        ));
         assert!(frame_changed(FrameChange::Changed, None, None));
         assert!(frame_changed(FrameChange::Unknown, None, None));
+    }
+
+    #[test]
+    fn pipewire_damage_accumulates_across_video_throttling() {
+        let mut damage = AccumulatedFrameDamage::default();
+
+        damage.observe(Some(false));
+        assert_eq!(damage.take(), Some(false));
+
+        damage.observe(Some(false));
+        damage.observe(Some(true));
+        damage.observe(Some(false));
+        assert_eq!(damage.take(), Some(true));
+
+        damage.observe(None);
+        damage.observe(Some(false));
+        assert_eq!(damage.take(), None);
+        assert_eq!(damage.take(), None);
     }
 
     #[test]
