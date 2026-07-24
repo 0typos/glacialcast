@@ -268,16 +268,15 @@ For niri portal routing helpers and an upstream diagnostic template, see
 ## Verify
 
 ```sh
-cargo fmt --check
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo deny -L error check
-node scripts/test-viewer-core.mjs
-scripts/verify-ingest-recovery.sh
-scripts/verify-internet-security.sh
+scripts/verify-quality.sh standard
+scripts/verify-quality.sh full
 scripts/verify-internet-browser.sh
-scripts/verify-performance.sh
 ```
+
+The `standard` profile is the normal commit gate. The `full` profile includes
+that gate plus the synthetic DASH/offline, crash-recovery, Internet-security,
+and release-performance integrations. Run the browser command separately when
+Docker and Playwright are available.
 
 `scripts/verify-dash-e2e.sh` exercises an authenticated encrypted test stream
 against a temporary relay and portable offline viewer. The recovery gate

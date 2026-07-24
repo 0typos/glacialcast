@@ -52,13 +52,7 @@ PASS: Rust, Clang, PipeWire, libva, and GBM build prerequisites are available
 These checks do not need Wayland, a browser, or a GPU:
 
 ```sh
-cargo fmt --all -- --check
-cargo test --workspace
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo doc --workspace --no-deps
-cargo deny -L error check
-bash -n scripts/*.sh
-node scripts/test-viewer-core.mjs
+scripts/verify-quality.sh standard
 ```
 
 Success means:
@@ -73,13 +67,11 @@ envelopes use version-gated Postcard.
 
 ## 3. Run the headless end-to-end gates
 
-Run the following in order:
+The canonical full local gate includes the standard checks and all deterministic
+headless integrations:
 
 ```sh
-scripts/verify-dash-e2e.sh
-scripts/verify-ingest-recovery.sh
-scripts/verify-internet-security.sh
-scripts/verify-performance.sh
+scripts/verify-quality.sh full
 ```
 
 They verify:

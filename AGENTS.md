@@ -50,3 +50,22 @@ These instructions apply to the entire repository.
   breaking change.
 - Do not generate a changelog, create a release commit, or create a version tag
   unless explicitly requested.
+
+## Documentation
+
+- Follow the documentation standard in `CONTRIBUTING.md`.
+- Library crates must deny missing rustdoc for public APIs. Document purpose,
+  units, bounds, ordering, errors, and security invariants rather than merely
+  restating identifiers.
+- Update the architecture, Internet deployment, or testing/demo guide in the
+  same change when their contract is affected.
+
+## Testing
+
+- Follow the testing standard and change-to-gate matrix in `CONTRIBUTING.md`.
+- Bug fixes require a regression test. Security changes require a negative
+  rejection test. Parser changes cover bounds, truncation, and trailing data.
+- Run `scripts/verify-quality.sh standard` for normal commits.
+- Run `scripts/verify-quality.sh full` for behavior, protocol, security,
+  storage, or viewer changes, plus affected browser, Wayland, or hardware gates
+  when the host supports them.
