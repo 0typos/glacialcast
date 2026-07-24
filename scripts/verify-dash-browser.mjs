@@ -7,6 +7,7 @@ const playwrightModule = process.env.GLACIALCAST_PLAYWRIGHT_MODULE || 'playwrigh
 const { chromium, firefox } = require(playwrightModule);
 
 const [origin, streamId, viewerKey, browserName = 'firefox'] = process.argv.slice(2);
+const accessToken = process.env.GLACIALCAST_VERIFY_ACCESS_TOKEN;
 if (!origin || !streamId || !viewerKey || !['firefox', 'chromium'].includes(browserName)) {
   console.error(
     'usage: verify-dash-browser.mjs ORIGIN STREAM_ID VIEWER_KEY [firefox|chromium]',
@@ -58,6 +59,12 @@ try {
     });
   });
 
+  if (accessToken) {
+    await page.goto(`${origin}/login`, { waitUntil: 'domcontentloaded' });
+    await page.locator('#access-token').fill(accessToken);
+    await page.locator('#login-form button').click();
+    await page.waitForURL(`${origin}/`);
+  }
   await page.goto(`${origin}/dash/${streamId}`, { waitUntil: 'domcontentloaded' });
   console.log('viewer loaded; submitting the viewer key');
   await page.locator('#viewer-key').fill(viewerKey);
