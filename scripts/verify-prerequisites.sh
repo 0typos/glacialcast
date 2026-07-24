@@ -2,7 +2,7 @@
 set -euo pipefail
 
 missing_commands=()
-for command_name in cargo pkg-config ffmpeg ffprobe; do
+for command_name in cargo pkg-config ffprobe; do
   if ! command -v "${command_name}" >/dev/null 2>&1; then
     missing_commands+=("${command_name}")
   fi
@@ -17,9 +17,7 @@ missing_modules=()
 for module_name in \
   libavcodec \
   libavfilter \
-  libavformat \
   libavutil \
-  libswresample \
   libswscale \
   libva \
   libpipewire-0.3
@@ -33,8 +31,8 @@ if (( ${#missing_modules[@]} > 0 )); then
   echo "missing pkg-config modules: ${missing_modules[*]}" >&2
   echo "Fedora install command:" >&2
   echo "  sudo dnf install pipewire-devel libva-devel pkgconf-pkg-config \\" >&2
-  echo "    libavcodec-free-devel libavfilter-free-devel libavformat-free-devel \\" >&2
-  echo "    libavutil-free-devel libswresample-free-devel libswscale-free-devel" >&2
+  echo "    libavcodec-free-devel libavfilter-free-devel libavutil-free-devel \\" >&2
+  echo "    libswscale-free-devel" >&2
   exit 1
 fi
 

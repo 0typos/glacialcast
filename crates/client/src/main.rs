@@ -94,12 +94,6 @@ struct Args {
     capture: CaptureMode,
     #[arg(long)]
     video_command: Option<String>,
-    #[arg(long)]
-    video_srt_url: Option<String>,
-    #[arg(long, default_value = "mpegts")]
-    video_srt_muxer: String,
-    #[arg(long, requires = "video_srt_url")]
-    video_srt_only: bool,
     #[arg(long, default_value = "~/photos/screenshots")]
     image_dir: PathBuf,
     #[arg(long, value_enum, default_value_t = PortalSourceMode::Monitor)]
@@ -307,11 +301,8 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
         }
         let mut video = build_video_capture(&args)?;
         let mut resend = VideoResendBuffer::new(args.resend_bytes);
-        let result = if args.video_srt_only {
-            run_video_srt_direct(&args, video.as_mut(), shutdown_rx).await
-        } else {
-            run_video_client(&args, &identity, video.as_mut(), &mut resend, shutdown_rx).await
-        };
+        let result =
+            run_video_client(&args, &identity, video.as_mut(), &mut resend, shutdown_rx).await;
         video.stop().await;
         return result;
     }
@@ -728,90 +719,6 @@ fn is_fatal_video_source_error(err: &anyhow::Error) -> bool {
     })
 }
 
-#[cfg(feature = "ffmpeg-vaapi")]
-fn open_video_srt_sink(
-    args: &Args,
-    source: &CaptureSource,
-) -> Result<Option<ffmpeg_vaapi::MpegTsH264Sink>> {
-    args.video_srt_url
-        .as_deref()
-        .map(|url| {
-            ffmpeg_vaapi::MpegTsH264Sink::new(
-                url,
-                &args.video_srt_muxer,
-                source.width,
-                source.height,
-            )
-        })
-        .transpose()
-}
-
-#[cfg(not(feature = "ffmpeg-vaapi"))]
-fn reject_video_srt_without_ffmpeg(args: &Args) -> Result<()> {
-    if args.video_srt_url.is_some() {
-        bail!(
-            "--video-srt-url requires rebuilding glacialcast-client with --features ffmpeg-vaapi"
-        );
-    }
-    Ok(())
-}
-
-async fn run_video_srt_direct(
-    args: &Args,
-    capture: &mut dyn VideoCapture,
-    mut shutdown_rx: watch::Receiver<bool>,
-) -> Result<()> {
-    #[cfg(not(feature = "ffmpeg-vaapi"))]
-    reject_video_srt_without_ffmpeg(args)?;
-
-    let url = args
-        .video_srt_url
-        .as_deref()
-        .context("--video-srt-only requires --video-srt-url")?;
-    let source = capture.source().await?;
-
-    #[cfg(feature = "ffmpeg-vaapi")]
-    let mut srt_sink =
-        open_video_srt_sink(args, &source)?.context("--video-srt-url was not set")?;
-
-    info!(
-        url,
-        backend = source.backend,
-        width = source.width,
-        height = source.height,
-        "publishing video directly to FFmpeg SRT output"
-    );
-
-    loop {
-        tokio::select! {
-            _ = wait_for_shutdown(&mut shutdown_rx) => {
-                info!("shutdown requested; closing SRT video output");
-                #[cfg(feature = "ffmpeg-vaapi")]
-                srt_sink.finish()?;
-                return Ok(());
-            }
-            chunk = capture.next_chunk() => {
-                let chunk = chunk?;
-                #[cfg(feature = "ffmpeg-vaapi")]
-                srt_sink.write_access_unit(
-                    &chunk.payload,
-                    chunk.pts_ms,
-                    chunk.duration_ms,
-                    chunk.keyframe,
-                )?;
-                info!(
-                    width = chunk.width,
-                    height = chunk.height,
-                    keyframe = chunk.keyframe,
-                    bytes = chunk.payload.len(),
-                    url,
-                    "published encoded video chunk to SRT output"
-                );
-            }
-        }
-    }
-}
-
 #[cfg_attr(not(feature = "ffmpeg-vaapi"), allow(dead_code))]
 fn is_vaapi_path_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
@@ -874,10 +781,6 @@ async fn run_video_connection(
         "server assigned video stream"
     );
     capture.request_keyframe()?;
-    #[cfg(not(feature = "ffmpeg-vaapi"))]
-    reject_video_srt_without_ffmpeg(args)?;
-    #[cfg(feature = "ffmpeg-vaapi")]
-    let mut srt_sink = open_video_srt_sink(args, source)?;
 
     let cursor_ms = 1000 / args.cursor_hz.max(1);
     let mut cursor_tick = tokio::time::interval(Duration::from_millis(cursor_ms));
@@ -912,15 +815,6 @@ async fn run_video_connection(
                     content_hash: fast_content_hash(&chunk.payload),
                     payload: chunk.payload,
                 };
-                #[cfg(feature = "ffmpeg-vaapi")]
-                if let Some(sink) = srt_sink.as_mut() {
-                    sink.write_access_unit(
-                        &message.payload,
-                        message.pts_ms,
-                        message.duration_ms,
-                        message.keyframe,
-                    )?;
-                }
                 socket.write(&ClientMessage::VideoChunk(message.clone())).await?;
                 info!(
                     seq,

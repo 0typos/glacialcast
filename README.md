@@ -85,9 +85,7 @@ the matching free devel packages instead of RPM Fusion `ffmpeg-devel`:
 sudo dnf install \
   libavcodec-free-devel \
   libavfilter-free-devel \
-  libavformat-free-devel \
   libavutil-free-devel \
-  libswresample-free-devel \
   libswscale-free-devel \
   libva-devel \
   pkgconf-pkg-config
@@ -407,28 +405,6 @@ cargo build --release -p glacialcast-client --features ffmpeg-vaapi
   --height 720 \
   --resend-bytes 100MiB
 ```
-
-The same encoded H.264 chunks can also be muxed and published by the client
-without spawning `wf-recorder` or `ffmpeg`. This mirrors a wf-recorder/MediaMTX
-SRT flow while still using the in-process capture/encoder path:
-
-```sh
-./target/release/glacialcast-client \
-  --no-viewer-key \
-  --capture wayland-video \
-  --portal-source monitor \
-  --portal-cursor embedded \
-  --fps 10 \
-  --width 1280 \
-  --height 720 \
-  --video-srt-url 'srt://127.0.0.1:8890?mode=caller&streamid=publish:mystream' \
-  --video-srt-only
-```
-
-Drop `--video-srt-only` to mirror the same video chunks to SRT while also
-sending them to the Glacialcast server over the encrypted ingest connection.
-The SRT output uses FFmpeg/libavformat in-process with the configured muxer
-(`mpegts` by default), so it requires `--features ffmpeg-vaapi`.
 
 To pass credentials without config files:
 

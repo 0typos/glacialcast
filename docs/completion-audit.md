@@ -62,7 +62,6 @@ scripts/verify-frame-integrity.sh
 scripts/verify-browser-frame-render.sh
 scripts/verify-video-webrtc.sh
 GLACIALCAST_VERIFY_SCREENCAST_BACKEND=mutter GLACIALCAST_VERIFY_MONITOR_NAME=DP-3 scripts/verify-wayland-video-hardware.sh
-scripts/verify-video-srt-file.sh
 ```
 
 Recent verifier output:
@@ -74,7 +73,6 @@ PASS: clear and encrypted dashboard image frames rendered in Google Chrome with 
 PASS: live H.264 decoded and painted non-uniform 1280x720 pixels in Google Chrome and Firefox; reload recovery completed within 3 seconds
 PASS: WebRTC viewer received decodable H.264 random access point after 155 RTP packets (161926 payload bytes, 3 access units, nal_types=[7, 8, 5, ...])
 PASS: Wayland capture attempted DMA-BUF VAAPI and CPU-upload VAAPI before delivering H.264 through the software fallback
-PASS: direct FFmpeg MPEG-TS output contains H.264 video (26 packets)
 ```
 
 The Fedora FFmpeg 8 feature build was also validated against matching Fedora 44
@@ -82,29 +80,6 @@ development headers extracted into a temporary local prefix. The host still
 needs the packages listed in the README installed system-wide before ordinary
 feature builds and the real Wayland hardware gate can run without that temporary
 `PKG_CONFIG_PATH`.
-
-The in-process FFmpeg/libavformat output path was also tested against
-MediaMTX v1.18.1 using:
-
-```sh
-cargo run -p glacialcast-client --features ffmpeg-vaapi -- \
-  --config /tmp/glacialcast-missing-client.toml \
-  --capture test-video \
-  --fps 5 \
-  --video-srt-url 'srt://127.0.0.1:8890?mode=caller&streamid=publish:mystream' \
-  --video-srt-only \
-  --no-viewer-key
-
-ffmpeg -v error -rtsp_transport tcp \
-  -i rtsp://127.0.0.1:8554/mystream \
-  -frames:v 1 \
-  -f null -
-```
-
-MediaMTX logged the SRT publish as `1 track (H264)`, and the RTSP read decoded
-one frame successfully. This validates the wf-recorder-like MPEG-TS/SRT client
-path, but it does not satisfy the independent cursor requirement because the
-cursor source is still compositor-dependent.
 
 The hard real-cursor gate still fails on this niri session:
 
