@@ -349,14 +349,14 @@ async function loadCursorObject(header) {
   if (state.seenSequences.has(header.sequence)) return;
   const payload = await fetchObject(header.sequence);
   await verifyObject(header, payload);
-  const encrypted = JSON.parse(decoder.decode(payload));
+  const encrypted = parseEncryptedCursorPayload(payload);
   const plaintext = await crypto.subtle.decrypt({
     name: 'AES-GCM',
-    iv: new Uint8Array(encrypted.nonce),
+    iv: encrypted.nonce,
     additionalData: cursorAad(header),
     tagLength: 128,
-  }, state.epochKeys.cursorKey, new Uint8Array(encrypted.ciphertext));
-  const batch = JSON.parse(decoder.decode(plaintext));
+  }, state.epochKeys.cursorKey, encrypted.ciphertext);
+  const batch = parseCursorBatch(new Uint8Array(plaintext));
   if (
     batch.source_width !== state.descriptor.width
     || batch.source_height !== state.descriptor.height
@@ -371,6 +371,122 @@ async function loadCursorObject(header) {
   state.seenSequences.add(header.sequence);
   state.decryptedCursorBatches += 1;
   updateMetrics();
+}
+
+function parseEncryptedCursorPayload(bytes) {
+  if (
+    bytes.byteLength < 16
+    || decoder.decode(bytes.slice(0, 4)) !== 'GCE1'
+  ) {
+    throw new Error('The encrypted cursor payload is malformed.');
+  }
+  return {
+    nonce: bytes.slice(4, 16),
+    ciphertext: bytes.slice(16),
+  };
+}
+
+function parseCursorBatch(bytes) {
+  let offset = 0;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const take = length => {
+    if (!Number.isSafeInteger(length) || length < 0 || offset + length > bytes.byteLength) {
+      throw new Error('The decrypted cursor batch is truncated.');
+    }
+    const value = bytes.slice(offset, offset + length);
+    offset += length;
+    return value;
+  };
+  const u8 = () => take(1)[0];
+  const u16 = () => {
+    const value = view.getUint16(offset);
+    offset += 2;
+    return value;
+  };
+  const u32 = () => {
+    const value = view.getUint32(offset);
+    offset += 4;
+    return value;
+  };
+  const i32 = () => {
+    const value = view.getInt32(offset);
+    offset += 4;
+    return value;
+  };
+  const safeInteger = (value, field) => {
+    const number = Number(value);
+    if (!Number.isSafeInteger(number)) {
+      throw new Error(`Cursor ${field} exceeds JavaScript's safe integer range.`);
+    }
+    return number;
+  };
+  const u64 = field => {
+    if (offset + 8 > bytes.byteLength) {
+      throw new Error('The decrypted cursor batch is truncated.');
+    }
+    const value = view.getBigUint64(offset);
+    offset += 8;
+    return safeInteger(value, field);
+  };
+  const i64 = field => {
+    if (offset + 8 > bytes.byteLength) {
+      throw new Error('The decrypted cursor batch is truncated.');
+    }
+    const value = view.getBigInt64(offset);
+    offset += 8;
+    return safeInteger(value, field);
+  };
+
+  if (decoder.decode(take(4)) !== 'GCC1') {
+    throw new Error('The decrypted cursor batch has an unknown version.');
+  }
+  const sourceWidth = u32();
+  const sourceHeight = u32();
+  const eventCount = u16();
+  const events = [];
+  for (let index = 0; index < eventCount; index += 1) {
+    const timestamp = u64('timestamp');
+    const xMicropixels = i64('x coordinate');
+    const yMicropixels = i64('y coordinate');
+    const flags = u8();
+    if (flags & ~0b11) throw new Error('The cursor event has unsupported flags.');
+    const bitmapId = u64('bitmap ID');
+    let bitmap = null;
+    if (flags & (1 << 1)) {
+      const width = u32();
+      const height = u32();
+      const hotspotX = i32();
+      const hotspotY = i32();
+      const rgbaLength = u32();
+      const expectedLength = width * height * 4;
+      if (!Number.isSafeInteger(expectedLength) || rgbaLength !== expectedLength) {
+        throw new Error('The cursor bitmap has invalid dimensions.');
+      }
+      bitmap = {
+        width,
+        height,
+        hotspot_x: hotspotX,
+        hotspot_y: hotspotY,
+        rgba: take(rgbaLength),
+      };
+    }
+    events.push({
+      timestamp,
+      x_micropixels: xMicropixels,
+      y_micropixels: yMicropixels,
+      visible: Boolean(flags & 1),
+      bitmap_id: bitmapId,
+      bitmap,
+    });
+  }
+  if (offset !== bytes.byteLength) {
+    throw new Error('The decrypted cursor batch has trailing data.');
+  }
+  return {
+    source_width: sourceWidth,
+    source_height: sourceHeight,
+    events,
+  };
 }
 
 function cursorAad(header) {

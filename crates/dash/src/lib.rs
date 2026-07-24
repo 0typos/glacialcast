@@ -36,6 +36,8 @@ pub enum DashError {
     MediaTooLarge,
     #[error("cursor payload exceeds {MAX_CURSOR_PAYLOAD} bytes")]
     CursorTooLarge,
+    #[error("cursor payload is malformed")]
+    InvalidCursorPayload,
     #[error("CENC auxiliary data exceeds one-byte saiz representation")]
     AuxiliaryInfoTooLarge,
     #[error("cryptographic operation failed")]
@@ -191,6 +193,32 @@ pub struct EncryptedCursorBatch {
     pub ciphertext: Vec<u8>,
 }
 
+impl EncryptedCursorBatch {
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        const HEADER_LEN: usize = 16;
+        if self.ciphertext.len().saturating_add(HEADER_LEN) > MAX_CURSOR_PAYLOAD {
+            return Err(DashError::CursorTooLarge);
+        }
+        let mut bytes = Vec::with_capacity(HEADER_LEN + self.ciphertext.len());
+        bytes.extend_from_slice(b"GCE1");
+        bytes.extend_from_slice(&self.nonce);
+        bytes.extend_from_slice(&self.ciphertext);
+        Ok(bytes)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 16 || bytes.len() > MAX_CURSOR_PAYLOAD || &bytes[..4] != b"GCE1" {
+            return Err(DashError::InvalidCursorPayload);
+        }
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&bytes[4..16]);
+        Ok(Self {
+            nonce,
+            ciphertext: bytes[16..].to_vec(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CursorContext {
     pub stream_id: Uuid,
@@ -207,7 +235,7 @@ pub fn encrypt_cursor_batch(
     batch: &CursorBatch,
 ) -> Result<EncryptedCursorBatch> {
     validate_cursor_batch(batch)?;
-    let plaintext = serde_json::to_vec(batch)?;
+    let plaintext = encode_cursor_batch(batch)?;
     if plaintext.len() > MAX_CURSOR_PAYLOAD {
         return Err(DashError::CursorTooLarge);
     }
@@ -241,9 +269,172 @@ pub fn decrypt_cursor_batch(
             },
         )
         .map_err(|_| DashError::Crypto)?;
-    let batch: CursorBatch = serde_json::from_slice(&plaintext)?;
+    let batch = decode_cursor_batch(&plaintext)?;
     validate_cursor_batch(&batch)?;
     Ok(batch)
+}
+
+fn encode_cursor_batch(batch: &CursorBatch) -> Result<Vec<u8>> {
+    let event_count = u16::try_from(batch.events.len()).map_err(|_| DashError::CursorTooLarge)?;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"GCC1");
+    bytes.extend_from_slice(&batch.source_width.to_be_bytes());
+    bytes.extend_from_slice(&batch.source_height.to_be_bytes());
+    bytes.extend_from_slice(&event_count.to_be_bytes());
+    for event in &batch.events {
+        bytes.extend_from_slice(&event.timestamp.to_be_bytes());
+        bytes.extend_from_slice(&event.x_micropixels.to_be_bytes());
+        bytes.extend_from_slice(&event.y_micropixels.to_be_bytes());
+        let mut flags = u8::from(event.visible);
+        if event.bitmap.is_some() {
+            flags |= 1 << 1;
+        }
+        bytes.push(flags);
+        bytes.extend_from_slice(&event.bitmap_id.to_be_bytes());
+        if let Some(bitmap) = &event.bitmap {
+            bytes.extend_from_slice(&bitmap.width.to_be_bytes());
+            bytes.extend_from_slice(&bitmap.height.to_be_bytes());
+            bytes.extend_from_slice(&bitmap.hotspot_x.to_be_bytes());
+            bytes.extend_from_slice(&bitmap.hotspot_y.to_be_bytes());
+            let rgba_len =
+                u32::try_from(bitmap.rgba.len()).map_err(|_| DashError::CursorTooLarge)?;
+            bytes.extend_from_slice(&rgba_len.to_be_bytes());
+            bytes.extend_from_slice(&bitmap.rgba);
+        }
+        if bytes.len() > MAX_CURSOR_PAYLOAD {
+            return Err(DashError::CursorTooLarge);
+        }
+    }
+    Ok(bytes)
+}
+
+fn decode_cursor_batch(bytes: &[u8]) -> Result<CursorBatch> {
+    if bytes.len() > MAX_CURSOR_PAYLOAD {
+        return Err(DashError::CursorTooLarge);
+    }
+    let mut reader = CursorReader::new(bytes);
+    if reader.take(4)? != b"GCC1" {
+        return Err(DashError::InvalidCursorPayload);
+    }
+    let source_width = reader.u32()?;
+    let source_height = reader.u32()?;
+    let event_count = reader.u16()?;
+    let mut events = Vec::with_capacity(usize::from(event_count));
+    for _ in 0..event_count {
+        let timestamp = reader.u64()?;
+        let x_micropixels = reader.i64()?;
+        let y_micropixels = reader.i64()?;
+        let flags = reader.u8()?;
+        if flags & !0b11 != 0 {
+            return Err(DashError::InvalidCursorPayload);
+        }
+        let bitmap_id = reader.u64()?;
+        let bitmap = if flags & (1 << 1) != 0 {
+            let width = reader.u32()?;
+            let height = reader.u32()?;
+            let hotspot_x = reader.i32()?;
+            let hotspot_y = reader.i32()?;
+            let rgba_len =
+                usize::try_from(reader.u32()?).map_err(|_| DashError::InvalidCursorPayload)?;
+            Some(CursorBitmap {
+                width,
+                height,
+                hotspot_x,
+                hotspot_y,
+                rgba: reader.take(rgba_len)?.to_vec(),
+            })
+        } else {
+            None
+        };
+        events.push(CursorEvent {
+            timestamp,
+            x_micropixels,
+            y_micropixels,
+            visible: flags & 1 != 0,
+            bitmap_id,
+            bitmap,
+        });
+    }
+    if !reader.is_empty() {
+        return Err(DashError::InvalidCursorPayload);
+    }
+    Ok(CursorBatch {
+        source_width,
+        source_height,
+        events,
+    })
+}
+
+struct CursorReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> CursorReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8]> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(DashError::InvalidCursorPayload)?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(DashError::InvalidCursorPayload)?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16> {
+        Ok(u16::from_be_bytes(
+            self.take(2)?
+                .try_into()
+                .map_err(|_| DashError::InvalidCursorPayload)?,
+        ))
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_be_bytes(
+            self.take(4)?
+                .try_into()
+                .map_err(|_| DashError::InvalidCursorPayload)?,
+        ))
+    }
+
+    fn i32(&mut self) -> Result<i32> {
+        Ok(i32::from_be_bytes(
+            self.take(4)?
+                .try_into()
+                .map_err(|_| DashError::InvalidCursorPayload)?,
+        ))
+    }
+
+    fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_be_bytes(
+            self.take(8)?
+                .try_into()
+                .map_err(|_| DashError::InvalidCursorPayload)?,
+        ))
+    }
+
+    fn i64(&mut self) -> Result<i64> {
+        Ok(i64::from_be_bytes(
+            self.take(8)?
+                .try_into()
+                .map_err(|_| DashError::InvalidCursorPayload)?,
+        ))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
 }
 
 fn validate_cursor_batch(batch: &CursorBatch) -> Result<()> {
@@ -855,6 +1046,52 @@ mod tests {
             ..context
         };
         assert!(decrypt_cursor_batch(&keys, wrong_context, &encrypted).is_err());
+    }
+
+    #[test]
+    fn cursor_batch_binary_encoding_is_compact_and_round_trips_bitmaps() {
+        let batch = CursorBatch {
+            source_width: 320,
+            source_height: 180,
+            events: vec![
+                CursorEvent {
+                    timestamp: 100,
+                    x_micropixels: 1_500_000,
+                    y_micropixels: -250_000,
+                    visible: true,
+                    bitmap_id: 9,
+                    bitmap: Some(CursorBitmap {
+                        width: 2,
+                        height: 1,
+                        hotspot_x: 1,
+                        hotspot_y: 0,
+                        rgba: vec![1, 2, 3, 4, 5, 6, 7, 8],
+                    }),
+                },
+                CursorEvent {
+                    timestamp: 200,
+                    x_micropixels: 2_500_000,
+                    y_micropixels: 750_000,
+                    visible: false,
+                    bitmap_id: 9,
+                    bitmap: None,
+                },
+            ],
+        };
+        let encoded = encode_cursor_batch(&batch).unwrap();
+        assert_eq!(decode_cursor_batch(&encoded).unwrap(), batch);
+        assert!(encoded.len() < serde_json::to_vec(&batch).unwrap().len());
+
+        let encrypted = EncryptedCursorBatch {
+            nonce: [7; 12],
+            ciphertext: encoded,
+        };
+        let payload = encrypted.to_bytes().unwrap();
+        assert_eq!(
+            EncryptedCursorBatch::from_bytes(&payload).unwrap(),
+            encrypted
+        );
+        assert!(EncryptedCursorBatch::from_bytes(&payload[..15]).is_err());
     }
 
     #[test]

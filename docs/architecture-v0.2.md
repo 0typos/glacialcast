@@ -129,6 +129,11 @@ opaque to the relay.
 The protocol has explicit size limits and rejects unknown versions and invalid
 dimensions before allocating payload storage.
 
+Cursor batches use a compact, versioned binary payload. Position-only events
+do not repeat bitmap pixels; a bitmap is included only when its identity or
+content changes. Batches flush often enough to keep live cursor latency below
+250 ms without paying per-event object and authentication overhead.
+
 ## Retention
 
 Retention is evaluated per stream. Objects are evicted when either:

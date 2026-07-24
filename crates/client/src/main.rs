@@ -645,11 +645,12 @@ async fn run_dash_connection(
     let cursor_interval = Duration::from_secs_f64(1.0 / args.cursor_hz.max(1) as f64);
     let mut cursor_tick = tokio::time::interval(cursor_interval);
     cursor_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut cursor_flush_tick = tokio::time::interval(Duration::from_millis(100));
+    let mut cursor_flush_tick = tokio::time::interval(Duration::from_millis(200));
     cursor_flush_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut media_index = 1u64;
     let mut cursor_sequence = 0u64;
     let mut pending_cursor_events = Vec::new();
+    let mut cursor_bitmap_state = DashCursorBitmapState::default();
 
     loop {
         tokio::select! {
@@ -708,7 +709,13 @@ async fn run_dash_connection(
                 cursor_sequence = cursor_sequence.saturating_add(1);
                 if let Some(cursor) = capture.cursor(cursor_sequence, stream_id).await? {
                     let timestamp = duration_to_media_ticks(epoch_started.elapsed());
-                    pending_cursor_events.push(cursor_to_dash_event(cursor, timestamp, width, height)?);
+                    pending_cursor_events.push(cursor_to_dash_event(
+                        cursor,
+                        timestamp,
+                        width,
+                        height,
+                        &mut cursor_bitmap_state,
+                    )?);
                 }
             }
             _ = cursor_flush_tick.tick() => {
@@ -851,34 +858,41 @@ fn cursor_to_dash_event(
     timestamp: u64,
     output_width: u32,
     output_height: u32,
+    bitmap_state: &mut DashCursorBitmapState,
 ) -> Result<DashCursorEvent> {
     let source_width = cursor.source_width.max(1);
     let source_height = cursor.source_height.max(1);
     let x = (cursor.x * output_width as f32 / source_width as f32).clamp(0.0, output_width as f32);
     let y =
         (cursor.y * output_height as f32 / source_height as f32).clamp(0.0, output_height as f32);
-    let (bitmap_id, bitmap) = if let Some(bitmap) = cursor.bitmap {
-        let png = BASE64_STANDARD
-            .decode(bitmap.png_b64)
-            .context("decoding PipeWire cursor bitmap")?;
-        let rgba: RgbaImage = image::load_from_memory(&png)
-            .context("decoding PipeWire cursor PNG")?
-            .to_rgba8();
-        if rgba.width() != bitmap.width || rgba.height() != bitmap.height {
-            bail!("PipeWire cursor bitmap dimensions do not match its PNG");
+    let (bitmap_id, bitmap) = match cursor.bitmap {
+        Some(bitmap) if bitmap_state.last.as_ref() == Some(&bitmap) => {
+            (bitmap_state.current_id, None)
         }
-        (
-            cursor.seq.max(1),
-            Some(DashCursorBitmap {
-                width: bitmap.width,
-                height: bitmap.height,
-                hotspot_x: bitmap.hotspot_x,
-                hotspot_y: bitmap.hotspot_y,
-                rgba: rgba.into_raw(),
-            }),
-        )
-    } else {
-        (0, None)
+        Some(bitmap) => {
+            let png = BASE64_STANDARD
+                .decode(&bitmap.png_b64)
+                .context("decoding PipeWire cursor bitmap")?;
+            let rgba: RgbaImage = image::load_from_memory(&png)
+                .context("decoding PipeWire cursor PNG")?
+                .to_rgba8();
+            if rgba.width() != bitmap.width || rgba.height() != bitmap.height {
+                bail!("PipeWire cursor bitmap dimensions do not match its PNG");
+            }
+            bitmap_state.current_id = bitmap_state.current_id.wrapping_add(1).max(1);
+            bitmap_state.last = Some(bitmap.clone());
+            (
+                bitmap_state.current_id,
+                Some(DashCursorBitmap {
+                    width: bitmap.width,
+                    height: bitmap.height,
+                    hotspot_x: bitmap.hotspot_x,
+                    hotspot_y: bitmap.hotspot_y,
+                    rgba: rgba.into_raw(),
+                }),
+            )
+        }
+        None => (bitmap_state.current_id, None),
     };
     Ok(DashCursorEvent {
         timestamp,
@@ -888,6 +902,12 @@ fn cursor_to_dash_event(
         bitmap_id,
         bitmap,
     })
+}
+
+#[derive(Default)]
+struct DashCursorBitmapState {
+    current_id: u64,
+    last: Option<CursorBitmap>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -943,8 +963,9 @@ async fn flush_dash_cursor_batch(
             timestamp: start_timestamp,
             duration: end_timestamp.saturating_sub(start_timestamp).max(1),
             random_access: true,
-            mime: "application/vnd.glacialcast.cursor+json",
-            payload: serde_json::to_vec(&encrypted)
+            mime: "application/vnd.glacialcast.cursor",
+            payload: encrypted
+                .to_bytes()
                 .context("serializing encrypted cursor batch")?,
         },
     )?;
@@ -3298,7 +3319,13 @@ fn pipewire_cursor_sample(
     last_cursor_sent_at: &mut Option<Instant>,
     min_cursor_interval: Duration,
 ) -> Option<PipewireCursorSample> {
-    let state = pipewire_cursor_state(buffer)?;
+    let mut state = pipewire_cursor_state(buffer)?;
+    if state.bitmap.is_none()
+        && let Some(previous) = last_cursor_state.as_ref()
+        && previous.id == state.id
+    {
+        state.bitmap = previous.bitmap.clone();
+    }
     if last_cursor_state
         .as_ref()
         .is_some_and(|last| *last == state)
@@ -6283,6 +6310,41 @@ mod tests {
             .unwrap()
             .to_rgba8();
         assert_eq!(decoded.as_raw(), &rgba_pixels);
+    }
+
+    #[test]
+    fn dash_cursor_sends_bitmap_pixels_only_when_the_bitmap_changes() {
+        let rgba = [255, 0, 0, 255, 0, 255, 0, 255];
+        let bitmap = CursorBitmap {
+            width: 2,
+            height: 1,
+            hotspot_x: 1,
+            hotspot_y: 0,
+            png_b64: encode_cursor_png_b64(2, 1, &rgba).unwrap(),
+        };
+        let message = |seq, bitmap| CursorMessage {
+            stream_id: Uuid::from_u128(1),
+            seq,
+            captured_at_ms: 0,
+            x: 10.0,
+            y: 20.0,
+            source_width: 100,
+            source_height: 100,
+            bitmap,
+        };
+        let mut state = DashCursorBitmapState::default();
+        let first =
+            cursor_to_dash_event(message(1, Some(bitmap.clone())), 10, 100, 100, &mut state)
+                .unwrap();
+        let repeated =
+            cursor_to_dash_event(message(2, Some(bitmap)), 20, 100, 100, &mut state).unwrap();
+        let position_only =
+            cursor_to_dash_event(message(3, None), 30, 100, 100, &mut state).unwrap();
+
+        assert!(first.bitmap.is_some());
+        assert!(repeated.bitmap.is_none());
+        assert_eq!(repeated.bitmap_id, first.bitmap_id);
+        assert_eq!(position_only.bitmap_id, first.bitmap_id);
     }
 
     #[test]
