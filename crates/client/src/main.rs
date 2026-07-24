@@ -24,8 +24,9 @@ use rand::{RngCore, rngs::OsRng};
 use serde::Deserialize;
 use std::{
     collections::VecDeque,
-    net::SocketAddr,
+    io::Read,
     os::fd::{FromRawFd, OwnedFd, RawFd},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::PathBuf,
     ptr,
     sync::{
@@ -95,7 +96,7 @@ struct Args {
     #[arg(long, default_value = "client.toml")]
     config: PathBuf,
     #[arg(long, default_value = "127.0.0.1:8900")]
-    ingest_addr: SocketAddr,
+    ingest_addr: String,
     #[arg(long, allow_hyphen_values = true)]
     ingest_token: Option<String>,
     #[arg(
@@ -161,7 +162,7 @@ struct Args {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct ClientConfig {
     client_id: Option<String>,
     ingest_token: Option<String>,
@@ -337,6 +338,7 @@ async fn run_dash_client(
     resend: &mut DashResendBuffer,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
+    let mut retry_delay = Duration::from_secs(1);
     loop {
         let source = match capture.source().await {
             Ok(source) => source,
@@ -352,6 +354,7 @@ async fn run_dash_client(
                 continue;
             }
         };
+        let connection_started = Instant::now();
         match run_dash_connection(
             args,
             identity,
@@ -368,11 +371,17 @@ async fn run_dash_client(
                 if is_fatal_capture_error(&err) || is_fatal_dash_error(&err) {
                     return Err(err.context("fatal encrypted DASH publisher error"));
                 }
-                warn!(?err, "DASH connection dropped; retrying in 1s");
+                if connection_started.elapsed() >= Duration::from_secs(60) {
+                    retry_delay = Duration::from_secs(1);
+                }
+                let jitter = Duration::from_millis(u64::from(OsRng.next_u32() % 500));
+                let wait = retry_delay.saturating_add(jitter);
+                warn!(?err, retry_ms = wait.as_millis(), "DASH connection dropped");
                 let mut retry_shutdown = shutdown_rx.clone();
-                if sleep_or_shutdown(Duration::from_secs(1), &mut retry_shutdown).await {
+                if sleep_or_shutdown(wait, &mut retry_shutdown).await {
                     return Ok(());
                 }
+                retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(30));
             }
         }
     }
@@ -389,6 +398,7 @@ fn is_fatal_dash_error(err: &anyhow::Error) -> bool {
             || message.contains("requires non-zero, even dimensions")
             || message.contains("segment-frames")
             || message.contains("does not fit MPEG-DASH")
+            || message.contains("server rejected hello")
     })
 }
 
@@ -407,8 +417,19 @@ async fn run_dash_connection(
     let ingest_server_key = identity.ingest_server_key.as_ref().context(
         "ingest server key is required; pass --ingest-server-key or set ingest_server_key in client.toml",
     )?;
-    let mut stream = TcpStream::connect(args.ingest_addr).await?;
-    let transport = initiator_handshake(&mut stream, ingest_server_key).await?;
+    let mut stream = timeout(
+        Duration::from_secs(15),
+        TcpStream::connect(args.ingest_addr.as_str()),
+    )
+    .await
+    .context("ingest connection timed out")??;
+    stream.set_nodelay(true)?;
+    let transport = timeout(
+        Duration::from_secs(10),
+        initiator_handshake(&mut stream, ingest_server_key),
+    )
+    .await
+    .context("Noise handshake timed out")??;
     let mut socket = NoiseSocket::new(stream, transport);
     let (low, high) = resend.range();
     socket
@@ -1070,7 +1091,20 @@ fn load_client_config(path: &PathBuf) -> Result<ClientConfig> {
     if !path.exists() {
         return Ok(ClientConfig::default());
     }
-    let raw = std::fs::read_to_string(path)
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("opening client config {}", path.display()))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
+        bail!(
+            "client config {} must be a private regular file with mode 0600",
+            path.display()
+        );
+    }
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)
         .with_context(|| format!("reading client config {}", path.display()))?;
     toml::from_str(&raw).with_context(|| format!("parsing client config {}", path.display()))
 }
@@ -4476,6 +4510,41 @@ mod tests {
         assert_eq!(args.ingest_token.as_deref(), Some("-token"));
         assert_eq!(args.ingest_server_key.as_deref(), Some("-server-key"));
         assert_eq!(args.viewer_key.as_deref(), Some("-viewer-key"));
+    }
+
+    #[test]
+    fn client_config_must_be_private_regular_and_rejects_unknown_keys() {
+        let root =
+            std::env::temp_dir().join(format!("glacialcast-client-config-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("client.toml");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(
+            &mut file,
+            b"client_id = \"desk\"\ndisplay_name = \"Desktop\"\n",
+        )
+        .unwrap();
+        drop(file);
+        assert_eq!(
+            load_client_config(&path).unwrap().client_id.as_deref(),
+            Some("desk")
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_client_config(&path).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&path, "unknown_security_setting = true\n").unwrap();
+        assert!(load_client_config(&path).is_err());
+
+        let link = root.join("client-link.toml");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(load_client_config(&link).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
