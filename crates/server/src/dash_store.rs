@@ -13,6 +13,7 @@ use std::{
 use uuid::Uuid;
 
 const CATALOG_VERSION: u16 = 2;
+const MAX_CATALOG_FILE_LEN: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct DashStore {
@@ -99,12 +100,12 @@ impl DashStore {
                 object.header.sequence
             );
         }
+        validate_media_progression(catalog, &object.header)?;
 
         let object_dir = self.stream_dir(stream_id).join("objects");
         std::fs::create_dir_all(&object_dir)
             .with_context(|| format!("creating object directory {}", object_dir.display()))?;
-        let relative_path =
-            PathBuf::from("objects").join(format!("{:020}.bin", object.header.sequence));
+        let relative_path = object_relative_path(object.header.sequence);
         let final_path = self.stream_dir(stream_id).join(&relative_path);
         let temp_path = object_dir.join(format!(
             ".{:020}-{}.tmp",
@@ -112,13 +113,18 @@ impl DashStore {
             Uuid::new_v4()
         ));
         write_durable_file(&temp_path, &object.payload)?;
-        std::fs::rename(&temp_path, &final_path).with_context(|| {
-            format!(
-                "publishing DASH object {} as {}",
-                temp_path.display(),
-                final_path.display()
-            )
-        })?;
+        if let Err(error) = std::fs::hard_link(&temp_path, &final_path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error).with_context(|| {
+                format!(
+                    "publishing DASH object {} as {} without replacing an existing file",
+                    temp_path.display(),
+                    final_path.display()
+                )
+            });
+        }
+        std::fs::remove_file(&temp_path)
+            .with_context(|| format!("removing temporary object {}", temp_path.display()))?;
         sync_directory(&object_dir)?;
 
         let stored = StoredDashObject {
@@ -164,13 +170,7 @@ impl DashStore {
         let Some(stored) = stored else {
             return Ok(None);
         };
-        let payload = std::fs::read(self.stream_dir(stream_id).join(&stored.relative_path))
-            .with_context(|| {
-                format!(
-                    "reading DASH object {} for stream {stream_id}",
-                    stored.header.sequence
-                )
-            })?;
+        let payload = self.read_stored_payload(stream_id, &stored)?;
         let object = DashObject {
             header: stored.header,
             payload,
@@ -211,6 +211,15 @@ impl DashStore {
             return Ok(None);
         }
         let mut segment = Vec::new();
+        for pair in sequences.windows(2) {
+            if pair[0]
+                .0
+                .checked_add(1)
+                .is_none_or(|expected| pair[1].0 != expected)
+            {
+                anyhow::bail!("DASH media segment has duplicate or missing chunks");
+            }
+        }
         for (_, sequence) in sequences {
             let object = self
                 .get(stream_id, sequence)?
@@ -331,7 +340,7 @@ impl DashStore {
         let cutoff_ms = now_ms.saturating_sub(
             i64::try_from(self.inner.retention_age.as_millis()).unwrap_or(i64::MAX),
         );
-        let expired = media_groups(catalog)
+        let expired = retention_groups(catalog)
             .into_iter()
             .filter(|(_, received_at)| *received_at < cutoff_ms)
             .map(|(group, _)| group)
@@ -342,7 +351,7 @@ impl DashStore {
         }
 
         while catalog.bytes > self.inner.retention_bytes {
-            let Some((oldest, _)) = oldest_media_group(catalog) else {
+            let Some((oldest, _)) = oldest_retention_group(catalog) else {
                 break;
             };
             removed.extend(self.remove_group(catalog, oldest));
@@ -369,10 +378,15 @@ impl DashStore {
     }
 
     fn remove_orphaned_epoch_metadata(&self, catalog: &mut StreamCatalog) -> Vec<PathBuf> {
-        let epochs_with_media = catalog
+        let epochs_with_timeline = catalog
             .objects
             .values()
-            .filter(|object| object.header.kind == DashObjectKind::Media)
+            .filter(|object| {
+                matches!(
+                    object.header.kind,
+                    DashObjectKind::Media | DashObjectKind::Cursor
+                )
+            })
             .map(|object| object.header.epoch_id)
             .collect::<BTreeSet<_>>();
         let newest_epoch = catalog
@@ -385,7 +399,7 @@ impl DashStore {
             .objects
             .iter()
             .filter(|(_, object)| {
-                !epochs_with_media.contains(&object.header.epoch_id)
+                !epochs_with_timeline.contains(&object.header.epoch_id)
                     && Some(object.header.epoch_id) != newest_epoch
             })
             .map(|(sequence, _)| *sequence)
@@ -426,6 +440,16 @@ impl DashStore {
             if !catalog_path.exists() {
                 continue;
             }
+            let catalog_metadata = std::fs::symlink_metadata(&catalog_path)
+                .with_context(|| format!("reading metadata for {}", catalog_path.display()))?;
+            if !catalog_metadata.file_type().is_file()
+                || catalog_metadata.len() > MAX_CATALOG_FILE_LEN
+            {
+                anyhow::bail!(
+                    "DASH catalog is not a bounded regular file: {}",
+                    catalog_path.display()
+                );
+            }
             let bytes = std::fs::read(&catalog_path)
                 .with_context(|| format!("reading {}", catalog_path.display()))?;
             let persisted: PersistedCatalog = serde_json::from_slice(&bytes)
@@ -441,20 +465,43 @@ impl DashStore {
                 last_sequence: persisted.last_sequence,
                 ..StreamCatalog::default()
             };
-            for stored in persisted.objects {
-                let path = entry.path().join(&stored.relative_path);
-                let payload = std::fs::read(&path)
-                    .with_context(|| format!("reading catalog object {}", path.display()))?;
+            let mut persisted_objects = persisted.objects;
+            persisted_objects.sort_by_key(|stored| stored.header.sequence);
+            for stored in persisted_objects {
+                if stored.header.stream_id != stream_id
+                    || stored.relative_path != object_relative_path(stored.header.sequence)
+                {
+                    anyhow::bail!(
+                        "DASH catalog {} contains an invalid object location",
+                        catalog_path.display()
+                    );
+                }
+                validate_media_progression(&catalog, &stored.header)?;
+                let payload = self.read_stored_payload(stream_id, &stored)?;
                 DashObject {
                     header: stored.header.clone(),
                     payload,
                 }
                 .validate()
-                .with_context(|| format!("validating catalog object {}", path.display()))?;
+                .with_context(|| {
+                    format!(
+                        "validating catalog object {}",
+                        stored.relative_path.display()
+                    )
+                })?;
                 catalog.bytes = catalog
                     .bytes
                     .saturating_add(u64::from(stored.header.payload_len));
-                catalog.objects.insert(stored.header.sequence, stored);
+                if catalog
+                    .objects
+                    .insert(stored.header.sequence, stored)
+                    .is_some()
+                {
+                    anyhow::bail!(
+                        "DASH catalog {} contains duplicate sequences",
+                        catalog_path.display()
+                    );
+                }
             }
             let retained_last_sequence = catalog.objects.last_key_value().map(|(seq, _)| *seq);
             if catalog
@@ -498,6 +545,9 @@ impl DashStore {
             objects: catalog.objects.values().cloned().collect(),
         };
         let bytes = serde_json::to_vec_pretty(&persisted)?;
+        if bytes.len() as u64 > MAX_CATALOG_FILE_LEN {
+            anyhow::bail!("DASH catalog exceeds its size limit");
+        }
         let temp_path = stream_dir.join(format!(".catalog-{}.tmp", Uuid::new_v4()));
         write_durable_file(&temp_path, &bytes)?;
         let catalog_path = stream_dir.join("catalog.json");
@@ -515,6 +565,30 @@ impl DashStore {
         self.inner.root.join("streams").join(stream_id.to_string())
     }
 
+    fn read_stored_payload(&self, stream_id: Uuid, stored: &StoredDashObject) -> Result<Vec<u8>> {
+        if stored.header.stream_id != stream_id
+            || stored.relative_path != object_relative_path(stored.header.sequence)
+        {
+            anyhow::bail!("DASH object has an invalid stored location");
+        }
+        if stored.header.payload_len as usize > stored.header.kind.max_payload_len() {
+            anyhow::bail!("stored DASH object exceeds its kind-specific size limit");
+        }
+        let path = self.stream_dir(stream_id).join(&stored.relative_path);
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("reading metadata for {}", path.display()))?;
+        if !metadata.file_type().is_file() || metadata.len() != u64::from(stored.header.payload_len)
+        {
+            anyhow::bail!("stored DASH object has an invalid file type or length");
+        }
+        std::fs::read(&path).with_context(|| {
+            format!(
+                "reading DASH object {} for stream {stream_id}",
+                stored.header.sequence
+            )
+        })
+    }
+
     fn streams(&self) -> Result<MutexGuard<'_, HashMap<Uuid, StreamCatalog>>> {
         self.inner
             .streams
@@ -523,13 +597,14 @@ impl DashStore {
     }
 }
 
-fn media_groups(catalog: &StreamCatalog) -> BTreeMap<(Uuid, u64), i64> {
+fn retention_groups(catalog: &StreamCatalog) -> BTreeMap<(Uuid, u64), i64> {
     let mut groups = BTreeMap::new();
-    for object in catalog
-        .objects
-        .values()
-        .filter(|object| object.header.kind == DashObjectKind::Media)
-    {
+    for object in catalog.objects.values().filter(|object| {
+        matches!(
+            object.header.kind,
+            DashObjectKind::Media | DashObjectKind::Cursor
+        )
+    }) {
         groups
             .entry((object.header.epoch_id, object.header.segment_number))
             .and_modify(|received: &mut i64| *received = (*received).max(object.received_at_ms))
@@ -538,10 +613,39 @@ fn media_groups(catalog: &StreamCatalog) -> BTreeMap<(Uuid, u64), i64> {
     groups
 }
 
-fn oldest_media_group(catalog: &StreamCatalog) -> Option<((Uuid, u64), i64)> {
-    media_groups(catalog)
+fn oldest_retention_group(catalog: &StreamCatalog) -> Option<((Uuid, u64), i64)> {
+    retention_groups(catalog)
         .into_iter()
         .min_by_key(|(_, received_at_ms)| *received_at_ms)
+}
+
+fn object_relative_path(sequence: u64) -> PathBuf {
+    PathBuf::from("objects").join(format!("{sequence:020}.bin"))
+}
+
+fn validate_media_progression(catalog: &StreamCatalog, candidate: &DashObjectHeader) -> Result<()> {
+    if candidate.kind != DashObjectKind::Media {
+        return Ok(());
+    }
+    let previous = catalog.objects.values().rev().find(|stored| {
+        stored.header.kind == DashObjectKind::Media && stored.header.epoch_id == candidate.epoch_id
+    });
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+    let previous = &previous.header;
+    if candidate.segment_number < previous.segment_number
+        || candidate.segment_number > previous.segment_number.saturating_add(1)
+        || candidate.timestamp < previous.timestamp.saturating_add(previous.duration)
+        || (candidate.segment_number == previous.segment_number
+            && previous
+                .chunk_index
+                .checked_add(1)
+                .is_none_or(|expected| candidate.chunk_index != expected))
+    {
+        anyhow::bail!("DASH media chunks are out of order or overlap");
+    }
+    Ok(())
 }
 
 fn write_durable_file(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -586,7 +690,7 @@ mod tests {
     }
 
     fn object(keys: &EpochKeys, stream_id: Uuid, epoch_id: Uuid, spec: ObjectSpec) -> DashObject {
-        let duration = if spec.kind == DashObjectKind::Media {
+        let duration = if matches!(spec.kind, DashObjectKind::Media | DashObjectKind::Cursor) {
             MEDIA_TIMESCALE as u64
         } else {
             0
@@ -709,7 +813,7 @@ mod tests {
         let stream_id = Uuid::from_u128(11);
         let epoch_id = Uuid::from_u128(12);
         let keys = EpochKeys::derive(&[8u8; 32], stream_id, epoch_id).unwrap();
-        for (sequence, segment) in [(1, 1), (2, 1), (3, 2), (4, 2)] {
+        for (sequence, segment, chunk_index) in [(1, 1, 0), (2, 1, 1), (3, 2, 0), (4, 2, 1)] {
             store
                 .store(object(
                     &keys,
@@ -719,7 +823,7 @@ mod tests {
                         kind: DashObjectKind::Media,
                         sequence,
                         segment_number: segment,
-                        chunk_index: (sequence % 2) as u16,
+                        chunk_index,
                         random_access: sequence % 2 == 1,
                         payload: vec![sequence as u8; 10],
                     },
@@ -818,7 +922,10 @@ mod tests {
             );
         }
 
-        assert_eq!(oldest_media_group(&catalog), Some(((oldest_epoch, 1), 10)));
+        assert_eq!(
+            oldest_retention_group(&catalog),
+            Some(((oldest_epoch, 1), 10))
+        );
     }
 
     #[test]
@@ -853,6 +960,343 @@ mod tests {
 
         let reopened = DashStore::open(root.clone(), 1024 * 1024, Duration::from_secs(1)).unwrap();
         assert!(reopened.list(stream_id).unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cursor_only_groups_obey_byte_retention() {
+        let (root, store) = test_store(15);
+        let stream_id = Uuid::from_u128(41);
+        let epoch_id = Uuid::from_u128(42);
+        let keys = EpochKeys::derive(&[1; 32], stream_id, epoch_id).unwrap();
+        for (sequence, segment_number) in [(1, 1), (2, 2)] {
+            store
+                .store(object(
+                    &keys,
+                    stream_id,
+                    epoch_id,
+                    ObjectSpec {
+                        kind: DashObjectKind::Cursor,
+                        sequence,
+                        segment_number,
+                        chunk_index: 0,
+                        random_access: true,
+                        payload: vec![sequence as u8; 10],
+                    },
+                ))
+                .unwrap();
+        }
+
+        let retained = store.list(stream_id).unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].header.sequence, 2);
+        assert_eq!(store.summaries().unwrap()[&stream_id].bytes, 10);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn media_retention_removes_cursor_objects_in_the_same_segment() {
+        let (root, store) = test_store(25);
+        let stream_id = Uuid::from_u128(43);
+        let epoch_id = Uuid::from_u128(44);
+        let keys = EpochKeys::derive(&[2; 32], stream_id, epoch_id).unwrap();
+        for (kind, sequence, segment_number) in [
+            (DashObjectKind::Media, 1, 1),
+            (DashObjectKind::Cursor, 2, 1),
+            (DashObjectKind::Media, 3, 2),
+        ] {
+            store
+                .store(object(
+                    &keys,
+                    stream_id,
+                    epoch_id,
+                    ObjectSpec {
+                        kind,
+                        sequence,
+                        segment_number,
+                        chunk_index: 0,
+                        random_access: true,
+                        payload: vec![sequence as u8; 10],
+                    },
+                ))
+                .unwrap();
+        }
+
+        let retained = store.list(stream_id).unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].header.sequence, 3);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn media_chunks_must_progress_without_duplicates_gaps_or_overlap() {
+        let (root, store) = test_store(1024);
+        let stream_id = Uuid::from_u128(45);
+        let epoch_id = Uuid::from_u128(46);
+        let keys = EpochKeys::derive(&[3; 32], stream_id, epoch_id).unwrap();
+        let media = |sequence, segment_number, chunk_index| {
+            object(
+                &keys,
+                stream_id,
+                epoch_id,
+                ObjectSpec {
+                    kind: DashObjectKind::Media,
+                    sequence,
+                    segment_number,
+                    chunk_index,
+                    random_access: chunk_index == 0,
+                    payload: vec![sequence as u8],
+                },
+            )
+        };
+
+        store.store(media(1, 1, 0)).unwrap();
+        assert!(store.store(media(2, 1, 0)).is_err());
+        assert!(store.store(media(2, 1, 2)).is_err());
+        store.store(media(2, 1, 1)).unwrap();
+        assert!(store.store(media(3, 3, 0)).is_err());
+
+        let mut overlapping = media(3, 2, 0);
+        overlapping.header.timestamp = MEDIA_TIMESCALE as u64;
+        assert!(store.store(overlapping).is_err());
+        store.store(media(3, 2, 0)).unwrap();
+
+        assert_eq!(store.list(stream_id).unwrap().len(), 3);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn storing_is_idempotent_but_never_skips_or_redefines_a_sequence() {
+        let (root, store) = test_store(1024);
+        let stream_id = Uuid::from_u128(47);
+        let epoch_id = Uuid::from_u128(48);
+        let keys = EpochKeys::derive(&[4; 32], stream_id, epoch_id).unwrap();
+        let media = |sequence, payload| {
+            object(
+                &keys,
+                stream_id,
+                epoch_id,
+                ObjectSpec {
+                    kind: DashObjectKind::Media,
+                    sequence,
+                    segment_number: sequence,
+                    chunk_index: 0,
+                    random_access: true,
+                    payload,
+                },
+            )
+        };
+        let first = media(1, vec![1]);
+        assert_eq!(
+            store.store(first.clone()).unwrap().header,
+            store.store(first).unwrap().header
+        );
+        assert!(store.store(media(3, vec![3])).is_err());
+        assert!(store.store(media(1, vec![9])).is_err());
+        assert_eq!(store.list(stream_id).unwrap().len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn object_publication_does_not_replace_an_untracked_file() {
+        let (root, store) = test_store(1024);
+        let stream_id = Uuid::from_u128(49);
+        let epoch_id = Uuid::from_u128(50);
+        let keys = EpochKeys::derive(&[5; 32], stream_id, epoch_id).unwrap();
+        let object_dir = store.stream_dir(stream_id).join("objects");
+        std::fs::create_dir_all(&object_dir).unwrap();
+        let final_path = store.stream_dir(stream_id).join(object_relative_path(1));
+        std::fs::write(&final_path, b"orphan").unwrap();
+
+        let result = store.store(object(
+            &keys,
+            stream_id,
+            epoch_id,
+            ObjectSpec {
+                kind: DashObjectKind::Media,
+                sequence: 1,
+                segment_number: 1,
+                chunk_index: 0,
+                random_access: true,
+                payload: vec![1],
+            },
+        ));
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(final_path).unwrap(), b"orphan");
+        assert_eq!(store.last_sequence(stream_id).unwrap(), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_reload_rejects_path_traversal_and_stream_mismatch() {
+        for mutation in ["path", "stream"] {
+            let (root, store) = test_store(1024);
+            let stream_id = Uuid::new_v4();
+            let epoch_id = Uuid::new_v4();
+            let keys = EpochKeys::derive(&[6; 32], stream_id, epoch_id).unwrap();
+            store
+                .store(object(
+                    &keys,
+                    stream_id,
+                    epoch_id,
+                    ObjectSpec {
+                        kind: DashObjectKind::Media,
+                        sequence: 1,
+                        segment_number: 1,
+                        chunk_index: 0,
+                        random_access: true,
+                        payload: vec![1],
+                    },
+                ))
+                .unwrap();
+            let catalog_path = store.stream_dir(stream_id).join("catalog.json");
+            let mut persisted: PersistedCatalog =
+                serde_json::from_slice(&std::fs::read(&catalog_path).unwrap()).unwrap();
+            if mutation == "path" {
+                persisted.objects[0].relative_path = PathBuf::from("../../outside");
+            } else {
+                persisted.objects[0].header.stream_id = Uuid::new_v4();
+            }
+            std::fs::write(&catalog_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+            drop(store);
+
+            assert!(
+                DashStore::open(root.clone(), 1024, Duration::from_secs(1800)).is_err(),
+                "accepted catalog mutation {mutation}"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_reload_rejects_symlinked_and_corrupt_payloads() {
+        use std::os::unix::fs::symlink;
+
+        for mutation in ["symlink", "corrupt"] {
+            let (root, store) = test_store(1024);
+            let stream_id = Uuid::new_v4();
+            let epoch_id = Uuid::new_v4();
+            let keys = EpochKeys::derive(&[7; 32], stream_id, epoch_id).unwrap();
+            store
+                .store(object(
+                    &keys,
+                    stream_id,
+                    epoch_id,
+                    ObjectSpec {
+                        kind: DashObjectKind::Media,
+                        sequence: 1,
+                        segment_number: 1,
+                        chunk_index: 0,
+                        random_access: true,
+                        payload: vec![1],
+                    },
+                ))
+                .unwrap();
+            let payload_path = store.stream_dir(stream_id).join(object_relative_path(1));
+            if mutation == "symlink" {
+                let target = root.join("target");
+                std::fs::write(&target, [1]).unwrap();
+                std::fs::remove_file(&payload_path).unwrap();
+                symlink(target, &payload_path).unwrap();
+            } else {
+                std::fs::write(&payload_path, [2]).unwrap();
+            }
+            drop(store);
+
+            assert!(
+                DashStore::open(root.clone(), 1024, Duration::from_secs(1800)).is_err(),
+                "accepted payload mutation {mutation}"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn catalog_reload_rejects_oversized_catalog_before_parsing() {
+        let root = std::env::temp_dir().join(format!("glacialcast-dash-{}", Uuid::new_v4()));
+        let stream_id = Uuid::new_v4();
+        let stream_dir = root.join("streams").join(stream_id.to_string());
+        std::fs::create_dir_all(&stream_dir).unwrap();
+        let file = File::create(stream_dir.join("catalog.json")).unwrap();
+        file.set_len(MAX_CATALOG_FILE_LEN + 1).unwrap();
+        drop(file);
+        assert!(DashStore::open(root.clone(), 1024, Duration::from_secs(1800)).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn summaries_and_delete_track_exact_stream_state() {
+        let (root, store) = test_store(1024);
+        let stream_id = Uuid::from_u128(51);
+        let epoch_id = Uuid::from_u128(52);
+        let keys = EpochKeys::derive(&[8; 32], stream_id, epoch_id).unwrap();
+        store
+            .store(object(
+                &keys,
+                stream_id,
+                epoch_id,
+                ObjectSpec {
+                    kind: DashObjectKind::Media,
+                    sequence: 1,
+                    segment_number: 1,
+                    chunk_index: 0,
+                    random_access: true,
+                    payload: vec![1, 2, 3],
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            store.summaries().unwrap()[&stream_id],
+            DashSummary {
+                bytes: 3,
+                last_sequence: Some(1),
+                last_timestamp: Some(0),
+            }
+        );
+        assert!(store.delete_stream(stream_id).unwrap());
+        assert!(!store.delete_stream(stream_id).unwrap());
+        assert!(store.list(stream_id).unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn readers_observe_complete_objects_during_concurrent_ingest() {
+        let (root, store) = test_store(1024 * 1024);
+        let stream_id = Uuid::from_u128(53);
+        let epoch_id = Uuid::from_u128(54);
+        let keys = EpochKeys::derive(&[9; 32], stream_id, epoch_id).unwrap();
+        let reader_store = store.clone();
+        let reader = std::thread::spawn(move || {
+            for _ in 0..100 {
+                for stored in reader_store.list(stream_id).unwrap() {
+                    let object = reader_store
+                        .get(stream_id, stored.header.sequence)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(object.header, stored.header);
+                }
+            }
+        });
+        for sequence in 1..=10 {
+            store
+                .store(object(
+                    &keys,
+                    stream_id,
+                    epoch_id,
+                    ObjectSpec {
+                        kind: DashObjectKind::Media,
+                        sequence,
+                        segment_number: sequence,
+                        chunk_index: 0,
+                        random_access: true,
+                        payload: vec![sequence as u8; 32],
+                    },
+                ))
+                .unwrap();
+        }
+        reader.join().unwrap();
+        assert_eq!(store.list(stream_id).unwrap().len(), 10);
         std::fs::remove_dir_all(root).unwrap();
     }
 }
