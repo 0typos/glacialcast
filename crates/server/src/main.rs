@@ -694,7 +694,7 @@ async fn handle_ingest(mut stream: TcpStream, state: AppState) -> Result<()> {
         .await
         .insert(stream_id, connection_id);
     publish_stream_event(&state, "stream_connected", stream_id);
-    let result = ingest_loop(&state, &mut socket, stream_id, &hello, last_seq).await;
+    let result = ingest_loop(&state, &mut socket, stream_id, last_seq).await;
     let mut active_ingests = state.active_ingests.lock().await;
     let owns_connection = active_ingests.get(&stream_id) == Some(&connection_id);
     if owns_connection {
@@ -721,20 +721,8 @@ async fn ingest_loop(
     state: &AppState,
     socket: &mut glacialcast_protocol::NoiseSocket<TcpStream>,
     stream_id: Uuid,
-    hello: &StreamHello,
     mut last_seq: u64,
 ) -> Result<()> {
-    if let Some(high) = hello.resend_high
-        && high > last_seq
-    {
-        socket
-            .write(&ServerMessage::ResendRequest {
-                from_seq: last_seq + 1,
-                to_seq: high,
-            })
-            .await?;
-    }
-
     loop {
         let message = socket.read::<ClientMessage>().await;
         match message {
@@ -746,13 +734,17 @@ async fn ingest_loop(
                 if object.header.stream_id != stream_id {
                     anyhow::bail!("DASH object stream_id does not match assigned stream");
                 }
-                if object.header.sequence > last_seq + 1 && last_seq > 0 {
+                let expected_sequence = last_seq
+                    .checked_add(1)
+                    .context("DASH sequence space exhausted")?;
+                if object.header.sequence > expected_sequence {
                     socket
                         .write(&ServerMessage::ResendRequest {
-                            from_seq: last_seq + 1,
-                            to_seq: object.header.sequence - 1,
+                            from_seq: expected_sequence,
+                            to_seq: object.header.sequence,
                         })
                         .await?;
+                    continue;
                 }
                 let stored = state.dash_store.store(object)?;
                 last_seq = last_seq.max(stored.header.sequence);

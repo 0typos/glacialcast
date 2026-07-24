@@ -441,11 +441,14 @@ async fn run_dash_connection(
     {
         let pending = resend.objects(server_last_sequence + 1, highest);
         for object in pending {
+            let expected_sequence = object.header.sequence;
             socket
                 .write(&ClientMessage::DashObject(object))
                 .await
                 .context("resending unacknowledged DASH object")?;
-            sequence = wait_for_dash_ack(&mut socket, resend).await?.max(sequence);
+            sequence = wait_for_dash_ack(&mut socket, resend, expected_sequence)
+                .await?
+                .max(sequence);
         }
     }
     sequence = sequence.max(resend.range().1.unwrap_or(0));
@@ -920,22 +923,30 @@ async fn send_new_dash_object(
     object: DashObject,
 ) -> Result<()> {
     let stream_id = object.header.stream_id;
+    let expected_sequence = object.header.sequence;
     resend.push(object.clone());
     socket.write(&ClientMessage::DashObject(object)).await?;
     debug!(%stream_id, buffered_bytes = resend.bytes, "DASH object queued for acknowledgement");
-    wait_for_dash_ack(socket, resend).await?;
+    wait_for_dash_ack(socket, resend, expected_sequence).await?;
     Ok(())
 }
 
 async fn wait_for_dash_ack(
     socket: &mut NoiseSocket<TcpStream>,
     resend: &mut DashResendBuffer,
+    expected_sequence: u64,
 ) -> Result<u64> {
     loop {
         match socket.read::<ServerMessage>().await? {
             ServerMessage::Ack { through_seq } => {
                 resend.ack(through_seq);
-                return Ok(through_seq);
+                if through_seq >= expected_sequence {
+                    return Ok(through_seq);
+                }
+                debug!(
+                    through_seq,
+                    expected_sequence, "ignoring stale DASH acknowledgement"
+                );
             }
             ServerMessage::ResendRequest { from_seq, to_seq } => {
                 let objects = resend.objects(from_seq, to_seq);

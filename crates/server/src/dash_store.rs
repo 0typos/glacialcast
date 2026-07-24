@@ -12,7 +12,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const CATALOG_VERSION: u16 = 1;
+const CATALOG_VERSION: u16 = 2;
 
 #[derive(Clone)]
 pub struct DashStore {
@@ -30,6 +30,8 @@ struct DashStoreInner {
 struct PersistedCatalog {
     version: u16,
     stream_id: Uuid,
+    #[serde(default)]
+    last_sequence: Option<u64>,
     objects: Vec<StoredDashObject>,
 }
 
@@ -44,6 +46,7 @@ pub struct StoredDashObject {
 struct StreamCatalog {
     objects: BTreeMap<u64, StoredDashObject>,
     bytes: u64,
+    last_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -84,6 +87,18 @@ impl DashStore {
                 object.header.sequence
             );
         }
+        let expected_sequence = match catalog.last_sequence {
+            Some(sequence) => sequence
+                .checked_add(1)
+                .context("DASH sequence space exhausted")?,
+            None => 1,
+        };
+        if object.header.sequence != expected_sequence {
+            anyhow::bail!(
+                "DASH sequence {} is out of order; expected {expected_sequence}",
+                object.header.sequence
+            );
+        }
 
         let object_dir = self.stream_dir(stream_id).join("objects");
         std::fs::create_dir_all(&object_dir)
@@ -117,6 +132,7 @@ impl DashStore {
         catalog
             .objects
             .insert(stored.header.sequence, stored.clone());
+        catalog.last_sequence = Some(stored.header.sequence);
 
         let evicted = self.enforce_retention(catalog, stored.received_at_ms);
         self.persist_catalog(stream_id, catalog)?;
@@ -255,7 +271,7 @@ impl DashStore {
         Ok(self
             .streams()?
             .get(&stream_id)
-            .and_then(|catalog| catalog.objects.last_key_value().map(|(seq, _)| *seq)))
+            .and_then(|catalog| catalog.last_sequence))
     }
 
     pub fn summaries(&self) -> Result<HashMap<Uuid, DashSummary>> {
@@ -267,7 +283,7 @@ impl DashStore {
                     *stream_id,
                     DashSummary {
                         bytes: catalog.bytes,
-                        last_sequence: catalog.objects.last_key_value().map(|(seq, _)| *seq),
+                        last_sequence: catalog.last_sequence,
                         last_timestamp: catalog
                             .objects
                             .values()
@@ -414,13 +430,17 @@ impl DashStore {
                 .with_context(|| format!("reading {}", catalog_path.display()))?;
             let persisted: PersistedCatalog = serde_json::from_slice(&bytes)
                 .with_context(|| format!("parsing {}", catalog_path.display()))?;
-            if persisted.version != CATALOG_VERSION || persisted.stream_id != stream_id {
+            if !matches!(persisted.version, 1 | CATALOG_VERSION) || persisted.stream_id != stream_id
+            {
                 anyhow::bail!(
                     "unsupported or mismatched DASH catalog {}",
                     catalog_path.display()
                 );
             }
-            let mut catalog = StreamCatalog::default();
+            let mut catalog = StreamCatalog {
+                last_sequence: persisted.last_sequence,
+                ..StreamCatalog::default()
+            };
             for stored in persisted.objects {
                 let path = entry.path().join(&stored.relative_path);
                 let payload = std::fs::read(&path)
@@ -436,6 +456,17 @@ impl DashStore {
                     .saturating_add(u64::from(stored.header.payload_len));
                 catalog.objects.insert(stored.header.sequence, stored);
             }
+            let retained_last_sequence = catalog.objects.last_key_value().map(|(seq, _)| *seq);
+            if catalog
+                .last_sequence
+                .is_some_and(|last| retained_last_sequence.is_some_and(|retained| last < retained))
+            {
+                anyhow::bail!(
+                    "DASH catalog {} has a sequence high-water mark below a retained object",
+                    catalog_path.display()
+                );
+            }
+            catalog.last_sequence = catalog.last_sequence.or(retained_last_sequence);
             let removed = self.enforce_retention(&mut catalog, glacialcast_protocol::now_ms());
             if !removed.is_empty() {
                 self.persist_catalog(stream_id, &catalog)?;
@@ -463,6 +494,7 @@ impl DashStore {
         let persisted = PersistedCatalog {
             version: CATALOG_VERSION,
             stream_id,
+            last_sequence: catalog.last_sequence,
             objects: catalog.objects.values().cloned().collect(),
         };
         let bytes = serde_json::to_vec_pretty(&persisted)?;
@@ -715,6 +747,42 @@ mod tests {
                 .len(),
             20
         );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sequence_high_water_mark_survives_complete_eviction_and_restart() {
+        let (root, store) = test_store(0);
+        let stream_id = Uuid::from_u128(31);
+        let epoch_id = Uuid::from_u128(32);
+        let keys = EpochKeys::derive(&[3u8; 32], stream_id, epoch_id).unwrap();
+        let media = |sequence| {
+            object(
+                &keys,
+                stream_id,
+                epoch_id,
+                ObjectSpec {
+                    kind: DashObjectKind::Media,
+                    sequence,
+                    segment_number: sequence,
+                    chunk_index: 0,
+                    random_access: true,
+                    payload: vec![sequence as u8],
+                },
+            )
+        };
+
+        store.store(media(1)).unwrap();
+        assert!(store.list(stream_id).unwrap().is_empty());
+        assert_eq!(store.last_sequence(stream_id).unwrap(), Some(1));
+        drop(store);
+
+        let reopened = DashStore::open(root.clone(), 0, Duration::from_secs(1800)).unwrap();
+        assert_eq!(reopened.last_sequence(stream_id).unwrap(), Some(1));
+        assert!(reopened.store(media(1)).is_err());
+        reopened.store(media(2)).unwrap();
+        assert_eq!(reopened.last_sequence(stream_id).unwrap(), Some(2));
 
         std::fs::remove_dir_all(root).unwrap();
     }
