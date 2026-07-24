@@ -3633,6 +3633,22 @@ fn mmap_fd_slice(fd: RawFd, offset: usize, size: usize, sync_dmabuf: bool) -> Op
     if size == 0 {
         return Some(Vec::new());
     }
+    let requested_end = offset.checked_add(size)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `stat` points to writable storage for one `libc::stat`, and `fd`
+    // remains borrowed from the PipeWire buffer for the duration of this call.
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } == 0 {
+        // SAFETY: a successful `fstat` initialized the output structure.
+        let extent = unsafe { stat.assume_init() }.st_size;
+        if let Ok(extent) = usize::try_from(extent)
+            && extent > 0
+            && requested_end > extent
+        {
+            return None;
+        }
+    }
+    // SAFETY: `sysconf` has no pointer arguments and `_SC_PAGESIZE` is a valid
+    // query on the supported Unix platforms.
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     let page_size = if page_size > 0 {
         page_size as usize
@@ -3646,6 +3662,8 @@ fn mmap_fd_slice(fd: RawFd, offset: usize, size: usize, sync_dmabuf: bool) -> Op
     if sync_dmabuf {
         sync_dmabuf_read(fd, false);
     }
+    // SAFETY: the offset is page-aligned, the length is non-zero and checked,
+    // and the borrowed descriptor remains valid until after `munmap`.
     let ptr = unsafe {
         libc::mmap(
             ptr::null_mut(),
@@ -3662,7 +3680,9 @@ fn mmap_fd_slice(fd: RawFd, offset: usize, size: usize, sync_dmabuf: bool) -> Op
         }
         return None;
     }
+    // SAFETY: the requested slice is contained in the successful mapping.
     let out = unsafe { std::slice::from_raw_parts((ptr as *const u8).add(delta), size).to_vec() };
+    // SAFETY: `ptr` and `map_len` are exactly the mapping returned above.
     let _ = unsafe { libc::munmap(ptr, map_len) };
     if sync_dmabuf {
         sync_dmabuf_read(fd, true);
@@ -4357,6 +4377,26 @@ mod tests {
             assert_eq!(*slot.lock().unwrap(), Some(42));
         }
         assert_eq!(*slot.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn fd_mapping_rejects_a_slice_beyond_the_reported_extent() {
+        let path = std::env::temp_dir().join(format!("glacialcast-mmap-test-{}", Uuid::new_v4()));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(4096).unwrap();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
+
+        assert_eq!(mmap_fd_slice(fd, 4000, 96, false).unwrap().len(), 96);
+        assert!(mmap_fd_slice(fd, 4000, 97, false).is_none());
+        assert!(mmap_fd_slice(fd, usize::MAX, 1, false).is_none());
+
+        drop(file);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
