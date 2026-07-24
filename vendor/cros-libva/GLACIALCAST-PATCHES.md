@@ -12,5 +12,7 @@ GlacialCast carries these narrow changes:
   with current Rust `check-cfg`.
 - Apply compiler-suggested lifetime annotations and a dead-code annotation to
   keep dependency builds warning-free.
+- Expose a narrow, owned `VAProcPipelineParameterBuffer` wrapper used to
+  convert imported PipeWire DMA-BUF surfaces into encoder-ready NV12.
 
 No media behavior used by GlacialCast is otherwise changed.

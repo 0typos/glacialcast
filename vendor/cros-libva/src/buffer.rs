@@ -251,6 +251,10 @@ impl Buffer {
                     std::mem::size_of_val(wrapper.inner_mut()),
                 ),
             },
+            BufferType::ProcPipeline(ref mut wrapper) => (
+                wrapper.inner_mut() as *mut _ as *mut std::ffi::c_void,
+                std::mem::size_of_val(wrapper.inner_mut()),
+            ),
         };
 
         // Safe because `self` represents a valid `VAContext`. `ptr` and `size` are also ensured to
@@ -319,6 +323,8 @@ pub enum BufferType {
     EncCodedBuffer(usize),
     /// Abstraction over `VAEncMiscParameterBuffer`.
     EncMiscParameter(EncMiscParameter),
+    /// Video-processing input and conversion parameters.
+    ProcPipeline(ProcPipelineParameterBuffer),
 }
 
 impl BufferType {
@@ -350,7 +356,30 @@ impl BufferType {
             BufferType::EncCodedBuffer(_) => bindings::VABufferType::VAEncCodedBufferType,
 
             BufferType::EncMiscParameter(_) => bindings::VABufferType::VAEncMiscParameterBufferType,
+            BufferType::ProcPipeline(_) => {
+                bindings::VABufferType::VAProcPipelineParameterBufferType
+            }
         }
+    }
+}
+
+/// Safe owned wrapper for a basic video-processing pipeline request.
+pub struct ProcPipelineParameterBuffer(Box<bindings::VAProcPipelineParameterBuffer>);
+
+impl ProcPipelineParameterBuffer {
+    /// Creates a conversion/scaling request using the complete source and
+    /// destination surfaces and driver-selected color conversion.
+    pub fn new(source_surface: bindings::VASurfaceID) -> Self {
+        let mut inner = bindings::VAProcPipelineParameterBuffer {
+            surface: source_surface,
+            ..Default::default()
+        };
+        inner.filter_flags = bindings::VA_FILTER_SCALING_FAST;
+        Self(Box::new(inner))
+    }
+
+    fn inner_mut(&mut self) -> &mut bindings::VAProcPipelineParameterBuffer {
+        &mut self.0
     }
 }
 

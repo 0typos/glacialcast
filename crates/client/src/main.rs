@@ -68,7 +68,10 @@ mod dash_encoder;
 #[cfg(feature = "ffmpeg-vaapi")]
 mod ffmpeg_vaapi;
 
-use dash_encoder::{DashEncoderMode, DashH264Encoder};
+use dash_encoder::{
+    DashDmaBufFrame, DashEncoderMode, DashFrameRelease, DashH264Encoder, DashInputFrame,
+    should_capture_dmabuf,
+};
 
 const PORTAL_SOURCE_MONITOR: u32 = 1;
 const PORTAL_SOURCE_WINDOW: u32 = 2;
@@ -180,7 +183,7 @@ struct CaptureEncodeSettings {
     max_height: u32,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CaptureMode {
     DashTest,
     DashWayland,
@@ -530,14 +533,14 @@ async fn run_dash_connection(
     }
     sequence = sequence.max(resend.range().1.unwrap_or(0));
 
-    let first_image = normalize_dash_image(
+    let first_frame = normalize_dash_input(
         capture
-            .capture_rgb(args.max_frame_width, args.max_frame_height)
+            .capture_dash_frame(args.max_frame_width, args.max_frame_height)
             .await?,
         None,
     );
-    let width = first_image.width();
-    let height = first_image.height();
+    let width = first_frame.width();
+    let height = first_frame.height();
     let frame_duration = ((f64::from(MEDIA_TIMESCALE) / args.fps).round() as u64)
         .clamp(1, u64::from(u32::MAX)) as u32;
     let epoch_id = Uuid::new_v4();
@@ -553,7 +556,7 @@ async fn run_dash_connection(
         args.video_bitrate,
         args.segment_frames,
     )?;
-    let first_encoded = encoder.encode(&first_image, false)?;
+    let first_encoded = encoder.encode(&first_frame, false)?;
     if !first_encoded.keyframe {
         bail!("H.264 encoder did not begin the epoch with a random-access frame");
     }
@@ -681,13 +684,13 @@ async fn run_dash_connection(
                 return Ok(());
             }
             _ = frame_tick.tick() => {
-                let image = normalize_dash_image(
-                    capture.capture_rgb(args.max_frame_width, args.max_frame_height).await?,
+                let frame = normalize_dash_input(
+                    capture.capture_dash_frame(args.max_frame_width, args.max_frame_height).await?,
                     Some((width, height)),
                 );
                 let segment_start =
                     media_index.is_multiple_of(u64::from(args.segment_frames));
-                let encoded = encoder.encode(&image, segment_start)?;
+                let encoded = encoder.encode(&frame, segment_start)?;
                 if segment_start && !encoded.keyframe {
                     bail!("H.264 encoder did not produce an IDR at the segment boundary");
                 }
@@ -830,28 +833,38 @@ fn build_dash_media_object(
     )
 }
 
-fn normalize_dash_image(
-    image: ImageBuffer<Rgb<u8>, Vec<u8>>,
-    target: Option<(u32, u32)>,
-) -> ImageBuffer<Rgb<u8>, Vec<u8>> {
+fn normalize_dash_input(input: DashInputFrame, target: Option<(u32, u32)>) -> DashInputFrame {
     let (width, height) = target.unwrap_or_else(|| {
-        let even_width = if image.width() < 2 {
+        let even_width = if input.width() < 2 {
             2
         } else {
-            image.width() & !1
+            input.width() & !1
         };
-        let even_height = if image.height() < 2 {
+        let even_height = if input.height() < 2 {
             2
         } else {
-            image.height() & !1
+            input.height() & !1
         };
         (even_width, even_height)
     });
-    if image.width() == width && image.height() == height {
-        image
-    } else {
-        image::imageops::resize(&image, width, height, FilterType::Triangle)
-    }
+    input.with_output_size(width, height)
+}
+
+fn fit_even_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
+    let max_width = max_width.max(2);
+    let max_height = max_height.max(2);
+    let scale =
+        (max_width as f64 / width.max(1) as f64).min(max_height as f64 / height.max(1) as f64);
+    let scale = scale.min(1.0);
+    let width = ((width.max(1) as f64 * scale).floor() as u32)
+        .max(2)
+        .min(max_width)
+        & !1;
+    let height = ((height.max(1) as f64 * scale).floor() as u32)
+        .max(2)
+        .min(max_height)
+        & !1;
+    (width.max(2), height.max(2))
 }
 
 fn duration_to_media_ticks(duration: Duration) -> u64 {
@@ -2638,6 +2651,15 @@ trait Capture: Send {
         max_width: u32,
         max_height: u32,
     ) -> Result<ImageBuffer<Rgb<u8>, Vec<u8>>>;
+    async fn capture_dash_frame(
+        &mut self,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<DashInputFrame> {
+        Ok(DashInputFrame::Rgb(
+            self.capture_rgb(max_width, max_height).await?,
+        ))
+    }
     async fn capture_jpeg(&mut self, settings: CaptureEncodeSettings) -> Result<EncodedFrame>;
     async fn cursor(&mut self, seq: u64, stream_id: Uuid) -> Result<Option<CursorMessage>>;
 }
@@ -2908,6 +2930,7 @@ struct WaylandPipewireCapture {
     monitor_name: Option<String>,
     portal_cursor: PortalCursorMode,
     require_cursor_metadata: bool,
+    prefer_dmabuf: bool,
     inner: Option<NativePipewireCapture>,
 }
 
@@ -2921,6 +2944,8 @@ impl WaylandPipewireCapture {
             monitor_name: args.monitor_name.clone(),
             portal_cursor: args.portal_cursor,
             require_cursor_metadata: args.require_cursor_metadata,
+            prefer_dmabuf: args.capture == CaptureMode::DashWayland
+                && should_capture_dmabuf(args.dash_encoder, &args.vaapi_device),
             inner: None,
         }
     }
@@ -2928,15 +2953,16 @@ impl WaylandPipewireCapture {
     async fn ensure_started(&mut self) -> Result<&mut NativePipewireCapture> {
         if self.inner.is_none() {
             self.inner = Some(
-                NativePipewireCapture::start(
-                    self.fps,
-                    self.cursor_hz,
-                    self.portal_source,
-                    self.screencast_backend,
-                    self.monitor_name.as_deref(),
-                    self.portal_cursor,
-                    self.require_cursor_metadata,
-                )
+                NativePipewireCapture::start(NativePipewireCaptureConfig {
+                    fps: self.fps,
+                    cursor_hz: self.cursor_hz,
+                    portal_source: self.portal_source,
+                    screencast_backend: self.screencast_backend,
+                    monitor_name: self.monitor_name.as_deref(),
+                    portal_cursor: self.portal_cursor,
+                    require_cursor_metadata: self.require_cursor_metadata,
+                    prefer_dmabuf: self.prefer_dmabuf,
+                })
                 .await?,
             );
         }
@@ -2976,6 +3002,21 @@ impl Capture for WaylandPipewireCapture {
         }
     }
 
+    async fn capture_dash_frame(
+        &mut self,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<DashInputFrame> {
+        let capture = self.ensure_started().await?;
+        match capture.next_dash_frame(max_width, max_height).await {
+            Ok(frame) => Ok(frame),
+            Err(err) => {
+                self.inner = None;
+                Err(err)
+            }
+        }
+    }
+
     async fn cursor(&mut self, seq: u64, stream_id: Uuid) -> Result<Option<CursorMessage>> {
         Ok(self
             .ensure_started()
@@ -2987,7 +3028,7 @@ impl Capture for WaylandPipewireCapture {
 
 struct NativePipewireCapture {
     source: CaptureSource,
-    latest: watch::Receiver<Option<RawFrame>>,
+    latest: NativePipewireFrames,
     cursor_latest: watch::Receiver<Option<PipewireCursorSample>>,
     pipewire_error: Arc<Mutex<Option<String>>>,
     last_encoded_serial: u64,
@@ -2996,16 +3037,34 @@ struct NativePipewireCapture {
     _pipewire_thread: PipewireThreadStop,
 }
 
+enum NativePipewireFrames {
+    Cpu(watch::Receiver<Option<RawFrame>>),
+    DmaBuf(watch::Receiver<Option<PipewireVideoFrame>>),
+}
+
+struct NativePipewireCaptureConfig<'a> {
+    fps: f64,
+    cursor_hz: u64,
+    portal_source: PortalSourceMode,
+    screencast_backend: ScreenCastBackend,
+    monitor_name: Option<&'a str>,
+    portal_cursor: PortalCursorMode,
+    require_cursor_metadata: bool,
+    prefer_dmabuf: bool,
+}
+
 impl NativePipewireCapture {
-    async fn start(
-        fps: f64,
-        cursor_hz: u64,
-        portal_source: PortalSourceMode,
-        screencast_backend: ScreenCastBackend,
-        monitor_name: Option<&str>,
-        portal_cursor: PortalCursorMode,
-        require_cursor_metadata: bool,
-    ) -> Result<Self> {
+    async fn start(config: NativePipewireCaptureConfig<'_>) -> Result<Self> {
+        let NativePipewireCaptureConfig {
+            fps,
+            cursor_hz,
+            portal_source,
+            screencast_backend,
+            monitor_name,
+            portal_cursor,
+            require_cursor_metadata,
+            prefer_dmabuf,
+        } = config;
         let capture = open_screencast_capture(
             screencast_backend,
             portal_source,
@@ -3013,31 +3072,36 @@ impl NativePipewireCapture {
             portal_cursor,
         )
         .await?;
-        let (tx, rx) = watch::channel(None);
         let (cursor_tx, cursor_rx) = watch::channel(None);
         let pipewire_error = Arc::new(Mutex::new(None));
         let thread_stop = Arc::new(AtomicUsize::new(0));
-        let pipewire_thread = start_pipewire_thread(
-            PipewireThreadConfig {
-                node_id: capture.node_id,
-                width: capture.width,
-                height: capture.height,
-                remote: capture.remote.try_clone()?,
-                fps,
-                cursor_hz,
-                require_cursor_metadata,
-                pipewire_error: pipewire_error.clone(),
-                mainloop_ptr_out: thread_stop.clone(),
-            },
-            tx,
-            cursor_tx,
-        )?;
+        let thread_config = PipewireThreadConfig {
+            node_id: capture.node_id,
+            width: capture.width,
+            height: capture.height,
+            remote: capture.remote.try_clone()?,
+            fps,
+            cursor_hz,
+            require_cursor_metadata,
+            pipewire_error: pipewire_error.clone(),
+            mainloop_ptr_out: thread_stop.clone(),
+        };
+        let (latest, pipewire_thread) = if prefer_dmabuf {
+            let (tx, rx) = watch::channel(None);
+            let thread = start_pipewire_video_thread(thread_config, tx, cursor_tx)?;
+            (NativePipewireFrames::DmaBuf(rx), thread)
+        } else {
+            let (tx, rx) = watch::channel(None);
+            let thread = start_pipewire_thread(thread_config, tx, cursor_tx)?;
+            (NativePipewireFrames::Cpu(rx), thread)
+        };
 
         info!(
             node_id = capture.node_id,
             width = capture.width,
             height = capture.height,
             backend = ?screencast_backend,
+            dmabuf = prefer_dmabuf,
             "Wayland/PipeWire native capture started"
         );
 
@@ -3052,7 +3116,7 @@ impl NativePipewireCapture {
                 width: capture.width,
                 height: capture.height,
             },
-            latest: rx,
+            latest,
             cursor_latest: cursor_rx,
             pipewire_error,
             last_encoded_serial: 0,
@@ -3090,6 +3154,9 @@ impl NativePipewireCapture {
     }
 
     async fn next_frame(&mut self) -> Result<RawFrame> {
+        let NativePipewireFrames::Cpu(latest) = &mut self.latest else {
+            bail!("CPU image capture was requested from a DMA-BUF PipeWire stream");
+        };
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(err) = self
@@ -3101,7 +3168,7 @@ impl NativePipewireCapture {
                 bail!("PipeWire stream failed: {err}");
             }
 
-            if let Some(frame) = self.latest.borrow().clone()
+            if let Some(frame) = latest.borrow().clone()
                 && frame.serial != self.last_encoded_serial
             {
                 self.last_encoded_serial = frame.serial;
@@ -3112,7 +3179,66 @@ impl NativePipewireCapture {
                 bail!("timed out waiting for a PipeWire frame from portal stream");
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let _ = timeout(remaining, self.latest.changed()).await;
+            let _ = timeout(remaining, latest.changed()).await;
+        }
+    }
+
+    async fn next_dash_frame(&mut self, max_width: u32, max_height: u32) -> Result<DashInputFrame> {
+        if matches!(&self.latest, NativePipewireFrames::Cpu(_)) {
+            return Ok(DashInputFrame::Rgb(
+                self.next_rgb(max_width, max_height).await?,
+            ));
+        }
+        let NativePipewireFrames::DmaBuf(latest) = &mut self.latest else {
+            unreachable!("PipeWire frame source was checked above");
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(err) = self
+                .pipewire_error
+                .lock()
+                .expect("PipeWire error mutex poisoned")
+                .clone()
+            {
+                bail!("PipeWire stream failed: {err}");
+            }
+            if let Some(frame) = latest.borrow().clone()
+                && frame.serial() != self.last_encoded_serial
+            {
+                self.last_encoded_serial = frame.serial();
+                return match frame {
+                    PipewireVideoFrame::Cpu(frame) => {
+                        Ok(DashInputFrame::Rgb(resize_rgb_image_to_fit(
+                            raw_frame_to_rgb_image(&frame)?,
+                            max_width,
+                            max_height,
+                        )))
+                    }
+                    PipewireVideoFrame::DmaBuf(frame) => {
+                        let (output_width, output_height) =
+                            fit_even_dimensions(frame.width, frame.height, max_width, max_height);
+                        Ok(DashInputFrame::DmaBuf(DashDmaBufFrame {
+                            fd: Arc::clone(&frame.fd),
+                            release: frame.release.clone(),
+                            offset: frame.offset,
+                            size: frame.size,
+                            stride: usize::try_from(frame.stride)
+                                .context("PipeWire DMA-BUF stride is negative")?,
+                            drm_format: frame.drm_format,
+                            modifier: frame.modifier,
+                            source_width: frame.width,
+                            source_height: frame.height,
+                            output_width,
+                            output_height,
+                        }))
+                    }
+                };
+            }
+            if Instant::now() >= deadline {
+                bail!("timed out waiting for a PipeWire frame from portal stream");
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let _ = timeout(remaining, latest.changed()).await;
         }
     }
 }
@@ -3198,6 +3324,12 @@ impl<'a> DequeuedPipewireBuffer<'a> {
                 )
             }
         }
+    }
+
+    fn defer_queue(self) -> *mut pw::sys::pw_buffer {
+        let buffer = self.buffer;
+        std::mem::forget(self);
+        buffer
     }
 }
 
@@ -3585,11 +3717,40 @@ struct DmaBufFrame {
     width: u32,
     height: u32,
     fd: Arc<OwnedFd>,
+    release: DashFrameRelease,
     offset: usize,
     size: usize,
     stride: i32,
     drm_format: u32,
     modifier: u64,
+}
+
+struct PipewireBufferLease {
+    sender: pw::channel::Sender<usize>,
+    buffer: usize,
+    released: AtomicBool,
+}
+
+impl PipewireBufferLease {
+    fn new(sender: pw::channel::Sender<usize>, buffer: *mut pw::sys::pw_buffer) -> Self {
+        Self {
+            sender,
+            buffer: buffer as usize,
+            released: AtomicBool::new(false),
+        }
+    }
+
+    fn release(&self) {
+        if !self.released.swap(true, Ordering::AcqRel) {
+            let _ = self.sender.send(self.buffer);
+        }
+    }
+}
+
+impl Drop for PipewireBufferLease {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4473,6 +4634,15 @@ fn run_pipewire_video_loop(
         stream_properties.insert("target.object", target_object.clone());
     }
     let stream = pw::stream::StreamBox::new(&core, "glacialcast-screen-video", stream_properties)?;
+    let (buffer_release_tx, buffer_release_rx) = pw::channel::channel::<usize>();
+    let stream_ptr = stream.as_raw_ptr() as usize;
+    let _buffer_release = buffer_release_rx.attach(mainloop.loop_(), move |buffer| unsafe {
+        pw::sys::pw_stream_queue_buffer(
+            stream_ptr as *mut pw::sys::pw_stream,
+            buffer as *mut pw::sys::pw_buffer,
+        );
+    });
+    let buffer_release_for_process = buffer_release_tx.clone();
 
     let _listener = stream
         .add_local_listener_with_user_data(data)
@@ -4633,12 +4803,22 @@ fn run_pipewire_video_loop(
                         "PipeWire video delivered DMA-BUF frame for VAAPI import"
                     );
                 }
+                let buffer_ptr = buffer.defer_queue();
+                let lease = Arc::new(PipewireBufferLease::new(
+                    buffer_release_for_process.clone(),
+                    buffer_ptr,
+                ));
+                let release = DashFrameRelease::new({
+                    let lease = Arc::clone(&lease);
+                    move || lease.release()
+                });
                 let frame = DmaBufFrame {
                     serial: user_data.serial,
                     captured_at_ms,
                     width: video_size.width,
                     height: video_size.height,
                     fd: Arc::new(owned_fd),
+                    release,
                     offset: total_offset,
                     size,
                     stride: stride as i32,
@@ -6129,6 +6309,14 @@ mod tests {
         assert_eq!(pipewire_capture_rate(1.0, 30), 30.0);
         assert_eq!(pipewire_capture_rate(15.0, 10), 15.0);
         assert_eq!(pipewire_capture_rate(15.0, 120), 60.0);
+    }
+
+    #[test]
+    fn dash_dmabuf_dimensions_preserve_aspect_ratio_and_encoder_constraints() {
+        assert_eq!(fit_even_dimensions(3840, 2160, 1280, 720), (1280, 720));
+        assert_eq!(fit_even_dimensions(1920, 1200, 1280, 720), (1152, 720));
+        assert_eq!(fit_even_dimensions(1279, 719, 1280, 720), (1278, 718));
+        assert_eq!(fit_even_dimensions(1, 1, 1, 1), (2, 2));
     }
 
     #[test]

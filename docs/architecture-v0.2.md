@@ -195,6 +195,13 @@ When VA-API H.264 encoding is unavailable, automatic mode falls back to the
 focused OpenH264 software encoder. An operator can require either backend
 explicitly. NVIDIA hardware encoding is not required for 0.2.
 
+On Intel and AMD render nodes that expose both constrained-baseline H.264
+encoding and the VA-API video-processing entrypoint, the Wayland path imports
+the compositor's RGB DMA-BUF and converts/scales it into an owned NV12 GBM
+surface before encoding. The client does not return the PipeWire buffer to its
+pool until that GPU operation has synchronized. If either capability is absent,
+the portal stream requests CPU-readable buffers instead.
+
 ## Compatibility Matrix
 
 Release verification covers:

@@ -202,7 +202,12 @@ unavailable. Use `--vaapi-device /dev/dri/renderD129` for another render node,
 `--dash-encoder vaapi` to require hardware encoding, or
 `--dash-encoder openh264` to require the software path. VA-API segment
 boundaries start a fresh low-delay encoder sequence so every advertised DASH
-segment begins with SPS, PPS, and an IDR.
+segment begins with SPS, PPS, and an IDR. When the render node also exposes
+VA-API video processing, `dash-wayland` negotiates compositor DMA-BUFs and
+converts them directly to encoder NV12 surfaces. GlacialCast retains each
+PipeWire buffer until the GPU conversion completes, so a compositor cannot
+overwrite an in-flight frame. If video processing is unavailable, capture
+negotiates CPU-readable buffers for the OpenH264 fallback or VA-API upload path.
 
 Open the dashboard, select the DASH stream, and enter the viewer key:
 
