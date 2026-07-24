@@ -395,6 +395,7 @@ target/release/glacialcast-offline mirror \
 
 mkdir -p "$demo_dir/received"
 cp "$demo_dir/outgoing/"*.gco "$demo_dir/received/"
+cp "$demo_dir/outgoing/"/glacialcast-transfer-chunk-*.json "$demo_dir/received/"
 cp "$demo_dir/outgoing/glacialcast-transfer.json" "$demo_dir/received/"
 
 target/release/glacialcast-offline verify \
@@ -402,17 +403,20 @@ target/release/glacialcast-offline verify \
 ```
 
 The `received` directory represents the files delivered to the disconnected
-machine. The versioned manifest contains each portable filename, public object
-header, byte length, and SHA-256 checksum. `verify` exits nonzero for missing,
-unexpected, corrupt, symlinked, or metadata-mismatched objects; add `--json` for
-a transfer tool or automation.
+machine. The v2 root manifest references immutable, content-addressed index
+chunks containing each portable filename, public object header, byte length,
+and SHA-256 checksum. `verify` also accepts a legacy v1 single-file manifest.
+It exits nonzero for missing, unexpected, corrupt, symlinked, oversized, or
+metadata-mismatched objects and index chunks; add `--json` for a transfer tool
+or automation. Checksums detect incomplete or corrupt transfer but do not prove
+who created the files. The viewer key authenticates and decrypts the `.gco`
+contents.
 
-Files may arrive in any order. For a resumable transfer, copy only the missing
-filenames reported by `verify`, then rerun it. Copy the manifest after taking
-the snapshot (or copy it first and treat its missing list as the work queue);
-publish each file by atomic rename on the receiver. Stop the live publisher and
-relay if you want to demonstrate that no network connection is needed, then
-run:
+Object files may arrive in any order. For a resumable transfer, copy only the
+missing object filenames reported by `verify`, then rerun it. Copy new
+content-addressed chunk indexes before the root manifest; publish every file by
+atomic rename on the receiver. Stop the live publisher and relay if you want to
+demonstrate that no network connection is needed, then run:
 
 ```sh
 target/release/glacialcast-offline serve \
@@ -428,9 +432,11 @@ input directory but never modifies it, so the verified presentation can be
 mounted read-only.
 
 For a continuously updated outgoing directory, add `--follow` to `mirror` and
-copy only completed `.gco` files. Copy the atomically replaced manifest after
-each batch. Never transfer `.part` files. Re-running `mirror` validates and
-skips existing objects, so an interrupted mirror resumes at object granularity.
+copy only completed `.gco` and content-addressed chunk files. Copy the
+atomically replaced root manifest last after each batch. Never transfer `.part`
+files. Re-running `mirror` indexes existing objects once and skips them, so an
+interrupted mirror resumes at object granularity; subsequent follow polls ask
+the relay only for objects beyond the local sequence high-water mark.
 
 ## 9. Smoke-test a deployed Internet instance
 

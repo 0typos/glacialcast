@@ -15,6 +15,9 @@ different reason:
   Noise. Peers reject any unequal version before normal ingest.
 - `DASH_FORMAT_VERSION` covers authenticated object metadata and the portable
   `GCO1` representation. The relay and offline tools reject unknown versions.
+- The JSON transfer index has an independent version. Writers publish a compact
+  v2 root manifest plus immutable v1 chunk files; readers continue to accept
+  the legacy v1 root manifest. An unknown root or chunk version is rejected.
 - Epoch descriptors carry their own format version and cryptographic
   parameters. Viewers reject a descriptor they cannot validate.
 - The constrained fMP4/CENC profile is standards-based but intentionally
@@ -56,7 +59,9 @@ derived keys and exact portable bytes for deterministic test inputs. The
 workspace test decodes and authenticates it on every normal test run.
 
 The five fuzz targets cover portable objects, cursor envelopes, Noise segment
-headers, epoch descriptors, and relay catalog-journal records:
+headers, epoch descriptors, and relay catalog-journal records. Transfer-index
+compatibility is additionally fixed by unit vectors that exercise legacy v1,
+chunked v2, checksum failure, duplicate metadata, and size limits:
 
 ```sh
 GLACIALCAST_FUZZ_SECONDS=30 scripts/verify-fuzz.sh

@@ -217,9 +217,11 @@ export GLACIALCAST_ACCESS_TOKEN='<viewer-access-token>'
   --follow
 ```
 
-Copy completed `.gco` files through the one-way file transport. Do not transfer
-temporary `.part` files. Copy the atomically replaced
-`glacialcast-transfer.json` after each batch.
+Copy completed `.gco` files and
+`glacialcast-transfer-chunk-*.json` files through the one-way file transport.
+The chunk indexes are immutable and content-addressed. Do not transfer temporary
+`.part` files. Copy the atomically replaced `glacialcast-transfer.json` last
+after each batch so it never references chunks that have not arrived.
 
 On the disconnected machine:
 
@@ -235,10 +237,11 @@ glacialcast-offline serve \
 Open `http://127.0.0.1:8910`, select the stream, and enter the out-of-band
 viewer key. The binary embeds the local HTTP service, DASH endpoints, and
 viewer assets; only it, the `.gco` files, and an installed Firefox or Chromium
-are required. The versioned transfer manifest records public headers, byte
-lengths, and SHA-256 checksums; `verify --json` reports missing and unexpected
-objects for resumable, out-of-order transfer automation. The offline viewer
-refuses a non-loopback listener unless
+are required. The versioned transfer index records public headers, byte
+lengths, and SHA-256 checksums in bounded chunks; `verify --json` reports
+missing and unexpected objects for resumable, out-of-order transfer automation.
+Its checksums detect corruption but do not authenticate the transport. The
+offline viewer refuses a non-loopback listener unless
 `--allow-non-loopback` is supplied explicitly; use that escape hatch only on a
 trusted network.
 

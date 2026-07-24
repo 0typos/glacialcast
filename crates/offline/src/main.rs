@@ -47,8 +47,12 @@ const VIEWER_CORE_JS: &str = include_str!("../../server/static/dash-viewer-core.
 const VIEWER_JS: &str = include_str!("../../server/static/dash-viewer.js");
 const MAX_PORTABLE_FILE_LEN: u64 = MAX_FRAME_LEN as u64 + 128 * 1024;
 const TRANSFER_MANIFEST_FILE: &str = "glacialcast-transfer.json";
-const TRANSFER_MANIFEST_VERSION: u16 = 1;
+const TRANSFER_MANIFEST_VERSION: u16 = 2;
+const LEGACY_TRANSFER_MANIFEST_VERSION: u16 = 1;
+const TRANSFER_CHUNK_VERSION: u16 = 1;
+const TRANSFER_CHUNK_OBJECTS: u64 = 1024;
 const MAX_TRANSFER_MANIFEST_LEN: u64 = 16 * 1024 * 1024;
+const MAX_TRANSFER_CHUNK_LEN: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -103,16 +107,51 @@ struct TransferManifest {
     version: u16,
     stream_id: Uuid,
     generated_at_ms: i64,
-    objects: Vec<TransferObject>,
+    chunks: Vec<TransferChunkDescriptor>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyTransferManifest {
+    version: u16,
+    stream_id: Uuid,
+    generated_at_ms: i64,
+    objects: Vec<TransferObject>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TransferObject {
     filename: String,
     length: u64,
     sha256: String,
     header: DashObjectHeader,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransferChunkDescriptor {
+    filename: String,
+    length: u64,
+    sha256: String,
+    first_sequence: u64,
+    last_sequence: u64,
+    object_count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransferChunk {
+    version: u16,
+    stream_id: Uuid,
+    objects: Vec<TransferObject>,
+}
+
+#[derive(Default)]
+struct TransferIndex {
+    objects: BTreeMap<u64, TransferObject>,
+    chunks: BTreeMap<u64, TransferChunkDescriptor>,
+    dirty_chunks: BTreeSet<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -228,14 +267,31 @@ async fn mirror(
         .build()
         .context("building relay HTTP client")?;
     let server = server.trim_end_matches('/');
+    let mut index = TransferIndex::load(output, stream_id)?;
+    let mut after_sequence = None;
 
     loop {
-        let mirrored = mirror_once(&client, server, access_token, stream_id, output).await?;
-        write_transfer_manifest(output, stream_id)?;
+        let mirrored = mirror_once(
+            &client,
+            server,
+            access_token,
+            stream_id,
+            output,
+            &mut index,
+            after_sequence,
+        )
+        .await?;
+        if after_sequence.is_none() || mirrored > 0 {
+            index.publish(output, stream_id)?;
+        }
         info!(stream_id = %stream_id, mirrored, "offline mirror pass complete");
         if !follow {
             return Ok(());
         }
+        after_sequence = index
+            .objects
+            .last_key_value()
+            .map(|(sequence, _)| *sequence);
         tokio::select! {
             _ = tokio::signal::ctrl_c() => return Ok(()),
             _ = tokio::time::sleep(Duration::from_millis(poll_ms)) => {}
@@ -249,9 +305,14 @@ async fn mirror_once(
     access_token: Option<&str>,
     stream_id: Uuid,
     output: &FsPath,
+    index: &mut TransferIndex,
+    after_sequence: Option<u64>,
 ) -> Result<usize> {
     let list_url = format!("{server}/api/dash/streams/{stream_id}/objects");
     let mut list_request = client.get(&list_url);
+    if let Some(sequence) = after_sequence {
+        list_request = list_request.query(&[("after_sequence", sequence)]);
+    }
     if let Some(token) = access_token {
         list_request = list_request.bearer_auth(token);
     }
@@ -272,15 +333,40 @@ async fn mirror_once(
             bail!("relay returned an object for the wrong stream");
         }
         let path = portable_object_path(output, object_header.sequence);
-        if path.exists() {
-            let existing = read_portable_object(&path)?;
+        if let Some(existing) = index.objects.get(&object_header.sequence) {
             if existing.header != object_header {
                 bail!(
                     "existing portable object {} conflicts with relay metadata",
                     path.display()
                 );
             }
+            let metadata = std::fs::symlink_metadata(&path)
+                .with_context(|| format!("inspecting portable object {}", path.display()))?;
+            if !metadata.file_type().is_file() || metadata.len() != existing.length {
+                bail!(
+                    "indexed portable object {} is missing or has changed length",
+                    path.display()
+                );
+            }
             continue;
+        }
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {
+                let existing = transfer_object_from_path(&path)?;
+                if existing.header != object_header {
+                    bail!(
+                        "existing portable object {} conflicts with relay metadata",
+                        path.display()
+                    );
+                }
+                index.insert(existing)?;
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspecting portable object {}", path.display()));
+            }
         }
         let object_url = format!(
             "{server}/api/dash/streams/{stream_id}/objects/{}",
@@ -315,47 +401,215 @@ async fn mirror_once(
         object
             .validate()
             .context("validating downloaded portable object")?;
-        write_portable_object(output, &path, &object)?;
+        let transferred = write_portable_object(output, &path, &object)?;
+        index.insert(transferred)?;
         mirrored += 1;
     }
     Ok(mirrored)
 }
 
+#[cfg(test)]
 fn write_transfer_manifest(root: &FsPath, stream_id: Uuid) -> Result<()> {
-    let mut objects = Vec::new();
-    for path in portable_paths(root)? {
-        let object = read_portable_object(&path)?;
-        if object.header.stream_id != stream_id {
-            bail!(
-                "portable object {} belongs to stream {}, expected {}",
-                path.display(),
-                object.header.stream_id,
-                stream_id
+    let mut index = TransferIndex::load(root, stream_id)?;
+    index.publish(root, stream_id)
+}
+
+impl TransferIndex {
+    fn load(root: &FsPath, stream_id: Uuid) -> Result<Self> {
+        let mut index = Self::default();
+        for path in portable_paths(root)? {
+            let object = transfer_object_from_path(&path)?;
+            if object.header.stream_id != stream_id {
+                bail!(
+                    "portable object {} belongs to stream {}, expected {}",
+                    path.display(),
+                    object.header.stream_id,
+                    stream_id
+                );
+            }
+            index.insert(object)?;
+        }
+        Ok(index)
+    }
+
+    fn insert(&mut self, object: TransferObject) -> Result<()> {
+        let sequence = object.header.sequence;
+        if let Some(existing) = self.objects.get(&sequence) {
+            if existing == &object {
+                return Ok(());
+            }
+            bail!("portable transfer contains conflicting sequence {sequence}");
+        }
+        self.objects.insert(sequence, object);
+        self.dirty_chunks.insert(transfer_chunk_id(sequence));
+        Ok(())
+    }
+
+    fn publish(&mut self, root: &FsPath, stream_id: Uuid) -> Result<()> {
+        let dirty = self.dirty_chunks.iter().copied().collect::<Vec<_>>();
+        for chunk_id in dirty {
+            let start = chunk_id
+                .saturating_mul(TRANSFER_CHUNK_OBJECTS)
+                .saturating_add(1);
+            let end = start.saturating_add(TRANSFER_CHUNK_OBJECTS - 1);
+            let objects = self
+                .objects
+                .range(start..=end)
+                .map(|(_, object)| object.clone())
+                .collect::<Vec<_>>();
+            if objects.is_empty() {
+                self.chunks.remove(&chunk_id);
+                continue;
+            }
+            let chunk = TransferChunk {
+                version: TRANSFER_CHUNK_VERSION,
+                stream_id,
+                objects,
+            };
+            let bytes =
+                serde_json::to_vec(&chunk).context("serializing transfer manifest chunk")?;
+            if bytes.len() as u64 > MAX_TRANSFER_CHUNK_LEN {
+                bail!("transfer manifest chunk exceeds its size limit");
+            }
+            let digest = sha256_hex(&bytes);
+            let filename = format!("glacialcast-transfer-chunk-{chunk_id:020}-{digest}.json");
+            let path = root.join(&filename);
+            write_immutable_transfer_chunk(root, &path, &bytes)?;
+            let first_sequence = chunk
+                .objects
+                .first()
+                .expect("nonempty transfer chunk")
+                .header
+                .sequence;
+            let last_sequence = chunk
+                .objects
+                .last()
+                .expect("nonempty transfer chunk")
+                .header
+                .sequence;
+            self.chunks.insert(
+                chunk_id,
+                TransferChunkDescriptor {
+                    filename,
+                    length: bytes.len() as u64,
+                    sha256: digest,
+                    first_sequence,
+                    last_sequence,
+                    object_count: chunk.objects.len(),
+                },
             );
         }
-        let filename = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .context("portable object filename is not UTF-8")?
-            .to_string();
-        let bytes = std::fs::read(&path)
-            .with_context(|| format!("hashing portable object {}", path.display()))?;
-        objects.push(TransferObject {
-            filename,
-            length: bytes.len() as u64,
-            sha256: sha256_hex(&bytes),
-            header: object.header,
-        });
+
+        let manifest = TransferManifest {
+            version: TRANSFER_MANIFEST_VERSION,
+            stream_id,
+            generated_at_ms: glacialcast_protocol::now_ms(),
+            chunks: self.chunks.values().cloned().collect(),
+        };
+        let bytes = serde_json::to_vec(&manifest).context("serializing transfer manifest")?;
+        if bytes.len() as u64 > MAX_TRANSFER_MANIFEST_LEN {
+            bail!("transfer manifest index exceeds its size limit");
+        }
+        atomic_write(root, &root.join(TRANSFER_MANIFEST_FILE), &bytes)?;
+        remove_unreferenced_transfer_chunks(root, &manifest.chunks)?;
+        self.dirty_chunks.clear();
+        Ok(())
     }
-    objects.sort_by_key(|object| object.header.sequence);
-    let manifest = TransferManifest {
-        version: TRANSFER_MANIFEST_VERSION,
-        stream_id,
-        generated_at_ms: glacialcast_protocol::now_ms(),
-        objects,
+}
+
+fn transfer_chunk_id(sequence: u64) -> u64 {
+    sequence.saturating_sub(1) / TRANSFER_CHUNK_OBJECTS
+}
+
+fn transfer_object_from_path(path: &FsPath) -> Result<TransferObject> {
+    let (object, bytes) = read_portable_file(path)?;
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("portable object filename is not UTF-8")?
+        .to_string();
+    Ok(TransferObject {
+        filename,
+        length: bytes.len() as u64,
+        sha256: sha256_hex(&bytes),
+        header: object.header,
+    })
+}
+
+fn write_immutable_transfer_chunk(directory: &FsPath, path: &FsPath, bytes: &[u8]) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() || metadata.len() != bytes.len() as u64 {
+                bail!(
+                    "existing transfer chunk is not the expected regular file: {}",
+                    path.display()
+                );
+            }
+            let existing =
+                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+            if existing != bytes {
+                bail!("existing transfer chunk conflicts with its content hash");
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            atomic_write(directory, path, bytes)
+        }
+        Err(error) => Err(error).with_context(|| format!("inspecting {}", path.display())),
+    }
+}
+
+fn remove_unreferenced_transfer_chunks(
+    root: &FsPath,
+    chunks: &[TransferChunkDescriptor],
+) -> Result<()> {
+    let referenced = chunks
+        .iter()
+        .map(|chunk| chunk.filename.as_str())
+        .collect::<HashSet<_>>();
+    let mut removed = false;
+    for entry in std::fs::read_dir(root).with_context(|| format!("reading {}", root.display()))? {
+        let entry = entry.with_context(|| format!("reading an entry in {}", root.display()))?;
+        let filename = entry.file_name();
+        let Some(filename) = filename.to_str() else {
+            continue;
+        };
+        if !transfer_chunk_filename(filename) || referenced.contains(filename) {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            bail!(
+                "managed transfer chunk path is unexpectedly a directory: {}",
+                entry.path().display()
+            );
+        }
+        std::fs::remove_file(entry.path())
+            .with_context(|| format!("removing stale transfer chunk {}", entry.path().display()))?;
+        removed = true;
+    }
+    if removed {
+        File::open(root)
+            .with_context(|| format!("opening {}", root.display()))?
+            .sync_all()
+            .with_context(|| format!("syncing {}", root.display()))?;
+    }
+    Ok(())
+}
+
+fn transfer_chunk_filename(filename: &str) -> bool {
+    let Some(body) = filename
+        .strip_prefix("glacialcast-transfer-chunk-")
+        .and_then(|filename| filename.strip_suffix(".json"))
+    else {
+        return false;
     };
-    let bytes = serde_json::to_vec_pretty(&manifest).context("serializing transfer manifest")?;
-    atomic_write(root, &root.join(TRANSFER_MANIFEST_FILE), &bytes)
+    let Some((chunk, digest)) = body.split_once('-') else {
+        return false;
+    };
+    chunk.len() == 20
+        && chunk.bytes().all(|byte| byte.is_ascii_digit())
+        && digest.len() == 64
+        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn verify_transfer(root: &FsPath) -> Result<TransferVerification> {
@@ -374,23 +628,15 @@ fn verify_transfer(root: &FsPath) -> Result<TransferVerification> {
     if metadata.len() > MAX_TRANSFER_MANIFEST_LEN {
         bail!("transfer manifest exceeds its size limit");
     }
-    let manifest: TransferManifest = serde_json::from_slice(
-        &std::fs::read(&manifest_path)
-            .with_context(|| format!("reading transfer manifest {}", manifest_path.display()))?,
-    )
-    .context("decoding transfer manifest")?;
-    if manifest.version != TRANSFER_MANIFEST_VERSION {
-        bail!("unsupported transfer manifest version {}", manifest.version);
-    }
-    if manifest.generated_at_ms <= 0 {
-        bail!("transfer manifest has an invalid generation time");
-    }
+    let manifest_bytes = std::fs::read(&manifest_path)
+        .with_context(|| format!("reading transfer manifest {}", manifest_path.display()))?;
+    let (manifest_stream_id, manifest_objects) = decode_transfer_manifest(root, &manifest_bytes)?;
 
     let mut expected_names = HashSet::new();
     let mut sequences = HashSet::new();
     let mut missing = Vec::new();
     let mut verified_objects = 0usize;
-    for declared in &manifest.objects {
+    for declared in &manifest_objects {
         let expected_filename = format!("{:020}.gco", declared.header.sequence);
         if declared.filename != expected_filename
             || !expected_names.insert(declared.filename.clone())
@@ -401,7 +647,7 @@ fn verify_transfer(root: &FsPath) -> Result<TransferVerification> {
                 declared.filename
             );
         }
-        if declared.header.stream_id != manifest.stream_id {
+        if declared.header.stream_id != manifest_stream_id {
             bail!("transfer manifest contains an object for a different stream");
         }
         let path = root.join(&declared.filename);
@@ -457,12 +703,115 @@ fn verify_transfer(root: &FsPath) -> Result<TransferVerification> {
     unexpected.sort();
     Ok(TransferVerification {
         complete: missing.is_empty() && unexpected.is_empty(),
-        stream_id: manifest.stream_id,
-        expected_objects: manifest.objects.len(),
+        stream_id: manifest_stream_id,
+        expected_objects: manifest_objects.len(),
         verified_objects,
         missing,
         unexpected,
     })
+}
+
+fn decode_transfer_manifest(
+    root: &FsPath,
+    manifest_bytes: &[u8],
+) -> Result<(Uuid, Vec<TransferObject>)> {
+    #[derive(Deserialize)]
+    struct ManifestVersion {
+        version: u16,
+    }
+
+    let version: ManifestVersion =
+        serde_json::from_slice(manifest_bytes).context("decoding transfer manifest version")?;
+    match version.version {
+        LEGACY_TRANSFER_MANIFEST_VERSION => {
+            let manifest: LegacyTransferManifest = serde_json::from_slice(manifest_bytes)
+                .context("decoding legacy transfer manifest")?;
+            if manifest.version != LEGACY_TRANSFER_MANIFEST_VERSION || manifest.generated_at_ms <= 0
+            {
+                bail!("legacy transfer manifest has invalid metadata");
+            }
+            Ok((manifest.stream_id, manifest.objects))
+        }
+        TRANSFER_MANIFEST_VERSION => {
+            let manifest: TransferManifest =
+                serde_json::from_slice(manifest_bytes).context("decoding transfer manifest")?;
+            if manifest.version != TRANSFER_MANIFEST_VERSION || manifest.generated_at_ms <= 0 {
+                bail!("transfer manifest has invalid metadata");
+            }
+            let mut objects = Vec::new();
+            let mut chunk_names = HashSet::new();
+            let mut previous_sequence = None;
+            for declared in &manifest.chunks {
+                if !transfer_chunk_filename(&declared.filename)
+                    || !chunk_names.insert(declared.filename.clone())
+                    || declared.length == 0
+                    || declared.length > MAX_TRANSFER_CHUNK_LEN
+                    || declared.object_count == 0
+                    || declared.object_count > TRANSFER_CHUNK_OBJECTS as usize
+                    || declared.first_sequence > declared.last_sequence
+                    || previous_sequence.is_some_and(|sequence| sequence >= declared.first_sequence)
+                {
+                    bail!(
+                        "transfer manifest contains an invalid chunk {}",
+                        declared.filename
+                    );
+                }
+                let path = root.join(&declared.filename);
+                let metadata = std::fs::symlink_metadata(&path)
+                    .with_context(|| format!("inspecting transfer chunk {}", path.display()))?;
+                if !metadata.file_type().is_file() || metadata.len() != declared.length {
+                    bail!(
+                        "transfer manifest chunk is not a regular file of the declared length: {}",
+                        path.display()
+                    );
+                }
+                let bytes = std::fs::read(&path)
+                    .with_context(|| format!("reading transfer chunk {}", path.display()))?;
+                let digest = sha256_hex(&bytes);
+                if digest != declared.sha256 {
+                    bail!(
+                        "transfer manifest chunk checksum mismatch: {}",
+                        path.display()
+                    );
+                }
+                let chunk: TransferChunk = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("decoding transfer chunk {}", path.display()))?;
+                if chunk.version != TRANSFER_CHUNK_VERSION
+                    || chunk.stream_id != manifest.stream_id
+                    || chunk.objects.len() != declared.object_count
+                    || chunk.objects.first().map(|object| object.header.sequence)
+                        != Some(declared.first_sequence)
+                    || chunk.objects.last().map(|object| object.header.sequence)
+                        != Some(declared.last_sequence)
+                {
+                    bail!(
+                        "transfer manifest chunk metadata mismatch: {}",
+                        path.display()
+                    );
+                }
+                let chunk_id = transfer_chunk_id(declared.first_sequence);
+                let expected_filename =
+                    format!("glacialcast-transfer-chunk-{chunk_id:020}-{digest}.json");
+                if declared.filename != expected_filename
+                    || chunk
+                        .objects
+                        .iter()
+                        .any(|object| transfer_chunk_id(object.header.sequence) != chunk_id)
+                {
+                    bail!("transfer manifest chunk has an invalid sequence range");
+                }
+                for pair in chunk.objects.windows(2) {
+                    if pair[0].header.sequence >= pair[1].header.sequence {
+                        bail!("transfer manifest chunk sequences are not strictly ordered");
+                    }
+                }
+                previous_sequence = Some(declared.last_sequence);
+                objects.extend(chunk.objects);
+            }
+            Ok((manifest.stream_id, objects))
+        }
+        version => bail!("unsupported transfer manifest version {version}"),
+    }
 }
 
 fn atomic_write(directory: &FsPath, path: &FsPath, bytes: &[u8]) -> Result<()> {
@@ -501,7 +850,11 @@ fn portable_object_path(output: &FsPath, sequence: u64) -> PathBuf {
     output.join(format!("{sequence:020}.gco"))
 }
 
-fn write_portable_object(directory: &FsPath, path: &FsPath, object: &DashObject) -> Result<()> {
+fn write_portable_object(
+    directory: &FsPath,
+    path: &FsPath,
+    object: &DashObject,
+) -> Result<TransferObject> {
     let bytes = object
         .to_portable_bytes()
         .context("encoding portable DASH object")?;
@@ -529,10 +882,24 @@ fn write_portable_object(directory: &FsPath, path: &FsPath, object: &DashObject)
     File::open(directory)
         .with_context(|| format!("opening {}", directory.display()))?
         .sync_all()
-        .with_context(|| format!("syncing {}", directory.display()))
+        .with_context(|| format!("syncing {}", directory.display()))?;
+    Ok(TransferObject {
+        filename: path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .context("portable object filename is not UTF-8")?
+            .to_string(),
+        length: bytes.len() as u64,
+        sha256: sha256_hex(&bytes),
+        header: object.header.clone(),
+    })
 }
 
 fn read_portable_object(path: &FsPath) -> Result<DashObject> {
+    read_portable_file(path).map(|(object, _)| object)
+}
+
+fn read_portable_file(path: &FsPath) -> Result<(DashObject, Vec<u8>)> {
     let metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("reading metadata for {}", path.display()))?;
     if !metadata.file_type().is_file() {
@@ -542,8 +909,9 @@ fn read_portable_object(path: &FsPath) -> Result<DashObject> {
         bail!("portable object {} exceeds its size limit", path.display());
     }
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    DashObject::from_portable_bytes(&bytes)
-        .with_context(|| format!("decoding portable object {}", path.display()))
+    let object = DashObject::from_portable_bytes(&bytes)
+        .with_context(|| format!("decoding portable object {}", path.display()))?;
+    Ok((object, bytes))
 }
 
 fn validate_offline_listener(listen: SocketAddr, allow_non_loopback: bool) -> Result<()> {
@@ -1221,6 +1589,141 @@ mod tests {
         assert_eq!(report.verified_objects, 2);
         assert_eq!(report.missing, ["00000000000000000002.gco"]);
         std::fs::rename(holding, second).unwrap();
+        assert!(verify_transfer(directory.path()).unwrap().complete);
+    }
+
+    #[test]
+    fn transfer_manifest_v2_chunks_large_sequence_ranges_incrementally() {
+        let directory = TestDirectory::new();
+        let stream_id = Uuid::new_v4();
+        let epoch_id = Uuid::new_v4();
+        let mut index = TransferIndex::default();
+        for sequence in [1, TRANSFER_CHUNK_OBJECTS, TRANSFER_CHUNK_OBJECTS + 1] {
+            let object = test_object(
+                stream_id,
+                epoch_id,
+                DashObjectKind::Cursor,
+                sequence,
+                sequence,
+                0,
+                vec![sequence as u8],
+            );
+            index
+                .insert(TransferObject {
+                    filename: format!("{sequence:020}.gco"),
+                    length: 1,
+                    sha256: "00".repeat(32),
+                    header: object.header,
+                })
+                .unwrap();
+        }
+
+        index.publish(directory.path(), stream_id).unwrap();
+        let manifest: TransferManifest = serde_json::from_slice(
+            &std::fs::read(directory.path().join(TRANSFER_MANIFEST_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.version, TRANSFER_MANIFEST_VERSION);
+        assert_eq!(manifest.chunks.len(), 2);
+        let (_, objects) = decode_transfer_manifest(
+            directory.path(),
+            &std::fs::read(directory.path().join(TRANSFER_MANIFEST_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            objects
+                .iter()
+                .map(|object| object.header.sequence)
+                .collect::<Vec<_>>(),
+            [1, TRANSFER_CHUNK_OBJECTS, TRANSFER_CHUNK_OBJECTS + 1]
+        );
+
+        let unchanged_chunk = manifest.chunks[0].filename.clone();
+        let old_chunk = manifest.chunks[1].filename.clone();
+        let next_sequence = TRANSFER_CHUNK_OBJECTS + 2;
+        let object = test_object(
+            stream_id,
+            epoch_id,
+            DashObjectKind::Cursor,
+            next_sequence,
+            next_sequence,
+            0,
+            vec![2],
+        );
+        index
+            .insert(TransferObject {
+                filename: format!("{next_sequence:020}.gco"),
+                length: 1,
+                sha256: "11".repeat(32),
+                header: object.header,
+            })
+            .unwrap();
+        index.publish(directory.path(), stream_id).unwrap();
+        let updated: TransferManifest = serde_json::from_slice(
+            &std::fs::read(directory.path().join(TRANSFER_MANIFEST_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(updated.chunks[0].filename, unchanged_chunk);
+        assert_ne!(updated.chunks[1].filename, old_chunk);
+        assert!(!directory.path().join(old_chunk).exists());
+    }
+
+    #[test]
+    fn transfer_manifest_writer_rejects_an_oversized_chunk_before_publication() {
+        let directory = TestDirectory::new();
+        let stream_id = Uuid::new_v4();
+        let epoch_id = Uuid::new_v4();
+        let object = test_object(
+            stream_id,
+            epoch_id,
+            DashObjectKind::Cursor,
+            1,
+            1,
+            0,
+            vec![1],
+        );
+        let mut index = TransferIndex::default();
+        index
+            .insert(TransferObject {
+                filename: "x".repeat(MAX_TRANSFER_CHUNK_LEN as usize),
+                length: 1,
+                sha256: "00".repeat(32),
+                header: object.header,
+            })
+            .unwrap();
+        assert!(index.publish(directory.path(), stream_id).is_err());
+        assert!(!directory.path().join(TRANSFER_MANIFEST_FILE).exists());
+    }
+
+    #[test]
+    fn transfer_verifier_remains_compatible_with_v1_manifests() {
+        let directory = TestDirectory::new();
+        let stream_id = Uuid::new_v4();
+        let epoch_id = Uuid::new_v4();
+        let object = test_object(
+            stream_id,
+            epoch_id,
+            DashObjectKind::Cursor,
+            1,
+            1,
+            0,
+            vec![1],
+        );
+        let path = portable_object_path(directory.path(), 1);
+        let transferred = write_portable_object(directory.path(), &path, &object).unwrap();
+        let manifest = LegacyTransferManifest {
+            version: LEGACY_TRANSFER_MANIFEST_VERSION,
+            stream_id,
+            generated_at_ms: glacialcast_protocol::now_ms(),
+            objects: vec![transferred],
+        };
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        atomic_write(
+            directory.path(),
+            &directory.path().join(TRANSFER_MANIFEST_FILE),
+            &bytes,
+        )
+        .unwrap();
         assert!(verify_transfer(directory.path()).unwrap().complete);
     }
 

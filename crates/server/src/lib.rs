@@ -31,7 +31,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{
-        ConnectInfo, DefaultBodyLimit, Path, State,
+        ConnectInfo, DefaultBodyLimit, Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, HeaderValue, StatusCode, header},
@@ -1225,6 +1225,7 @@ async fn list_dash_objects(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(stream_id): Path<Uuid>,
+    Query(query): Query<DashObjectListQuery>,
 ) -> Result<Json<Vec<DashObjectHeader>>, AppError> {
     let identity = request_identity(&state, &headers)?;
     authorize_stream(&state, &identity.principal, stream_id)?;
@@ -1233,9 +1234,19 @@ async fn list_dash_objects(
             .dash_store
             .list(stream_id)?
             .into_iter()
+            .filter(|object| {
+                query
+                    .after_sequence
+                    .is_none_or(|sequence| object.header.sequence > sequence)
+            })
             .map(|object| object.header)
             .collect(),
     ))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DashObjectListQuery {
+    after_sequence: Option<u64>,
 }
 
 async fn get_dash_object(

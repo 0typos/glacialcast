@@ -56,7 +56,7 @@ XDG portal / PipeWire
                                   +-------------------------------+-------------+
                                   |                                             |
                          authenticated relay                         stream bundle files
-                       + bounded opaque history                     + signed manifest
+                       + bounded opaque history                     + checksummed chunk index
                                   |                                             |
                                   +----------- Firefox/Chromium ----------------+
                                                 MSE + EME
@@ -238,12 +238,20 @@ so a one-way file transport can copy them incrementally without understanding
 the media or possessing the viewer key.
 
 `glacialcast-offline mirror` materializes these files atomically from a relay.
-After each pass it atomically publishes a versioned
-`glacialcast-transfer.json` containing the stream identity, exact object
-headers, lengths, and SHA-256 checksums. Existing valid objects are skipped, so
-mirroring resumes at object granularity. `glacialcast-offline verify` checks
-the manifest and reports missing or unexpected filenames, allowing files to
-arrive out of order through any out-of-band mechanism.
+It indexes existing files once at startup, requests only sequence numbers beyond
+its high-water mark while following a stream, and atomically publishes a
+versioned `glacialcast-transfer.json`. The v2 root manifest references immutable,
+content-addressed chunks of at most 1,024 object records. Those records contain
+the exact public headers, lengths, and SHA-256 checksums. A new object therefore
+rewrites only its bounded chunk and the compact root index rather than hashing
+the full history on every poll. The verifier remains able to read the legacy v1
+single-file manifest. Existing valid objects are skipped, so mirroring resumes
+at object granularity. `glacialcast-offline verify` checks the root, chunk, and
+object checksums and reports missing or unexpected object filenames, allowing
+files to arrive out of order through any out-of-band mechanism. These checksums
+detect transfer errors; they are not a signature or a substitute for a trusted
+transport. The authenticated `.gco` contents remain protected by the
+out-of-band viewer key.
 `glacialcast-offline serve` watches a received directory and embeds the complete
 local viewer and MPEG-DASH endpoints in one binary. The offline host therefore
 needs only that binary, the object files, and an installed Firefox or Chromium
