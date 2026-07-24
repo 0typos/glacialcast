@@ -9,7 +9,8 @@ independent higher-rate overlay.
 The current `0.2` vertical slice provides:
 
 - Native XDG Desktop Portal and PipeWire capture without GStreamer.
-- In-process OpenH264 software encoding without FFmpeg.
+- Direct VA-API H.264 encoding on supported Intel/AMD devices, with an
+  in-process OpenH264 software fallback and no FFmpeg.
 - Authenticated, server-blind CENC media and AES-GCM cursor objects.
 - Durable, age-and-byte-bounded history on the relay.
 - A dependency-free browser viewer using MSE and EME Clear Key.
@@ -54,11 +55,12 @@ compositor-authoritative cursor position source for an independent overlay.
 
 ## Fedora Host Dependencies
 
-Native PipeWire capture needs the PipeWire development package to build, and
-the DASH software fallback loads the OpenH264 2.6 ABI at runtime:
+Native PipeWire capture and the default VA-API encoder need the PipeWire,
+libva, GBM, and Clang development packages to build. The DASH software fallback
+loads the OpenH264 2.6 ABI at runtime:
 
 ```sh
-sudo dnf install pipewire-devel openh264
+sudo dnf install pipewire-devel libva-devel mesa-libgbm-devel clang-devel openh264
 ```
 
 `--openh264-library` can point at `libopenh264.so.8` or
@@ -193,6 +195,14 @@ cargo run -p glacialcast-client -- \
   --portal-cursor metadata \
   --require-cursor-metadata
 ```
+
+`--dash-encoder auto` is the default. It tries constrained-baseline VA-API on
+`/dev/dri/renderD128`, then falls back to OpenH264 if the device or encoder is
+unavailable. Use `--vaapi-device /dev/dri/renderD129` for another render node,
+`--dash-encoder vaapi` to require hardware encoding, or
+`--dash-encoder openh264` to require the software path. VA-API segment
+boundaries start a fresh low-delay encoder sequence so every advertised DASH
+segment begins with SPS, PPS, and an IDR.
 
 Open the dashboard, select the DASH stream, and enter the viewer key:
 

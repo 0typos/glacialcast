@@ -191,9 +191,9 @@ FFmpeg, GStreamer, MediaMTX, WebRTC, and dash.js are not part of the target
 runtime. The project may use external conformance tools during development
 without shipping them.
 
-When VA-API H.264 encoding is unavailable, the MVP reports the missing
-capability and can expose the existing sparse-image diagnostic path. NVIDIA
-hardware encoding is not required for 0.2.
+When VA-API H.264 encoding is unavailable, automatic mode falls back to the
+focused OpenH264 software encoder. An operator can require either backend
+explicitly. NVIDIA hardware encoding is not required for 0.2.
 
 ## Compatibility Matrix
 

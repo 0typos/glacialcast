@@ -68,7 +68,7 @@ mod dash_encoder;
 #[cfg(feature = "ffmpeg-vaapi")]
 mod ffmpeg_vaapi;
 
-use dash_encoder::SoftwareH264Encoder;
+use dash_encoder::{DashEncoderMode, DashH264Encoder};
 
 const PORTAL_SOURCE_MONITOR: u32 = 1;
 const PORTAL_SOURCE_WINDOW: u32 = 2;
@@ -137,6 +137,10 @@ struct Args {
     video_bitrate: u32,
     #[arg(long, default_value_t = DEFAULT_SEGMENT_FRAMES)]
     segment_frames: u16,
+    #[arg(long, value_enum, default_value_t = DashEncoderMode::Auto)]
+    dash_encoder: DashEncoderMode,
+    #[arg(long, default_value = "/dev/dri/renderD128")]
+    vaapi_device: PathBuf,
     #[arg(long)]
     openh264_library: Option<PathBuf>,
     #[arg(long, value_parser = parse_human_bytes, default_value = "128MiB")]
@@ -461,6 +465,8 @@ fn is_fatal_dash_error(err: &anyhow::Error) -> bool {
         let message = cause.to_string();
         message.contains("OpenH264")
             || message.contains("openh264")
+            || message.contains("VA-API H.264")
+            || message.contains("required VA-API")
             || message.contains("encoder dimensions changed")
             || message.contains("requires non-zero, even dimensions")
             || message.contains("segment-frames")
@@ -537,7 +543,9 @@ async fn run_dash_connection(
     let epoch_id = Uuid::new_v4();
     let keys = EpochKeys::derive(viewer_key, stream_id, epoch_id)
         .context("deriving encrypted DASH epoch keys")?;
-    let mut encoder = SoftwareH264Encoder::new(
+    let mut encoder = DashH264Encoder::new(
+        args.dash_encoder,
+        &args.vaapi_device,
         args.openh264_library.as_deref(),
         width,
         height,
@@ -547,12 +555,12 @@ async fn run_dash_connection(
     )?;
     let first_encoded = encoder.encode(&first_image, false)?;
     if !first_encoded.keyframe {
-        bail!("OpenH264 did not begin the epoch with a random-access frame");
+        bail!("H.264 encoder did not begin the epoch with a random-access frame");
     }
     let avc_config = first_encoded
         .config
         .clone()
-        .context("OpenH264 did not provide an AVC decoder configuration")?;
+        .context("H.264 encoder did not provide an AVC decoder configuration")?;
     let codec = avc_config
         .codec_string()
         .context("building AVC codec string")?;
@@ -634,6 +642,7 @@ async fn run_dash_connection(
         height,
         fps = args.fps,
         bitrate = args.video_bitrate,
+        encoder = encoder.backend_name(),
         bytes = first_bytes,
         "encrypted MPEG-DASH publisher started"
     );
@@ -680,7 +689,7 @@ async fn run_dash_connection(
                     media_index.is_multiple_of(u64::from(args.segment_frames));
                 let encoded = encoder.encode(&image, segment_start)?;
                 if segment_start && !encoded.keyframe {
-                    bail!("OpenH264 did not honor a segment-boundary keyframe request");
+                    bail!("H.264 encoder did not produce an IDR at the segment boundary");
                 }
                 let object = build_dash_media_object(
                     &mut sequence,
