@@ -18,6 +18,7 @@ ingest_token="ingest-0123456789abcdef0123456789abcdef"
 admin_token="admin-0123456789abcdef0123456789abcdef"
 viewer_token="viewer-0123456789abcdef0123456789abcdef"
 denied_token="denied-0123456789abcdef0123456789abcdef"
+managed_token=""
 
 cleanup() {
   for pid in "${client_pid}" "${server_pid}"; do
@@ -280,6 +281,79 @@ denied_streams="$(
   echo "publisher-scoped stream listing failed" >&2
   exit 1
 }
+
+curl -fsS \
+  -H "Authorization: Bearer ${admin_token}" \
+  -H "Origin: ${public_origin}" \
+  -H 'Content-Type: application/json' \
+  --data '{"name":"managed-viewer","publishers":["internet-client"]}' \
+  "${local_origin}/api/admin/enrollments" >"${work_dir}/enrollment.json"
+managed_token="$(
+  node -e \
+    "const fs=require('fs');const v=JSON.parse(fs.readFileSync(process.argv[1]));console.log(v.access_token)" \
+    "${work_dir}/enrollment.json"
+)"
+[[ "${managed_token}" == gca_* ]] || {
+  echo "managed enrollment did not return a one-time access token" >&2
+  exit 1
+}
+enrollments="$(
+  curl -fsS -H "Authorization: Bearer ${admin_token}" \
+    "${local_origin}/api/admin/enrollments"
+)"
+[[ "${enrollments}" == *'"name":"managed-viewer"'* \
+  && "${enrollments}" != *"${managed_token}"* ]] || {
+  echo "managed enrollment listing was missing or exposed the token" >&2
+  exit 1
+}
+managed_streams="$(
+  curl -fsS -H "Authorization: Bearer ${managed_token}" \
+    "${local_origin}/api/streams"
+)"
+[[ "${managed_streams}" == *"${stream_id}"* ]] || {
+  echo "managed viewer could not access its publisher scope" >&2
+  exit 1
+}
+curl -sS -D "${work_dir}/managed-login.headers" -o "${work_dir}/managed-login.json" \
+  -X POST \
+  -H "Origin: ${public_origin}" \
+  -H 'X-Forwarded-For: 203.0.113.12' \
+  -H 'Content-Type: application/json' \
+  --data "{\"token\":\"${managed_token}\"}" \
+  "${local_origin}/api/auth/login"
+managed_cookie="$(
+  sed -n 's/^[Ss]et-[Cc]ookie: \([^;]*\).*/\1/p' \
+    "${work_dir}/managed-login.headers" | tr -d '\r'
+)"
+[[ -n "${managed_cookie}" ]] || {
+  echo "managed viewer login did not issue a session cookie" >&2
+  exit 1
+}
+status="$(
+  curl -sS -o /dev/null -w '%{http_code}' \
+    -X DELETE \
+    -H "Authorization: Bearer ${admin_token}" \
+    -H "Origin: ${public_origin}" \
+    "${local_origin}/api/admin/enrollments/managed-viewer"
+)"
+[[ "${status}" == "204" ]] || {
+  echo "managed viewer revocation returned ${status}, expected 204" >&2
+  exit 1
+}
+for authority in \
+  "Authorization: Bearer ${managed_token}" \
+  "Cookie: ${managed_cookie}"; do
+  status="$(
+    curl -sS -o /dev/null -w '%{http_code}' \
+      -H "${authority}" \
+      "${local_origin}/api/streams"
+  )"
+  [[ "${status}" == "401" ]] || {
+    echo "revoked managed authority returned ${status}, expected 401" >&2
+    exit 1
+  }
+done
+
 curl -fsS -H "Authorization: Bearer ${viewer_token}" \
   "${local_origin}/api/dash/streams/${stream_id}/objects" >/dev/null
 status="$(
@@ -357,6 +431,7 @@ status="$(
 if grep -Fq "${admin_token}" "${server_log}" \
   || grep -Fq "${viewer_token}" "${server_log}" \
   || grep -Fq "${ingest_token}" "${server_log}" \
+  || grep -Fq "${managed_token}" "${server_log}" \
   || grep -Fq "${viewer_key}" "${server_log}"; then
   echo "a configured credential leaked into the relay log" >&2
   exit 1
@@ -385,4 +460,4 @@ if target/debug/glacialcast-server \
 fi
 grep -Fq "refusing a non-loopback HTTP listener" "${work_dir}/public-http.log"
 
-echo "PASS: Internet profile enforced authentication, publisher authorization, CSRF/origin policy, login throttling, secure cookies, security headers, private configuration, monitoring, and fail-closed binds"
+echo "PASS: Internet profile enforced authentication, managed enrollment/revocation, publisher authorization, CSRF/origin policy, login throttling, secure cookies, security headers, private configuration, monitoring, and fail-closed binds"

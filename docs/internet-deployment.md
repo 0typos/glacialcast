@@ -113,12 +113,22 @@ backoff with jitter.
 
 ## Viewer enrollment and revocation
 
-Give each person or device its own access token and an appropriate publisher
-scope. Deliver that token and the E2EE viewer key over an authenticated channel
-separate from GlacialCast. The access token permits retrieval; the viewer key
-decrypts the selected stream. Neither belongs in a URL.
+Sign in as an administrator and use **Viewer access** on the relay dashboard to
+create one scoped identity for each person or device. The generated access
+token is shown exactly once. The relay persists only its SHA-256 hash in
+`access-enrollments.json`, with mode `0600`; revoking the identity immediately
+invalidates both its token and existing browser sessions.
 
-For a staged access-token rotation:
+The dashboard-generated secret is a **relay access token**: it permits retrieval
+of the named publishers' opaque objects. It is not the **E2EE viewer key**, which
+decrypts one publisher's media and cursor objects and is never sent to the
+relay. Deliver those two secrets separately through authenticated channels.
+Neither belongs in a URL, screenshot, issue, or chat log. The wildcard scope
+`*` authorizes every publisher and should be reserved for trusted operators or
+dedicated overview displays.
+
+Configured TOML identities remain useful for the bootstrap administrator and
+automation. For a staged configured-token rotation:
 
 1. Generate the replacement.
 2. Put the old value in `previous_tokens` and the new value in `token`.
@@ -126,9 +136,10 @@ For a staged access-token rotation:
 4. Remove the old value and restart after the migration window.
 
 The session key persists in `/var/lib/glacialcast/http-session.key`. Changes to
-a principal's token set, role, or publisher scope invalidate that principal's
-existing signed sessions after restart. Removing the principal revokes it
-entirely. Replacing the session-key file logs out every viewer.
+a configured principal's token set, role, or publisher scope invalidate that
+principal's existing signed sessions after restart. Removing the principal
+revokes it entirely. Dashboard revocation takes effect without a restart.
+Replacing the session-key file logs out every viewer.
 
 Ingest tokens use the same `previous_tokens` process. The publisher reconnects
 to its existing stream identity after the relay restart.

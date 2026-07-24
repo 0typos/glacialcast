@@ -45,6 +45,12 @@ main { padding: 2rem 0 4rem; }
 }
 .operations .summary { align-items: end; }
 .operations h2 { margin: 0; font-size: 1.35rem; }
+.help {
+  max-width: 52rem;
+  margin: .45rem 0 0;
+  color: var(--muted);
+  font-size: .9rem;
+}
 .metric-cards {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -69,6 +75,67 @@ main { padding: 2rem 0 4rem; }
   font-size: 1.1rem;
   font-weight: 750;
 }
+.enrollment-panel {
+  display: grid;
+  gap: 1rem;
+  margin-top: 1.5rem;
+  padding: 1.15rem;
+  border: 1px solid var(--line);
+  border-radius: .8rem;
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+}
+.enrollment-panel h2 { margin: 0; }
+#enrollment-form {
+  display: grid;
+  grid-template-columns: minmax(10rem, .7fr) minmax(14rem, 1.3fr) auto;
+  align-items: end;
+  gap: .7rem;
+}
+label {
+  display: grid;
+  gap: .35rem;
+  color: var(--muted);
+  font-size: .8rem;
+}
+input {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: .5rem;
+  padding: .62rem .7rem;
+  color: #edfaff;
+  background: #071923;
+  font: inherit;
+}
+input:focus { border-color: var(--ice); outline: 2px solid #9be7ff33; }
+.credential-result {
+  display: grid;
+  gap: .65rem;
+  padding: .9rem;
+  border: 1px solid var(--ice);
+  border-radius: .65rem;
+  background: #092b37;
+}
+.credential-result[hidden] { display: none; }
+.credential-result code {
+  padding: .65rem;
+  overflow-wrap: anywhere;
+  border-radius: .4rem;
+  background: #051118;
+  color: var(--ice);
+}
+.credential-result p { margin: 0; color: var(--muted); font-size: .82rem; }
+.credential-result button { justify-self: start; }
+.enrollment-list { display: grid; gap: .55rem; }
+.enrollment {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .75rem;
+  padding: .7rem;
+  border-top: 1px solid var(--line);
+}
+.enrollment-name { font-weight: 700; }
+.empty.compact { padding: 1rem; }
 .summary {
   display: flex;
   justify-content: space-between;
@@ -142,5 +209,6 @@ button.danger { color: var(--danger); background: transparent; }
   .account { align-items: start; flex-wrap: wrap; }
   .stream { grid-template-columns: 1fr; }
   .metric-cards { grid-template-columns: 1fr 1fr; }
+  #enrollment-form { grid-template-columns: 1fr; }
   .actions { justify-content: start; }
 }

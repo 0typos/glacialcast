@@ -6,6 +6,12 @@ const connectionElement = document.querySelector('#connection');
 const identityElement = document.querySelector('#identity');
 const operationsElement = document.querySelector('#operations');
 const metricCardsElement = document.querySelector('#metric-cards');
+const enrollmentForm = document.querySelector('#enrollment-form');
+const enrollmentNameElement = document.querySelector('#enrollment-name');
+const enrollmentPublishersElement = document.querySelector('#enrollment-publishers');
+const enrollmentResultElement = document.querySelector('#enrollment-result');
+const enrollmentTokenElement = document.querySelector('#enrollment-token');
+const enrollmentsElement = document.querySelector('#enrollments');
 let session = null;
 let traffic = null;
 
@@ -43,6 +49,28 @@ function formatRate(bytes, windowSeconds = 60) {
   return `${formatBytes(perMinute)}/min`;
 }
 
+function formatDuration(seconds) {
+  const value = Number(seconds || 0);
+  if (value >= 3600 && value % 3600 === 0) return `${value / 3600} h`;
+  if (value >= 60 && value % 60 === 0) return `${value / 60} min`;
+  return `${value} s`;
+}
+
+function formatAge(timestampMs) {
+  if (!timestampMs) return 'never';
+  const seconds = Math.max(0, Math.round((Date.now() - Number(timestampMs)) / 1000));
+  if (seconds < 60) return `${seconds} s ago`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)} min ago`;
+  return `${Math.round(seconds / 3600)} h ago`;
+}
+
+function parsePublisherScopes(value) {
+  return [...new Set(String(value || '')
+    .split(',')
+    .map(scope => scope.trim())
+    .filter(Boolean))];
+}
+
 function streamTraffic(streamId) {
   return traffic?.streams?.find(item => item.stream_id === streamId) || null;
 }
@@ -75,7 +103,7 @@ function renderStream(stream) {
   appendText(
     details,
     'source',
-    `${stream.source?.description || 'Unknown source'} · ${stream.stream_id}`,
+    `${stream.source?.description || 'Unknown source'} · ${stream.source?.width || '?'}×${stream.source?.height || '?'} · last seen ${formatAge(stream.last_seen_at_ms)} · sequence ${stream.last_object_sequence || 0} · ${stream.stream_id}`,
   );
 
   const actions = document.createElement('div');
@@ -92,7 +120,7 @@ function renderStream(stream) {
     remove.textContent = 'Delete';
     remove.addEventListener('click', async () => {
       if (!confirm(`Delete ${title.textContent} and all retained data?`)) return;
-      const response = await fetch(`/api/streams/${encodeURIComponent(stream.stream_id)}`, {
+      const response = await authenticatedFetch(`/api/streams/${encodeURIComponent(stream.stream_id)}`, {
         method: 'DELETE',
         headers: { 'X-GlacialCast-CSRF': session.csrf_token || '' },
       });
@@ -152,8 +180,67 @@ function renderMetrics(metrics) {
       `${metrics.http_requests} requests`,
       `${metrics.http_overloaded} overloaded · ${metrics.http_timed_out} timed out`,
     ),
+    metricCard(
+      'Retention',
+      formatDuration(metrics.retention_seconds),
+      `${formatBytes(metrics.retention_bytes_per_stream)} per stream ceiling`,
+    ),
+    metricCard(
+      'Managed access',
+      `${metrics.managed_viewers} viewer${metrics.managed_viewers === 1 ? '' : 's'}`,
+      'access tokens only · E2EE keys stay off relay',
+    ),
   );
   operationsElement.hidden = false;
+}
+
+function renderEnrollments(enrollments) {
+  enrollmentsElement.replaceChildren();
+  if (!enrollments.length) {
+    appendText(enrollmentsElement, 'empty compact', 'No dashboard-managed viewers.');
+    return;
+  }
+  for (const viewer of enrollments) {
+    const row = document.createElement('div');
+    row.className = 'enrollment';
+    const details = document.createElement('div');
+    appendText(details, 'enrollment-name', viewer.name);
+    appendText(
+      details,
+      'meta',
+      `${viewer.publishers.join(', ')} · created ${formatAge(viewer.created_at_ms)}`,
+    );
+    const revoke = document.createElement('button');
+    revoke.className = 'danger';
+    revoke.type = 'button';
+    revoke.textContent = 'Revoke';
+    revoke.addEventListener('click', async () => {
+      if (!confirm(`Revoke relay access for ${viewer.name}?`)) return;
+      const response = await authenticatedFetch(
+        `/api/admin/enrollments/${encodeURIComponent(viewer.name)}`,
+        {
+          method: 'DELETE',
+          headers: { 'X-GlacialCast-CSRF': session.csrf_token || '' },
+        },
+      );
+      if (!response.ok && response.status !== 404) {
+        alert(await response.text());
+        return;
+      }
+      enrollmentResultElement.hidden = true;
+      enrollmentTokenElement.textContent = '';
+      await refreshEnrollments();
+      await refresh();
+    });
+    row.append(details, revoke);
+    enrollmentsElement.append(row);
+  }
+}
+
+async function refreshEnrollments() {
+  const response = await authenticatedFetch('/api/admin/enrollments', { cache: 'no-store' });
+  if (!response.ok) throw new Error(await response.text());
+  renderEnrollments(await response.json());
 }
 
 async function authenticatedFetch(path, options) {
@@ -170,6 +257,7 @@ async function refresh() {
     const metricsResponse = await authenticatedFetch('/api/admin/metrics', { cache: 'no-store' });
     if (!metricsResponse.ok) throw new Error(await metricsResponse.text());
     renderMetrics(await metricsResponse.json());
+    await refreshEnrollments();
   }
   const response = await authenticatedFetch('/api/streams', { cache: 'no-store' });
   if (!response.ok) throw new Error(await response.text());
@@ -218,6 +306,41 @@ async function initialize() {
 }
 
 document.querySelector('#refresh').addEventListener('click', () => refresh().catch(showError));
+enrollmentForm.addEventListener('submit', async event => {
+  event.preventDefault();
+  enrollmentResultElement.hidden = true;
+  enrollmentTokenElement.textContent = '';
+  const response = await authenticatedFetch('/api/admin/enrollments', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-GlacialCast-CSRF': session.csrf_token || '',
+    },
+    body: JSON.stringify({
+      name: enrollmentNameElement.value.trim(),
+      publishers: parsePublisherScopes(enrollmentPublishersElement.value),
+    }),
+  });
+  if (!response.ok) {
+    showError(new Error(await response.text()));
+    return;
+  }
+  const enrollment = await response.json();
+  enrollmentTokenElement.textContent = enrollment.access_token;
+  enrollmentResultElement.hidden = false;
+  enrollmentForm.reset();
+  await refresh();
+});
+document.querySelector('#copy-enrollment-token').addEventListener('click', async () => {
+  const token = enrollmentTokenElement.textContent;
+  if (!token) return;
+  try {
+    await navigator.clipboard.writeText(token);
+    connectionElement.textContent = 'access token copied';
+  } catch {
+    connectionElement.textContent = 'copy failed; select the access token manually';
+  }
+});
 document.querySelector('#logout').addEventListener('click', async () => {
   await fetch('/api/auth/logout', {
     method: 'POST',

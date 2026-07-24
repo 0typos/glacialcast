@@ -27,6 +27,31 @@
         </div>
       </div>
       <div id="metric-cards" class="metric-cards" aria-live="polite"></div>
+      <section class="enrollment-panel" aria-labelledby="enrollment-title">
+        <div>
+          <p class="eyebrow">Viewer access</p>
+          <h2 id="enrollment-title">Enrollment and revocation</h2>
+          <p class="help">Create a scoped relay access token. This is not the E2EE viewer key; deliver the two secrets separately.</p>
+        </div>
+        <form id="enrollment-form">
+          <label>
+            Viewer name
+            <input id="enrollment-name" name="name" required maxlength="64" pattern="[A-Za-z0-9._-]+" autocomplete="off">
+          </label>
+          <label>
+            Publisher scopes
+            <input id="enrollment-publishers" name="publishers" required placeholder="workstation, laptop or *" autocomplete="off">
+          </label>
+          <button type="submit">Create access token</button>
+        </form>
+        <div id="enrollment-result" class="credential-result" hidden aria-live="assertive">
+          <strong>Copy this access token now. It will not be shown again.</strong>
+          <code id="enrollment-token"></code>
+          <button id="copy-enrollment-token" type="button">Copy access token</button>
+          <p>Transfer it through an authenticated channel. Transfer the publisher’s E2EE viewer key separately.</p>
+        </div>
+        <div id="enrollments" class="enrollment-list" aria-live="polite"></div>
+      </section>
     </section>
     <div class="summary">
       <h2 id="count">Streams</h2>

@@ -20,7 +20,8 @@ use crate::{
     dash_store::DashStore,
     security::{
         AccessConfig, AccessControl, AccessRole, AuthenticatedRequest, FixedWindowLimiter,
-        Principal, SessionSigner, client_ip, normalize_public_origin, validate_request_origin,
+        ManagedViewerEnrollment, ManagedViewerMutationError, ManagedViewerSummary, Principal,
+        SessionSigner, client_ip, normalize_public_origin, validate_request_origin,
     },
     storage::Store,
     traffic::{TrafficMetrics, TrafficSnapshot},
@@ -140,6 +141,8 @@ struct AppState {
     ingest_idle_timeout: Duration,
     metrics: Arc<ServerMetrics>,
     traffic: TrafficMetrics,
+    retention_bytes_per_stream: u64,
+    retention_seconds: u64,
     active_ingests: Arc<AsyncMutex<HashMap<Uuid, Uuid>>>,
     ingest_private_key: [u8; NOISE_KEY_LEN],
 }
@@ -556,7 +559,11 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
         events,
         dash_events,
         auth: AuthConfig::from_config(config.ingest, require_strong_ingest)?,
-        access: AccessControl::from_config(config.access, !internet_mode)?,
+        access: AccessControl::from_config_with_managed_file(
+            config.access,
+            !internet_mode,
+            args.data_dir.join("access-enrollments.json"),
+        )?,
         sessions: SessionSigner::load_or_create(
             &session_key_path,
             session_ttl_seconds,
@@ -600,6 +607,8 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
         ingest_idle_timeout: Duration::from_secs(limits.ingest_idle_timeout_seconds),
         metrics: metrics.clone(),
         traffic: TrafficMetrics::default(),
+        retention_bytes_per_stream: args.retention_bytes_per_stream,
+        retention_seconds: args.retention_seconds,
         active_ingests: Arc::new(AsyncMutex::new(HashMap::new())),
         ingest_private_key: ingest_key.private,
     };
@@ -634,6 +643,11 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
         .route("/api/admin/metrics", get(admin_metrics))
+        .route(
+            "/api/admin/enrollments",
+            get(list_enrollments).post(enroll_viewer),
+        )
+        .route("/api/admin/enrollments/{name}", delete(revoke_viewer))
         .route("/api/streams", get(list_streams))
         .route("/api/streams/{stream_id}", delete(delete_stream))
         .route("/api/ws", get(control_ws))
@@ -1013,6 +1027,9 @@ struct MetricsResponse {
     active_ingest_connections: u64,
     ingest_rejected: u64,
     ingest_auth_failures: u64,
+    retention_bytes_per_stream: u64,
+    retention_seconds: u64,
+    managed_viewers: usize,
     traffic: TrafficSnapshot,
 }
 
@@ -1038,8 +1055,74 @@ async fn admin_metrics(
         active_ingest_connections: metrics.active_ingest_connections.load(Ordering::Relaxed),
         ingest_rejected: metrics.ingest_rejected.load(Ordering::Relaxed),
         ingest_auth_failures: metrics.ingest_auth_failures.load(Ordering::Relaxed),
+        retention_bytes_per_stream: state.retention_bytes_per_stream,
+        retention_seconds: state.retention_seconds,
+        managed_viewers: state.access.managed_viewers()?.len(),
         traffic: state.traffic.snapshot(),
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct EnrollViewerRequest {
+    name: String,
+    publishers: Vec<String>,
+}
+
+async fn list_enrollments(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ManagedViewerSummary>>, AppError> {
+    let identity = request_identity(&state, &headers)?;
+    if !identity.principal.is_admin() {
+        return Err(AppError::Forbidden);
+    }
+    Ok(Json(state.access.managed_viewers()?))
+}
+
+async fn enroll_viewer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<EnrollViewerRequest>,
+) -> Result<(StatusCode, Json<ManagedViewerEnrollment>), AppError> {
+    let identity = request_identity(&state, &headers)?;
+    if !identity.principal.is_admin() {
+        return Err(AppError::Forbidden);
+    }
+    require_mutation_authority(&state, &headers, &identity)?;
+    let enrollment = state
+        .access
+        .enroll_viewer(request.name.trim(), request.publishers)
+        .map_err(|error| match error {
+            ManagedViewerMutationError::Invalid(message) => AppError::BadRequest(message),
+            ManagedViewerMutationError::Storage(error) => AppError::Anyhow(error),
+        })?;
+    info!(
+        principal = %identity.principal.name,
+        viewer = %enrollment.viewer.name,
+        "administrator enrolled managed viewer"
+    );
+    Ok((StatusCode::CREATED, Json(enrollment)))
+}
+
+async fn revoke_viewer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<StatusCode, AppError> {
+    let identity = request_identity(&state, &headers)?;
+    if !identity.principal.is_admin() {
+        return Err(AppError::Forbidden);
+    }
+    require_mutation_authority(&state, &headers, &identity)?;
+    if !state.access.revoke_viewer(name.trim())? {
+        return Err(AppError::NotFound);
+    }
+    info!(
+        principal = %identity.principal.name,
+        viewer = %name,
+        "administrator revoked managed viewer"
+    );
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_streams(
@@ -1925,6 +2008,7 @@ mod tests {
 #[derive(Debug)]
 enum AppError {
     NotFound,
+    BadRequest(String),
     Unauthorized,
     Forbidden,
     TooManyRequests,
@@ -1944,6 +2028,7 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         match self {
             AppError::NotFound => (StatusCode::NOT_FOUND, "not found").into_response(),
+            AppError::BadRequest(message) => (StatusCode::BAD_REQUEST, message).into_response(),
             AppError::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 [(header::WWW_AUTHENTICATE, "Bearer")],

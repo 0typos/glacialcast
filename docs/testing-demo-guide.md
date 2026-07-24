@@ -436,6 +436,14 @@ Then perform the user-visible acceptance test:
 8. Confirm a viewer token cannot access administrator metrics or delete a
    stream.
 
+To exercise first-run viewer management, sign in as the bootstrap
+administrator, create a viewer under **Viewer access**, and copy the displayed
+access token before leaving the page. Sign in with that token in a private
+browser window, then revoke it from the administrator window. Both the active
+session and subsequent token login should stop working immediately. The access
+token only authorizes relay retrieval; test playback with the separately
+delivered E2EE viewer key.
+
 An administrator can check counters without putting a token in the URL:
 
 ```sh

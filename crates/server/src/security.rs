@@ -15,16 +15,18 @@ use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
+    fmt,
     io::{Read, Write},
     net::IpAddr,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
     time::{SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
+use uuid::Uuid;
 
 const SESSION_KEY_MAGIC: &[u8; 5] = b"GCSK1";
 const SESSION_KEY_LEN: usize = 32;
@@ -35,6 +37,8 @@ const MIN_ACCESS_TOKEN_LEN: usize = 32;
 const MAX_ACCESS_TOKEN_LEN: usize = 512;
 const MAX_PRINCIPAL_NAME_LEN: usize = 64;
 const MAX_PUBLISHER_NAME_LEN: usize = 128;
+const MANAGED_ACCESS_VERSION: u16 = 1;
+const MAX_MANAGED_ACCESS_FILE_LEN: u64 = 1024 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -92,12 +96,78 @@ pub struct AccessControl {
     principals: HashMap<String, Principal>,
     credentials: Vec<Credential>,
     local_anonymous: bool,
+    managed: Option<Arc<Mutex<ManagedAccessState>>>,
 }
 
 #[derive(Clone)]
 struct Credential {
     token_hash: [u8; 32],
     principal_name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ManagedViewerSummary {
+    pub name: String,
+    pub publishers: Vec<String>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ManagedViewerEnrollment {
+    pub viewer: ManagedViewerSummary,
+    pub access_token: String,
+}
+
+#[derive(Debug)]
+pub enum ManagedViewerMutationError {
+    Invalid(String),
+    Storage(anyhow::Error),
+}
+
+impl fmt::Display for ManagedViewerMutationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid(message) => formatter.write_str(message),
+            Self::Storage(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ManagedViewerMutationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Invalid(_) => None,
+            Self::Storage(error) => Some(error.as_ref()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ManagedViewer {
+    summary: ManagedViewerSummary,
+    token_hash: [u8; 32],
+    principal: Principal,
+}
+
+struct ManagedAccessState {
+    path: PathBuf,
+    viewers: BTreeMap<String, ManagedViewer>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedAccessFile {
+    version: u16,
+    viewers: Vec<ManagedAccessRecord>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedAccessRecord {
+    name: String,
+    publishers: Vec<String>,
+    created_at_ms: i64,
+    token_hash_b64: String,
 }
 
 impl AccessControl {
@@ -185,7 +255,19 @@ impl AccessControl {
             principals,
             credentials,
             local_anonymous,
+            managed: None,
         })
+    }
+
+    pub fn from_config_with_managed_file(
+        config: AccessConfig,
+        allow_local_anonymous: bool,
+        managed_path: PathBuf,
+    ) -> Result<Self> {
+        let mut access = Self::from_config(config, allow_local_anonymous)?;
+        let state = ManagedAccessState::load(managed_path, &access.principals)?;
+        access.managed = Some(Arc::new(Mutex::new(state)));
+        Ok(access)
     }
 
     pub fn authenticate_token(&self, token: &str) -> Option<Principal> {
@@ -199,11 +281,27 @@ impl AccessControl {
                 matched = self.principals.get(&credential.principal_name).cloned();
             }
         }
+        if let Some(managed) = &self.managed {
+            let managed = managed.lock().ok()?;
+            for viewer in managed.viewers.values() {
+                if bool::from(viewer.token_hash.ct_eq(&presented)) {
+                    matched = Some(viewer.principal.clone());
+                }
+            }
+        }
         matched
     }
 
     pub fn principal(&self, name: &str) -> Option<Principal> {
-        self.principals.get(name).cloned()
+        self.principals.get(name).cloned().or_else(|| {
+            self.managed
+                .as_ref()?
+                .lock()
+                .ok()?
+                .viewers
+                .get(name)
+                .map(|viewer| viewer.principal.clone())
+        })
     }
 
     pub fn local_principal(&self) -> Option<Principal> {
@@ -215,6 +313,281 @@ impl AccessControl {
             auth_version: [0; 16],
         })
     }
+
+    pub fn managed_viewers(&self) -> Result<Vec<ManagedViewerSummary>> {
+        let managed = self
+            .managed
+            .as_ref()
+            .context("managed viewer enrollment is unavailable")?
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed access state mutex poisoned"))?;
+        Ok(managed
+            .viewers
+            .values()
+            .map(|viewer| viewer.summary.clone())
+            .collect())
+    }
+
+    pub fn enroll_viewer(
+        &self,
+        name: &str,
+        publishers: Vec<String>,
+    ) -> std::result::Result<ManagedViewerEnrollment, ManagedViewerMutationError> {
+        validate_identifier("viewer name", name, MAX_PRINCIPAL_NAME_LEN)
+            .map_err(|error| ManagedViewerMutationError::Invalid(error.to_string()))?;
+        if self.principals.contains_key(name) {
+            return Err(ManagedViewerMutationError::Invalid(
+                "viewer name conflicts with a configured access principal".to_string(),
+            ));
+        }
+        let publishers = validated_publishers(publishers)
+            .map_err(|error| ManagedViewerMutationError::Invalid(error.to_string()))?;
+        let mut token_bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut token_bytes);
+        let access_token = format!("gca_{}", URL_SAFE_NO_PAD.encode(token_bytes));
+        let token_hash: [u8; 32] = Sha256::digest(access_token.as_bytes()).into();
+        let summary = ManagedViewerSummary {
+            name: name.to_string(),
+            publishers,
+            created_at_ms: glacialcast_protocol::now_ms(),
+        };
+        let principal =
+            managed_principal(&summary, token_hash).map_err(ManagedViewerMutationError::Storage)?;
+        let viewer = ManagedViewer {
+            summary: summary.clone(),
+            token_hash,
+            principal,
+        };
+
+        let managed = self.managed.as_ref().ok_or_else(|| {
+            ManagedViewerMutationError::Storage(anyhow::anyhow!(
+                "managed viewer enrollment is unavailable"
+            ))
+        })?;
+        let mut managed = managed.lock().map_err(|_| {
+            ManagedViewerMutationError::Storage(anyhow::anyhow!(
+                "managed access state mutex poisoned"
+            ))
+        })?;
+        if managed.viewers.contains_key(name) {
+            return Err(ManagedViewerMutationError::Invalid(format!(
+                "managed viewer {name} already exists"
+            )));
+        }
+        let mut next = managed.viewers.clone();
+        next.insert(name.to_string(), viewer);
+        managed
+            .persist(&next)
+            .map_err(ManagedViewerMutationError::Storage)?;
+        managed.viewers = next;
+        Ok(ManagedViewerEnrollment {
+            viewer: summary,
+            access_token,
+        })
+    }
+
+    pub fn revoke_viewer(&self, name: &str) -> Result<bool> {
+        let managed = self
+            .managed
+            .as_ref()
+            .context("managed viewer enrollment is unavailable")?;
+        let mut managed = managed
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed access state mutex poisoned"))?;
+        if !managed.viewers.contains_key(name) {
+            return Ok(false);
+        }
+        let mut next = managed.viewers.clone();
+        next.remove(name);
+        managed.persist(&next)?;
+        managed.viewers = next;
+        Ok(true)
+    }
+}
+
+impl ManagedAccessState {
+    fn load(path: PathBuf, configured: &HashMap<String, Principal>) -> Result<Self> {
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self {
+                    path,
+                    viewers: BTreeMap::new(),
+                });
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspecting managed access file {}", path.display()));
+            }
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .with_context(|| format!("opening managed access file {}", path.display()))?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
+            bail!(
+                "managed access file {} must be a private regular file",
+                path.display()
+            );
+        }
+        if metadata.len() > MAX_MANAGED_ACCESS_FILE_LEN {
+            bail!(
+                "managed access file {} exceeds its size limit",
+                path.display()
+            );
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.read_to_end(&mut bytes)?;
+        let stored: ManagedAccessFile = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing managed access file {}", path.display()))?;
+        if stored.version != MANAGED_ACCESS_VERSION {
+            bail!(
+                "managed access file {} has unsupported version {}",
+                path.display(),
+                stored.version
+            );
+        }
+        let mut viewers = BTreeMap::new();
+        for record in stored.viewers {
+            validate_identifier("managed viewer name", &record.name, MAX_PRINCIPAL_NAME_LEN)?;
+            if configured.contains_key(&record.name) || viewers.contains_key(&record.name) {
+                bail!(
+                    "managed viewer name {} is duplicated or configured",
+                    record.name
+                );
+            }
+            if record.created_at_ms <= 0 {
+                bail!(
+                    "managed viewer {} has an invalid creation time",
+                    record.name
+                );
+            }
+            let publishers = validated_publishers(record.publishers)?;
+            let token_hash: [u8; 32] = URL_SAFE_NO_PAD
+                .decode(&record.token_hash_b64)
+                .context("decoding managed viewer token hash")?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("managed viewer token hash must contain 32 bytes"))?;
+            let summary = ManagedViewerSummary {
+                name: record.name.clone(),
+                publishers,
+                created_at_ms: record.created_at_ms,
+            };
+            viewers.insert(
+                record.name,
+                ManagedViewer {
+                    principal: managed_principal(&summary, token_hash)?,
+                    summary,
+                    token_hash,
+                },
+            );
+        }
+        Ok(Self { path, viewers })
+    }
+
+    fn persist(&self, viewers: &BTreeMap<String, ManagedViewer>) -> Result<()> {
+        let parent = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating managed access directory {}", parent.display()))?;
+        let stored = ManagedAccessFile {
+            version: MANAGED_ACCESS_VERSION,
+            viewers: viewers
+                .values()
+                .map(|viewer| ManagedAccessRecord {
+                    name: viewer.summary.name.clone(),
+                    publishers: viewer.summary.publishers.clone(),
+                    created_at_ms: viewer.summary.created_at_ms,
+                    token_hash_b64: URL_SAFE_NO_PAD.encode(viewer.token_hash),
+                })
+                .collect(),
+        };
+        let bytes =
+            serde_json::to_vec_pretty(&stored).context("serializing managed access file")?;
+        let temporary = parent.join(format!(
+            ".{}-{}.tmp",
+            self.path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("access-enrollments"),
+            Uuid::new_v4()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temporary)
+            .with_context(|| format!("creating {}", temporary.display()))?;
+        file.write_all(&bytes)
+            .with_context(|| format!("writing {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing {}", temporary.display()))?;
+        std::fs::rename(&temporary, &self.path).with_context(|| {
+            format!(
+                "publishing managed access file {} as {}",
+                temporary.display(),
+                self.path.display()
+            )
+        })?;
+        std::fs::File::open(parent)
+            .with_context(|| format!("opening managed access directory {}", parent.display()))?
+            .sync_all()
+            .with_context(|| format!("syncing managed access directory {}", parent.display()))
+    }
+}
+
+fn validated_publishers(publishers: Vec<String>) -> Result<Vec<String>> {
+    let mut normalized = HashSet::new();
+    for publisher in publishers {
+        let publisher = publisher.trim();
+        if publisher == "*" {
+            normalized.insert(publisher.to_string());
+            continue;
+        }
+        validate_identifier("publisher identity", publisher, MAX_PUBLISHER_NAME_LEN)?;
+        normalized.insert(publisher.to_string());
+    }
+    if normalized.is_empty() {
+        bail!("managed viewer must name at least one publisher or use \"*\"");
+    }
+    let mut normalized = normalized.into_iter().collect::<Vec<_>>();
+    normalized.sort_unstable();
+    Ok(normalized)
+}
+
+fn managed_principal(summary: &ManagedViewerSummary, token_hash: [u8; 32]) -> Result<Principal> {
+    let all_publishers = summary.publishers.iter().any(|publisher| publisher == "*");
+    let publishers = summary
+        .publishers
+        .iter()
+        .filter(|publisher| publisher.as_str() != "*")
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut version = Sha256::new();
+    version.update(b"glacialcast-managed-viewer-v1");
+    version.update(summary.name.as_bytes());
+    version.update(summary.created_at_ms.to_be_bytes());
+    for publisher in &summary.publishers {
+        version.update((publisher.len() as u64).to_be_bytes());
+        version.update(publisher.as_bytes());
+    }
+    version.update(token_hash);
+    let auth_version: [u8; 16] = version.finalize()[..16]
+        .try_into()
+        .expect("SHA-256 version prefix has 16 bytes");
+    Ok(Principal {
+        name: summary.name.clone(),
+        role: AccessRole::Viewer,
+        all_publishers,
+        publishers,
+        auth_version,
+    })
 }
 
 fn validate_identifier(field: &str, value: &str, max_len: usize) -> Result<()> {
@@ -687,6 +1060,104 @@ mod tests {
         let mut duplicate = access_config();
         duplicate.tokens[1].token = TOKEN.to_string();
         assert!(AccessControl::from_config(duplicate, false).is_err());
+    }
+
+    #[test]
+    fn managed_viewers_persist_hashes_and_revoke_tokens_and_sessions() {
+        let root =
+            std::env::temp_dir().join(format!("glacialcast-managed-access-{}", Uuid::new_v4()));
+        let managed_path = root.join("access-enrollments.json");
+        let access = AccessControl::from_config_with_managed_file(
+            access_config(),
+            false,
+            managed_path.clone(),
+        )
+        .unwrap();
+        let enrollment = access
+            .enroll_viewer(
+                "field-viewer",
+                vec!["workstation".to_string(), "workstation".to_string()],
+            )
+            .unwrap();
+        assert_eq!(enrollment.viewer.publishers, ["workstation"]);
+        assert!(enrollment.access_token.starts_with("gca_"));
+        assert_eq!(
+            access
+                .authenticate_token(&enrollment.access_token)
+                .unwrap()
+                .name,
+            "field-viewer"
+        );
+        let stored = std::fs::read_to_string(&managed_path).unwrap();
+        assert!(!stored.contains(&enrollment.access_token));
+        assert!(stored.contains("token_hash_b64"));
+        assert_eq!(
+            std::fs::metadata(&managed_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        let (signer, session_path) = signer();
+        let principal = access.authenticate_token(&enrollment.access_token).unwrap();
+        let (cookie, _) = signer.create_session(&principal).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            format!("{}={cookie}", signer.cookie_name())
+                .parse()
+                .unwrap(),
+        );
+        let reloaded =
+            AccessControl::from_config_with_managed_file(access_config(), false, managed_path)
+                .unwrap();
+        assert!(signer.authenticate(&headers, &reloaded).is_some());
+        assert!(reloaded.revoke_viewer("field-viewer").unwrap());
+        assert!(!reloaded.revoke_viewer("field-viewer").unwrap());
+        assert!(
+            reloaded
+                .authenticate_token(&enrollment.access_token)
+                .is_none()
+        );
+        assert!(signer.authenticate(&headers, &reloaded).is_none());
+
+        std::fs::remove_file(session_path).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_viewer_enrollment_rejects_bad_scope_conflicts_and_symlinks() {
+        let root =
+            std::env::temp_dir().join(format!("glacialcast-managed-access-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let managed_path = root.join("access-enrollments.json");
+        let access = AccessControl::from_config_with_managed_file(
+            access_config(),
+            false,
+            managed_path.clone(),
+        )
+        .unwrap();
+        assert!(matches!(
+            access.enroll_viewer("operator", vec!["*".to_string()]),
+            Err(ManagedViewerMutationError::Invalid(_))
+        ));
+        assert!(matches!(
+            access.enroll_viewer("new-viewer", Vec::new()),
+            Err(ManagedViewerMutationError::Invalid(_))
+        ));
+        assert!(matches!(
+            access.enroll_viewer("new viewer", vec!["*".to_string()]),
+            Err(ManagedViewerMutationError::Invalid(_))
+        ));
+
+        let link = root.join("managed-link.json");
+        std::os::unix::fs::symlink(&managed_path, &link).unwrap();
+        assert!(
+            AccessControl::from_config_with_managed_file(access_config(), false, link).is_err()
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
