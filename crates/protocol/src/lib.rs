@@ -19,6 +19,8 @@ pub mod daemon;
 
 pub const PROTOCOL_VERSION: u16 = 3;
 pub const MAX_FRAME_LEN: usize = 32 * 1024 * 1024;
+pub const PORTABLE_DASH_MAGIC: &[u8; 4] = b"GCO1";
+const MAX_PORTABLE_DASH_HEADER_LEN: usize = 64 * 1024;
 const MAX_NOISE_PLAINTEXT_LEN: usize = 60 * 1024;
 const NOISE_SEGMENT_MAGIC: &[u8; 4] = b"GCN1";
 const NOISE_SEGMENT_HEADER_LEN: usize = 12;
@@ -54,6 +56,8 @@ pub enum ProtocolError {
     InvalidDashMetadata(&'static str),
     #[error("DASH object authentication failed")]
     DashAuthentication,
+    #[error("portable DASH object is malformed")]
+    InvalidPortableDashObject,
 }
 
 pub type Result<T> = std::result::Result<T, ProtocolError>;
@@ -297,6 +301,52 @@ impl DashObject {
             return Err(ProtocolError::DashAuthentication);
         }
         Ok(())
+    }
+
+    pub fn to_portable_bytes(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let header = serde_json::to_vec(&self.header)
+            .map_err(|_| ProtocolError::InvalidPortableDashObject)?;
+        if header.len() > MAX_PORTABLE_DASH_HEADER_LEN {
+            return Err(ProtocolError::InvalidPortableDashObject);
+        }
+        let header_len =
+            u32::try_from(header.len()).map_err(|_| ProtocolError::InvalidPortableDashObject)?;
+        let mut bytes = Vec::with_capacity(8 + header.len() + self.payload.len());
+        bytes.extend_from_slice(PORTABLE_DASH_MAGIC);
+        bytes.extend_from_slice(&header_len.to_be_bytes());
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&self.payload);
+        Ok(bytes)
+    }
+
+    pub fn from_portable_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 8 || &bytes[..4] != PORTABLE_DASH_MAGIC {
+            return Err(ProtocolError::InvalidPortableDashObject);
+        }
+        let header_len = u32::from_be_bytes(
+            bytes[4..8]
+                .try_into()
+                .map_err(|_| ProtocolError::InvalidPortableDashObject)?,
+        ) as usize;
+        if header_len == 0 || header_len > MAX_PORTABLE_DASH_HEADER_LEN {
+            return Err(ProtocolError::InvalidPortableDashObject);
+        }
+        let payload_offset = 8usize
+            .checked_add(header_len)
+            .ok_or(ProtocolError::InvalidPortableDashObject)?;
+        let header_bytes = bytes
+            .get(8..payload_offset)
+            .ok_or(ProtocolError::InvalidPortableDashObject)?;
+        let payload = bytes
+            .get(payload_offset..)
+            .ok_or(ProtocolError::InvalidPortableDashObject)?
+            .to_vec();
+        let header: DashObjectHeader = serde_json::from_slice(header_bytes)
+            .map_err(|_| ProtocolError::InvalidPortableDashObject)?;
+        let object = Self { header, payload };
+        object.validate()?;
+        Ok(object)
     }
 }
 
@@ -1086,6 +1136,11 @@ mod tests {
 
         object.validate().unwrap();
         object.verify_authentication(&keys).unwrap();
+        let portable = object.to_portable_bytes().unwrap();
+        assert!(portable.starts_with(PORTABLE_DASH_MAGIC));
+        let restored = DashObject::from_portable_bytes(&portable).unwrap();
+        assert_eq!(restored, object);
+        restored.verify_authentication(&keys).unwrap();
 
         let mut tampered = object.clone();
         tampered.header.timestamp += 1;

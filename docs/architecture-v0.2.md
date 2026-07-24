@@ -163,6 +163,21 @@ Metadata cursor mode is mandatory for the independent overlay. Embedded cursor
 mode may be exposed as an explicitly degraded diagnostic option, but it does not
 satisfy the MVP capability.
 
+## Offline Object Stream
+
+Every authenticated stream object can be wrapped in a standalone `GCO1`
+portable file containing its public header and opaque payload. Files are named
+by monotonically increasing object sequence and are independently verifiable,
+so a one-way file transport can copy them incrementally without understanding
+the media or possessing the viewer key.
+
+`glacialcast-offline mirror` materializes these files atomically from a relay.
+The files can then be transferred by any out-of-band mechanism.
+`glacialcast-offline serve` watches a received directory and embeds the complete
+local viewer and MPEG-DASH endpoints in one binary. The offline host therefore
+needs only that binary, the object files, and an installed Firefox or Chromium
+browser; it does not need Internet access or third-party JavaScript.
+
 ## Runtime Dependency Boundary
 
 The intended runtime boundary includes:

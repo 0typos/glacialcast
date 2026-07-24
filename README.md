@@ -213,6 +213,35 @@ The dedicated DASH viewer verifies every authenticated object before appending
 it, derives per-epoch keys locally, and never submits the viewer key to the
 server.
 
+## Mirror to an offline viewer
+
+Mirror the relay's opaque objects into independently transferable files:
+
+```sh
+cargo run -p glacialcast-offline -- mirror \
+  --server http://127.0.0.1:8899 \
+  --stream-id <stream-uuid> \
+  --output glacialcast-transfer \
+  --follow
+```
+
+Each `.gco` file contains one versioned, authenticated stream object. Copy the
+completed files through the desired one-way file transport; `.part` files are
+temporary and should not be transferred.
+
+On the disconnected machine, run the self-contained local viewer:
+
+```sh
+glacialcast-offline serve \
+  --input glacialcast-transfer \
+  --listen 127.0.0.1:8910
+```
+
+Open `http://127.0.0.1:8910`, select the stream, and enter the viewer key. The
+binary embeds its HTML, CSS, JavaScript, MPEG-DASH endpoints, and file watcher.
+Only the binary, the `.gco` files, an installed Firefox or Chromium browser, and
+the out-of-band viewer key are needed; no Internet connection is used.
+
 ## Compatibility and diagnostic paths
 
 Start a generated test stream:

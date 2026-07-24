@@ -50,11 +50,16 @@ try {
     await page.waitForFunction(() => {
       const video = document.querySelector('#video');
       const metrics = document.querySelector('#metrics')?.textContent || '';
+      const status = document.querySelector('#status')?.textContent || '';
       return video?.videoWidth > 0
         && video.videoHeight > 0
         && video.buffered.length > 0
         && /[1-9]\d* media fragments/.test(metrics)
-        && /[1-9]\d* cursor events/.test(metrics);
+        && /[1-9]\d* cursor events/.test(metrics)
+        && (
+          status.includes('playback ready')
+          || status.includes('Connected to live')
+        );
     }, null, { timeout: 30_000 });
   } catch (error) {
     const diagnostic = await page.evaluate(() => {
@@ -79,9 +84,15 @@ try {
   console.log('encrypted media and cursor events reached the browser');
   await page.evaluate(async () => {
     const video = document.querySelector('#video');
+    const start = video.buffered.start(0);
+    const end = video.buffered.end(video.buffered.length - 1);
+    video.currentTime = Math.max(start, end - 0.5);
     if (video.paused) await video.play();
     if (typeof video.requestVideoFrameCallback === 'function') {
-      await new Promise(resolve => video.requestVideoFrameCallback(resolve));
+      await Promise.race([
+        new Promise(resolve => video.requestVideoFrameCallback(resolve)),
+        new Promise(resolve => setTimeout(resolve, 2_000)),
+      ]);
     } else {
       await new Promise(resolve => setTimeout(resolve, 500));
     }

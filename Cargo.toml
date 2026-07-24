@@ -2,6 +2,7 @@
 members = [
     "crates/client",
     "crates/dash",
+    "crates/offline",
     "crates/protocol",
     "crates/server",
 ]

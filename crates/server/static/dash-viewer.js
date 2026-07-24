@@ -340,12 +340,18 @@ async function loadHistoricalCursors(headers) {
   const cursors = headers.filter(header =>
     header.kind === 'Cursor' && header.epoch_id === state.descriptor.epoch_id
   );
-  for (const header of cursors) {
-    await loadCursorObject(header);
+  const concurrency = 12;
+  for (let index = 0; index < cursors.length; index += concurrency) {
+    await Promise.all(
+      cursors
+        .slice(index, index + concurrency)
+        .map(header => loadCursorObject(header, false)),
+    );
   }
+  state.cursorEvents.sort((left, right) => left.timestamp - right.timestamp);
 }
 
-async function loadCursorObject(header) {
+async function loadCursorObject(header, sortEvents = true) {
   if (state.seenSequences.has(header.sequence)) return;
   const payload = await fetchObject(header.sequence);
   await verifyObject(header, payload);
@@ -367,7 +373,9 @@ async function loadCursorObject(header) {
     if (event.bitmap) state.cursorBitmaps.set(event.bitmap_id, event.bitmap);
     state.cursorEvents.push(event);
   }
-  state.cursorEvents.sort((left, right) => left.timestamp - right.timestamp);
+  if (sortEvents) {
+    state.cursorEvents.sort((left, right) => left.timestamp - right.timestamp);
+  }
   state.seenSequences.add(header.sequence);
   state.decryptedCursorBatches += 1;
   updateMetrics();

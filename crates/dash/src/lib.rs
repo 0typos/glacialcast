@@ -847,18 +847,34 @@ pub struct MpdConfig<'a> {
 
 pub fn build_mpd(config: &MpdConfig<'_>) -> String {
     let mpd_type = if config.dynamic { "dynamic" } else { "static" };
-    let minimum_update = if config.dynamic {
-        " minimumUpdatePeriod=\"PT1S\" suggestedPresentationDelay=\"PT2S\""
+    let first_timestamp = config.segments.first().map_or(0, |segment| segment.start);
+    let presentation_end = config.segments.last().map_or(first_timestamp, |segment| {
+        segment.start.saturating_add(segment.duration)
+    });
+    let timing_attributes = if config.dynamic {
+        format!(
+            "availabilityStartTime=\"{}\" timeShiftBufferDepth=\"PT{}S\" \
+             minimumUpdatePeriod=\"PT1S\" suggestedPresentationDelay=\"PT2S\"",
+            xml_escape(config.availability_start_time),
+            config.time_shift_buffer_depth_seconds
+        )
     } else {
-        ""
+        format!(
+            "mediaPresentationDuration=\"PT{:.3}S\"",
+            presentation_end.saturating_sub(first_timestamp) as f64 / f64::from(MEDIA_TIMESCALE)
+        )
+    };
+    let presentation_time_offset = if config.dynamic {
+        String::new()
+    } else {
+        format!(" presentationTimeOffset=\"{first_timestamp}\"")
     };
     let mut xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" \
          xmlns:cenc=\"urn:mpeg:cenc:2013\" \
          profiles=\"urn:mpeg:dash:profile:isoff-live:2011\" \
-         type=\"{mpd_type}\" availabilityStartTime=\"{}\" \
-         timeShiftBufferDepth=\"PT{}S\" minBufferTime=\"PT1S\"{minimum_update}>\n\
+         type=\"{mpd_type}\" {timing_attributes} minBufferTime=\"PT1S\">\n\
          <Period id=\"{}\" start=\"PT0S\">\n\
          <AdaptationSet id=\"1\" contentType=\"video\" mimeType=\"video/mp4\" \
          segmentAlignment=\"true\" startWithSAP=\"1\">\n\
@@ -866,12 +882,10 @@ pub fn build_mpd(config: &MpdConfig<'_>) -> String {
          value=\"cenc\" cenc:default_KID=\"{}\"/>\n\
          <Representation id=\"video\" bandwidth=\"1000000\" codecs=\"{}\" \
          width=\"{}\" height=\"{}\">\n\
-         <SegmentTemplate timescale=\"{}\" startNumber=\"{}\" \
+         <SegmentTemplate timescale=\"{}\" startNumber=\"{}\"{presentation_time_offset} \
          initialization=\"epochs/{}/init.mp4\" \
          media=\"epochs/{}/media/$Number$.m4s\">\n\
          <SegmentTimeline>\n",
-        xml_escape(config.availability_start_time),
-        config.time_shift_buffer_depth_seconds,
         config.stream_id,
         format_uuid(config.key_id),
         xml_escape(config.codec),
@@ -1174,6 +1188,35 @@ mod tests {
         assert!(mpd.contains(&format!("cenc:default_KID=\"{epoch}\"")));
         assert!(mpd.contains("startNumber=\"7\""));
         assert!(mpd.contains("<S t=\"360000\" d=\"360000\"/>"));
+
+        let static_segments = [
+            SegmentTimelineEntry {
+                number: 7,
+                start: 360_000,
+                duration: 360_000,
+            },
+            SegmentTimelineEntry {
+                number: 8,
+                start: 720_000,
+                duration: 360_000,
+            },
+        ];
+        let static_mpd = build_mpd(&MpdConfig {
+            stream_id: stream,
+            epoch_id: epoch,
+            key_id: *epoch.as_bytes(),
+            width: 1280,
+            height: 720,
+            codec: "avc1.42c01f",
+            availability_start_time: "2026-01-01T00:00:00Z",
+            time_shift_buffer_depth_seconds: 1800,
+            segments: &static_segments,
+            dynamic: false,
+        });
+        assert!(static_mpd.contains("type=\"static\""));
+        assert!(static_mpd.contains("mediaPresentationDuration=\"PT8.000S\""));
+        assert!(static_mpd.contains("presentationTimeOffset=\"360000\""));
+        assert!(!static_mpd.contains("availabilityStartTime"));
     }
 
     #[test]

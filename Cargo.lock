@@ -1228,6 +1228,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "glacialcast-offline"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "futures-util",
+ "glacialcast-dash",
+ "glacialcast-protocol",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "glacialcast-protocol"
 version = "0.2.0"
 dependencies = [
