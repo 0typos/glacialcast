@@ -4386,6 +4386,81 @@ fn hostname() -> String {
 mod tests {
     use super::*;
 
+    fn resend_object(stream_id: Uuid, sequence: u64, payload_len: usize) -> DashObject {
+        let epoch_id = Uuid::from_u128(1);
+        let keys = EpochKeys::derive(&[7; 32], stream_id, epoch_id).unwrap();
+        DashObject::authenticated(
+            NewDashObject {
+                stream_id,
+                epoch_id,
+                kind: DashObjectKind::Media,
+                sequence,
+                segment_number: sequence,
+                chunk_index: 0,
+                timestamp: sequence,
+                duration: 1,
+                random_access: true,
+                mime: "video/iso.segment",
+                payload: vec![sequence as u8; payload_len],
+            },
+            &keys,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn resend_buffer_bounds_history_but_always_keeps_latest_object() {
+        let stream_id = Uuid::from_u128(2);
+        let mut resend = DashResendBuffer::new(5);
+        resend.push(resend_object(stream_id, 1, 3));
+        resend.push(resend_object(stream_id, 2, 3));
+        assert_eq!(resend.range(), (Some(2), Some(2)));
+        assert_eq!(resend.bytes, 3);
+
+        resend.push(resend_object(stream_id, 3, 10));
+        assert_eq!(resend.range(), (Some(3), Some(3)));
+        assert_eq!(resend.bytes, 10);
+    }
+
+    #[test]
+    fn resend_buffer_ack_and_range_selection_are_inclusive() {
+        let stream_id = Uuid::from_u128(3);
+        let mut resend = DashResendBuffer::new(1024);
+        for sequence in 1..=4 {
+            resend.push(resend_object(stream_id, sequence, sequence as usize));
+        }
+        assert_eq!(
+            resend
+                .objects(2, 3)
+                .into_iter()
+                .map(|object| object.header.sequence)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        resend.ack(0);
+        assert_eq!(resend.range(), (Some(1), Some(4)));
+        resend.ack(2);
+        assert_eq!(resend.range(), (Some(3), Some(4)));
+        assert_eq!(resend.bytes, 7);
+        resend.ack(u64::MAX);
+        assert_eq!(resend.range(), (None, None));
+        assert_eq!(resend.bytes, 0);
+    }
+
+    #[test]
+    fn resend_buffer_drops_objects_assigned_to_a_previous_stream() {
+        let retained_stream = Uuid::from_u128(4);
+        let old_stream = Uuid::from_u128(5);
+        let mut resend = DashResendBuffer::new(1024);
+        resend.push(resend_object(old_stream, 1, 4));
+        resend.push(resend_object(retained_stream, 2, 5));
+        resend.push(resend_object(old_stream, 3, 6));
+
+        resend.drop_other_streams(retained_stream);
+        assert_eq!(resend.range(), (Some(2), Some(2)));
+        assert_eq!(resend.bytes, 5);
+    }
+
     #[test]
     fn command_line_accepts_url_safe_keys_that_begin_with_hyphens() {
         let args = Args::try_parse_from([
