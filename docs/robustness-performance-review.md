@@ -105,6 +105,21 @@ surface per bitmap rather than allocating `ImageData` and `OffscreenCanvas`
 objects every animation frame. Live cursor batches are merged in order and
 history is pruned with relay retention.
 
+Damage-aware cadence now coalesces unchanged screen time into sparse,
+variable-duration media samples while keeping cursor delivery independent. A
+2026-07-24 application-traffic run at 1280×720, 1 FPS, 30 Hz cursor, and
+250 kbit/s encoder target measured:
+
+| Synthetic activity | Media bytes/minute | Gate ceiling |
+| --- | ---: | ---: |
+| Static | 5,380 | 65,536 |
+| Typing-like | 20,305 | 262,144 |
+| Scrolling | 232,855 | 1,048,576 |
+| Full motion | 690,130 | 2,097,152 |
+
+Cursor traffic remained about 68 KiB/minute across the four profiles and has a
+separate 256 KiB/minute ceiling.
+
 ## Remaining Risks and Next Architecture Thresholds
 
 - Real cursor correctness still depends on compositor/portal

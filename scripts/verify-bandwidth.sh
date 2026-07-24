@@ -4,12 +4,40 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 
+profile="${GLACIALCAST_BANDWIDTH_PROFILE:-all}"
+if [[ "${profile}" == "all" ]]; then
+  for scenario in static typing scroll motion; do
+    GLACIALCAST_BANDWIDTH_PROFILE="${scenario}" "${BASH_SOURCE[0]}"
+  done
+  echo "PASS: static, typing, scroll, and motion bandwidth profiles"
+  exit 0
+fi
+case "${profile}" in
+  static)
+    default_max_media=65536
+    ;;
+  typing)
+    default_max_media=262144
+    ;;
+  scroll)
+    default_max_media=1048576
+    ;;
+  motion)
+    default_max_media=2097152
+    ;;
+  *)
+    echo "GLACIALCAST_BANDWIDTH_PROFILE must be all, static, typing, scroll, or motion" >&2
+    exit 2
+    ;;
+esac
+
 control_addr="${GLACIALCAST_BANDWIDTH_CONTROL_ADDR:-127.0.0.1:19699}"
 ingest_addr="${GLACIALCAST_BANDWIDTH_INGEST_ADDR:-127.0.0.1:19700}"
-sample_seconds="${GLACIALCAST_BANDWIDTH_SECONDS:-20}"
-max_media_per_minute="${GLACIALCAST_MAX_MEDIA_BYTES_PER_MINUTE:-2097152}"
+sample_seconds="${GLACIALCAST_BANDWIDTH_SECONDS:-12}"
+max_media_per_minute="${GLACIALCAST_MAX_MEDIA_BYTES_PER_MINUTE:-${default_max_media}}"
 max_cursor_per_minute="${GLACIALCAST_MAX_CURSOR_BYTES_PER_MINUTE:-262144}"
-max_total_per_minute="${GLACIALCAST_MAX_TOTAL_BYTES_PER_MINUTE:-2359296}"
+default_max_total=$((max_media_per_minute + max_cursor_per_minute))
+max_total_per_minute="${GLACIALCAST_MAX_TOTAL_BYTES_PER_MINUTE:-${default_max_total}}"
 origin="http://${control_addr}"
 work_dir="$(mktemp -d /tmp/glacialcast-bandwidth.XXXXXX)"
 server_log="${work_dir}/server.log"
@@ -72,8 +100,9 @@ target/debug/glacialcast-client \
   "--ingest-server-key=${ingest_server_key}" \
   "--viewer-key=${viewer_key}" \
   --client-id bandwidth-client \
-  --display-name "Bandwidth Verify" \
+  --display-name "Bandwidth Verify ${profile}" \
   --capture dash-test \
+  --test-pattern "${profile}" \
   --dash-encoder openh264 \
   --width 1280 \
   --height 720 \
@@ -90,6 +119,7 @@ node - \
   "${max_media_per_minute}" \
   "${max_cursor_per_minute}" \
   "${max_total_per_minute}" \
+  "${profile}" \
   "${server_pid}" \
   "${client_pid}" <<'NODE'
 const [
@@ -98,6 +128,7 @@ const [
   maxMediaText,
   maxCursorText,
   maxTotalText,
+  profile,
   serverPidText,
   clientPidText,
 ] = process.argv.slice(2);
@@ -124,7 +155,9 @@ while (Date.now() < deadline) {
   alive(serverPidText, 'server');
   alive(clientPidText, 'client');
   const streams = await fetch(`${origin}/api/streams`).then(response => response.json());
-  streamId = streams.find(stream => stream.display_name === 'Bandwidth Verify')?.stream_id;
+  streamId = streams.find(
+    stream => stream.display_name === `Bandwidth Verify ${profile}`
+  )?.stream_id;
   if (streamId) {
     const traffic = (await metrics()).traffic.streams.find(stream => stream.stream_id === streamId);
     if (traffic?.lifetime.media.objects >= 2 && traffic?.lifetime.cursor.objects >= 1) break;
@@ -151,7 +184,7 @@ const mediaPerMinute = Math.ceil(mediaBytes * scale);
 const cursorPerMinute = Math.ceil(cursorBytes * scale);
 const totalPerMinute = Math.ceil((mediaBytes + cursorBytes + otherBytes) * scale);
 const result = {
-  profile: 'moving-pattern-1280x720-1fps-30hz-250kbps',
+  profile: `${profile}-pattern-1280x720-1fps-30hz-250kbps`,
   sample_seconds: seconds,
   media_bytes_per_minute: mediaPerMinute,
   cursor_bytes_per_minute: cursorPerMinute,
@@ -171,4 +204,4 @@ if (totalPerMinute > Number(maxTotalText)) {
 }
 NODE
 
-echo "PASS: moving-pattern application traffic stayed within media=${max_media_per_minute} cursor=${max_cursor_per_minute} total=${max_total_per_minute} bytes/minute"
+echo "PASS: ${profile} application traffic stayed within media=${max_media_per_minute} cursor=${max_cursor_per_minute} total=${max_total_per_minute} bytes/minute"

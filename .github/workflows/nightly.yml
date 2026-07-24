@@ -44,9 +44,13 @@ jobs:
         run: scripts/verify-soak.sh
 
   browsers:
-    name: Firefox and Chromium playback
+    name: Firefox and Chromium playback (${{ matrix.test-pattern }})
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        test-pattern: [motion, static]
     steps:
       - uses: actions/checkout@v6
       - name: Install native build dependencies
@@ -73,6 +77,8 @@ jobs:
           GLACIALCAST_PLAYWRIGHT_MODULE: /tmp/glacialcast-playwright/node_modules/playwright
           GLACIALCAST_VERIFY_BROWSERS: firefox,chromium
           GLACIALCAST_VERIFY_OFFLINE_BROWSERS: firefox,chromium
+          GLACIALCAST_VERIFY_TEST_PATTERN: ${{ matrix.test-pattern }}
+          GLACIALCAST_VERIFY_IDLE_HEARTBEAT_SECONDS: "4"
         run: scripts/verify-dash-e2e.sh
 
   fuzz:

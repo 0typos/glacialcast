@@ -1031,6 +1031,7 @@ dependencies = [
  "pipewire",
  "rand 0.8.6",
  "serde",
+ "sha2",
  "tokio",
  "toml 0.8.23",
  "tracing",

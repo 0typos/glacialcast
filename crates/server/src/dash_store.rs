@@ -334,8 +334,14 @@ impl DashStore {
                         start: object.header.timestamp,
                         duration: 0,
                     });
+            let end = entry.start.saturating_add(entry.duration).max(
+                object
+                    .header
+                    .timestamp
+                    .saturating_add(object.header.duration),
+            );
             entry.start = entry.start.min(object.header.timestamp);
-            entry.duration = entry.duration.saturating_add(object.header.duration);
+            entry.duration = end.saturating_sub(entry.start);
         }
         let segments = segments.into_values().collect::<Vec<_>>();
         Ok(Some(build_mpd(&MpdConfig {
@@ -1134,6 +1140,68 @@ mod tests {
         assert!(manifest.contains("media=\"epochs/"));
         assert!(manifest.contains("<S t=\"0\" d=\"360000\"/>"));
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manifest_segment_duration_includes_sparse_frame_time() {
+        let (root, store) = test_store(1024 * 1024);
+        let stream_id = Uuid::new_v4();
+        let epoch_id = Uuid::new_v4();
+        let keys = EpochKeys::derive(&[8; 32], stream_id, epoch_id).unwrap();
+        let descriptor = EpochDescriptor {
+            format_version: DASH_FORMAT_VERSION,
+            stream_id,
+            epoch_id,
+            key_id: keys.key_id,
+            width: 320,
+            height: 180,
+            codec: "avc1.42c01f".to_string(),
+            timescale: MEDIA_TIMESCALE,
+            segment_frames: 4,
+            availability_start_time: "2026-01-01T00:00:00Z".to_string(),
+        };
+        store
+            .store(object(
+                &keys,
+                stream_id,
+                epoch_id,
+                ObjectSpec {
+                    kind: DashObjectKind::Epoch,
+                    sequence: 1,
+                    segment_number: 0,
+                    chunk_index: 0,
+                    random_access: true,
+                    payload: descriptor.to_json().unwrap(),
+                },
+            ))
+            .unwrap();
+        for (sequence, chunk_index, timestamp) in [(2, 0, 0), (3, 1, 900_000)] {
+            store
+                .store(
+                    DashObject::authenticated(
+                        NewDashObject {
+                            stream_id,
+                            epoch_id,
+                            kind: DashObjectKind::Media,
+                            sequence,
+                            segment_number: 1,
+                            chunk_index,
+                            timestamp,
+                            duration: 90_000,
+                            random_access: chunk_index == 0,
+                            mime: "video/iso.segment",
+                            payload: vec![sequence as u8],
+                        },
+                        &keys,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+
+        let manifest = store.manifest(stream_id, true).unwrap().unwrap();
+        assert!(manifest.contains("<S t=\"0\" d=\"990000\"/>"));
         std::fs::remove_dir_all(root).unwrap();
     }
 

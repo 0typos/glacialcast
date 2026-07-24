@@ -142,6 +142,7 @@ Publish a selected Wayland monitor:
   --portal-cursor metadata \
   --require-cursor-metadata \
   --fps 1 \
+  --idle-heartbeat-seconds 10 \
   --cursor-hz 30
 ```
 
@@ -157,6 +158,7 @@ For a noninteractive transport test, publish the built-in pattern:
   --capture dash-test \
   --width 1280 \
   --height 720 \
+  --test-pattern motion \
   --fps 1 \
   --cursor-hz 30
 ```
@@ -181,6 +183,17 @@ the default. Niri's Mutter-compatible ScreenCast API can be selected directly:
 `--require-cursor-metadata` when an independent cursor is mandatory. Embedded
 cursor mode is an explicit degraded fallback: the cursor remains visible but
 only updates with video frames.
+
+The video cadence is damage-aware. PipeWire `SPA_META_VideoDamage` is preferred;
+CPU-readable frames fall back to a pixel fingerprint, and a DMA-BUF source
+without damage metadata safely remains at the configured `--fps`. Unchanged
+content is represented by a variable-duration sample at
+`--idle-heartbeat-seconds` instead of resending a frame every tick. A changed
+frame is still published on the next video tick, while cursor objects continue
+at `--cursor-hz`. Set the heartbeat to `1` for a denser compatibility profile.
+
+For repeatable bandwidth tests, `--test-pattern` accepts `static`, `typing`,
+`scroll`, and `motion`.
 
 `--dash-encoder auto` first tries constrained-baseline VA-API on
 `/dev/dri/renderD128`, then OpenH264. Use another render node with

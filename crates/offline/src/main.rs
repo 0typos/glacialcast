@@ -602,8 +602,14 @@ async fn get_manifest(
                 start: object.header.timestamp,
                 duration: 0,
             });
+        let end = entry.start.saturating_add(entry.duration).max(
+            object
+                .header
+                .timestamp
+                .saturating_add(object.header.duration),
+        );
         entry.start = entry.start.min(object.header.timestamp);
-        entry.duration = entry.duration.saturating_add(object.header.duration);
+        entry.duration = end.saturating_sub(entry.start);
     }
     let segments = segments.into_values().collect::<Vec<_>>();
     if segments.is_empty() {
@@ -1115,6 +1121,68 @@ mod tests {
         let manifest = std::str::from_utf8(&body).unwrap();
         assert!(manifest.contains("type=\"static\""));
         assert!(manifest.contains(&epoch_id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn offline_manifest_includes_sparse_frame_time_in_segment_duration() {
+        let directory = TestDirectory::new();
+        let stream_id = Uuid::new_v4();
+        let epoch_id = Uuid::new_v4();
+        let keys = EpochKeys::derive(&[4; 32], stream_id, epoch_id).unwrap();
+        let descriptor = EpochDescriptor {
+            format_version: DASH_FORMAT_VERSION,
+            stream_id,
+            epoch_id,
+            key_id: keys.key_id,
+            width: 320,
+            height: 180,
+            codec: "avc1.42c01f".to_string(),
+            timescale: MEDIA_TIMESCALE,
+            segment_frames: 4,
+            availability_start_time: "2026-01-01T00:00:00Z".to_string(),
+        };
+        store_object(
+            &directory,
+            "epoch.gco",
+            &test_object(
+                stream_id,
+                epoch_id,
+                DashObjectKind::Epoch,
+                1,
+                0,
+                0,
+                descriptor.to_json().unwrap(),
+            ),
+        );
+        for (sequence, chunk_index, timestamp) in [(2, 0, 0), (3, 1, 900_000)] {
+            let media = DashObject::authenticated(
+                NewDashObject {
+                    stream_id,
+                    epoch_id,
+                    kind: DashObjectKind::Media,
+                    sequence,
+                    segment_number: 1,
+                    chunk_index,
+                    timestamp,
+                    duration: 90_000,
+                    random_access: chunk_index == 0,
+                    mime: "video/iso.segment",
+                    payload: vec![sequence as u8],
+                },
+                &keys,
+            )
+            .unwrap();
+            store_object(&directory, &format!("media-{sequence}.gco"), &media);
+        }
+
+        let response = get_manifest(State(offline_state(&directory)), Path(stream_id))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let manifest = std::str::from_utf8(&body).unwrap();
+        assert!(manifest.contains("<S t=\"0\" d=\"990000\"/>"));
     }
 
     #[tokio::test]

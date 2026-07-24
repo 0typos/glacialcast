@@ -254,6 +254,7 @@ target/release/glacialcast-client \
   --dash-encoder openh264 \
   --width 1280 \
   --height 720 \
+  --test-pattern motion \
   --fps 1 \
   --cursor-hz 30 \
   --segment-frames 4
@@ -271,6 +272,11 @@ Expected behavior:
 - the metrics count both media fragments and cursor events; and
 - after the stream has run for a while, the timeline moves backward through
   retained history and **Live** returns to the live edge.
+
+Repeat the publisher with `--test-pattern static --idle-heartbeat-seconds 4`.
+The cursor should remain smooth, the media-fragment count should rise only on
+the heartbeat, and history playback should still span the complete idle time.
+The nightly Firefox/Chromium matrix exercises both motion and static profiles.
 
 Repeat in Chromium. Also try a wrong viewer key: playback should fail without
 revealing decrypted content.
@@ -298,6 +304,16 @@ target/release/glacialcast-client \
 Choose a monitor in the portal dialog and move the pointer over that monitor.
 The browser should show the real screen at the sparse video cadence while the
 independent cursor remains responsive.
+
+Run the deterministic application-traffic matrix separately:
+
+```sh
+scripts/verify-bandwidth.sh
+```
+
+It measures static, typing-like, scrolling, and full-motion patterns. Static
+and typing profiles have stricter media-byte ceilings; every profile keeps the
+same independent 30 Hz cursor ceiling.
 
 For an automated pass/fail check:
 

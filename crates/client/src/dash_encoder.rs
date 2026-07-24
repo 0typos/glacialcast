@@ -40,6 +40,7 @@ use openh264::{
     },
     formats::{RgbSliceU8, YUVBuffer},
 };
+use sha2::{Digest, Sha256};
 use std::{
     os::fd::{AsRawFd, OwnedFd},
     path::{Path, PathBuf},
@@ -202,6 +203,23 @@ impl DashInputFrame {
             }
         }
         self
+    }
+
+    pub fn content_fingerprint(&self) -> Option<[u8; 32]> {
+        let Self::Rgb(image) = self else {
+            return None;
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(image.width().to_be_bytes());
+        hasher.update(image.height().to_be_bytes());
+        hasher.update(image.as_raw());
+        Some(hasher.finalize().into())
+    }
+
+    pub fn discard(self) {
+        if let Self::DmaBuf(frame) = self {
+            frame.release.release();
+        }
     }
 }
 

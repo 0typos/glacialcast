@@ -7,6 +7,20 @@ cd "${repo_root}"
 control_addr="${GLACIALCAST_VERIFY_CONTROL_ADDR:-127.0.0.1:18999}"
 ingest_addr="${GLACIALCAST_VERIFY_INGEST_ADDR:-127.0.0.1:19000}"
 offline_addr="${GLACIALCAST_VERIFY_OFFLINE_ADDR:-127.0.0.1:19001}"
+test_pattern="${GLACIALCAST_VERIFY_TEST_PATTERN:-motion}"
+idle_heartbeat_seconds="${GLACIALCAST_VERIFY_IDLE_HEARTBEAT_SECONDS:-10}"
+case "${test_pattern}" in
+  static | typing | scroll | motion) ;;
+  *)
+    echo "GLACIALCAST_VERIFY_TEST_PATTERN must be static, typing, scroll, or motion" >&2
+    exit 2
+    ;;
+esac
+if ! [[ "${idle_heartbeat_seconds}" =~ ^[0-9]+$ ]] \
+  || (( idle_heartbeat_seconds < 1 || idle_heartbeat_seconds > 300 )); then
+  echo "GLACIALCAST_VERIFY_IDLE_HEARTBEAT_SECONDS must be between 1 and 300" >&2
+  exit 2
+fi
 origin="http://${control_addr}"
 offline_origin="http://${offline_addr}"
 work_dir="$(mktemp -d /tmp/glacialcast-dash-e2e.XXXXXX)"
@@ -77,10 +91,12 @@ RUST_LOG=glacialcast_client=debug target/debug/glacialcast-client \
   --client-id dash-e2e \
   --display-name "DASH E2E" \
   --capture dash-test \
+  --test-pattern "${test_pattern}" \
   --dash-encoder openh264 \
   --width 320 \
   --height 180 \
   --fps 2 \
+  --idle-heartbeat-seconds "${idle_heartbeat_seconds}" \
   --cursor-hz 30 \
   --segment-frames 2 \
   >"${client_log}" 2>&1 &

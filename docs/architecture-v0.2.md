@@ -46,7 +46,7 @@ The MVP is complete when all of the following are true:
 ```text
 XDG portal / PipeWire
        |
-       +-- raw video --> 1 FPS sampler --> H.264 encoder --> fMP4/CENC packager
+       +-- raw video --> damage-aware sampler --> H.264 encoder --> fMP4/CENC
        |
        +-- cursor metadata ------------------------------> AEAD cursor records
                                                                   |
@@ -98,14 +98,24 @@ The initial interoperable media profile is:
 - 1 FPS default video cadence
 - no B-frames
 - four-second group of pictures and segment target
-- one complete `moof`/`mdat` fragment per captured frame
+- one complete `moof`/`mdat` fragment per published frame
 - IDR plus SPS and PPS at the start of each segment
 
-The client sends each completed fragment immediately. The relay may assemble
-four fragments into one retained `.m4s` object without delaying the live
-notification. An unchanged desktop still emits a small predicted frame at the
-configured cadence for the MVP so the browser media clock has continuous
-samples.
+The configured video rate is the maximum sampling and change-notification
+cadence. The client requests PipeWire video-damage regions, falls back to
+fingerprinting CPU-readable pixels, and treats DMA-BUF content without damage
+metadata as changed. Unchanged content is coalesced into a variable-duration
+predicted sample and emitted on the bounded idle heartbeat. If content changes
+while such a sample is pending, the client publishes the completed idle span
+before immediately publishing the changed frame. This keeps retained history
+continuous without resending static pixels every video tick. Independent live
+cursor rendering always uses the newest cursor event and does not wait for the
+media clock.
+
+The relay may assemble four published fragments into one retained `.m4s`
+object without delaying live notification. Segment timeline duration spans
+from the first sample start through the final sample end, including any sparse
+publication interval.
 
 The MPD uses a dynamic `SegmentTemplate` and `SegmentTimeline` for live viewing.
 A finalized copy uses a static MPD. GlacialCast implements the constrained

@@ -130,6 +130,8 @@ struct Args {
     display_name: Option<String>,
     #[arg(long, value_enum, default_value_t = CaptureMode::DashWayland)]
     capture: CaptureMode,
+    #[arg(long, value_enum, default_value_t = TestPatternMode::Motion)]
+    test_pattern: TestPatternMode,
     #[arg(long, value_enum, default_value_t = PortalSourceMode::Monitor)]
     portal_source: PortalSourceMode,
     #[arg(long, value_enum, default_value_t = ScreenCastBackend::Portal)]
@@ -150,6 +152,8 @@ struct Args {
     max_frame_height: u32,
     #[arg(long, value_parser = parse_update_rate, default_value = "1")]
     fps: f64,
+    #[arg(long, value_parser = parse_idle_heartbeat_seconds, default_value_t = 10)]
+    idle_heartbeat_seconds: u64,
     #[arg(long, default_value_t = 30)]
     cursor_hz: u64,
     #[arg(long, default_value_t = 250_000)]
@@ -198,6 +202,14 @@ struct ClientIdentity {
 enum CaptureMode {
     DashTest,
     DashWayland,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TestPatternMode {
+    Static,
+    Typing,
+    Scroll,
+    Motion,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -328,7 +340,11 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
     }
 
     let mut capture: Box<dyn Capture> = match args.capture {
-        CaptureMode::DashTest => Box::new(TestPatternCapture::new(args.width, args.height)),
+        CaptureMode::DashTest => Box::new(TestPatternCapture::new(
+            args.width,
+            args.height,
+            args.test_pattern,
+        )),
         CaptureMode::DashWayland => Box::new(WaylandPipewireCapture::new(&args)),
     };
     let mut resend = DashResendBuffer::new(args.resend_bytes);
@@ -496,12 +512,13 @@ async fn run_dash_connection(
     }
     sequence = sequence.max(resend.range().1.unwrap_or(0));
 
-    let first_frame = normalize_dash_input(
+    let first_capture = normalize_captured_dash_frame(
         capture
             .capture_dash_frame(args.max_frame_width, args.max_frame_height)
             .await?,
         None,
     );
+    let first_frame = first_capture.frame;
     let width = first_frame.width();
     let height = first_frame.height();
     let frame_duration = ((f64::from(MEDIA_TIMESCALE) / args.fps).round() as u64)
@@ -519,6 +536,7 @@ async fn run_dash_connection(
         args.video_bitrate,
         args.segment_frames,
     )?;
+    let mut last_frame_fingerprint = first_frame.content_fingerprint();
     let first_encoded = encoder.encode(&first_frame, false)?;
     if !first_encoded.keyframe {
         bail!("H.264 encoder did not begin the epoch with a random-access frame");
@@ -595,6 +613,7 @@ async fn run_dash_connection(
         stream_id,
         epoch_id,
         0,
+        0,
         frame_duration,
         args.segment_frames,
         &first_encoded,
@@ -623,6 +642,11 @@ async fn run_dash_connection(
     let mut cursor_flush_tick = tokio::time::interval(Duration::from_millis(200));
     cursor_flush_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut media_index = 1u64;
+    let heartbeat_ticks = args
+        .idle_heartbeat_seconds
+        .saturating_mul(u64::from(MEDIA_TIMESCALE));
+    let mut media_cadence = AdaptiveMediaCadence::new(u64::from(frame_duration), heartbeat_ticks);
+    let mut pending_media: Option<PendingEncodedMedia> = None;
     let mut cursor_sequence = 0u64;
     let mut pending_cursor_events = Vec::new();
     let mut cursor_bitmap_state = DashCursorBitmapState::default();
@@ -630,6 +654,24 @@ async fn run_dash_connection(
     loop {
         tokio::select! {
             _ = wait_for_shutdown(&mut shutdown_rx) => {
+                if let Some(duration) =
+                    media_cadence.finish(duration_to_media_ticks(epoch_started.elapsed()))
+                    && let Some(pending) = pending_media.take()
+                {
+                    publish_encoded_media(
+                        &mut socket,
+                        resend,
+                        &mut sequence,
+                        &keys,
+                        stream_id,
+                        epoch_id,
+                        &mut media_index,
+                        pending.timestamp,
+                        duration,
+                        args.segment_frames,
+                        pending.encoded,
+                    ).await?;
+                }
                 flush_dash_cursor_batch(
                     &mut socket,
                     resend,
@@ -648,40 +690,80 @@ async fn run_dash_connection(
             }
             _ = frame_tick.tick() => {
                 let publish_started = Instant::now();
-                let frame = normalize_dash_input(
+                let capture = normalize_captured_dash_frame(
                     capture.capture_dash_frame(args.max_frame_width, args.max_frame_height).await?,
                     Some((width, height)),
                 );
-                let segment_start =
-                    media_index.is_multiple_of(u64::from(args.segment_frames));
-                let encoded = encoder.encode(&frame, segment_start)?;
-                if segment_start && !encoded.keyframe {
-                    bail!("H.264 encoder did not produce an IDR at the segment boundary");
+                let fingerprint = (capture.change == FrameChange::Unknown)
+                    .then(|| capture.frame.content_fingerprint())
+                    .flatten();
+                let changed = frame_changed(
+                    capture.change,
+                    last_frame_fingerprint.as_ref(),
+                    fingerprint.as_ref(),
+                );
+                let decision = media_cadence.observe(
+                    duration_to_media_ticks(epoch_started.elapsed()),
+                    changed,
+                );
+                if let Some(duration) = decision.flush_pending_duration {
+                    let pending = pending_media
+                        .take()
+                        .context("adaptive cadence lost its pending encoded frame")?;
+                    publish_encoded_media(
+                        &mut socket,
+                        resend,
+                        &mut sequence,
+                        &keys,
+                        stream_id,
+                        epoch_id,
+                        &mut media_index,
+                        pending.timestamp,
+                        duration,
+                        args.segment_frames,
+                        pending.encoded,
+                    ).await?;
                 }
-                let object = build_dash_media_object(
-                    &mut sequence,
-                    &keys,
-                    stream_id,
-                    epoch_id,
-                    media_index,
-                    frame_duration,
-                    args.segment_frames,
-                    &encoded,
-                )?;
-                let bytes = object.payload.len();
-                let sent_sequence = object.header.sequence;
-                send_new_dash_object(&mut socket, resend, object).await?;
-                let capture_to_ack_ms = publish_started.elapsed().as_millis();
+                if let Some(timestamp) = decision.publish_current_timestamp {
+                    let encoded = encode_media_frame(
+                        &mut encoder,
+                        &capture.frame,
+                        media_index,
+                        args.segment_frames,
+                    )?;
+                    publish_encoded_media(
+                        &mut socket,
+                        resend,
+                        &mut sequence,
+                        &keys,
+                        stream_id,
+                        epoch_id,
+                        &mut media_index,
+                        timestamp,
+                        frame_duration,
+                        args.segment_frames,
+                        encoded,
+                    ).await?;
+                    last_frame_fingerprint = fingerprint;
+                } else if let Some(timestamp) = decision.encode_pending_timestamp {
+                    let encoded = encode_media_frame(
+                        &mut encoder,
+                        &capture.frame,
+                        media_index,
+                        args.segment_frames,
+                    )?;
+                    pending_media = Some(PendingEncodedMedia { timestamp, encoded });
+                } else {
+                    capture.frame.discard();
+                }
                 debug!(
                     %stream_id,
-                    sequence = sent_sequence,
+                    changed,
                     media_index,
-                    keyframe = encoded.keyframe,
-                    bytes,
-                    capture_to_ack_ms,
-                    "sent encrypted DASH media fragment"
+                    capture_to_ack_ms = publish_started.elapsed().as_millis(),
+                    pending = pending_media.is_some(),
+                    "processed adaptive DASH media cadence"
                 );
-                media_index = media_index.saturating_add(1);
             }
             _ = cursor_tick.tick() => {
                 cursor_sequence = cursor_sequence.saturating_add(1);
@@ -728,6 +810,103 @@ struct DashObjectSpec<'a> {
     payload: Vec<u8>,
 }
 
+struct PendingEncodedMedia {
+    timestamp: u64,
+    encoded: dash_encoder::EncodedH264Frame,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MediaCadenceDecision {
+    flush_pending_duration: Option<u32>,
+    publish_current_timestamp: Option<u64>,
+    encode_pending_timestamp: Option<u64>,
+}
+
+#[derive(Debug)]
+struct AdaptiveMediaCadence {
+    frame_duration: u64,
+    heartbeat_ticks: u64,
+    media_end: u64,
+    pending_timestamp: Option<u64>,
+}
+
+impl AdaptiveMediaCadence {
+    fn new(frame_duration: u64, heartbeat_ticks: u64) -> Self {
+        Self {
+            frame_duration,
+            heartbeat_ticks: heartbeat_ticks.max(frame_duration).min(u64::from(u32::MAX)),
+            media_end: frame_duration,
+            pending_timestamp: None,
+        }
+    }
+
+    fn observe(&mut self, timestamp: u64, changed: bool) -> MediaCadenceDecision {
+        if changed {
+            let mut decision = MediaCadenceDecision::default();
+            if let Some(pending_timestamp) = self.pending_timestamp.take() {
+                let duration = timestamp
+                    .saturating_sub(pending_timestamp)
+                    .clamp(1, u64::from(u32::MAX)) as u32;
+                decision.flush_pending_duration = Some(duration);
+                self.media_end = pending_timestamp.saturating_add(u64::from(duration));
+            }
+            let current_timestamp = timestamp.max(self.media_end);
+            decision.publish_current_timestamp = Some(current_timestamp);
+            self.media_end = current_timestamp.saturating_add(self.frame_duration);
+            return decision;
+        }
+
+        if self.pending_timestamp.is_none() && timestamp >= self.media_end {
+            self.pending_timestamp = Some(self.media_end);
+            return MediaCadenceDecision {
+                encode_pending_timestamp: self.pending_timestamp,
+                ..MediaCadenceDecision::default()
+            };
+        }
+        let Some(pending_timestamp) = self.pending_timestamp else {
+            return MediaCadenceDecision::default();
+        };
+        if timestamp.saturating_sub(pending_timestamp) < self.heartbeat_ticks {
+            return MediaCadenceDecision::default();
+        }
+        let duration = timestamp
+            .saturating_sub(pending_timestamp)
+            .clamp(1, u64::from(u32::MAX)) as u32;
+        self.media_end = pending_timestamp.saturating_add(u64::from(duration));
+        self.pending_timestamp = Some(self.media_end);
+        MediaCadenceDecision {
+            flush_pending_duration: Some(duration),
+            encode_pending_timestamp: self.pending_timestamp,
+            ..MediaCadenceDecision::default()
+        }
+    }
+
+    fn finish(&mut self, timestamp: u64) -> Option<u32> {
+        let pending_timestamp = self.pending_timestamp.take()?;
+        let duration = timestamp
+            .max(pending_timestamp.saturating_add(1))
+            .saturating_sub(pending_timestamp)
+            .clamp(1, u64::from(u32::MAX)) as u32;
+        self.media_end = pending_timestamp.saturating_add(u64::from(duration));
+        Some(duration)
+    }
+}
+
+fn frame_changed(
+    change: FrameChange,
+    previous_fingerprint: Option<&[u8; 32]>,
+    current_fingerprint: Option<&[u8; 32]>,
+) -> bool {
+    match change {
+        FrameChange::Changed => true,
+        FrameChange::Unchanged => false,
+        FrameChange::Unknown => match (previous_fingerprint, current_fingerprint) {
+            (Some(previous), Some(current)) => previous != current,
+            _ => true,
+        },
+    }
+}
+
 fn next_dash_object(
     sequence: &mut u64,
     keys: &EpochKeys,
@@ -753,6 +932,62 @@ fn next_dash_object(
     .context("authenticating DASH object")
 }
 
+fn encode_media_frame(
+    encoder: &mut DashH264Encoder,
+    frame: &DashInputFrame,
+    media_index: u64,
+    segment_frames: u16,
+) -> Result<dash_encoder::EncodedH264Frame> {
+    let segment_start = media_index.is_multiple_of(u64::from(segment_frames));
+    let encoded = encoder.encode(frame, segment_start)?;
+    if segment_start && !encoded.keyframe {
+        bail!("H.264 encoder did not produce an IDR at the segment boundary");
+    }
+    Ok(encoded)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_encoded_media(
+    socket: &mut NoiseSocket<TcpStream>,
+    resend: &mut DashResendBuffer,
+    sequence: &mut u64,
+    keys: &EpochKeys,
+    stream_id: Uuid,
+    epoch_id: Uuid,
+    media_index: &mut u64,
+    timestamp: u64,
+    duration: u32,
+    segment_frames: u16,
+    encoded: dash_encoder::EncodedH264Frame,
+) -> Result<()> {
+    let object = build_dash_media_object(
+        sequence,
+        keys,
+        stream_id,
+        epoch_id,
+        *media_index,
+        timestamp,
+        duration,
+        segment_frames,
+        &encoded,
+    )?;
+    let bytes = object.payload.len();
+    let sent_sequence = object.header.sequence;
+    send_new_dash_object(socket, resend, object).await?;
+    debug!(
+        %stream_id,
+        sequence = sent_sequence,
+        media_index = *media_index,
+        timestamp,
+        duration,
+        keyframe = encoded.keyframe,
+        bytes,
+        "sent encrypted DASH media fragment"
+    );
+    *media_index = media_index.saturating_add(1);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_dash_media_object(
     sequence: &mut u64,
@@ -760,13 +995,13 @@ fn build_dash_media_object(
     stream_id: Uuid,
     epoch_id: Uuid,
     media_index: u64,
+    timestamp: u64,
     frame_duration: u32,
     segment_frames: u16,
     encoded: &dash_encoder::EncodedH264Frame,
 ) -> Result<DashObject> {
     let mut iv = [0u8; 16];
     OsRng.fill_bytes(&mut iv);
-    let timestamp = media_index.saturating_mul(u64::from(frame_duration));
     let fragment = build_encrypted_fragment(
         &keys.cenc_key,
         FragmentInput {
@@ -797,6 +1032,16 @@ fn build_dash_media_object(
             payload: fragment.bytes,
         },
     )
+}
+
+fn normalize_captured_dash_frame(
+    capture: CapturedDashFrame,
+    target: Option<(u32, u32)>,
+) -> CapturedDashFrame {
+    CapturedDashFrame {
+        frame: normalize_dash_input(capture.frame, target),
+        change: capture.change,
+    }
 }
 
 fn normalize_dash_input(input: DashInputFrame, target: Option<(u32, u32)>) -> DashInputFrame {
@@ -1153,6 +1398,17 @@ fn parse_update_rate(value: &str) -> std::result::Result<f64, String> {
     Ok(fps)
 }
 
+fn parse_idle_heartbeat_seconds(value: &str) -> std::result::Result<u64, String> {
+    let seconds = value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| format!("invalid idle heartbeat {value:?}"))?;
+    if !(1..=300).contains(&seconds) {
+        return Err("idle heartbeat must be between 1 and 300 seconds".to_string());
+    }
+    Ok(seconds)
+}
+
 struct PipewireThreadStop {
     mainloop_ptr: Arc<Mutex<Option<usize>>>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -1217,26 +1473,41 @@ trait Capture: Send {
         &mut self,
         max_width: u32,
         max_height: u32,
-    ) -> Result<DashInputFrame> {
-        Ok(DashInputFrame::Rgb(
-            self.capture_rgb(max_width, max_height).await?,
-        ))
+    ) -> Result<CapturedDashFrame> {
+        Ok(CapturedDashFrame {
+            frame: DashInputFrame::Rgb(self.capture_rgb(max_width, max_height).await?),
+            change: FrameChange::Unknown,
+        })
     }
     async fn cursor(&mut self, seq: u64) -> Result<Option<CursorMessage>>;
+}
+
+struct CapturedDashFrame {
+    frame: DashInputFrame,
+    change: FrameChange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameChange {
+    Changed,
+    Unchanged,
+    Unknown,
 }
 
 struct TestPatternCapture {
     width: u32,
     height: u32,
     tick: u32,
+    mode: TestPatternMode,
 }
 
 impl TestPatternCapture {
-    fn new(width: u32, height: u32) -> Self {
+    fn new(width: u32, height: u32, mode: TestPatternMode) -> Self {
         Self {
             width,
             height,
             tick: 0,
+            mode,
         }
     }
 
@@ -1244,12 +1515,17 @@ impl TestPatternCapture {
         self.tick = self.tick.wrapping_add(1);
         let mut image = ImageBuffer::<Rgb<u8>, Vec<u8>>::new(self.width, self.height);
         for (x, y, pixel) in image.enumerate_pixels_mut() {
-            let r = ((x + self.tick * 17) % 255) as u8;
-            let g = ((y + self.tick * 29) % 255) as u8;
-            let b = (((x / 8) + (y / 8) + self.tick * 11) % 255) as u8;
-            *pixel = Rgb([r, g, b]);
+            *pixel = test_pattern_pixel(self.mode, self.tick, x, y);
         }
         image
+    }
+
+    fn frame_changed(&self) -> bool {
+        match self.mode {
+            TestPatternMode::Static => self.tick == 1,
+            TestPatternMode::Typing => self.tick == 1 || self.tick.is_multiple_of(4),
+            TestPatternMode::Scroll | TestPatternMode::Motion => true,
+        }
     }
 }
 
@@ -1258,7 +1534,7 @@ impl Capture for TestPatternCapture {
     async fn source(&mut self) -> Result<CaptureSource> {
         Ok(CaptureSource {
             backend: "test-pattern".to_string(),
-            description: "Generated moving color bars".to_string(),
+            description: format!("Generated {:?} low-bandwidth profile", self.mode),
             width: self.width,
             height: self.height,
         })
@@ -1276,6 +1552,22 @@ impl Capture for TestPatternCapture {
         ))
     }
 
+    async fn capture_dash_frame(
+        &mut self,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<CapturedDashFrame> {
+        let image = resize_rgb_image_to_fit(self.next_rgb(), max_width, max_height);
+        Ok(CapturedDashFrame {
+            frame: DashInputFrame::Rgb(image),
+            change: if self.frame_changed() {
+                FrameChange::Changed
+            } else {
+                FrameChange::Unchanged
+            },
+        })
+    }
+
     async fn cursor(&mut self, seq: u64) -> Result<Option<CursorMessage>> {
         let t = seq as f32 / 30.0;
         Ok(Some(CursorMessage {
@@ -1286,6 +1578,38 @@ impl Capture for TestPatternCapture {
             source_height: self.height,
             bitmap: None,
         }))
+    }
+}
+
+fn test_pattern_pixel(mode: TestPatternMode, tick: u32, x: u32, y: u32) -> Rgb<u8> {
+    match mode {
+        TestPatternMode::Static => Rgb([
+            (x % 251) as u8,
+            (y % 241) as u8,
+            (((x / 8) + (y / 8)) % 239) as u8,
+        ]),
+        TestPatternMode::Typing => {
+            let typed = (tick / 4).saturating_mul(24);
+            if (64..88).contains(&y) && (64..64u32.saturating_add(typed)).contains(&x) {
+                Rgb([235, 235, 225])
+            } else {
+                Rgb([24, 28, 34])
+            }
+        }
+        TestPatternMode::Scroll => {
+            let shifted_y = y.wrapping_add(tick.saturating_mul(12));
+            let band = (shifted_y / 48) % 4;
+            Rgb([
+                (40 + band * 35) as u8,
+                ((x / 8 + band * 17) % 255) as u8,
+                (90 + band * 25) as u8,
+            ])
+        }
+        TestPatternMode::Motion => Rgb([
+            ((x + tick * 17) % 255) as u8,
+            ((y + tick * 29) % 255) as u8,
+            (((x / 8) + (y / 8) + tick * 11) % 255) as u8,
+        ]),
     }
 }
 
@@ -1366,7 +1690,7 @@ impl Capture for WaylandPipewireCapture {
         &mut self,
         max_width: u32,
         max_height: u32,
-    ) -> Result<DashInputFrame> {
+    ) -> Result<CapturedDashFrame> {
         let capture = self.ensure_started().await?;
         match capture.next_dash_frame(max_width, max_height).await {
             Ok(frame) => Ok(frame),
@@ -1538,11 +1862,22 @@ impl NativePipewireCapture {
         }
     }
 
-    async fn next_dash_frame(&mut self, max_width: u32, max_height: u32) -> Result<DashInputFrame> {
+    async fn next_dash_frame(
+        &mut self,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<CapturedDashFrame> {
         if matches!(&self.latest, NativePipewireFrames::Cpu(_)) {
-            return Ok(DashInputFrame::Rgb(
-                self.next_rgb(max_width, max_height).await?,
-            ));
+            let frame = self.next_frame().await?;
+            let change = frame_change_from_damage(frame.damage);
+            return Ok(CapturedDashFrame {
+                frame: DashInputFrame::Rgb(resize_rgb_image_to_fit(
+                    raw_frame_to_rgb_image(&frame)?,
+                    max_width,
+                    max_height,
+                )),
+                change,
+            });
         }
         let NativePipewireFrames::DmaBuf(latest) = &mut self.latest else {
             unreachable!("PipeWire frame source was checked above");
@@ -1562,30 +1897,34 @@ impl NativePipewireCapture {
             {
                 self.last_encoded_serial = frame.serial();
                 return match frame {
-                    PipewireVideoFrame::Cpu(frame) => {
-                        Ok(DashInputFrame::Rgb(resize_rgb_image_to_fit(
+                    PipewireVideoFrame::Cpu(frame) => Ok(CapturedDashFrame {
+                        change: frame_change_from_damage(frame.damage),
+                        frame: DashInputFrame::Rgb(resize_rgb_image_to_fit(
                             raw_frame_to_rgb_image(&frame)?,
                             max_width,
                             max_height,
-                        )))
-                    }
+                        )),
+                    }),
                     PipewireVideoFrame::DmaBuf(frame) => {
                         let (output_width, output_height) =
                             fit_even_dimensions(frame.width, frame.height, max_width, max_height);
-                        Ok(DashInputFrame::DmaBuf(DashDmaBufFrame {
-                            fd: Arc::clone(&frame.fd),
-                            release: frame.release.clone(),
-                            offset: frame.offset,
-                            size: frame.size,
-                            stride: usize::try_from(frame.stride)
-                                .context("PipeWire DMA-BUF stride is negative")?,
-                            drm_format: frame.drm_format,
-                            modifier: frame.modifier,
-                            source_width: frame.width,
-                            source_height: frame.height,
-                            output_width,
-                            output_height,
-                        }))
+                        Ok(CapturedDashFrame {
+                            change: frame_change_from_damage(frame.damage),
+                            frame: DashInputFrame::DmaBuf(DashDmaBufFrame {
+                                fd: Arc::clone(&frame.fd),
+                                release: frame.release.clone(),
+                                offset: frame.offset,
+                                size: frame.size,
+                                stride: usize::try_from(frame.stride)
+                                    .context("PipeWire DMA-BUF stride is negative")?,
+                                drm_format: frame.drm_format,
+                                modifier: frame.modifier,
+                                source_width: frame.width,
+                                source_height: frame.height,
+                                output_width,
+                                output_height,
+                            }),
+                        })
                     }
                 };
             }
@@ -1601,6 +1940,7 @@ impl NativePipewireCapture {
 #[derive(Clone)]
 struct RawFrame {
     serial: u64,
+    damage: Option<bool>,
     width: u32,
     height: u32,
     stride: usize,
@@ -1867,6 +2207,48 @@ fn clamped_cursor_position(position: i32, extent: u32) -> f32 {
     position.clamp(0, extent.min(i32::MAX as u32) as i32) as f32
 }
 
+fn frame_change_from_damage(damage: Option<bool>) -> FrameChange {
+    match damage {
+        Some(true) => FrameChange::Changed,
+        Some(false) => FrameChange::Unchanged,
+        None => FrameChange::Unknown,
+    }
+}
+
+fn pipewire_video_damage(buffer: *const spa::sys::spa_buffer) -> Option<bool> {
+    if buffer.is_null() {
+        return None;
+    }
+    // SAFETY: PipeWire owns `buffer` for the active process callback. Metadata
+    // pointers and byte lengths are validated before constructing a bounded
+    // array of `spa_meta_region` values.
+    unsafe {
+        if (*buffer).n_metas == 0 || (*buffer).metas.is_null() {
+            return None;
+        }
+        let metas = std::slice::from_raw_parts((*buffer).metas, (*buffer).n_metas as usize);
+        let meta = metas
+            .iter()
+            .find(|meta| meta.type_ == spa::sys::SPA_META_VideoDamage)?;
+        let region_size = std::mem::size_of::<spa::sys::spa_meta_region>();
+        if meta.data.is_null()
+            || region_size == 0
+            || !(meta.size as usize).is_multiple_of(region_size)
+        {
+            return None;
+        }
+        let regions = std::slice::from_raw_parts(
+            meta.data.cast::<spa::sys::spa_meta_region>(),
+            meta.size as usize / region_size,
+        );
+        Some(
+            regions.first().is_some_and(|region| {
+                region.region.size.width != 0 && region.region.size.height != 0
+            }),
+        )
+    }
+}
+
 fn pipewire_cursor_update(buffer: *const spa::sys::spa_buffer) -> PipewireCursorUpdate {
     if buffer.is_null() {
         return PipewireCursorUpdate::Unchanged;
@@ -2091,6 +2473,7 @@ impl PipewireVideoFrame {
 #[derive(Clone)]
 struct DmaBufFrame {
     serial: u64,
+    damage: Option<bool>,
     width: u32,
     height: u32,
     fd: Arc<OwnedFd>,
@@ -2700,7 +3083,7 @@ fn run_pipewire_loop(
                 modifier,
             ) {
                 Ok(buffer_param_bytes) => {
-                    update_pipewire_buffer_params_with_cursor_meta(
+                    update_pipewire_buffer_params_with_metadata(
                         stream,
                         buffer_param_bytes,
                         "PipeWire",
@@ -2744,6 +3127,7 @@ fn run_pipewire_loop(
             ) {
                 return;
             }
+            let damage = pipewire_video_damage(buffer.spa_buffer_ptr());
             let datas = buffer.datas_mut();
             if datas.is_empty() {
                 return;
@@ -2887,6 +3271,7 @@ fn run_pipewire_loop(
             user_data.serial = user_data.serial.wrapping_add(1);
             let frame = RawFrame {
                 serial: user_data.serial,
+                damage,
                 width: video_size.width,
                 height: video_size.height,
                 stride,
@@ -3077,7 +3462,7 @@ fn run_pipewire_video_loop(
                 user_data.format.modifier(),
             ) {
                 Ok(buffer_param_bytes) => {
-                    update_pipewire_buffer_params_with_cursor_meta(
+                    update_pipewire_buffer_params_with_metadata(
                         stream,
                         buffer_param_bytes,
                         "PipeWire video",
@@ -3113,6 +3498,7 @@ fn run_pipewire_video_loop(
             ) {
                 return;
             }
+            let damage = pipewire_video_damage(buffer.spa_buffer_ptr());
             let datas = buffer.datas_mut();
             if datas.is_empty() {
                 return;
@@ -3189,6 +3575,7 @@ fn run_pipewire_video_loop(
                 });
                 let frame = DmaBufFrame {
                     serial: user_data.serial,
+                    damage,
                     width: video_size.width,
                     height: video_size.height,
                     fd: Arc::new(owned_fd),
@@ -3236,6 +3623,7 @@ fn run_pipewire_video_loop(
             }
             let frame = RawFrame {
                 serial: user_data.serial,
+                damage,
                 width: video_size.width,
                 height: video_size.height,
                 stride,
@@ -3562,7 +3950,7 @@ fn serialize_pod_object(obj: spa::pod::Object) -> Result<Vec<u8>> {
     .into_inner())
 }
 
-fn update_pipewire_buffer_params_with_cursor_meta(
+fn update_pipewire_buffer_params_with_metadata(
     stream: &pw::stream::Stream,
     buffer_param_bytes: Vec<u8>,
     label: &str,
@@ -3571,6 +3959,10 @@ fn update_pipewire_buffer_params_with_cursor_meta(
     match build_pipewire_cursor_meta_param_pod() {
         Ok(bytes) => param_bytes.push(bytes),
         Err(err) => warn!(?err, %label, "failed to serialize PipeWire cursor metadata params"),
+    }
+    match build_pipewire_damage_meta_param_pod() {
+        Ok(bytes) => param_bytes.push(bytes),
+        Err(err) => warn!(?err, %label, "failed to serialize PipeWire damage metadata params"),
     }
     let mut params = Vec::with_capacity(param_bytes.len());
     for bytes in &param_bytes {
@@ -3583,6 +3975,25 @@ fn update_pipewire_buffer_params_with_cursor_meta(
     if let Err(err) = stream.update_params(&mut params) {
         warn!(?err, %label, "failed to update PipeWire buffer params");
     }
+}
+
+fn build_pipewire_damage_meta_param_pod() -> Result<Vec<u8>> {
+    const DAMAGE_REGION_CAPACITY: usize = 16;
+    let size = std::mem::size_of::<spa::sys::spa_meta_region>()
+        .saturating_mul(DAMAGE_REGION_CAPACITY)
+        .min(i32::MAX as usize) as i32;
+    let obj = spa::pod::Object {
+        type_: spa::utils::SpaTypes::ObjectParamMeta.as_raw(),
+        id: spa::param::ParamType::Meta.as_raw(),
+        properties: vec![
+            spa::pod::Property::new(
+                spa::sys::SPA_PARAM_META_type,
+                spa::pod::Value::Id(spa::utils::Id(spa::sys::SPA_META_VideoDamage)),
+            ),
+            spa::pod::Property::new(spa::sys::SPA_PARAM_META_size, spa::pod::Value::Int(size)),
+        ],
+    };
+    serialize_pod_object(obj)
 }
 
 fn build_pipewire_cursor_meta_param_pod() -> Result<Vec<u8>> {
@@ -4675,6 +5086,109 @@ mod tests {
     }
 
     #[test]
+    fn idle_heartbeat_is_bounded() {
+        assert_eq!(parse_idle_heartbeat_seconds("1").unwrap(), 1);
+        assert_eq!(parse_idle_heartbeat_seconds("300").unwrap(), 300);
+        assert!(parse_idle_heartbeat_seconds("0").is_err());
+        assert!(parse_idle_heartbeat_seconds("301").is_err());
+    }
+
+    #[test]
+    fn adaptive_media_cadence_coalesces_idle_time_and_flushes_before_changes() {
+        let mut cadence = AdaptiveMediaCadence::new(90_000, 900_000);
+        assert_eq!(
+            cadence.observe(90_000, false),
+            MediaCadenceDecision {
+                encode_pending_timestamp: Some(90_000),
+                ..MediaCadenceDecision::default()
+            }
+        );
+        assert_eq!(
+            cadence.observe(540_000, false),
+            MediaCadenceDecision::default()
+        );
+        assert_eq!(
+            cadence.observe(990_000, false),
+            MediaCadenceDecision {
+                flush_pending_duration: Some(900_000),
+                encode_pending_timestamp: Some(990_000),
+                ..MediaCadenceDecision::default()
+            }
+        );
+        assert_eq!(
+            cadence.observe(1_080_000, true),
+            MediaCadenceDecision {
+                flush_pending_duration: Some(90_000),
+                publish_current_timestamp: Some(1_080_000),
+                ..MediaCadenceDecision::default()
+            }
+        );
+        assert_eq!(cadence.finish(1_170_000), None);
+    }
+
+    #[test]
+    fn adaptive_media_cadence_never_overlaps_a_previous_sample() {
+        let mut cadence = AdaptiveMediaCadence::new(90_000, 900_000);
+        assert_eq!(
+            cadence.observe(89_000, true).publish_current_timestamp,
+            Some(90_000)
+        );
+        assert_eq!(
+            cadence.observe(150_000, true).publish_current_timestamp,
+            Some(180_000)
+        );
+    }
+
+    #[test]
+    fn frame_change_hints_override_rgb_fingerprint_fallback() {
+        let first = [1; 32];
+        let second = [2; 32];
+        assert!(!frame_changed(
+            FrameChange::Unknown,
+            Some(&first),
+            Some(&first)
+        ));
+        assert!(frame_changed(
+            FrameChange::Unknown,
+            Some(&first),
+            Some(&second)
+        ));
+        assert!(!frame_changed(
+            FrameChange::Unchanged,
+            Some(&first),
+            Some(&second)
+        ));
+        assert!(frame_changed(FrameChange::Changed, None, None));
+        assert!(frame_changed(FrameChange::Unknown, None, None));
+    }
+
+    #[test]
+    fn test_patterns_model_static_typing_scroll_and_motion_damage() {
+        let mut static_pattern = TestPatternCapture::new(96, 96, TestPatternMode::Static);
+        let static_first = static_pattern.next_rgb();
+        let static_second = static_pattern.next_rgb();
+        assert_eq!(static_first, static_second);
+        assert!(!static_pattern.frame_changed());
+
+        let mut typing = TestPatternCapture::new(96, 96, TestPatternMode::Typing);
+        let first = typing.next_rgb();
+        let second = typing.next_rgb();
+        assert_eq!(first, second);
+        typing.next_rgb();
+        let fourth = typing.next_rgb();
+        assert_ne!(second, fourth);
+        assert!(typing.frame_changed());
+
+        for mode in [TestPatternMode::Scroll, TestPatternMode::Motion] {
+            let mut pattern = TestPatternCapture::new(96, 96, mode);
+            let first = pattern.next_rgb();
+            let second = pattern.next_rgb();
+            assert_ne!(first, second);
+            assert!(pattern.frame_changed());
+        }
+    }
+
+    #[test]
     fn pipewire_capture_rate_tracks_cursor_rate_above_frame_rate() {
         assert_eq!(pipewire_capture_rate(1.0, 30), 30.0);
         assert_eq!(pipewire_capture_rate(15.0, 10), 15.0);
@@ -4759,6 +5273,55 @@ mod tests {
                 .is_some()
         );
         assert!(pipewire_cursor_meta_size(PIPEWIRE_CURSOR_DEFAULT_BITMAP_SIDE) > 0);
+    }
+
+    #[test]
+    fn pipewire_damage_meta_request_has_type_and_capacity() {
+        let bytes = build_pipewire_damage_meta_param_pod().unwrap();
+        let pod = spa::pod::Pod::from_bytes(&bytes).unwrap();
+        let object = <&spa::pod::PodObject>::try_from(pod).unwrap();
+        let meta_type = object
+            .find_prop(spa::utils::Id(spa::sys::SPA_PARAM_META_type))
+            .expect("damage meta request type property");
+        assert_eq!(
+            meta_type.value().get_id().unwrap(),
+            spa::utils::Id(spa::sys::SPA_META_VideoDamage)
+        );
+        assert!(
+            object
+                .find_prop(spa::utils::Id(spa::sys::SPA_PARAM_META_size))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn pipewire_damage_metadata_distinguishes_idle_changed_and_unknown_buffers() {
+        let damage = |width, height, complete: bool| {
+            let mut region = spa::sys::spa_meta_region {
+                region: spa::sys::spa_region {
+                    position: spa::sys::spa_point { x: 0, y: 0 },
+                    size: spa::sys::spa_rectangle { width, height },
+                },
+            };
+            let mut meta = spa::sys::spa_meta {
+                type_: spa::sys::SPA_META_VideoDamage,
+                size: std::mem::size_of::<spa::sys::spa_meta_region>() as u32
+                    - u32::from(!complete),
+                data: (&mut region as *mut spa::sys::spa_meta_region).cast(),
+            };
+            let buffer = spa::sys::spa_buffer {
+                n_metas: 1,
+                n_datas: 0,
+                metas: &mut meta,
+                datas: ptr::null_mut(),
+            };
+            pipewire_video_damage(&buffer)
+        };
+
+        assert_eq!(damage(0, 0, true), Some(false));
+        assert_eq!(damage(12, 8, true), Some(true));
+        assert_eq!(damage(12, 8, false), None);
+        assert_eq!(pipewire_video_damage(ptr::null()), None);
     }
 
     #[test]
