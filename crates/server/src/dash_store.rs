@@ -417,6 +417,33 @@ impl DashStore {
         Ok(removed.is_some())
     }
 
+    pub fn enforce_retention_now(&self) -> Result<usize> {
+        self.enforce_retention_at(glacialcast_protocol::now_ms())
+    }
+
+    fn enforce_retention_at(&self, now_ms: i64) -> Result<usize> {
+        let handles = self.catalogs()?;
+        let mut removed_count = 0usize;
+        for (stream_id, handle) in handles {
+            let mut catalog = handle
+                .lock()
+                .map_err(|_| anyhow::anyhow!("DASH stream catalog mutex poisoned"))?;
+            let mut next_catalog = catalog.clone();
+            let removed = self.enforce_retention(&mut next_catalog, now_ms);
+            if removed.is_empty() {
+                continue;
+            }
+
+            self.persist_catalog(stream_id, &next_catalog)
+                .context("persisting periodic DASH retention")?;
+            next_catalog.journal_entries = 0;
+            *catalog = next_catalog;
+            removed_count = removed_count.saturating_add(removed.len());
+            remove_retained_paths(removed, "periodic DASH retention");
+        }
+        Ok(removed_count)
+    }
+
     fn latest_payload(
         &self,
         stream_id: Uuid,
@@ -1003,6 +1030,18 @@ fn sync_directory(path: &Path) -> Result<()> {
         .with_context(|| format!("syncing directory {}", path.display()))
 }
 
+fn remove_retained_paths(paths: Vec<PathBuf>, operation: &'static str) {
+    for path in paths {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::warn!(?err, path = %path.display(), operation, "failed to remove retained DASH object")
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1509,6 +1548,51 @@ mod tests {
 
         let reopened = DashStore::open(root.clone(), 1024 * 1024, Duration::from_secs(1)).unwrap();
         assert!(reopened.list(stream_id).unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn periodic_retention_expires_an_idle_stream_durably() {
+        let root = std::env::temp_dir().join(format!("glacialcast-dash-{}", Uuid::new_v4()));
+        let store = DashStore::open(root.clone(), 1024 * 1024, Duration::from_secs(1)).unwrap();
+        let stream_id = Uuid::from_u128(23);
+        let epoch_id = Uuid::from_u128(24);
+        let keys = EpochKeys::derive(&[8u8; 32], stream_id, epoch_id).unwrap();
+        let stored = store
+            .store(object(
+                &keys,
+                stream_id,
+                epoch_id,
+                ObjectSpec {
+                    kind: DashObjectKind::Media,
+                    sequence: 1,
+                    segment_number: 1,
+                    chunk_index: 0,
+                    random_access: true,
+                    payload: vec![1, 2, 3],
+                },
+            ))
+            .unwrap();
+
+        assert_eq!(
+            store
+                .enforce_retention_at(stored.received_at_ms + 1_001)
+                .unwrap(),
+            1
+        );
+        assert!(store.list(stream_id).unwrap().is_empty());
+        assert_eq!(store.last_sequence(stream_id).unwrap(), Some(1));
+        assert!(
+            !store
+                .stream_dir(stream_id)
+                .join(stored.relative_path)
+                .exists()
+        );
+
+        drop(store);
+        let reopened = DashStore::open(root.clone(), 1024 * 1024, Duration::from_secs(1)).unwrap();
+        assert!(reopened.list(stream_id).unwrap().is_empty());
+        assert_eq!(reopened.last_sequence(stream_id).unwrap(), Some(1));
         std::fs::remove_dir_all(root).unwrap();
     }
 

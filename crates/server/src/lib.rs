@@ -615,6 +615,32 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
     };
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     tokio::spawn(install_signal_handlers(shutdown_tx.clone()));
+    let retention_store = state.dash_store.clone();
+    let mut retention_shutdown = shutdown_rx.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = wait_for_shutdown(&mut retention_shutdown) => return,
+                _ = interval.tick() => {
+                    let store = retention_store.clone();
+                    match tokio::task::spawn_blocking(move || store.enforce_retention_now()).await {
+                        Ok(Ok(0)) => {}
+                        Ok(Ok(removed)) => {
+                            info!(removed, "expired retained DASH objects");
+                        }
+                        Ok(Err(err)) => {
+                            error!(?err, "periodic DASH retention failed");
+                        }
+                        Err(err) => {
+                            error!(?err, "periodic DASH retention task panicked");
+                        }
+                    }
+                }
+            }
+        }
+    });
     if serve_control {
         let control_shutdown = shutdown_tx.clone();
         tokio::spawn(async move {

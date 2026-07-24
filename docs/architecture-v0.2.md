@@ -190,6 +190,9 @@ The default is 30 minutes and 512 MiB. Eviction operates on decodable segment
 groups and retains the epoch initialization object required by every surviving
 group. Cursor batches are evicted with their corresponding media time range,
 and cursor-only groups are subject to the same age and byte limits.
+The relay evaluates the policy on ingest and startup and runs a periodic
+one-second sweep, so an inactive stream cannot retain objects indefinitely
+after its age window expires.
 
 Acknowledgement means an object is durably written and indexed, not merely
 queued in memory.
