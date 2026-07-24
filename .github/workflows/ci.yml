@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Standard quality gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            clang \
+            libclang-dev \
+            libgbm-dev \
+            libopenh264-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev \
+            libva-dev
+      - name: Install Rust tools
+        run: |
+          rustup update stable
+          rustup default stable
+          cargo install cargo-deny --locked
+      - name: Run standard gate
+        run: scripts/verify-quality.sh standard
+
+  integration:
+    name: Deterministic integration gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            clang \
+            libclang-dev \
+            libgbm-dev \
+            libopenh264-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev \
+            libva-dev
+      - name: Select stable Rust
+        run: |
+          rustup update stable
+          rustup default stable
+      - name: Run encrypted transport and recovery gates
+        run: |
+          scripts/verify-dash-e2e.sh
+          scripts/verify-ingest-recovery.sh
+          scripts/verify-internet-security.sh
+          scripts/verify-performance.sh
+      - name: Run short reliability soak
+        env:
+          GLACIALCAST_SOAK_SECONDS: "30"
+          GLACIALCAST_SOAK_SAMPLE_SECONDS: "2"
+        run: scripts/verify-soak.sh
+      - name: Enforce low-bandwidth profile
+        run: scripts/verify-bandwidth.sh

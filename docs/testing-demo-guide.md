@@ -82,11 +82,24 @@ They verify:
 - portable `.gco` mirroring and offline endpoints;
 - invalid publisher-token rejection and recovery across a forced crash;
 - viewer/admin roles, publisher scopes, CSRF, exact origins, throttling,
-  security headers, private configuration, and fail-closed listeners; and
+  security headers, private configuration, and fail-closed listeners;
+- a moving 1280×720, 1 FPS, 30 Hz cursor application-traffic ceiling; and
 - conservative crypto, packaging, and durable-storage throughput floors.
 
 Each script prints a final line beginning with `PASS:`. A failure is meaningful:
 do not continue to the hardware-specific tests until these pass.
+
+Run the reliability profile for at least 30 minutes before a release:
+
+```sh
+GLACIALCAST_SOAK_SECONDS=1800 scripts/verify-quality.sh soak
+```
+
+The soak gate samples readiness and durable sequence progress, rejects a
+stalled publisher, enforces configurable client/server RSS ceilings, confirms
+media and cursor traffic accounting, and checks that the viewer key never
+appears in relay logs. Pull requests run a short version; the nightly workflow
+runs the 30-minute release duration.
 
 The scripts use isolated `/tmp/glacialcast-*` directories and loopback ports.
 If a default port is occupied, override it. For example:
@@ -97,6 +110,12 @@ GLACIALCAST_VERIFY_INGEST_ADDR=127.0.0.1:29000 \
 GLACIALCAST_VERIFY_OFFLINE_ADDR=127.0.0.1:29001 \
 scripts/verify-dash-e2e.sh
 ```
+
+The hosted workflows run the standard and deterministic integration gates on
+every push or pull request. Nightly automation runs the release-duration soak
+and Firefox/Chromium live plus offline playback. Real compositor and GPU gates
+remain self-hosted; record their release evidence with the procedure in
+`docs/support-matrix.md`.
 
 ## 4. Install the browser-test runtime
 

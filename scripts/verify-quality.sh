@@ -7,7 +7,7 @@ cd "${repo_root}"
 profile="${1:-standard}"
 
 usage() {
-  echo "usage: scripts/verify-quality.sh [standard|full]" >&2
+  echo "usage: scripts/verify-quality.sh [standard|full|soak]" >&2
 }
 
 run() {
@@ -33,6 +33,7 @@ full_checks() {
   run scripts/verify-dash-e2e.sh
   run scripts/verify-ingest-recovery.sh
   run scripts/verify-internet-security.sh
+  run scripts/verify-bandwidth.sh
   run scripts/verify-performance.sh
 }
 
@@ -42,6 +43,10 @@ case "${profile}" in
     ;;
   full)
     full_checks
+    ;;
+  soak)
+    standard_checks
+    run scripts/verify-soak.sh
     ;;
   *)
     usage

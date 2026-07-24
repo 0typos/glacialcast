@@ -158,6 +158,16 @@ scripts/verify-wayland-cursor-metadata.sh
 scripts/verify-wayland-video-hardware.sh
 ```
 
+Release candidates also run:
+
+```sh
+GLACIALCAST_SOAK_SECONDS=1800 scripts/verify-quality.sh soak
+```
+
+Record compositor and GPU results with
+`scripts/record-platform-support.sh --run-gates`; a compilation result is not
+platform-validation evidence.
+
 The browser gate requires Docker and Playwright. Wayland and hardware gates
 must run inside the target graphical session; see
 `docs/testing-demo-guide.md`.

@@ -270,12 +270,15 @@ For niri portal routing helpers and an upstream diagnostic template, see
 ```sh
 scripts/verify-quality.sh standard
 scripts/verify-quality.sh full
+GLACIALCAST_SOAK_SECONDS=1800 scripts/verify-quality.sh soak
 scripts/verify-internet-browser.sh
 ```
 
 The `standard` profile is the normal commit gate. The `full` profile includes
 that gate plus the synthetic DASH/offline, crash-recovery, Internet-security,
-and release-performance integrations. Run the browser command separately when
+and release-performance integrations. The `soak` profile adds a bounded
+long-running publisher/relay reliability check with progress, memory, traffic,
+retention, and key-leak assertions. Run the browser command separately when
 Docker and Playwright are available.
 
 `scripts/verify-dash-e2e.sh` exercises an authenticated encrypted test stream
@@ -286,9 +289,13 @@ origin and CSRF enforcement, throttling, security headers, protected mirroring,
 monitoring, and fail-closed configuration. The Internet browser gate places
 the relay behind a real Caddy HTTPS proxy and verifies authenticated playback
 and cursor behavior in both Firefox and Chromium. The performance gate runs
-conservative release-mode throughput and durable-object floors. Hardware
-checks require the corresponding host capabilities and are described in
-`docs/completion-audit.md`.
+conservative release-mode throughput and durable-object floors. The bandwidth
+gate enforces application-byte ceilings for the default moving 1280×720,
+1 FPS video and independent 30 Hz cursor profile; framing overhead remains a
+deployment measurement. Hardware checks require the corresponding host
+capabilities and are described in `docs/completion-audit.md`. The
+release-validation targets and evidence collection command are in
+`docs/support-matrix.md`.
 
 For a staged checklist, interactive local demo, browser setup, real Wayland and
 VA-API gates, offline-file demonstration, deployed-host smoke test, and

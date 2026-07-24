@@ -1,0 +1,76 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-main
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  soak:
+    name: Thirty-minute reliability soak
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            clang \
+            libclang-dev \
+            libgbm-dev \
+            libopenh264-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev \
+            libva-dev
+      - name: Select stable Rust
+        run: |
+          rustup update stable
+          rustup default stable
+      - name: Run reliability soak
+        env:
+          GLACIALCAST_SOAK_SECONDS: "1800"
+          GLACIALCAST_SOAK_SAMPLE_SECONDS: "10"
+        run: scripts/verify-soak.sh
+
+  browsers:
+    name: Firefox and Chromium playback
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            clang \
+            libclang-dev \
+            libgbm-dev \
+            libopenh264-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev \
+            libva-dev
+      - name: Select stable Rust
+        run: |
+          rustup update stable
+          rustup default stable
+      - name: Install browser test runtime
+        run: |
+          npm install --prefix /tmp/glacialcast-playwright playwright
+          /tmp/glacialcast-playwright/node_modules/.bin/playwright install --with-deps firefox chromium
+      - name: Run live and offline browser matrix
+        env:
+          GLACIALCAST_PLAYWRIGHT_MODULE: /tmp/glacialcast-playwright/node_modules/playwright
+          GLACIALCAST_VERIFY_BROWSERS: firefox,chromium
+          GLACIALCAST_VERIFY_OFFLINE_BROWSERS: firefox,chromium
+        run: scripts/verify-dash-e2e.sh
