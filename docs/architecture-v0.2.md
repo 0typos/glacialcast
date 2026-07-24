@@ -230,7 +230,12 @@ so a one-way file transport can copy them incrementally without understanding
 the media or possessing the viewer key.
 
 `glacialcast-offline mirror` materializes these files atomically from a relay.
-The files can then be transferred by any out-of-band mechanism.
+After each pass it atomically publishes a versioned
+`glacialcast-transfer.json` containing the stream identity, exact object
+headers, lengths, and SHA-256 checksums. Existing valid objects are skipped, so
+mirroring resumes at object granularity. `glacialcast-offline verify` checks
+the manifest and reports missing or unexpected filenames, allowing files to
+arrive out of order through any out-of-band mechanism.
 `glacialcast-offline serve` watches a received directory and embeds the complete
 local viewer and MPEG-DASH endpoints in one binary. The offline host therefore
 needs only that binary, the object files, and an installed Firefox or Chromium

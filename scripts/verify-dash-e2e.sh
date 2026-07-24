@@ -182,6 +182,25 @@ if ! find "${work_dir}/offline" -maxdepth 1 -name '*.gco' -print -quit | grep -q
   echo "offline mirror did not produce portable .gco objects" >&2
   exit 1
 fi
+target/debug/glacialcast-offline verify \
+  --input "${work_dir}/offline" \
+  --json >"${work_dir}/verify-complete.json"
+grep -Fq '"complete": true' "${work_dir}/verify-complete.json"
+portable_objects=("${work_dir}/offline/"*.gco)
+missing_object="${portable_objects[0]}"
+missing_name="${missing_object##*/}"
+mv "${missing_object}" "${missing_object}.holding"
+if target/debug/glacialcast-offline verify \
+  --input "${work_dir}/offline" \
+  --json >"${work_dir}/verify-missing.json" 2>"${work_dir}/verify-missing.log"; then
+  echo "offline verification accepted a missing declared object" >&2
+  exit 1
+fi
+grep -Fq '"complete": false' "${work_dir}/verify-missing.json"
+grep -Fq "\"${missing_name}\"" "${work_dir}/verify-missing.json"
+mv "${missing_object}.holding" "${missing_object}"
+target/debug/glacialcast-offline verify --input "${work_dir}/offline" >/dev/null
+
 target/debug/glacialcast-offline mirror \
   --server "${origin}" \
   --stream-id "${stream_id}" \
@@ -224,4 +243,4 @@ if [[ -n "${GLACIALCAST_VERIFY_OFFLINE_BROWSERS:-}" ]]; then
   done
 fi
 
-echo "PASS: authenticated CENC DASH media and cursor objects survived relay and portable offline playback; capture-to-relay max=${max_capture_latency_ms}ms"
+echo "PASS: authenticated CENC DASH media and cursor objects survived relay, checksummed resumable transfer, and portable offline playback; capture-to-relay max=${max_capture_latency_ms}ms"

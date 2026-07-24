@@ -377,11 +377,24 @@ target/release/glacialcast-offline mirror \
 
 mkdir -p "$demo_dir/received"
 cp "$demo_dir/outgoing/"*.gco "$demo_dir/received/"
+cp "$demo_dir/outgoing/glacialcast-transfer.json" "$demo_dir/received/"
+
+target/release/glacialcast-offline verify \
+  --input "$demo_dir/received"
 ```
 
 The `received` directory represents the files delivered to the disconnected
-machine. Stop the live publisher and relay if you want to demonstrate that no
-network connection is needed, then run:
+machine. The versioned manifest contains each portable filename, public object
+header, byte length, and SHA-256 checksum. `verify` exits nonzero for missing,
+unexpected, corrupt, symlinked, or metadata-mismatched objects; add `--json` for
+a transfer tool or automation.
+
+Files may arrive in any order. For a resumable transfer, copy only the missing
+filenames reported by `verify`, then rerun it. Copy the manifest after taking
+the snapshot (or copy it first and treat its missing list as the work queue);
+publish each file by atomic rename on the receiver. Stop the live publisher and
+relay if you want to demonstrate that no network connection is needed, then
+run:
 
 ```sh
 target/release/glacialcast-offline serve \
@@ -392,10 +405,14 @@ target/release/glacialcast-offline serve \
 Open `http://127.0.0.1:8910`, select the stream, and use the same viewer key.
 The copied presentation should decode, include cursor history, and allow
 timeline seeking. The offline service intentionally refuses a non-loopback bind
-unless `--allow-non-loopback` is explicitly supplied.
+unless `--allow-non-loopback` is explicitly supplied. It reads and watches the
+input directory but never modifies it, so the verified presentation can be
+mounted read-only.
 
 For a continuously updated outgoing directory, add `--follow` to `mirror` and
-copy only completed `.gco` files. Never transfer `.part` files.
+copy only completed `.gco` files. Copy the atomically replaced manifest after
+each batch. Never transfer `.part` files. Re-running `mirror` validates and
+skips existing objects, so an interrupted mirror resumes at object granularity.
 
 ## 9. Smoke-test a deployed Internet instance
 

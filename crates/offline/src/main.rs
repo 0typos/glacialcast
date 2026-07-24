@@ -25,11 +25,14 @@ use futures_util::{SinkExt, StreamExt};
 use glacialcast_dash::{EpochDescriptor, MpdConfig, SegmentTimelineEntry, build_mpd};
 use glacialcast_protocol::{DashObject, DashObjectHeader, DashObjectKind, MAX_FRAME_LEN};
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     fs::{File, OpenOptions},
     io::Write,
     net::SocketAddr,
+    os::unix::fs::OpenOptionsExt,
     path::{Path as FsPath, PathBuf},
     sync::Arc,
     time::Duration,
@@ -43,9 +46,15 @@ const VIEWER_CSS: &str = include_str!("../../server/static/dash-viewer.css");
 const VIEWER_CORE_JS: &str = include_str!("../../server/static/dash-viewer-core.js");
 const VIEWER_JS: &str = include_str!("../../server/static/dash-viewer.js");
 const MAX_PORTABLE_FILE_LEN: u64 = MAX_FRAME_LEN as u64 + 128 * 1024;
+const TRANSFER_MANIFEST_FILE: &str = "glacialcast-transfer.json";
+const TRANSFER_MANIFEST_VERSION: u16 = 1;
+const MAX_TRANSFER_MANIFEST_LEN: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
-#[command(about = "Mirror and view GlacialCast encrypted DASH object files")]
+#[command(
+    about = "Mirror and view GlacialCast encrypted DASH object files",
+    version
+)]
 struct Args {
     #[command(subcommand)]
     command: Command,
@@ -78,6 +87,42 @@ enum Command {
         #[arg(long)]
         allow_non_loopback: bool,
     },
+    /// Verify a portable transfer manifest and every declared object.
+    Verify {
+        #[arg(long)]
+        input: PathBuf,
+        /// Emit a machine-readable verification report.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransferManifest {
+    version: u16,
+    stream_id: Uuid,
+    generated_at_ms: i64,
+    objects: Vec<TransferObject>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransferObject {
+    filename: String,
+    length: u64,
+    sha256: String,
+    header: DashObjectHeader,
+}
+
+#[derive(Debug, Serialize)]
+struct TransferVerification {
+    complete: bool,
+    stream_id: Uuid,
+    expected_objects: usize,
+    verified_objects: usize,
+    missing: Vec<String>,
+    unexpected: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -124,6 +169,27 @@ async fn main() -> Result<()> {
             listen,
             allow_non_loopback,
         } => serve(input, listen, allow_non_loopback).await,
+        Command::Verify { input, json } => {
+            let report = verify_transfer(&input)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "stream {}: verified {}/{} objects",
+                    report.stream_id, report.verified_objects, report.expected_objects
+                );
+                for filename in &report.missing {
+                    println!("missing: {filename}");
+                }
+                for filename in &report.unexpected {
+                    println!("unexpected: {filename}");
+                }
+            }
+            if !report.complete {
+                bail!("portable transfer is incomplete");
+            }
+            Ok(())
+        }
     }
 }
 
@@ -165,6 +231,7 @@ async fn mirror(
 
     loop {
         let mirrored = mirror_once(&client, server, access_token, stream_id, output).await?;
+        write_transfer_manifest(output, stream_id)?;
         info!(stream_id = %stream_id, mirrored, "offline mirror pass complete");
         if !follow {
             return Ok(());
@@ -254,6 +321,182 @@ async fn mirror_once(
     Ok(mirrored)
 }
 
+fn write_transfer_manifest(root: &FsPath, stream_id: Uuid) -> Result<()> {
+    let mut objects = Vec::new();
+    for path in portable_paths(root)? {
+        let object = read_portable_object(&path)?;
+        if object.header.stream_id != stream_id {
+            bail!(
+                "portable object {} belongs to stream {}, expected {}",
+                path.display(),
+                object.header.stream_id,
+                stream_id
+            );
+        }
+        let filename = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .context("portable object filename is not UTF-8")?
+            .to_string();
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("hashing portable object {}", path.display()))?;
+        objects.push(TransferObject {
+            filename,
+            length: bytes.len() as u64,
+            sha256: sha256_hex(&bytes),
+            header: object.header,
+        });
+    }
+    objects.sort_by_key(|object| object.header.sequence);
+    let manifest = TransferManifest {
+        version: TRANSFER_MANIFEST_VERSION,
+        stream_id,
+        generated_at_ms: glacialcast_protocol::now_ms(),
+        objects,
+    };
+    let bytes = serde_json::to_vec_pretty(&manifest).context("serializing transfer manifest")?;
+    atomic_write(root, &root.join(TRANSFER_MANIFEST_FILE), &bytes)
+}
+
+fn verify_transfer(root: &FsPath) -> Result<TransferVerification> {
+    if !root.is_dir() {
+        bail!("portable transfer is not a directory: {}", root.display());
+    }
+    let manifest_path = root.join(TRANSFER_MANIFEST_FILE);
+    let metadata = std::fs::symlink_metadata(&manifest_path)
+        .with_context(|| format!("reading transfer manifest {}", manifest_path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "transfer manifest is not a regular file: {}",
+            manifest_path.display()
+        );
+    }
+    if metadata.len() > MAX_TRANSFER_MANIFEST_LEN {
+        bail!("transfer manifest exceeds its size limit");
+    }
+    let manifest: TransferManifest = serde_json::from_slice(
+        &std::fs::read(&manifest_path)
+            .with_context(|| format!("reading transfer manifest {}", manifest_path.display()))?,
+    )
+    .context("decoding transfer manifest")?;
+    if manifest.version != TRANSFER_MANIFEST_VERSION {
+        bail!("unsupported transfer manifest version {}", manifest.version);
+    }
+    if manifest.generated_at_ms <= 0 {
+        bail!("transfer manifest has an invalid generation time");
+    }
+
+    let mut expected_names = HashSet::new();
+    let mut sequences = HashSet::new();
+    let mut missing = Vec::new();
+    let mut verified_objects = 0usize;
+    for declared in &manifest.objects {
+        let expected_filename = format!("{:020}.gco", declared.header.sequence);
+        if declared.filename != expected_filename
+            || !expected_names.insert(declared.filename.clone())
+            || !sequences.insert(declared.header.sequence)
+        {
+            bail!(
+                "transfer manifest contains an invalid or duplicate object {}",
+                declared.filename
+            );
+        }
+        if declared.header.stream_id != manifest.stream_id {
+            bail!("transfer manifest contains an object for a different stream");
+        }
+        let path = root.join(&declared.filename);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(declared.filename.clone());
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspecting {}", path.display()));
+            }
+        };
+        if !metadata.file_type().is_file() {
+            bail!("declared object is not a regular file: {}", path.display());
+        }
+        if metadata.len() != declared.length || metadata.len() > MAX_PORTABLE_FILE_LEN {
+            bail!("declared object length mismatch: {}", path.display());
+        }
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        if sha256_hex(&bytes) != declared.sha256 {
+            bail!("declared object checksum mismatch: {}", path.display());
+        }
+        let object = DashObject::from_portable_bytes(&bytes)
+            .with_context(|| format!("decoding declared object {}", path.display()))?;
+        if object.header != declared.header {
+            bail!("declared object metadata mismatch: {}", path.display());
+        }
+        verified_objects += 1;
+    }
+
+    let mut unexpected = Vec::new();
+    for entry in
+        std::fs::read_dir(root).with_context(|| format!("reading transfer {}", root.display()))?
+    {
+        let entry = entry.with_context(|| format!("reading an entry in {}", root.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("gco") {
+            continue;
+        }
+        let filename = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("portable object filename is not UTF-8"))?;
+        if !entry.file_type()?.is_file() {
+            bail!("portable object is not a regular file: {}", path.display());
+        }
+        if !expected_names.contains(&filename) {
+            unexpected.push(filename);
+        }
+    }
+    missing.sort();
+    unexpected.sort();
+    Ok(TransferVerification {
+        complete: missing.is_empty() && unexpected.is_empty(),
+        stream_id: manifest.stream_id,
+        expected_objects: manifest.objects.len(),
+        verified_objects,
+        missing,
+        unexpected,
+    })
+}
+
+fn atomic_write(directory: &FsPath, path: &FsPath, bytes: &[u8]) -> Result<()> {
+    let temporary = directory.join(format!(".transfer-{}.part", Uuid::new_v4()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(&temporary)
+        .with_context(|| format!("creating {}", temporary.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("writing {}", temporary.display()))?;
+    file.sync_all()
+        .with_context(|| format!("syncing {}", temporary.display()))?;
+    std::fs::rename(&temporary, path).with_context(|| {
+        format!(
+            "publishing transfer manifest {} as {}",
+            temporary.display(),
+            path.display()
+        )
+    })?;
+    File::open(directory)
+        .with_context(|| format!("opening {}", directory.display()))?
+        .sync_all()
+        .with_context(|| format!("syncing {}", directory.display()))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn portable_object_path(output: &FsPath, sequence: u64) -> PathBuf {
     output.join(format!("{sequence:020}.gco"))
 }
@@ -316,6 +559,24 @@ async fn serve(input: PathBuf, listen: SocketAddr, allow_non_loopback: bool) -> 
     validate_offline_listener(listen, allow_non_loopback)?;
     if !input.is_dir() {
         bail!("offline input is not a directory: {}", input.display());
+    }
+    let transfer_manifest = input.join(TRANSFER_MANIFEST_FILE);
+    match std::fs::symlink_metadata(&transfer_manifest) {
+        Ok(_) => {
+            let report = verify_transfer(&input)?;
+            if !report.complete {
+                warn!(
+                    missing = report.missing.len(),
+                    unexpected = report.unexpected.len(),
+                    "serving an incomplete transfer while objects continue to arrive"
+                );
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspecting {}", transfer_manifest.display()));
+        }
     }
     if !listen.ip().is_loopback() {
         warn!(
@@ -926,6 +1187,83 @@ mod tests {
         drop(file);
         let error = OfflineCatalog::load(oversized.path()).err().unwrap();
         assert!(error.to_string().contains("exceeds its size limit"));
+    }
+
+    #[test]
+    fn transfer_manifest_verifies_out_of_order_files_and_reports_missing_objects() {
+        let directory = TestDirectory::new();
+        let stream_id = Uuid::new_v4();
+        let epoch_id = Uuid::new_v4();
+        for sequence in [3, 1, 2] {
+            let object = test_object(
+                stream_id,
+                epoch_id,
+                DashObjectKind::Cursor,
+                sequence,
+                1,
+                0,
+                vec![sequence as u8],
+            );
+            let path = portable_object_path(directory.path(), sequence);
+            write_portable_object(directory.path(), &path, &object).unwrap();
+        }
+        write_transfer_manifest(directory.path(), stream_id).unwrap();
+        let report = verify_transfer(directory.path()).unwrap();
+        assert!(report.complete);
+        assert_eq!(report.expected_objects, 3);
+        assert_eq!(report.verified_objects, 3);
+
+        let second = portable_object_path(directory.path(), 2);
+        let holding = directory.path().join("second.holding");
+        std::fs::rename(&second, &holding).unwrap();
+        let report = verify_transfer(directory.path()).unwrap();
+        assert!(!report.complete);
+        assert_eq!(report.verified_objects, 2);
+        assert_eq!(report.missing, ["00000000000000000002.gco"]);
+        std::fs::rename(holding, second).unwrap();
+        assert!(verify_transfer(directory.path()).unwrap().complete);
+    }
+
+    #[test]
+    fn transfer_verification_rejects_checksum_changes_and_unexpected_objects() {
+        let directory = TestDirectory::new();
+        let stream_id = Uuid::new_v4();
+        let epoch_id = Uuid::new_v4();
+        let first = test_object(
+            stream_id,
+            epoch_id,
+            DashObjectKind::Cursor,
+            1,
+            1,
+            0,
+            vec![1],
+        );
+        let first_path = portable_object_path(directory.path(), 1);
+        write_portable_object(directory.path(), &first_path, &first).unwrap();
+        write_transfer_manifest(directory.path(), stream_id).unwrap();
+
+        let unexpected = test_object(
+            stream_id,
+            epoch_id,
+            DashObjectKind::Cursor,
+            2,
+            1,
+            0,
+            vec![2],
+        );
+        let unexpected_path = portable_object_path(directory.path(), 2);
+        write_portable_object(directory.path(), &unexpected_path, &unexpected).unwrap();
+        let report = verify_transfer(directory.path()).unwrap();
+        assert!(!report.complete);
+        assert_eq!(report.unexpected, ["00000000000000000002.gco"]);
+        std::fs::remove_file(unexpected_path).unwrap();
+
+        let mut bytes = std::fs::read(&first_path).unwrap();
+        let last = bytes.last_mut().unwrap();
+        *last ^= 1;
+        std::fs::write(&first_path, bytes).unwrap();
+        let error = verify_transfer(directory.path()).unwrap_err();
+        assert!(error.to_string().contains("checksum mismatch"));
     }
 
     #[cfg(unix)]
