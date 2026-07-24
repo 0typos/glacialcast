@@ -3,7 +3,12 @@ use aes_gcm::{
     aead::{Aead, OsRng, rand_core::RngCore},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use glacialcast_dash::{
+    DASH_FORMAT_VERSION, EpochKeys, MAX_CURSOR_PAYLOAD, MAX_MEDIA_PAYLOAD, authenticate_object,
+    verify_object_authentication,
+};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use snow::{Builder, HandshakeState, TransportState, params::NoiseParams};
 use std::io;
 use thiserror::Error;
@@ -12,7 +17,7 @@ use uuid::Uuid;
 
 pub mod daemon;
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MAX_FRAME_LEN: usize = 32 * 1024 * 1024;
 const MAX_NOISE_PLAINTEXT_LEN: usize = 60 * 1024;
 const NOISE_SEGMENT_MAGIC: &[u8; 4] = b"GCN1";
@@ -37,6 +42,18 @@ pub enum ProtocolError {
     Crypto,
     #[error("viewer key must decode to 32 bytes, got {0}")]
     InvalidKeyLength(usize),
+    #[error("unsupported DASH object format version {0}")]
+    UnsupportedDashVersion(u16),
+    #[error("DASH object payload length does not match its header")]
+    DashPayloadLength,
+    #[error("DASH object payload exceeds its size limit")]
+    DashPayloadTooLarge,
+    #[error("DASH object payload hash does not match its header")]
+    DashPayloadHash,
+    #[error("DASH object has invalid metadata: {0}")]
+    InvalidDashMetadata(&'static str),
+    #[error("DASH object authentication failed")]
+    DashAuthentication,
 }
 
 pub type Result<T> = std::result::Result<T, ProtocolError>;
@@ -58,6 +75,7 @@ pub struct StreamHello {
 pub enum StreamMediaKind {
     Image,
     Video,
+    Dash,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,9 +91,213 @@ pub enum ClientMessage {
     Hello(StreamHello),
     Frame(FrameMessage),
     VideoChunk(VideoChunkMessage),
+    DashObject(DashObject),
     Cursor(CursorMessage),
     BufferStatus(BufferStatus),
     Ping { now_ms: i64 },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DashObjectKind {
+    Epoch,
+    Initialization,
+    Media,
+    Cursor,
+    Index,
+    End,
+}
+
+impl DashObjectKind {
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Epoch => 0,
+            Self::Initialization => 1,
+            Self::Media => 2,
+            Self::Cursor => 3,
+            Self::Index => 4,
+            Self::End => 5,
+        }
+    }
+
+    pub fn max_payload_len(self) -> usize {
+        match self {
+            Self::Media => MAX_MEDIA_PAYLOAD,
+            Self::Cursor => MAX_CURSOR_PAYLOAD,
+            Self::Initialization => 4 * 1024 * 1024,
+            Self::Epoch | Self::Index => 1024 * 1024,
+            Self::End => 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DashObjectHeader {
+    pub format_version: u16,
+    pub stream_id: Uuid,
+    pub epoch_id: Uuid,
+    pub kind: DashObjectKind,
+    pub sequence: u64,
+    pub segment_number: u64,
+    pub chunk_index: u16,
+    pub timestamp: u64,
+    pub duration: u64,
+    pub random_access: bool,
+    pub mime: String,
+    pub payload_len: u32,
+    pub payload_sha256: [u8; 32],
+    pub authentication_tag: [u8; 32],
+}
+
+impl DashObjectHeader {
+    pub fn authentication_bytes(&self) -> Result<Vec<u8>> {
+        if self.mime.len() > u16::MAX as usize {
+            return Err(ProtocolError::InvalidDashMetadata("MIME type is too long"));
+        }
+        let mut bytes = Vec::with_capacity(160 + self.mime.len());
+        bytes.extend_from_slice(b"glacial-dash-object-v1");
+        bytes.extend_from_slice(&self.format_version.to_be_bytes());
+        bytes.extend_from_slice(self.stream_id.as_bytes());
+        bytes.extend_from_slice(self.epoch_id.as_bytes());
+        bytes.push(self.kind.code());
+        bytes.extend_from_slice(&self.sequence.to_be_bytes());
+        bytes.extend_from_slice(&self.segment_number.to_be_bytes());
+        bytes.extend_from_slice(&self.chunk_index.to_be_bytes());
+        bytes.extend_from_slice(&self.timestamp.to_be_bytes());
+        bytes.extend_from_slice(&self.duration.to_be_bytes());
+        bytes.push(u8::from(self.random_access));
+        bytes.extend_from_slice(&(self.mime.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(self.mime.as_bytes());
+        bytes.extend_from_slice(&self.payload_len.to_be_bytes());
+        bytes.extend_from_slice(&self.payload_sha256);
+        Ok(bytes)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DashObject {
+    pub header: DashObjectHeader,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewDashObject<'a> {
+    pub stream_id: Uuid,
+    pub epoch_id: Uuid,
+    pub kind: DashObjectKind,
+    pub sequence: u64,
+    pub segment_number: u64,
+    pub chunk_index: u16,
+    pub timestamp: u64,
+    pub duration: u64,
+    pub random_access: bool,
+    pub mime: &'a str,
+    pub payload: Vec<u8>,
+}
+
+impl DashObject {
+    pub fn authenticated(input: NewDashObject<'_>, keys: &EpochKeys) -> Result<Self> {
+        let payload_len =
+            u32::try_from(input.payload.len()).map_err(|_| ProtocolError::DashPayloadTooLarge)?;
+        let payload_sha256: [u8; 32] = Sha256::digest(&input.payload).into();
+        let mut header = DashObjectHeader {
+            format_version: DASH_FORMAT_VERSION,
+            stream_id: input.stream_id,
+            epoch_id: input.epoch_id,
+            kind: input.kind,
+            sequence: input.sequence,
+            segment_number: input.segment_number,
+            chunk_index: input.chunk_index,
+            timestamp: input.timestamp,
+            duration: input.duration,
+            random_access: input.random_access,
+            mime: input.mime.to_string(),
+            payload_len,
+            payload_sha256,
+            authentication_tag: [0; 32],
+        };
+        let authentication_bytes = header.authentication_bytes()?;
+        header.authentication_tag = authenticate_object(
+            &keys.authentication_key,
+            &authentication_bytes,
+            &input.payload,
+        );
+        let object = Self {
+            header,
+            payload: input.payload,
+        };
+        object.validate()?;
+        Ok(object)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.header.format_version != DASH_FORMAT_VERSION {
+            return Err(ProtocolError::UnsupportedDashVersion(
+                self.header.format_version,
+            ));
+        }
+        if self.header.stream_id.is_nil() {
+            return Err(ProtocolError::InvalidDashMetadata(
+                "stream ID must not be nil",
+            ));
+        }
+        if self.header.epoch_id.is_nil() {
+            return Err(ProtocolError::InvalidDashMetadata(
+                "epoch ID must not be nil",
+            ));
+        }
+        if self.header.mime.len() > 127 || !self.header.mime.is_ascii() {
+            return Err(ProtocolError::InvalidDashMetadata(
+                "MIME type must be short ASCII",
+            ));
+        }
+        if self.payload.len() != self.header.payload_len as usize {
+            return Err(ProtocolError::DashPayloadLength);
+        }
+        if self.payload.len() > self.header.kind.max_payload_len() {
+            return Err(ProtocolError::DashPayloadTooLarge);
+        }
+        let actual_hash: [u8; 32] = Sha256::digest(&self.payload).into();
+        if actual_hash != self.header.payload_sha256 {
+            return Err(ProtocolError::DashPayloadHash);
+        }
+        match self.header.kind {
+            DashObjectKind::Initialization
+                if self.header.segment_number != 0
+                    || self.header.chunk_index != 0
+                    || self.header.duration != 0 =>
+            {
+                return Err(ProtocolError::InvalidDashMetadata(
+                    "initialization object has media timing",
+                ));
+            }
+            DashObjectKind::Media if self.header.duration == 0 => {
+                return Err(ProtocolError::InvalidDashMetadata(
+                    "media object duration must not be zero",
+                ));
+            }
+            DashObjectKind::End if !self.payload.is_empty() => {
+                return Err(ProtocolError::InvalidDashMetadata(
+                    "end object must not contain a payload",
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub fn verify_authentication(&self, keys: &EpochKeys) -> Result<()> {
+        self.validate()?;
+        let authentication_bytes = self.header.authentication_bytes()?;
+        if !verify_object_authentication(
+            &keys.authentication_key,
+            &authentication_bytes,
+            &self.payload,
+            &self.header.authentication_tag,
+        ) {
+            return Err(ProtocolError::DashAuthentication);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -837,6 +1059,86 @@ mod tests {
         let unhinted_idr = vec![0, 0, 1, 5, 11, 12];
         let normalized = cache.normalize_access_unit(unhinted_idr, false);
         assert!(inspect_h264_access_unit(&normalized).is_decodable_random_access_point());
+    }
+
+    #[test]
+    fn dash_object_authenticates_header_and_opaque_payload() {
+        let stream_id = Uuid::from_u128(1);
+        let epoch_id = Uuid::from_u128(2);
+        let keys = EpochKeys::derive(&[7u8; 32], stream_id, epoch_id).unwrap();
+        let object = DashObject::authenticated(
+            NewDashObject {
+                stream_id,
+                epoch_id,
+                kind: DashObjectKind::Media,
+                sequence: 9,
+                segment_number: 3,
+                chunk_index: 1,
+                timestamp: 270_000,
+                duration: 90_000,
+                random_access: false,
+                mime: "video/iso.segment",
+                payload: vec![1, 2, 3, 4],
+            },
+            &keys,
+        )
+        .unwrap();
+
+        object.validate().unwrap();
+        object.verify_authentication(&keys).unwrap();
+
+        let mut tampered = object.clone();
+        tampered.header.timestamp += 1;
+        assert!(matches!(
+            tampered.verify_authentication(&keys),
+            Err(ProtocolError::DashAuthentication)
+        ));
+    }
+
+    #[test]
+    fn dash_object_validation_rejects_size_hash_and_timing_mismatches() {
+        let stream_id = Uuid::from_u128(1);
+        let epoch_id = Uuid::from_u128(2);
+        let keys = EpochKeys::derive(&[7u8; 32], stream_id, epoch_id).unwrap();
+        let object = DashObject::authenticated(
+            NewDashObject {
+                stream_id,
+                epoch_id,
+                kind: DashObjectKind::Media,
+                sequence: 1,
+                segment_number: 1,
+                chunk_index: 0,
+                timestamp: 0,
+                duration: 90_000,
+                random_access: true,
+                mime: "video/iso.segment",
+                payload: vec![1, 2, 3],
+            },
+            &keys,
+        )
+        .unwrap();
+
+        let mut wrong_length = object.clone();
+        wrong_length.header.payload_len += 1;
+        assert!(matches!(
+            wrong_length.validate(),
+            Err(ProtocolError::DashPayloadLength)
+        ));
+
+        let mut wrong_hash = object.clone();
+        wrong_hash.payload[0] ^= 0xff;
+        assert!(matches!(
+            wrong_hash.validate(),
+            Err(ProtocolError::DashPayloadHash)
+        ));
+
+        let mut no_duration = object;
+        no_duration.header.duration = 0;
+        no_duration.header.payload_sha256 = Sha256::digest(&no_duration.payload).into();
+        assert!(matches!(
+            no_duration.validate(),
+            Err(ProtocolError::InvalidDashMetadata(_))
+        ));
     }
 
     #[tokio::test]

@@ -936,6 +936,9 @@ async fn ingest_loop(
                     .await?;
                 debug!(stream_id = %stream_id, through_seq = last_seq, "ingest sent video ack");
             }
+            Ok(ClientMessage::DashObject(_)) => {
+                anyhow::bail!("DASH ingest is not enabled by this server build");
+            }
             Ok(ClientMessage::Cursor(cursor)) => {
                 debug!(stream_id = %stream_id, seq = cursor.seq, x = cursor.x, y = cursor.y, "ingest received cursor");
                 if !state.store.stream_exists(stream_id)? {

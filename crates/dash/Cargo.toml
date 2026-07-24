@@ -1,22 +1,19 @@
 [package]
-name = "glacialcast-protocol"
+name = "glacialcast-dash"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 
 [dependencies]
-anyhow.workspace = true
-base64.workspace = true
-bincode.workspace = true
-bytes.workspace = true
+aes.workspace = true
 aes-gcm.workspace = true
-glacialcast-dash = { path = "../dash" }
-libc.workspace = true
+base64.workspace = true
+ctr.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-snow.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
 uuid.workspace = true

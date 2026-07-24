@@ -1458,12 +1458,14 @@ fn media_kind_to_db(kind: StreamMediaKind) -> &'static str {
     match kind {
         StreamMediaKind::Image => "image",
         StreamMediaKind::Video => "video",
+        StreamMediaKind::Dash => "dash",
     }
 }
 
 fn stream_media_kind_from_db(kind: &str) -> StreamMediaKind {
     match kind {
         "video" => StreamMediaKind::Video,
+        "dash" => StreamMediaKind::Dash,
         _ => StreamMediaKind::Image,
     }
 }

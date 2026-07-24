@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/client",
+    "crates/dash",
     "crates/protocol",
     "crates/server",
 ]
@@ -9,9 +10,10 @@ resolver = "3"
 [workspace.package]
 edition = "2024"
 license = "MIT"
-version = "0.1.0"
+version = "0.2.0"
 
 [workspace.dependencies]
+aes = "0.8"
 anyhow = "1.0"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
@@ -21,7 +23,10 @@ bytes = "1.6"
 aes-gcm = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
+ctr = "0.9"
 futures-util = "0.3"
+hkdf = "0.12"
+hmac = "0.12"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 ffmpeg-sys-next = { version = "8.1", default-features = false, features = ["avcodec", "avfilter", "swscale"] }
 libc = "0.2"

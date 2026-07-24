@@ -1154,7 +1154,7 @@ dependencies = [
 
 [[package]]
 name = "glacialcast-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1177,18 +1177,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "glacialcast-dash"
+version = "0.2.0"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "base64",
+ "ctr",
+ "hkdf",
+ "hmac",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "glacialcast-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
  "base64",
  "bincode",
  "bytes",
+ "glacialcast-dash",
  "libc",
  "rand 0.8.6",
  "serde",
  "serde_json",
+ "sha2",
  "snow",
  "thiserror 2.0.18",
  "tokio",
@@ -1197,7 +1217,7 @@ dependencies = [
 
 [[package]]
 name = "glacialcast-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
