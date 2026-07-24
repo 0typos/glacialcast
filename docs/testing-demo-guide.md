@@ -57,7 +57,8 @@ scripts/verify-quality.sh standard
 
 Success means:
 
-- 129 Rust tests pass and one release-only performance test is ignored;
+- all Rust unit tests and checked rustdoc examples pass, while the release-only
+  persistence performance test is ignored by the normal profile;
 - the viewer core reports `PASS viewer core: 14 tests`;
 - Clippy produces no warnings; and
 - `cargo-deny` reports `advisories ok, bans ok, licenses ok, sources ok`.

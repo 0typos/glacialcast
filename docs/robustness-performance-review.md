@@ -71,13 +71,15 @@ release mode:
 | Relay, authorization, and storage | 38 |
 | Whole Rust workspace | 130 |
 
-The last pre-Internet-hardening coverage run measured 58.51% line coverage.
-The browser core has another 14 JavaScript tests. Multi-process gates cover
-live ingest, portable mirroring, offline serving, authentication, crash/restart,
-and optional Firefox/Chromium playback. The lower client and server-main
-coverage is concentrated in process orchestration, D-Bus/PipeWire/VA-API
-integration, and HTTP wiring; those paths are better represented by the
-process and host-specific gates than by the current unit coverage report.
+Three checked rustdoc examples cover epoch-key derivation, authenticated object
+construction, and byte-size parsing. The current coverage run measured 57.89%
+line coverage. The browser core has another 14 JavaScript tests. Multi-process
+gates cover live ingest, portable mirroring, offline serving, authentication,
+crash/restart, and optional Firefox/Chromium playback. The lower client and
+server-main coverage is concentrated in process orchestration,
+D-Bus/PipeWire/VA-API integration, and HTTP wiring; those paths are better
+represented by the process and host-specific gates than by the current unit
+coverage report.
 
 ## Performance Results
 

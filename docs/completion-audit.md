@@ -73,9 +73,11 @@ scripts/verify-dash-e2e.sh
 The current workspace has 130 defined Rust tests: 42 client, 16 DASH, 10
 offline, 24 protocol, and 38 server tests. Of those, 129 run in the ordinary
 profile; one ignored server test is run explicitly by the release performance
-gate. The viewer core adds 14 dependency-free JavaScript tests. The last
-pre-Internet-hardening `cargo llvm-cov --workspace --summary-only` run reported
-58.51% line coverage, up from the earlier 44.98%.
+gate. Three checked rustdoc examples cover epoch-key derivation, authenticated
+object construction, and byte-size parsing. The viewer core adds 14
+dependency-free JavaScript tests. The current
+`cargo llvm-cov --workspace --all-features --summary-only` run reports 57.89%
+line coverage; process and browser gates are not included in that number.
 
 ## Environment-Specific Gates
 
