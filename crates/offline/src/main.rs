@@ -30,6 +30,7 @@ use uuid::Uuid;
 
 const VIEWER_HTML: &str = include_str!("../../server/static/dash-viewer.html");
 const VIEWER_CSS: &str = include_str!("../../server/static/dash-viewer.css");
+const VIEWER_CORE_JS: &str = include_str!("../../server/static/dash-viewer-core.js");
 const VIEWER_JS: &str = include_str!("../../server/static/dash-viewer.js");
 const MAX_PORTABLE_FILE_LEN: u64 = MAX_FRAME_LEN as u64 + 128 * 1024;
 
@@ -274,6 +275,7 @@ async fn serve(input: PathBuf, listen: SocketAddr) -> Result<()> {
         .route("/favicon.ico", get(|| async { StatusCode::NO_CONTENT }))
         .route("/dash/{stream_id}", get(viewer))
         .route("/assets/dash-viewer.css", get(viewer_css))
+        .route("/assets/dash-viewer-core.js", get(viewer_core_js))
         .route("/assets/dash-viewer.js", get(viewer_js))
         .route("/api/dash/streams/{stream_id}/objects", get(list_objects))
         .route(
@@ -457,6 +459,10 @@ async fn viewer_css() -> Response {
 
 async fn viewer_js() -> Response {
     static_response("text/javascript; charset=utf-8", VIEWER_JS)
+}
+
+async fn viewer_core_js() -> Response {
+    static_response("text/javascript; charset=utf-8", VIEWER_CORE_JS)
 }
 
 fn static_response(content_type: &'static str, body: &'static str) -> Response {

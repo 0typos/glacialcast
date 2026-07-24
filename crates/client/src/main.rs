@@ -1214,12 +1214,16 @@ impl Capture for TestPatternCapture {
         Ok(Some(CursorMessage {
             x: ((t.sin() + 1.0) * 0.5) * self.width as f32,
             y: ((t.cos() + 1.0) * 0.5) * self.height as f32,
-            visible: true,
+            visible: test_pattern_cursor_visible(seq),
             source_width: self.width,
             source_height: self.height,
             bitmap: None,
         }))
     }
+}
+
+fn test_pattern_cursor_visible(sequence: u64) -> bool {
+    sequence % 30 < 20
 }
 
 struct WaylandPipewireCapture {
@@ -4734,6 +4738,15 @@ mod tests {
         assert_eq!(hidden.x_micropixels, 0);
         assert_eq!(hidden.y_micropixels, 0);
         assert!(!hidden.visible);
+    }
+
+    #[test]
+    fn test_pattern_cursor_cycles_through_visible_and_hidden_states() {
+        assert!(test_pattern_cursor_visible(1));
+        assert!(test_pattern_cursor_visible(19));
+        assert!(!test_pattern_cursor_visible(20));
+        assert!(!test_pattern_cursor_visible(29));
+        assert!(test_pattern_cursor_visible(30));
     }
 
     #[test]

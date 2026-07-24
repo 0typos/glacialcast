@@ -98,6 +98,81 @@ try {
     );
   }
   console.log('encrypted media and cursor events reached the browser');
+  const cursorMotion = await page.evaluate(async () => {
+    const canvas = document.querySelector('#cursor-layer');
+    const bounds = () => {
+      const context = canvas.getContext('2d');
+      const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+      let count = 0;
+      let minX = canvas.width;
+      let minY = canvas.height;
+      let maxX = -1;
+      let maxY = -1;
+      for (let index = 3; index < pixels.length; index += 4) {
+        if (pixels[index] === 0) continue;
+        const pixel = (index - 3) / 4;
+        const x = pixel % canvas.width;
+        const y = Math.floor(pixel / canvas.width);
+        count += 1;
+        minX = Math.min(minX, x);
+        minY = Math.min(minY, y);
+        maxX = Math.max(maxX, x);
+        maxY = Math.max(maxY, y);
+      }
+      return count === 0
+        ? null
+        : {
+          count,
+          centerX: (minX + maxX) / 2,
+          centerY: (minY + maxY) / 2,
+        };
+    };
+
+    const deadline = Date.now() + 3_000;
+    let first = bounds();
+    while (!first && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+      first = bounds();
+    }
+    if (!first) throw new Error('the independent cursor overlay did not paint');
+
+    let motion = null;
+    while (Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      const current = bounds();
+      if (
+        current
+        && (
+          Math.abs(current.centerX - first.centerX) >= 1
+          || Math.abs(current.centerY - first.centerY) >= 1
+        )
+      ) {
+        motion = {
+          paintedPixels: current.count,
+          movedX: current.centerX - first.centerX,
+          movedY: current.centerY - first.centerY,
+        };
+        break;
+      }
+    }
+    if (!motion) {
+      throw new Error('the independent cursor overlay painted but did not move');
+    }
+
+    const visibilityDeadline = Date.now() + 4_000;
+    let hidden = false;
+    while (Date.now() < visibilityDeadline) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+      const current = bounds();
+      if (!current) hidden = true;
+      else if (hidden) return { ...motion, hidAndReturned: true };
+    }
+    throw new Error('the independent cursor overlay did not hide and return');
+  });
+  console.log(
+    `cursor overlay painted ${cursorMotion.paintedPixels} pixels and moved `
+      + `${cursorMotion.movedX.toFixed(1)},${cursorMotion.movedY.toFixed(1)}`,
+  );
   const initialMediaCount = await page.evaluate(() => {
     const match = (document.querySelector('#metrics')?.textContent || '')
       .match(/(\d+) media fragments/);
@@ -162,6 +237,7 @@ try {
     };
   });
   result.liveAppendLatencyMs = liveAppendLatencyMs;
+  result.cursorMotion = cursorMotion;
   const paintedVideo = await page.locator('#video').screenshot();
   result.paintedVideoBytes = paintedVideo.byteLength;
   if (paintedVideo.byteLength < 5_000) {

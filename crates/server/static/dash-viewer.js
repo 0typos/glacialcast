@@ -2,6 +2,9 @@
 
 const TIMESCALE = 90000;
 const FORMAT_VERSION = 1;
+const LIVE_RECONCILE_INTERVAL_MS = 15_000;
+const ViewerCore = globalThis.GlacialCastViewerCore;
+if (!ViewerCore) throw new Error('The GlacialCast viewer core failed to load.');
 const streamId = location.pathname.split('/').filter(Boolean).at(-1);
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -33,10 +36,16 @@ const state = {
   mediaSource: null,
   sourceBuffer: null,
   mediaQueue: Promise.resolve(),
+  liveQueue: Promise.resolve(),
   liveSocket: null,
+  liveReconnectTimer: null,
+  liveReconcileTimer: null,
   live: true,
   appendedMedia: 0,
   decryptedCursorBatches: 0,
+  lastRenderedCursor: undefined,
+  lastRenderedBitmap: undefined,
+  lastRenderLayout: '',
 };
 
 els.streamLabel.textContent = `Stream ${streamId}`;
@@ -342,159 +351,70 @@ async function loadHistoricalCursors(headers) {
   );
   const concurrency = 12;
   for (let index = 0; index < cursors.length; index += concurrency) {
-    await Promise.all(
+    const decoded = await Promise.all(
       cursors
         .slice(index, index + concurrency)
-        .map(header => loadCursorObject(header, false)),
+        .map(async header => [header, await decodeCursorObject(header)]),
     );
+    for (const [header, batch] of decoded) commitCursorObject(header, batch);
   }
-  state.cursorEvents.sort((left, right) => left.timestamp - right.timestamp);
 }
 
-async function loadCursorObject(header, sortEvents = true) {
-  if (state.seenSequences.has(header.sequence)) return;
+async function decodeCursorObject(header) {
   const payload = await fetchObject(header.sequence);
   await verifyObject(header, payload);
-  const encrypted = parseEncryptedCursorPayload(payload);
+  const encrypted = ViewerCore.parseEncryptedCursorPayload(payload);
   const plaintext = await crypto.subtle.decrypt({
     name: 'AES-GCM',
     iv: encrypted.nonce,
     additionalData: cursorAad(header),
     tagLength: 128,
   }, state.epochKeys.cursorKey, encrypted.ciphertext);
-  const batch = parseCursorBatch(new Uint8Array(plaintext));
-  if (
-    batch.source_width !== state.descriptor.width
-    || batch.source_height !== state.descriptor.height
-  ) {
-    throw new Error(`Cursor object ${header.sequence} has invalid dimensions.`);
-  }
+  return ViewerCore.parseCursorBatch(new Uint8Array(plaintext), {
+    sourceWidth: state.descriptor.width,
+    sourceHeight: state.descriptor.height,
+    startTimestamp: header.timestamp,
+  });
+}
+
+function commitCursorObject(header, batch) {
+  if (state.seenSequences.has(header.sequence)) return;
   for (const event of batch.events) {
-    if (event.bitmap) state.cursorBitmaps.set(event.bitmap_id, event.bitmap);
-    state.cursorEvents.push(event);
+    if (event.bitmap) cacheCursorBitmap(event.bitmap_id, event.bitmap);
   }
-  if (sortEvents) {
-    state.cursorEvents.sort((left, right) => left.timestamp - right.timestamp);
-  }
+  state.cursorEvents = ViewerCore.mergeSortedCursorEvents(state.cursorEvents, batch.events);
   state.seenSequences.add(header.sequence);
   state.decryptedCursorBatches += 1;
   updateMetrics();
 }
 
-function parseEncryptedCursorPayload(bytes) {
-  if (
-    bytes.byteLength < 16
-    || decoder.decode(bytes.slice(0, 4)) !== 'GCE1'
-  ) {
-    throw new Error('The encrypted cursor payload is malformed.');
-  }
-  return {
-    nonce: bytes.slice(4, 16),
-    ciphertext: bytes.slice(16),
-  };
+async function loadCursorObject(header) {
+  if (state.seenSequences.has(header.sequence)) return;
+  commitCursorObject(header, await decodeCursorObject(header));
 }
 
-function parseCursorBatch(bytes) {
-  let offset = 0;
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const take = length => {
-    if (!Number.isSafeInteger(length) || length < 0 || offset + length > bytes.byteLength) {
-      throw new Error('The decrypted cursor batch is truncated.');
-    }
-    const value = bytes.slice(offset, offset + length);
-    offset += length;
-    return value;
-  };
-  const u8 = () => take(1)[0];
-  const u16 = () => {
-    const value = view.getUint16(offset);
-    offset += 2;
-    return value;
-  };
-  const u32 = () => {
-    const value = view.getUint32(offset);
-    offset += 4;
-    return value;
-  };
-  const i32 = () => {
-    const value = view.getInt32(offset);
-    offset += 4;
-    return value;
-  };
-  const safeInteger = (value, field) => {
-    const number = Number(value);
-    if (!Number.isSafeInteger(number)) {
-      throw new Error(`Cursor ${field} exceeds JavaScript's safe integer range.`);
-    }
-    return number;
-  };
-  const u64 = field => {
-    if (offset + 8 > bytes.byteLength) {
-      throw new Error('The decrypted cursor batch is truncated.');
-    }
-    const value = view.getBigUint64(offset);
-    offset += 8;
-    return safeInteger(value, field);
-  };
-  const i64 = field => {
-    if (offset + 8 > bytes.byteLength) {
-      throw new Error('The decrypted cursor batch is truncated.');
-    }
-    const value = view.getBigInt64(offset);
-    offset += 8;
-    return safeInteger(value, field);
-  };
-
-  if (decoder.decode(take(4)) !== 'GCC1') {
-    throw new Error('The decrypted cursor batch has an unknown version.');
-  }
-  const sourceWidth = u32();
-  const sourceHeight = u32();
-  const eventCount = u16();
-  const events = [];
-  for (let index = 0; index < eventCount; index += 1) {
-    const timestamp = u64('timestamp');
-    const xMicropixels = i64('x coordinate');
-    const yMicropixels = i64('y coordinate');
-    const flags = u8();
-    if (flags & ~0b11) throw new Error('The cursor event has unsupported flags.');
-    const bitmapId = u64('bitmap ID');
-    let bitmap = null;
-    if (flags & (1 << 1)) {
-      const width = u32();
-      const height = u32();
-      const hotspotX = i32();
-      const hotspotY = i32();
-      const rgbaLength = u32();
-      const expectedLength = width * height * 4;
-      if (!Number.isSafeInteger(expectedLength) || rgbaLength !== expectedLength) {
-        throw new Error('The cursor bitmap has invalid dimensions.');
-      }
-      bitmap = {
-        width,
-        height,
-        hotspot_x: hotspotX,
-        hotspot_y: hotspotY,
-        rgba: take(rgbaLength),
-      };
-    }
-    events.push({
-      timestamp,
-      x_micropixels: xMicropixels,
-      y_micropixels: yMicropixels,
-      visible: Boolean(flags & 1),
-      bitmap_id: bitmapId,
-      bitmap,
+function cacheCursorBitmap(bitmapId, bitmap) {
+  const surface = typeof OffscreenCanvas === 'function'
+    ? new OffscreenCanvas(bitmap.width, bitmap.height)
+    : Object.assign(document.createElement('canvas'), {
+      width: bitmap.width,
+      height: bitmap.height,
     });
-  }
-  if (offset !== bytes.byteLength) {
-    throw new Error('The decrypted cursor batch has trailing data.');
-  }
-  return {
-    source_width: sourceWidth,
-    source_height: sourceHeight,
-    events,
-  };
+  const context = surface.getContext('2d');
+  if (!context) throw new Error('The browser cannot render the cursor bitmap.');
+  const pixels = new Uint8ClampedArray(
+    bitmap.rgba.buffer,
+    bitmap.rgba.byteOffset,
+    bitmap.rgba.byteLength,
+  );
+  context.putImageData(new ImageData(pixels, bitmap.width, bitmap.height), 0, 0);
+  state.cursorBitmaps.set(bitmapId, {
+    width: bitmap.width,
+    height: bitmap.height,
+    hotspot_x: bitmap.hotspot_x,
+    hotspot_y: bitmap.hotspot_y,
+    surface,
+  });
 }
 
 function cursorAad(header) {
@@ -510,21 +430,70 @@ function cursorAad(header) {
 }
 
 function connectLive() {
+  clearTimeout(state.liveReconnectTimer);
+  clearInterval(state.liveReconcileTimer);
   state.liveSocket?.close();
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const socket = new WebSocket(
     `${scheme}//${location.host}/api/dash/streams/${streamId}/live`
   );
   state.liveSocket = socket;
-  socket.addEventListener('open', () => setStatus('Connected to live encrypted stream.'));
+  socket.addEventListener('open', () => {
+    queueLiveTask(async () => {
+      await reconcileLiveHeaders();
+      if (state.liveSocket === socket) {
+        setStatus('Connected to live encrypted stream.');
+      }
+    });
+    state.liveReconcileTimer = setInterval(() => {
+      queueLiveTask(reconcileLiveHeaders);
+    }, LIVE_RECONCILE_INTERVAL_MS);
+  });
   socket.addEventListener('message', event => {
-    handleLiveHeader(JSON.parse(event.data)).catch(showError);
+    queueLiveTask(() => handleLiveHeader(JSON.parse(event.data)));
   });
   socket.addEventListener('close', () => {
     if (state.liveSocket !== socket) return;
+    clearInterval(state.liveReconcileTimer);
     setStatus('Live connection interrupted; reconnecting…');
-    setTimeout(connectLive, 1000);
+    state.liveReconnectTimer = setTimeout(connectLive, 1000);
   });
+}
+
+function queueLiveTask(task) {
+  state.liveQueue = state.liveQueue.then(task).catch(showError);
+  return state.liveQueue;
+}
+
+async function reconcileLiveHeaders() {
+  const headers = await fetchHeaders();
+  const latestEpoch = [...headers].reverse().find(header => header.kind === 'Epoch');
+  if (latestEpoch && latestEpoch.epoch_id !== state.descriptor.epoch_id) {
+    setStatus('The capture epoch changed. Reloading is required.');
+    return;
+  }
+
+  const epochHeaders = headers.filter(
+    header => header.epoch_id === state.descriptor.epoch_id
+  );
+  for (const header of epochHeaders) {
+    await handleLiveHeader(header);
+  }
+
+  const retainedSequences = new Set(epochHeaders.map(header => header.sequence));
+  const listedHighWater = headers.at(-1)?.sequence || 0;
+  state.seenSequences = new Set(
+    [...state.seenSequences].filter(
+      sequence => retainedSequences.has(sequence) || sequence > listedHighWater
+    )
+  );
+
+  const firstRandomAccess = epochHeaders.find(
+    header => header.kind === 'Media' && header.random_access
+  );
+  if (firstRandomAccess) {
+    await trimPlaybackHistory(firstRandomAccess.timestamp);
+  }
 }
 
 async function handleLiveHeader(header) {
@@ -540,37 +509,79 @@ async function handleLiveHeader(header) {
   }
 }
 
+async function trimPlaybackHistory(cutoffTimestamp) {
+  state.cursorEvents = ViewerCore.retainCursorHistory(
+    state.cursorEvents,
+    cutoffTimestamp,
+  );
+  const referencedBitmaps = ViewerCore.referencedBitmapIds(state.cursorEvents);
+  for (const bitmapId of state.cursorBitmaps.keys()) {
+    if (!referencedBitmaps.has(bitmapId)) state.cursorBitmaps.delete(bitmapId);
+  }
+
+  const cutoffSeconds = cutoffTimestamp / TIMESCALE;
+  state.mediaQueue = state.mediaQueue.then(async () => {
+    const sourceBuffer = state.sourceBuffer;
+    if (!sourceBuffer || state.mediaSource?.readyState !== 'open' || !sourceBuffer.buffered.length) {
+      return;
+    }
+    if (sourceBuffer.updating) await once(sourceBuffer, 'updateend');
+    const bufferedStart = sourceBuffer.buffered.start(0);
+    const bufferedEnd = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+    const removeEnd = Math.min(cutoffSeconds, bufferedEnd);
+    if (removeEnd <= bufferedStart + 0.001) return;
+    if (els.video.currentTime < removeEnd) els.video.currentTime = removeEnd;
+    sourceBuffer.remove(0, removeEnd);
+    await once(sourceBuffer, 'updateend');
+    updateTimelineBounds();
+  });
+  await state.mediaQueue;
+  updateMetrics();
+}
+
 function renderCursor() {
   const canvas = els.cursorLayer;
-  const context = canvas.getContext('2d');
   const ratio = globalThis.devicePixelRatio || 1;
   const width = Math.max(1, els.stage.clientWidth);
   const height = Math.max(1, els.stage.clientHeight);
-  if (canvas.width !== Math.round(width * ratio) || canvas.height !== Math.round(height * ratio)) {
-    canvas.width = Math.round(width * ratio);
-    canvas.height = Math.round(height * ratio);
+  const canvasWidth = Math.round(width * ratio);
+  const canvasHeight = Math.round(height * ratio);
+  const event = currentCursorEvent();
+  const bitmap = event?.visible ? state.cursorBitmaps.get(event.bitmap_id) : undefined;
+  const layout = `${canvasWidth}:${canvasHeight}:${ratio}`;
+  if (
+    state.lastRenderedCursor === event
+    && state.lastRenderedBitmap === bitmap
+    && state.lastRenderLayout === layout
+  ) {
+    requestAnimationFrame(renderCursor);
+    return;
+  }
+  state.lastRenderedCursor = event;
+  state.lastRenderedBitmap = bitmap;
+  state.lastRenderLayout = layout;
+
+  if (canvas.width !== canvasWidth || canvas.height !== canvasHeight) {
+    canvas.width = canvasWidth;
+    canvas.height = canvasHeight;
+  }
+  const context = canvas.getContext('2d');
+  if (!context) {
+    showError(new Error('The browser cannot render the cursor overlay.'));
+    return;
   }
   context.setTransform(ratio, 0, 0, ratio, 0, 0);
   context.clearRect(0, 0, width, height);
 
-  const event = currentCursorEvent();
   if (event?.visible) {
     const rectangle = containedVideoRectangle(width, height);
     const scaleX = rectangle.width / state.descriptor.width;
     const scaleY = rectangle.height / state.descriptor.height;
     const x = rectangle.left + event.x_micropixels / 1_000_000 * scaleX;
     const y = rectangle.top + event.y_micropixels / 1_000_000 * scaleY;
-    const bitmap = state.cursorBitmaps.get(event.bitmap_id);
     if (bitmap) {
-      const image = new ImageData(
-        new Uint8ClampedArray(bitmap.rgba),
-        bitmap.width,
-        bitmap.height,
-      );
-      const scratch = new OffscreenCanvas(bitmap.width, bitmap.height);
-      scratch.getContext('2d').putImageData(image, 0, 0);
       context.drawImage(
-        scratch,
+        bitmap.surface,
         x - bitmap.hotspot_x * scaleX,
         y - bitmap.hotspot_y * scaleY,
         bitmap.width * scaleX,
@@ -591,32 +602,20 @@ function renderCursor() {
 
 function currentCursorEvent() {
   if (!state.cursorEvents.length || !state.descriptor) return null;
-  if (state.live) return state.cursorEvents.at(-1);
-  const timestamp = els.video.currentTime * TIMESCALE;
-  let low = 0;
-  let high = state.cursorEvents.length - 1;
-  let found = null;
-  while (low <= high) {
-    const middle = Math.floor((low + high) / 2);
-    if (state.cursorEvents[middle].timestamp <= timestamp) {
-      found = state.cursorEvents[middle];
-      low = middle + 1;
-    } else {
-      high = middle - 1;
-    }
-  }
-  return found;
+  return ViewerCore.findCursorEvent(
+    state.cursorEvents,
+    els.video.currentTime * TIMESCALE,
+    state.live,
+  );
 }
 
 function containedVideoRectangle(width, height) {
-  const videoRatio = state.descriptor.width / state.descriptor.height;
-  const stageRatio = width / height;
-  if (stageRatio > videoRatio) {
-    const contentWidth = height * videoRatio;
-    return { left: (width - contentWidth) / 2, top: 0, width: contentWidth, height };
-  }
-  const contentHeight = width / videoRatio;
-  return { left: 0, top: (height - contentHeight) / 2, width, height: contentHeight };
+  return ViewerCore.containedVideoRectangle(
+    width,
+    height,
+    state.descriptor.width,
+    state.descriptor.height,
+  );
 }
 
 function updateTimelineBounds() {
