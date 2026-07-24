@@ -47,6 +47,8 @@ enum Command {
     Mirror {
         #[arg(long, default_value = "http://127.0.0.1:8899")]
         server: String,
+        #[arg(long, env = "GLACIALCAST_ACCESS_TOKEN", allow_hyphen_values = true)]
+        access_token: Option<String>,
         #[arg(long)]
         stream_id: Uuid,
         #[arg(long)]
@@ -88,17 +90,29 @@ async fn main() -> Result<()> {
     match Args::parse().command {
         Command::Mirror {
             server,
+            access_token,
             stream_id,
             output,
             poll_ms,
             follow,
-        } => mirror(&server, stream_id, &output, poll_ms, follow).await,
+        } => {
+            mirror(
+                &server,
+                access_token.as_deref(),
+                stream_id,
+                &output,
+                poll_ms,
+                follow,
+            )
+            .await
+        }
         Command::Serve { input, listen } => serve(input, listen).await,
     }
 }
 
 async fn mirror(
     server: &str,
+    access_token: Option<&str>,
     stream_id: Uuid,
     output: &FsPath,
     poll_ms: u64,
@@ -106,6 +120,23 @@ async fn mirror(
 ) -> Result<()> {
     if poll_ms == 0 {
         bail!("--poll-ms must be at least 1");
+    }
+    let parsed_server = reqwest::Url::parse(server).context("parsing --server URL")?;
+    let secure_transport = parsed_server.scheme() == "https";
+    let loopback = parsed_server
+        .host_str()
+        .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+        .is_some_and(|address| address.is_loopback())
+        || parsed_server.host_str() == Some("localhost");
+    if !secure_transport && !loopback {
+        bail!("remote relay mirroring requires an HTTPS --server URL");
+    }
+    if parsed_server.username() != ""
+        || parsed_server.password().is_some()
+        || parsed_server.query().is_some()
+        || parsed_server.fragment().is_some()
+    {
+        bail!("--server must not contain credentials, a query, or a fragment");
     }
     std::fs::create_dir_all(output)
         .with_context(|| format!("creating offline object directory {}", output.display()))?;
@@ -116,7 +147,7 @@ async fn mirror(
     let server = server.trim_end_matches('/');
 
     loop {
-        let mirrored = mirror_once(&client, server, stream_id, output).await?;
+        let mirrored = mirror_once(&client, server, access_token, stream_id, output).await?;
         info!(stream_id = %stream_id, mirrored, "offline mirror pass complete");
         if !follow {
             return Ok(());
@@ -131,12 +162,16 @@ async fn mirror(
 async fn mirror_once(
     client: &Client,
     server: &str,
+    access_token: Option<&str>,
     stream_id: Uuid,
     output: &FsPath,
 ) -> Result<usize> {
     let list_url = format!("{server}/api/dash/streams/{stream_id}/objects");
-    let mut headers = client
-        .get(&list_url)
+    let mut list_request = client.get(&list_url);
+    if let Some(token) = access_token {
+        list_request = list_request.bearer_auth(token);
+    }
+    let mut headers = list_request
         .send()
         .await
         .with_context(|| format!("requesting {list_url}"))?
@@ -167,8 +202,11 @@ async fn mirror_once(
             "{server}/api/dash/streams/{stream_id}/objects/{}",
             object_header.sequence
         );
-        let response = client
-            .get(&object_url)
+        let mut object_request = client.get(&object_url);
+        if let Some(token) = access_token {
+            object_request = object_request.bearer_auth(token);
+        }
+        let response = object_request
             .send()
             .await
             .with_context(|| format!("requesting {object_url}"))?;

@@ -1,18 +1,27 @@
 mod dash_store;
+mod security;
 mod storage;
 
-use crate::{dash_store::DashStore, storage::Store};
+use crate::{
+    dash_store::DashStore,
+    security::{
+        AccessConfig, AccessControl, AccessRole, AuthenticatedRequest, FixedWindowLimiter,
+        Principal, SessionSigner, client_ip, normalize_public_origin, validate_request_origin,
+    },
+    storage::Store,
+};
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     body::Body,
     extract::{
-        Path, State,
+        ConnectInfo, DefaultBodyLimit, Path, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{StatusCode, header},
-    response::{Html, IntoResponse, Response},
-    routing::{delete, get},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware,
+    response::{IntoResponse, Redirect, Response},
+    routing::{delete, get, post},
 };
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
@@ -26,7 +35,7 @@ use glacialcast_protocol::{
     encode_noise_public_key, encode_ws_event, generate_noise_keypair, now_ms, parse_human_bytes,
     responder_handshake,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
@@ -35,13 +44,15 @@ use std::{
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path as FsPath, PathBuf},
     sync::Arc,
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
+use subtle::ConstantTimeEq;
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{Mutex as AsyncMutex, broadcast, watch},
+    sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, broadcast, watch},
 };
-use tower_http::services::ServeDir;
+use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -65,6 +76,8 @@ struct Args {
     data_dir: PathBuf,
     #[arg(long, env = "GLACIALCAST_INGEST_KEY_FILE")]
     ingest_key_file: Option<PathBuf>,
+    #[arg(long, env = "GLACIALCAST_ALLOW_INSECURE_HTTP")]
+    allow_insecure_http: bool,
     #[arg(long)]
     print_ingest_server_key: bool,
     #[arg(
@@ -95,14 +108,96 @@ struct AppState {
     events: broadcast::Sender<ControlEvent>,
     dash_events: broadcast::Sender<DashObjectHeader>,
     auth: AuthConfig,
+    access: AccessControl,
+    sessions: SessionSigner,
+    public_origin: Option<String>,
+    trust_forwarded_for: bool,
+    login_limiter: FixedWindowLimiter,
+    global_login_limiter: FixedWindowLimiter,
+    request_limiter: FixedWindowLimiter,
+    websocket_slots: Arc<Semaphore>,
+    ingest_slots: Arc<Semaphore>,
+    ingest_handshake_timeout: Duration,
+    ingest_idle_timeout: Duration,
+    metrics: Arc<ServerMetrics>,
     active_ingests: Arc<AsyncMutex<HashMap<Uuid, Uuid>>>,
     ingest_private_key: [u8; NOISE_KEY_LEN],
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct ServerConfig {
     ingest: IngestConfig,
+    access: AccessConfig,
+    security: SecurityConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SecurityConfig {
+    public_origin: Option<String>,
+    session_secret_file: Option<PathBuf>,
+    session_ttl_seconds: u64,
+    trust_forwarded_for: bool,
+    limits: LimitsConfig,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            public_origin: None,
+            session_secret_file: None,
+            session_ttl_seconds: 12 * 60 * 60,
+            trust_forwarded_for: false,
+            limits: LimitsConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct LimitsConfig {
+    max_http_in_flight: usize,
+    max_websockets: usize,
+    max_ingest_connections: usize,
+    login_attempts_per_minute: u32,
+    global_login_attempts_per_minute: u32,
+    authenticated_requests_per_minute: u32,
+    http_timeout_seconds: u64,
+    ingest_handshake_timeout_seconds: u64,
+    ingest_idle_timeout_seconds: u64,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_http_in_flight: 128,
+            max_websockets: 64,
+            max_ingest_connections: 16,
+            login_attempts_per_minute: 10,
+            global_login_attempts_per_minute: 1000,
+            authenticated_requests_per_minute: 30_000,
+            http_timeout_seconds: 30,
+            ingest_handshake_timeout_seconds: 10,
+            ingest_idle_timeout_seconds: 120,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ServerMetrics {
+    http_requests: AtomicU64,
+    http_overloaded: AtomicU64,
+    http_timed_out: AtomicU64,
+    login_successes: AtomicU64,
+    login_failures: AtomicU64,
+    login_rate_limited: AtomicU64,
+    request_rate_limited: AtomicU64,
+    active_websockets: AtomicU64,
+    websocket_rejected: AtomicU64,
+    active_ingest_connections: AtomicU64,
+    ingest_rejected: AtomicU64,
+    ingest_auth_failures: AtomicU64,
 }
 
 fn load_server_config(path: &PathBuf) -> Result<ServerConfig> {
@@ -115,22 +210,31 @@ fn load_server_config(path: &PathBuf) -> Result<ServerConfig> {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct IngestConfig {
     require_token: bool,
     tokens: Vec<ConfiguredIngestToken>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ConfiguredIngestToken {
     name: String,
     token: String,
+    #[serde(default)]
+    previous_tokens: Vec<String>,
 }
 
 #[derive(Clone)]
 struct AuthConfig {
     require_token: bool,
-    token_hash_to_name: HashMap<String, String>,
+    credentials: Vec<IngestCredential>,
+}
+
+#[derive(Clone)]
+struct IngestCredential {
+    token_hash: [u8; 32],
+    name: String,
 }
 
 struct AuthenticatedClient {
@@ -206,36 +310,53 @@ fn read_ingest_key(path: &FsPath) -> Result<NoiseKeypair> {
 }
 
 impl AuthConfig {
-    fn from_config(config: IngestConfig) -> Result<Self> {
+    fn from_config(config: IngestConfig, require_strong_tokens: bool) -> Result<Self> {
         if config.require_token && config.tokens.is_empty() {
             anyhow::bail!("server config requires ingest tokens but none were configured");
         }
 
-        let mut token_hash_to_name = HashMap::new();
+        let mut credentials: Vec<IngestCredential> = Vec::new();
         let mut names = HashSet::new();
-        for token in config.tokens {
-            let name = token.name.trim();
-            let value = token.token.trim();
+        for configured in config.tokens {
+            let name = configured.name.trim();
             if name.is_empty() {
                 anyhow::bail!("configured ingest token name must not be empty");
-            }
-            if value.is_empty() {
-                anyhow::bail!("configured ingest token for {name} must not be empty");
             }
             if !names.insert(name.to_string()) {
                 anyhow::bail!("duplicate ingest token name {name}");
             }
-            if token_hash_to_name
-                .insert(hash_token(value), name.to_string())
-                .is_some()
-            {
-                anyhow::bail!("duplicate ingest token value for {name}");
+            let mut tokens = Vec::with_capacity(1 + configured.previous_tokens.len());
+            tokens.push(configured.token);
+            tokens.extend(configured.previous_tokens);
+            for value in tokens {
+                if value.is_empty() || value.len() > 512 {
+                    anyhow::bail!("configured ingest token for {name} has an invalid length");
+                }
+                if require_strong_tokens && value.len() < 32 {
+                    anyhow::bail!(
+                        "Internet-facing ingest token for {name} must contain at least 32 bytes"
+                    );
+                }
+                if value.trim() != value || value.bytes().any(|byte| byte.is_ascii_control()) {
+                    anyhow::bail!("configured ingest token for {name} contains invalid whitespace");
+                }
+                let token_hash = hash_token(&value);
+                if credentials
+                    .iter()
+                    .any(|credential| bool::from(credential.token_hash.ct_eq(&token_hash)))
+                {
+                    anyhow::bail!("duplicate ingest token value for {name}");
+                }
+                credentials.push(IngestCredential {
+                    token_hash,
+                    name: name.to_string(),
+                });
             }
         }
 
         Ok(Self {
             require_token: config.require_token,
-            token_hash_to_name,
+            credentials,
         })
     }
 
@@ -248,10 +369,13 @@ impl AuthConfig {
         match presented_token {
             Some(token) if !token.is_empty() => {
                 let hash = hash_token(token);
-                self.token_hash_to_name
-                    .get(&hash)
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("invalid ingest token"))
+                let mut identity = None;
+                for credential in &self.credentials {
+                    if bool::from(credential.token_hash.ct_eq(&hash)) {
+                        identity = Some(credential.name.clone());
+                    }
+                }
+                identity.ok_or_else(|| anyhow::anyhow!("invalid ingest token"))
             }
             _ if self.require_token => anyhow::bail!("ingest token required"),
             _ => Ok(client_id.to_string()),
@@ -311,9 +435,46 @@ fn server_daemon_socket(args: &Args) -> PathBuf {
 async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
     let serve_control = args.daemon_child || args.daemon_socket.is_some();
     let config = load_server_config(&args.config)?;
+    let SecurityConfig {
+        public_origin: configured_public_origin,
+        session_secret_file,
+        session_ttl_seconds,
+        trust_forwarded_for,
+        limits,
+    } = config.security;
+    validate_limits(&limits)?;
+    let public_origin = normalize_public_origin(configured_public_origin)?;
+    let internet_mode = public_origin.is_some();
+    let require_strong_ingest = internet_mode || !args.ingest_addr.ip().is_loopback();
+    if !args.control_addr.ip().is_loopback() && !args.allow_insecure_http {
+        anyhow::bail!(
+            "refusing a non-loopback HTTP listener; bind --control-addr to loopback behind an HTTPS reverse proxy or explicitly pass --allow-insecure-http for a trusted LAN"
+        );
+    }
+    if internet_mode && !args.control_addr.ip().is_loopback() {
+        anyhow::bail!(
+            "Internet mode requires a loopback HTTP listener behind the configured HTTPS origin"
+        );
+    }
+    if trust_forwarded_for && !internet_mode {
+        anyhow::bail!("security.trust_forwarded_for requires an HTTPS public_origin");
+    }
+    if internet_mode && !config.ingest.require_token {
+        anyhow::bail!("Internet mode requires ingest.require_token = true");
+    }
+    if !args.ingest_addr.ip().is_loopback() && !config.ingest.require_token {
+        anyhow::bail!("a non-loopback ingest listener requires ingest.require_token = true");
+    }
+    if internet_mode {
+        validate_private_config_file(&args.config)?;
+    }
     tokio::fs::create_dir_all(&args.data_dir)
         .await
         .with_context(|| format!("creating data dir {}", args.data_dir.display()))?;
+    if internet_mode {
+        std::fs::set_permissions(&args.data_dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("securing data dir {}", args.data_dir.display()))?;
+    }
     let ingest_key_path = args
         .ingest_key_file
         .clone()
@@ -333,12 +494,46 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
     )?;
     let (events, _) = broadcast::channel(1024);
     let (dash_events, _) = broadcast::channel(1024);
+    let session_key_path =
+        session_secret_file.unwrap_or_else(|| args.data_dir.join("http-session.key"));
+    let metrics = Arc::new(ServerMetrics::default());
+    let http_slots = Arc::new(Semaphore::new(limits.max_http_in_flight));
+    let websocket_slots = Arc::new(Semaphore::new(limits.max_websockets));
+    let ingest_slots = Arc::new(Semaphore::new(limits.max_ingest_connections));
     let state = AppState {
         store,
         dash_store,
         events,
         dash_events,
-        auth: AuthConfig::from_config(config.ingest)?,
+        auth: AuthConfig::from_config(config.ingest, require_strong_ingest)?,
+        access: AccessControl::from_config(config.access, !internet_mode)?,
+        sessions: SessionSigner::load_or_create(
+            &session_key_path,
+            session_ttl_seconds,
+            internet_mode,
+        )?,
+        public_origin,
+        trust_forwarded_for,
+        login_limiter: FixedWindowLimiter::new(
+            limits.login_attempts_per_minute,
+            Duration::from_secs(60),
+            10_000,
+        )?,
+        global_login_limiter: FixedWindowLimiter::new(
+            limits.global_login_attempts_per_minute,
+            Duration::from_secs(60),
+            1,
+        )?,
+        request_limiter: FixedWindowLimiter::new(
+            limits.authenticated_requests_per_minute,
+            Duration::from_secs(60),
+            10_000,
+        )?,
+        websocket_slots,
+        ingest_slots,
+        ingest_handshake_timeout: Duration::from_secs(limits.ingest_handshake_timeout_seconds),
+        ingest_idle_timeout: Duration::from_secs(limits.ingest_idle_timeout_seconds),
+        metrics: metrics.clone(),
         active_ingests: Arc::new(AsyncMutex::new(HashMap::new())),
         ingest_private_key: ingest_key.private,
     };
@@ -364,8 +559,15 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
 
     let app = Router::new()
         .route("/", get(index))
+        .route("/login", get(login_page))
         .route("/dash/{stream_id}", get(dash_viewer))
         .route("/favicon.ico", get(favicon))
+        .route("/api/auth/login", post(login))
+        .route("/api/auth/logout", post(logout))
+        .route("/api/session", get(session))
+        .route("/health/live", get(health_live))
+        .route("/health/ready", get(health_ready))
+        .route("/api/admin/metrics", get(admin_metrics))
         .route("/api/streams", get(list_streams))
         .route("/api/streams/{stream_id}", delete(delete_stream))
         .route("/api/ws", get(control_ws))
@@ -390,8 +592,31 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
             get(get_dash_segment),
         )
         .route("/api/dash/streams/{stream_id}/live", get(dash_live_ws))
-        .nest_service("/assets", ServeDir::new("crates/server/static"))
-        .with_state(state);
+        .route("/assets/index.css", get(index_css))
+        .route("/assets/index.js", get(index_js))
+        .route("/assets/login.css", get(login_css))
+        .route("/assets/login.js", get(login_js))
+        .route("/assets/dash-viewer.css", get(dash_viewer_css))
+        .route("/assets/dash-viewer-core.js", get(dash_viewer_core_js))
+        .route("/assets/dash-viewer.js", get(dash_viewer_js))
+        .with_state(state)
+        .layer(DefaultBodyLimit::max(4096))
+        .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(move |request, next| {
+            let http_slots = http_slots.clone();
+            let metrics = metrics.clone();
+            async move {
+                bounded_http_request(
+                    request,
+                    next,
+                    internet_mode,
+                    limits.http_timeout_seconds,
+                    http_slots,
+                    metrics,
+                )
+                .await
+            }
+        }));
 
     info!(
         control = %args.control_addr,
@@ -400,41 +625,370 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
         "glacialcast server listening"
     );
     let listener = TcpListener::bind(args.control_addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            wait_for_shutdown(&mut shutdown_rx).await;
-        })
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        wait_for_shutdown(&mut shutdown_rx).await;
+    })
+    .await?;
     let _ = shutdown_tx.send(true);
     Ok(())
 }
 
-async fn index() -> Html<&'static str> {
-    Html(include_str!("../static/index.html"))
+fn validate_private_config_file(path: &FsPath) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspecting server config {}", path.display()))?;
+    if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o077 != 0 {
+        anyhow::bail!(
+            "Internet-mode server config {} must be a private regular file with mode 0600",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
-async fn dash_viewer(Path(_stream_id): Path<Uuid>) -> Response {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .header(
-            "content-security-policy",
-            "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data: blob:; media-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'self'",
-        )
-        .header("x-content-type-options", "nosniff")
-        .header("referrer-policy", "no-referrer")
-        .body(Body::from(include_str!("../static/dash-viewer.html")))
-        .expect("static DASH viewer response headers are valid")
+fn validate_limits(limits: &LimitsConfig) -> Result<()> {
+    if limits.max_http_in_flight == 0
+        || limits.max_websockets == 0
+        || limits.max_ingest_connections == 0
+        || limits.login_attempts_per_minute == 0
+        || limits.global_login_attempts_per_minute < limits.login_attempts_per_minute
+        || limits.authenticated_requests_per_minute == 0
+        || !(1..=300).contains(&limits.http_timeout_seconds)
+        || !(1..=60).contains(&limits.ingest_handshake_timeout_seconds)
+        || !(30..=3600).contains(&limits.ingest_idle_timeout_seconds)
+    {
+        anyhow::bail!("security limit values are zero, inconsistent, or outside safe bounds");
+    }
+    Ok(())
+}
+
+async fn bounded_http_request(
+    request: axum::extract::Request,
+    next: middleware::Next,
+    hsts: bool,
+    timeout_seconds: u64,
+    slots: Arc<Semaphore>,
+    metrics: Arc<ServerMetrics>,
+) -> Response {
+    metrics.http_requests.fetch_add(1, Ordering::Relaxed);
+    let Ok(_permit) = slots.try_acquire_owned() else {
+        metrics.http_overloaded.fetch_add(1, Ordering::Relaxed);
+        return security_headers(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "1")],
+                "server busy",
+            )
+                .into_response(),
+            hsts,
+        );
+    };
+    let response =
+        match tokio::time::timeout(Duration::from_secs(timeout_seconds), next.run(request)).await {
+            Ok(response) => response,
+            Err(_) => {
+                metrics.http_timed_out.fetch_add(1, Ordering::Relaxed);
+                (StatusCode::GATEWAY_TIMEOUT, "request timed out").into_response()
+            }
+        };
+    security_headers(response, hsts)
+}
+
+fn security_headers(mut response: Response, hsts: bool) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+        ),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    headers.insert(
+        "permissions-policy",
+        HeaderValue::from_static(
+            "camera=(), microphone=(), geolocation=(), display-capture=(), usb=()",
+        ),
+    );
+    headers.insert(
+        "cross-origin-opener-policy",
+        HeaderValue::from_static("same-origin"),
+    );
+    headers.insert(
+        "cross-origin-resource-policy",
+        HeaderValue::from_static("same-origin"),
+    );
+    if hsts {
+        headers.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        );
+    }
+    if !headers.contains_key(header::CACHE_CONTROL) {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    response
+}
+
+async fn index(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if request_identity(&state, &headers).is_err() {
+        return Redirect::to("/login").into_response();
+    }
+    static_response(
+        "text/html; charset=utf-8",
+        include_str!("../static/index.html"),
+    )
+}
+
+async fn login_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if request_identity(&state, &headers).is_ok() {
+        return Redirect::to("/").into_response();
+    }
+    static_response(
+        "text/html; charset=utf-8",
+        include_str!("../static/login.html"),
+    )
+}
+
+async fn dash_viewer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(stream_id): Path<Uuid>,
+) -> Response {
+    let Ok(identity) = request_identity(&state, &headers) else {
+        return Redirect::to("/login").into_response();
+    };
+    if authorize_stream(&state, &identity.principal, stream_id).is_err() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    static_response(
+        "text/html; charset=utf-8",
+        include_str!("../static/dash-viewer.html"),
+    )
 }
 
 async fn favicon() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+fn static_response(content_type: &'static str, body: &'static str) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .body(Body::from(body))
+        .expect("static response headers are valid")
+}
+
+async fn index_css() -> Response {
+    static_response(
+        "text/css; charset=utf-8",
+        include_str!("../static/index.css"),
+    )
+}
+
+async fn index_js() -> Response {
+    static_response(
+        "text/javascript; charset=utf-8",
+        include_str!("../static/index.js"),
+    )
+}
+
+async fn login_css() -> Response {
+    static_response(
+        "text/css; charset=utf-8",
+        include_str!("../static/login.css"),
+    )
+}
+
+async fn login_js() -> Response {
+    static_response(
+        "text/javascript; charset=utf-8",
+        include_str!("../static/login.js"),
+    )
+}
+
+async fn dash_viewer_css() -> Response {
+    static_response(
+        "text/css; charset=utf-8",
+        include_str!("../static/dash-viewer.css"),
+    )
+}
+
+async fn dash_viewer_js() -> Response {
+    static_response(
+        "text/javascript; charset=utf-8",
+        include_str!("../static/dash-viewer.js"),
+    )
+}
+
+async fn dash_viewer_core_js() -> Response {
+    static_response(
+        "text/javascript; charset=utf-8",
+        include_str!("../static/dash-viewer-core.js"),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginRequest {
+    token: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionResponse {
+    name: String,
+    role: AccessRole,
+    csrf_token: Option<String>,
+}
+
+async fn login(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<LoginRequest>,
+) -> Result<Response, AppError> {
+    if !validate_request_origin(&headers, state.public_origin.as_deref()) {
+        return Err(AppError::Forbidden);
+    }
+    let remote_ip = client_ip(&headers, peer.ip(), state.trust_forwarded_for);
+    if !state.login_limiter.check(remote_ip.to_string())
+        || !state.global_login_limiter.check("global")
+    {
+        state
+            .metrics
+            .login_rate_limited
+            .fetch_add(1, Ordering::Relaxed);
+        warn!(%remote_ip, "viewer login rate limited");
+        return Err(AppError::TooManyRequests);
+    }
+    let Some(principal) = state.access.authenticate_token(&request.token) else {
+        state.metrics.login_failures.fetch_add(1, Ordering::Relaxed);
+        warn!(%remote_ip, "viewer login failed");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        return Err(AppError::Unauthorized);
+    };
+    let (cookie, csrf_token) = state.sessions.create_session(&principal)?;
+    state
+        .metrics
+        .login_successes
+        .fetch_add(1, Ordering::Relaxed);
+    info!(principal = %principal.name, role = ?principal.role, "viewer login succeeded");
+    Ok((
+        [(header::SET_COOKIE, state.sessions.session_cookie(&cookie))],
+        Json(SessionResponse {
+            name: principal.name,
+            role: principal.role,
+            csrf_token: Some(csrf_token),
+        }),
+    )
+        .into_response())
+}
+
+async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, AppError> {
+    let request = request_identity(&state, &headers)?;
+    require_mutation_authority(&state, &headers, &request)?;
+    Ok((
+        [(header::SET_COOKIE, state.sessions.expired_cookie())],
+        StatusCode::NO_CONTENT,
+    )
+        .into_response())
+}
+
+async fn session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<SessionResponse>, AppError> {
+    let request = request_identity(&state, &headers)?;
+    Ok(Json(SessionResponse {
+        name: request.principal.name,
+        role: request.principal.role,
+        csrf_token: request.csrf,
+    }))
+}
+
+async fn health_live() -> &'static str {
+    "ok\n"
+}
+
+async fn health_ready(State(state): State<AppState>) -> Response {
+    match state
+        .store
+        .healthcheck()
+        .and_then(|()| state.dash_store.summaries().map(|_| ()))
+    {
+        Ok(()) => (StatusCode::OK, "ready\n").into_response(),
+        Err(err) => {
+            error!(?err, "readiness check failed");
+            (StatusCode::SERVICE_UNAVAILABLE, "not ready\n").into_response()
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct MetricsResponse {
+    http_requests: u64,
+    http_overloaded: u64,
+    http_timed_out: u64,
+    login_successes: u64,
+    login_failures: u64,
+    login_rate_limited: u64,
+    request_rate_limited: u64,
+    active_websockets: u64,
+    websocket_rejected: u64,
+    active_ingest_connections: u64,
+    ingest_rejected: u64,
+    ingest_auth_failures: u64,
+}
+
+async fn admin_metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<MetricsResponse>, AppError> {
+    let identity = request_identity(&state, &headers)?;
+    if !identity.principal.is_admin() {
+        return Err(AppError::Forbidden);
+    }
+    let metrics = &state.metrics;
+    Ok(Json(MetricsResponse {
+        http_requests: metrics.http_requests.load(Ordering::Relaxed),
+        http_overloaded: metrics.http_overloaded.load(Ordering::Relaxed),
+        http_timed_out: metrics.http_timed_out.load(Ordering::Relaxed),
+        login_successes: metrics.login_successes.load(Ordering::Relaxed),
+        login_failures: metrics.login_failures.load(Ordering::Relaxed),
+        login_rate_limited: metrics.login_rate_limited.load(Ordering::Relaxed),
+        request_rate_limited: metrics.request_rate_limited.load(Ordering::Relaxed),
+        active_websockets: metrics.active_websockets.load(Ordering::Relaxed),
+        websocket_rejected: metrics.websocket_rejected.load(Ordering::Relaxed),
+        active_ingest_connections: metrics.active_ingest_connections.load(Ordering::Relaxed),
+        ingest_rejected: metrics.ingest_rejected.load(Ordering::Relaxed),
+        ingest_auth_failures: metrics.ingest_auth_failures.load(Ordering::Relaxed),
+    }))
+}
+
 async fn list_streams(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<axum::Json<Vec<glacialcast_protocol::PublicStream>>, AppError> {
-    let mut streams = state.store.list_streams()?;
+    let identity = request_identity(&state, &headers)?;
+    let records = state.store.list_stream_records()?;
+    let mut streams: Vec<_> = records
+        .into_iter()
+        .filter(|record| {
+            identity
+                .principal
+                .can_view_publisher(record.client_id.as_str())
+        })
+        .map(|record| record.stream)
+        .collect();
     let dash_summaries = state.dash_store.summaries()?;
     for stream in &mut streams {
         if let Some(summary) = dash_summaries.get(&stream.stream_id) {
@@ -447,8 +1001,14 @@ async fn list_streams(
 
 async fn delete_stream(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(stream_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
+    let identity = request_identity(&state, &headers)?;
+    if !identity.principal.is_admin() {
+        return Err(AppError::Forbidden);
+    }
+    require_mutation_authority(&state, &headers, &identity)?;
     if state.store.delete_stream(stream_id)? {
         state.dash_store.delete_stream(stream_id)?;
         publish_stream_event(&state, "stream_deleted", stream_id);
@@ -460,8 +1020,11 @@ async fn delete_stream(
 
 async fn dash_manifest(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(stream_id): Path<Uuid>,
 ) -> Result<Response, AppError> {
+    let identity = request_identity(&state, &headers)?;
+    authorize_stream(&state, &identity.principal, stream_id)?;
     let manifest = state
         .dash_store
         .manifest(stream_id, true)?
@@ -476,8 +1039,11 @@ async fn dash_manifest(
 
 async fn list_dash_objects(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(stream_id): Path<Uuid>,
 ) -> Result<Json<Vec<DashObjectHeader>>, AppError> {
+    let identity = request_identity(&state, &headers)?;
+    authorize_stream(&state, &identity.principal, stream_id)?;
     Ok(Json(
         state
             .dash_store
@@ -490,8 +1056,11 @@ async fn list_dash_objects(
 
 async fn get_dash_object(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((stream_id, sequence)): Path<(Uuid, u64)>,
 ) -> Result<Response, AppError> {
+    let identity = request_identity(&state, &headers)?;
+    authorize_stream(&state, &identity.principal, stream_id)?;
     let object = state
         .dash_store
         .get(stream_id, sequence)?
@@ -509,8 +1078,11 @@ async fn get_dash_object(
 
 async fn get_dash_initialization(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((stream_id, epoch_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Response, AppError> {
+    let identity = request_identity(&state, &headers)?;
+    authorize_stream(&state, &identity.principal, stream_id)?;
     let initialization = state
         .dash_store
         .initialization(stream_id, epoch_id)?
@@ -528,8 +1100,11 @@ async fn get_dash_initialization(
 
 async fn get_dash_segment(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((stream_id, epoch_id, segment_file)): Path<(Uuid, Uuid, String)>,
 ) -> Result<Response, AppError> {
+    let identity = request_identity(&state, &headers)?;
+    authorize_stream(&state, &identity.principal, stream_id)?;
     let segment_number = segment_file
         .strip_suffix(".m4s")
         .ok_or_else(|| anyhow::anyhow!("DASH segment path must end in .m4s"))?
@@ -552,13 +1127,27 @@ async fn get_dash_segment(
 
 async fn dash_live_ws(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(stream_id): Path<Uuid>,
     ws: WebSocketUpgrade,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| dash_live_socket(socket, state, stream_id))
+) -> Result<Response, AppError> {
+    let identity = request_identity(&state, &headers)?;
+    authorize_stream(&state, &identity.principal, stream_id)?;
+    if !validate_request_origin(&headers, state.public_origin.as_deref()) {
+        return Err(AppError::Forbidden);
+    }
+    let guard = websocket_guard(&state)?;
+    Ok(ws
+        .on_upgrade(move |socket| dash_live_socket(socket, state, stream_id, guard))
+        .into_response())
 }
 
-async fn dash_live_socket(socket: WebSocket, state: AppState, stream_id: Uuid) {
+async fn dash_live_socket(
+    socket: WebSocket,
+    state: AppState,
+    stream_id: Uuid,
+    _guard: ConnectionGuard,
+) {
     let mut rx = state.dash_events.subscribe();
     let (mut sender, mut receiver) = socket.split();
     let send_task = tokio::spawn(async move {
@@ -588,15 +1177,40 @@ async fn dash_live_socket(socket: WebSocket, state: AppState, stream_id: Uuid) {
     send_task.abort();
 }
 
-async fn control_ws(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| control_socket(socket, state))
+async fn control_ws(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Result<Response, AppError> {
+    let identity = request_identity(&state, &headers)?;
+    if !validate_request_origin(&headers, state.public_origin.as_deref()) {
+        return Err(AppError::Forbidden);
+    }
+    let guard = websocket_guard(&state)?;
+    Ok(ws
+        .on_upgrade(move |socket| control_socket(socket, state, identity.principal, guard))
+        .into_response())
 }
 
-async fn control_socket(socket: WebSocket, state: AppState) {
+async fn control_socket(
+    socket: WebSocket,
+    state: AppState,
+    principal: Principal,
+    _guard: ConnectionGuard,
+) {
     let mut rx = state.events.subscribe();
     let (mut sender, mut receiver) = socket.split();
     let send_task = tokio::spawn(async move {
         while let Ok(event) = rx.recv().await {
+            let allowed = state
+                .store
+                .client_id_for_stream(event.stream_id)
+                .ok()
+                .flatten()
+                .is_some_and(|publisher| principal.can_view_publisher(&publisher));
+            if !allowed {
+                continue;
+            }
             if sender
                 .send(Message::Text(encode_ws_event(&event).into()))
                 .await
@@ -616,6 +1230,135 @@ async fn control_socket(socket: WebSocket, state: AppState) {
     send_task.abort();
 }
 
+fn request_identity(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedRequest, AppError> {
+    let request = state
+        .sessions
+        .authenticate(headers, &state.access)
+        .or_else(|| {
+            state
+                .access
+                .local_principal()
+                .map(|principal| AuthenticatedRequest {
+                    principal,
+                    csrf: None,
+                })
+        })
+        .ok_or(AppError::Unauthorized)?;
+    if !state.request_limiter.check(request.principal.name.as_str()) {
+        state
+            .metrics
+            .request_rate_limited
+            .fetch_add(1, Ordering::Relaxed);
+        return Err(AppError::TooManyRequests);
+    }
+    Ok(request)
+}
+
+fn authorize_stream(
+    state: &AppState,
+    principal: &Principal,
+    stream_id: Uuid,
+) -> Result<(), AppError> {
+    let publisher = state
+        .store
+        .client_id_for_stream(stream_id)?
+        .ok_or(AppError::NotFound)?;
+    if !principal.can_view_publisher(&publisher) {
+        // Do not disclose the existence of streams outside the principal's
+        // configured publisher scope.
+        return Err(AppError::NotFound);
+    }
+    Ok(())
+}
+
+fn require_mutation_authority(
+    state: &AppState,
+    headers: &HeaderMap,
+    request: &AuthenticatedRequest,
+) -> Result<(), AppError> {
+    if !validate_request_origin(headers, state.public_origin.as_deref())
+        || !state.sessions.verify_csrf(request, headers)
+    {
+        return Err(AppError::Forbidden);
+    }
+    Ok(())
+}
+
+struct ConnectionGuard {
+    _permit: OwnedSemaphorePermit,
+    metrics: Arc<ServerMetrics>,
+    kind: ConnectionKind,
+}
+
+#[derive(Clone, Copy)]
+enum ConnectionKind {
+    WebSocket,
+    Ingest,
+}
+
+impl ConnectionGuard {
+    fn new(
+        permit: OwnedSemaphorePermit,
+        metrics: Arc<ServerMetrics>,
+        kind: ConnectionKind,
+    ) -> Self {
+        match kind {
+            ConnectionKind::WebSocket => {
+                metrics.active_websockets.fetch_add(1, Ordering::Relaxed);
+            }
+            ConnectionKind::Ingest => {
+                metrics
+                    .active_ingest_connections
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Self {
+            _permit: permit,
+            metrics,
+            kind,
+        }
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        match self.kind {
+            ConnectionKind::WebSocket => {
+                self.metrics
+                    .active_websockets
+                    .fetch_sub(1, Ordering::Relaxed);
+            }
+            ConnectionKind::Ingest => {
+                self.metrics
+                    .active_ingest_connections
+                    .fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+fn websocket_guard(state: &AppState) -> Result<ConnectionGuard, AppError> {
+    let permit = state
+        .websocket_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            state
+                .metrics
+                .websocket_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            AppError::TooManyRequests
+        })?;
+    Ok(ConnectionGuard::new(
+        permit,
+        state.metrics.clone(),
+        ConnectionKind::WebSocket,
+    ))
+}
+
 async fn run_ingest(
     addr: SocketAddr,
     state: AppState,
@@ -628,9 +1371,24 @@ async fn run_ingest(
             accepted = listener.accept() => accepted?,
             _ = wait_for_shutdown(&mut shutdown_rx) => break,
         };
+        let permit = match state.ingest_slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                state
+                    .metrics
+                    .ingest_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(%peer, "ingest connection limit reached");
+                continue;
+            }
+        };
+        if let Err(err) = stream.set_nodelay(true) {
+            debug!(%peer, ?err, "could not enable TCP_NODELAY for ingest");
+        }
+        let guard = ConnectionGuard::new(permit, state.metrics.clone(), ConnectionKind::Ingest);
         let state = state.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_ingest(stream, state).await {
+            if let Err(err) = handle_ingest(stream, state, guard).await {
                 warn!(%peer, ?err, "ingest connection failed");
             }
         });
@@ -638,10 +1396,25 @@ async fn run_ingest(
     Ok(())
 }
 
-async fn handle_ingest(mut stream: TcpStream, state: AppState) -> Result<()> {
-    let transport = responder_handshake(&mut stream, &state.ingest_private_key).await?;
+async fn handle_ingest(
+    mut stream: TcpStream,
+    state: AppState,
+    _guard: ConnectionGuard,
+) -> Result<()> {
+    let transport = tokio::time::timeout(
+        state.ingest_handshake_timeout,
+        responder_handshake(&mut stream, &state.ingest_private_key),
+    )
+    .await
+    .context("Noise handshake timed out")??;
     let mut socket = glacialcast_protocol::NoiseSocket::new(stream, transport);
-    let hello = match socket.read::<ClientMessage>().await? {
+    let hello = match tokio::time::timeout(
+        state.ingest_handshake_timeout,
+        socket.read::<ClientMessage>(),
+    )
+    .await
+    .context("publisher hello timed out")??
+    {
         ClientMessage::Hello(hello) => hello,
         other => {
             socket
@@ -660,10 +1433,16 @@ async fn handle_ingest(mut stream: TcpStream, state: AppState) -> Result<()> {
     let authenticated = match authenticate_hello(&state, &hello).await {
         Ok(authenticated) => authenticated,
         Err(err) => {
+            state
+                .metrics
+                .ingest_auth_failures
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(?err, "publisher authentication failed");
+            tokio::time::sleep(Duration::from_millis(250)).await;
             socket
                 .write(&ServerMessage::HelloAck {
                     accepted: false,
-                    reason: Some(err.to_string()),
+                    reason: Some("publisher authentication failed".to_string()),
                     stream_id: None,
                     last_sequence: 0,
                     server_time_ms: now_ms(),
@@ -694,7 +1473,14 @@ async fn handle_ingest(mut stream: TcpStream, state: AppState) -> Result<()> {
         .await
         .insert(stream_id, connection_id);
     publish_stream_event(&state, "stream_connected", stream_id);
-    let result = ingest_loop(&state, &mut socket, stream_id, last_seq).await;
+    let result = ingest_loop(
+        &state,
+        &mut socket,
+        stream_id,
+        last_seq,
+        state.ingest_idle_timeout,
+    )
+    .await;
     let mut active_ingests = state.active_ingests.lock().await;
     let owns_connection = active_ingests.get(&stream_id) == Some(&connection_id);
     if owns_connection {
@@ -722,9 +1508,12 @@ async fn ingest_loop(
     socket: &mut glacialcast_protocol::NoiseSocket<TcpStream>,
     stream_id: Uuid,
     mut last_seq: u64,
+    idle_timeout: Duration,
 ) -> Result<()> {
     loop {
-        let message = socket.read::<ClientMessage>().await;
+        let message = tokio::time::timeout(idle_timeout, socket.read::<ClientMessage>())
+            .await
+            .context("publisher connection idle timeout")?;
         match message {
             Ok(ClientMessage::DashObject(object)) => {
                 object.validate().context("validating DASH ingest object")?;
@@ -806,10 +1595,8 @@ async fn authenticate_hello(state: &AppState, hello: &StreamHello) -> Result<Aut
     Ok(AuthenticatedClient { identity })
 }
 
-fn hash_token(token: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    format!("{:x}", hasher.finalize())
+fn hash_token(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
 }
 
 #[cfg(test)]
@@ -822,19 +1609,20 @@ mod tests {
             tokens: vec![ConfiguredIngestToken {
                 name: "laptop".to_string(),
                 token: "secret".to_string(),
+                previous_tokens: Vec::new(),
             }],
         }
     }
 
     #[test]
     fn optional_auth_accepts_client_id_without_token() {
-        let auth = AuthConfig::from_config(token_config(false)).unwrap();
+        let auth = AuthConfig::from_config(token_config(false), false).unwrap();
         assert_eq!(auth.authenticate(None, "desk").unwrap(), "desk");
     }
 
     #[test]
     fn configured_token_maps_to_client_identity() {
-        let auth = AuthConfig::from_config(token_config(false)).unwrap();
+        let auth = AuthConfig::from_config(token_config(false), false).unwrap();
         assert_eq!(
             auth.authenticate(Some("secret"), "spoofed").unwrap(),
             "laptop"
@@ -843,14 +1631,33 @@ mod tests {
 
     #[test]
     fn required_auth_rejects_missing_token() {
-        let auth = AuthConfig::from_config(token_config(true)).unwrap();
+        let auth = AuthConfig::from_config(token_config(true), false).unwrap();
         assert!(auth.authenticate(None, "desk").is_err());
     }
 
     #[test]
     fn invalid_token_is_rejected_even_when_optional() {
-        let auth = AuthConfig::from_config(token_config(false)).unwrap();
+        let auth = AuthConfig::from_config(token_config(false), false).unwrap();
         assert!(auth.authenticate(Some("wrong"), "desk").is_err());
+    }
+
+    #[test]
+    fn internet_ingest_requires_strong_tokens_and_supports_rotation() {
+        assert!(AuthConfig::from_config(token_config(true), true).is_err());
+        let mut config = token_config(true);
+        config.tokens[0].token = "current-0123456789abcdef0123456789".to_string();
+        config.tokens[0].previous_tokens = vec!["previous-0123456789abcdef01234567".to_string()];
+        let auth = AuthConfig::from_config(config, true).unwrap();
+        assert_eq!(
+            auth.authenticate(Some("current-0123456789abcdef0123456789"), "ignored")
+                .unwrap(),
+            "laptop"
+        );
+        assert_eq!(
+            auth.authenticate(Some("previous-0123456789abcdef01234567"), "ignored")
+                .unwrap(),
+            "laptop"
+        );
     }
 
     #[test]
@@ -883,6 +1690,9 @@ mod tests {
 #[derive(Debug)]
 enum AppError {
     NotFound,
+    Unauthorized,
+    Forbidden,
+    TooManyRequests,
     Anyhow(anyhow::Error),
 }
 
@@ -899,9 +1709,22 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         match self {
             AppError::NotFound => (StatusCode::NOT_FOUND, "not found").into_response(),
+            AppError::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "Bearer")],
+                "authentication required",
+            )
+                .into_response(),
+            AppError::Forbidden => (StatusCode::FORBIDDEN, "forbidden").into_response(),
+            AppError::TooManyRequests => (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, "60")],
+                "rate limit exceeded",
+            )
+                .into_response(),
             AppError::Anyhow(err) => {
                 error!(?err, "request failed");
-                (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
             }
         }
     }

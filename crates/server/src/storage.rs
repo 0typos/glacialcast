@@ -16,6 +16,12 @@ struct StoreInner {
     conn: Mutex<Connection>,
 }
 
+#[derive(Debug, Clone)]
+pub struct StreamRecord {
+    pub stream: PublicStream,
+    pub client_id: String,
+}
+
 impl Store {
     pub fn open(data_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&data_dir)
@@ -145,11 +151,26 @@ impl Store {
         Ok(found.is_some())
     }
 
+    pub fn healthcheck(&self) -> Result<()> {
+        self.conn()?
+            .query_row("SELECT 1", [], |_| Ok(()))
+            .context("checking stream catalog health")
+    }
+
+    #[cfg(test)]
     pub fn list_streams(&self) -> Result<Vec<PublicStream>> {
+        Ok(self
+            .list_stream_records()?
+            .into_iter()
+            .map(|record| record.stream)
+            .collect())
+    }
+
+    pub fn list_stream_records(&self) -> Result<Vec<StreamRecord>> {
         let conn = self.conn()?;
         let mut statement = conn.prepare(
             r#"
-            SELECT stream_id, display_name, backend, source_description,
+            SELECT stream_id, client_id, display_name, backend, source_description,
                    source_width, source_height, active, last_seen_at_ms
             FROM streams
             ORDER BY active DESC, COALESCE(last_seen_at_ms, created_at_ms) DESC
@@ -161,35 +182,59 @@ impl Store {
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
+                row.get::<_, String>(4)?,
                 row.get::<_, i64>(5)?,
                 row.get::<_, i64>(6)?,
-                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, Option<i64>>(8)?,
             ))
         })?;
 
         rows.map(|row| {
-            let (stream_id, display_name, backend, description, width, height, active, last_seen) =
-                row?;
-            Ok(PublicStream {
-                stream_id: Uuid::parse_str(&stream_id)
-                    .context("invalid stream_id in stream catalog")?,
+            let (
+                stream_id,
+                client_id,
                 display_name,
-                source: CaptureSource {
-                    backend,
-                    description,
-                    width: u32::try_from(width)
-                        .context("invalid source width in stream catalog")?,
-                    height: u32::try_from(height)
-                        .context("invalid source height in stream catalog")?,
+                backend,
+                description,
+                width,
+                height,
+                active,
+                last_seen,
+            ) = row?;
+            Ok(StreamRecord {
+                client_id,
+                stream: PublicStream {
+                    stream_id: Uuid::parse_str(&stream_id)
+                        .context("invalid stream_id in stream catalog")?,
+                    display_name,
+                    source: CaptureSource {
+                        backend,
+                        description,
+                        width: u32::try_from(width)
+                            .context("invalid source width in stream catalog")?,
+                        height: u32::try_from(height)
+                            .context("invalid source height in stream catalog")?,
+                    },
+                    active: active != 0,
+                    last_seen_at_ms: last_seen,
+                    last_object_sequence: None,
+                    retained_bytes: 0,
                 },
-                active: active != 0,
-                last_seen_at_ms: last_seen,
-                last_object_sequence: None,
-                retained_bytes: 0,
             })
         })
         .collect()
+    }
+
+    pub fn client_id_for_stream(&self, stream_id: Uuid) -> Result<Option<String>> {
+        self.conn()?
+            .query_row(
+                "SELECT client_id FROM streams WHERE stream_id = ?1",
+                params![stream_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .context("looking up stream publisher identity")
     }
 
     pub fn delete_stream(&self, stream_id: Uuid) -> Result<bool> {
@@ -241,6 +286,26 @@ mod tests {
         assert_eq!(streams[0].display_name, "Renamed");
         assert_eq!(streams[0].source.description, "second");
         assert!(!streams[0].active);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_exposes_publisher_identity_only_to_authorization_code() {
+        let root =
+            std::env::temp_dir().join(format!("glacialcast-stream-authz-{}", Uuid::new_v4()));
+        let store = Store::open(root.clone()).unwrap();
+        let stream_id = store
+            .ensure_stream_for_client("publisher-one", "Desktop", &source("screen"))
+            .unwrap();
+        let records = store.list_stream_records().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].client_id, "publisher-one");
+        assert_eq!(
+            store.client_id_for_stream(stream_id).unwrap().as_deref(),
+            Some("publisher-one")
+        );
+        assert_eq!(store.client_id_for_stream(Uuid::new_v4()).unwrap(), None);
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 

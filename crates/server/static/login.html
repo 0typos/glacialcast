@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in · GlacialCast</title>
+  <link rel="stylesheet" href="/assets/login.css">
+</head>
+<body>
+  <main>
+    <p class="eyebrow">Encrypted screen relay</p>
+    <h1>GlacialCast</h1>
+    <form id="login-form">
+      <label for="access-token">Access token</label>
+      <input
+        id="access-token"
+        type="password"
+        autocomplete="current-password"
+        spellcheck="false"
+        required
+        autofocus
+      >
+      <button type="submit">Sign in</button>
+      <p id="status" role="alert">Enter the access token issued by the relay operator.</p>
+    </form>
+  </main>
+  <script src="/assets/login.js"></script>
+</body>
+</html>
