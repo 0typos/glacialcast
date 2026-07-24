@@ -1,3 +1,10 @@
+//! Local Unix-socket lifecycle helpers for GlacialCast binaries.
+//!
+//! The control protocol is intentionally small and local: one newline-
+//! terminated command receives one newline-terminated response. It supports
+//! status inspection and graceful shutdown, while process daemonization
+//! re-executes the current binary in a detached session.
+
 use anyhow::{Context, Result, bail};
 use std::{
     env,
@@ -14,6 +21,7 @@ use tokio::{
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
+/// Converts a user-facing value into a conservative Unix-socket path component.
 pub fn sanitize_socket_component(value: &str) -> String {
     let sanitized = value
         .chars()
@@ -28,6 +36,11 @@ pub fn sanitize_socket_component(value: &str) -> String {
     sanitized.trim_matches('-').to_string()
 }
 
+/// Re-executes the current process as a detached daemon when requested.
+///
+/// Returns `true` in the parent after spawning the daemon child, which tells
+/// the caller to exit successfully. Returns `false` when the current process
+/// should continue normal startup.
 pub fn daemonize_if_requested(
     daemon: bool,
     daemon_child: bool,
@@ -101,6 +114,7 @@ fn filtered_daemon_args(
     Ok(out)
 }
 
+/// Sends one command to a local daemon control socket and returns its response.
 pub async fn manager_command(socket_path: &Path, command: &str) -> Result<String> {
     let mut stream = UnixStream::connect(socket_path)
         .await
@@ -124,6 +138,10 @@ pub async fn manager_command(socket_path: &Path, command: &str) -> Result<String
     Ok(response)
 }
 
+/// Serves status and shutdown commands until shutdown is requested.
+///
+/// Startup refuses to replace an active socket and removes only a stale socket
+/// at the exact requested path. The socket is removed on graceful exit.
 pub async fn serve_control_socket(
     socket_path: PathBuf,
     shutdown_tx: watch::Sender<bool>,
@@ -199,6 +217,7 @@ async fn handle_control_connection(
     Ok(())
 }
 
+/// Waits for `Ctrl+C` or `SIGTERM`, then broadcasts graceful shutdown.
 pub async fn install_signal_handlers(shutdown_tx: watch::Sender<bool>) -> Result<()> {
     let mut sigterm = {
         #[cfg(unix)]
@@ -230,6 +249,7 @@ pub async fn install_signal_handlers(shutdown_tx: watch::Sender<bool>) -> Result
     Ok(())
 }
 
+/// Waits until shutdown was requested or all watch senders were dropped.
 pub async fn wait_for_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
     if *shutdown_rx.borrow() {
         return;

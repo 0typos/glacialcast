@@ -1,3 +1,18 @@
+//! Versioned publisher, relay, portable-object, and daemon protocols.
+//!
+//! Publisher traffic is serialized with Postcard only after both peers agree
+//! on [`PROTOCOL_VERSION`], segmented into bounded records, and carried through
+//! a pinned Noise NK transport. DASH objects expose only routing and retention
+//! metadata; their media and cursor payloads remain encrypted and are
+//! authenticated end to end by keys the relay does not possess.
+//!
+//! The portable `GCO1` representation contains the same authenticated object
+//! and can be copied independently to an offline viewer. All inbound lengths
+//! are checked before allocation, and parsers reject trailing or noncanonical
+//! data.
+
+#![deny(missing_docs)]
+
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use glacialcast_dash::{
     DASH_FORMAT_VERSION, EpochKeys, MAX_CURSOR_PAYLOAD, MAX_MEDIA_PAYLOAD, authenticate_object,
@@ -11,94 +26,146 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
+/// Helpers shared by the client and server daemon-control implementations.
 pub mod daemon;
 
+/// Publisher/relay message schema version.
 pub const PROTOCOL_VERSION: u16 = 5;
+/// Absolute maximum serialized message size accepted by [`NoiseSocket`].
 pub const MAX_FRAME_LEN: usize = 32 * 1024 * 1024;
 const MAX_WIRE_PACKET_LEN: usize = 65_535;
+/// Magic prefix for a portable [`DashObject`] file.
 pub const PORTABLE_DASH_MAGIC: &[u8; 4] = b"GCO1";
 const MAX_PORTABLE_DASH_HEADER_LEN: usize = 64 * 1024;
 const MAX_NOISE_PLAINTEXT_LEN: usize = 60 * 1024;
 const NOISE_SEGMENT_MAGIC: &[u8; 4] = b"GCN1";
 const NOISE_SEGMENT_HEADER_LEN: usize = 12;
+/// Noise protocol pattern used for pinned-server publisher ingest.
 pub const NOISE_PATTERN: &str = "Noise_NK_25519_ChaChaPoly_BLAKE2s";
+/// Byte length of Noise X25519 public and private keys.
 pub const NOISE_KEY_LEN: usize = 32;
 
 #[derive(Debug, Error)]
+/// Errors produced by protocol framing, validation, serialization, or crypto.
 pub enum ProtocolError {
+    /// A declared or encoded frame exceeded the applicable maximum.
     #[error("message exceeds max frame length: {0}")]
     FrameTooLarge(usize),
+    /// Framing, segmentation, or canonical-message validation failed.
     #[error("malformed frame")]
     MalformedFrame,
+    /// The Noise state machine rejected an operation.
     #[error("noise error: {0}")]
     Noise(String),
+    /// The underlying asynchronous stream failed.
     #[error("io error: {0}")]
     Io(#[from] io::Error),
+    /// A Postcard message could not be encoded or decoded.
     #[error("serialization error: {0}")]
     Postcard(#[from] postcard::Error),
+    /// An unpadded URL-safe base64 value could not be decoded.
     #[error("base64 decode error: {0}")]
     Base64(#[from] base64::DecodeError),
+    /// A cryptographic primitive failed.
     #[error("crypto error")]
     Crypto,
+    /// A decoded viewer key had the reported length instead of 32 bytes.
     #[error("viewer key must decode to 32 bytes, got {0}")]
     InvalidKeyLength(usize),
+    /// A decoded Noise key had the reported length instead of [`NOISE_KEY_LEN`].
     #[error("Noise key must contain 32 bytes, got {0}")]
     InvalidNoiseKeyLength(usize),
+    /// A DASH object used an unsupported format version.
     #[error("unsupported DASH object format version {0}")]
     UnsupportedDashVersion(u16),
+    /// A DASH object's actual and declared payload lengths differed.
     #[error("DASH object payload length does not match its header")]
     DashPayloadLength,
+    /// A DASH object exceeded the maximum for its object kind.
     #[error("DASH object payload exceeds its size limit")]
     DashPayloadTooLarge,
+    /// A DASH object's payload did not match its declared SHA-256 digest.
     #[error("DASH object payload hash does not match its header")]
     DashPayloadHash,
+    /// Public routing metadata violated the invariant named in the value.
     #[error("DASH object has invalid metadata: {0}")]
     InvalidDashMetadata(&'static str),
+    /// End-to-end DASH object authentication failed.
     #[error("DASH object authentication failed")]
     DashAuthentication,
+    /// A portable `GCO1` object violated its framing or object invariants.
     #[error("portable DASH object is malformed")]
     InvalidPortableDashObject,
 }
 
+/// Result type returned by protocol operations.
 pub type Result<T> = std::result::Result<T, ProtocolError>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Publisher identity and resume range sent as the first Noise message.
 pub struct StreamHello {
+    /// Message schema version, which must equal [`PROTOCOL_VERSION`].
     pub protocol_version: u16,
+    /// Client-supplied identity used only when ingest authentication is optional.
     pub client_id: String,
+    /// Publisher credential sent inside the authenticated Noise channel.
     pub auth_token: Option<String>,
+    /// Human-readable stream label shown to authorized viewers.
     pub display_name: String,
+    /// Public capture-source metadata.
     pub source: CaptureSource,
+    /// Lowest object sequence still available for retransmission.
     pub resend_low: Option<u64>,
+    /// Highest object sequence still available for retransmission.
     pub resend_high: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Non-secret metadata describing the captured source.
 pub struct CaptureSource {
+    /// Capture backend identifier, such as `portal` or `dash-test`.
     pub backend: String,
+    /// Human-readable monitor, window, or test-source description.
     pub description: String,
+    /// Source width in pixels.
     pub width: u32,
+    /// Source height in pixels.
     pub height: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Message sent from a publisher to the relay over [`NoiseSocket`].
 pub enum ClientMessage {
+    /// Opens or resumes a publisher stream and authenticates the publisher.
     Hello(StreamHello),
+    /// Publishes one authenticated, opaque DASH object.
     DashObject(DashObject),
-    Ping { now_ms: i64 },
+    /// Checks liveness using the publisher's current Unix time.
+    Ping {
+        /// Publisher Unix timestamp in milliseconds.
+        now_ms: i64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// Semantic role of a versioned DASH stream object.
 pub enum DashObjectKind {
+    /// Authenticated epoch descriptor.
     Epoch,
+    /// CENC fragmented-MP4 initialization segment.
     Initialization,
+    /// One independently appendable encrypted media fragment.
     Media,
+    /// One encrypted batch of independent cursor events.
     Cursor,
+    /// Authenticated presentation index metadata.
     Index,
+    /// Clean epoch termination marker.
     End,
 }
 
 impl DashObjectKind {
+    /// Returns the stable numeric code included in object authentication.
     pub fn code(self) -> u8 {
         match self {
             Self::Epoch => 0,
@@ -110,6 +177,7 @@ impl DashObjectKind {
         }
     }
 
+    /// Returns the maximum payload size accepted for this object kind.
     pub fn max_payload_len(self) -> usize {
         match self {
             Self::Media => MAX_MEDIA_PAYLOAD,
@@ -122,24 +190,42 @@ impl DashObjectKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Public routing, timing, integrity, and authentication data for a DASH object.
 pub struct DashObjectHeader {
+    /// DASH object format version.
     pub format_version: u16,
+    /// Durable relay-assigned stream identity.
     pub stream_id: Uuid,
+    /// Capture and encryption epoch identity.
     pub epoch_id: Uuid,
+    /// Semantic object role.
     pub kind: DashObjectKind,
+    /// Monotonic sequence within the stream.
     pub sequence: u64,
+    /// Random-access segment group, or zero for epoch-level metadata.
     pub segment_number: u64,
+    /// Fragment index within a media segment.
     pub chunk_index: u16,
+    /// Start in the shared 90 kHz media timeline.
     pub timestamp: u64,
+    /// Duration in the shared 90 kHz media timeline.
     pub duration: u64,
+    /// Whether this object starts at a decodable random-access point.
     pub random_access: bool,
+    /// Short ASCII media type used by HTTP responses.
     pub mime: String,
+    /// Exact opaque payload length.
     pub payload_len: u32,
+    /// SHA-256 digest of the opaque payload.
     pub payload_sha256: [u8; 32],
+    /// End-to-end HMAC-SHA-256 tag over the canonical header and payload.
     pub authentication_tag: [u8; 32],
 }
 
 impl DashObjectHeader {
+    /// Encodes the canonical header bytes covered by object authentication.
+    ///
+    /// The authentication tag itself is deliberately excluded.
     pub fn authentication_bytes(&self) -> Result<Vec<u8>> {
         if self.mime.len() > u16::MAX as usize {
             return Err(ProtocolError::InvalidDashMetadata("MIME type is too long"));
@@ -165,27 +251,43 @@ impl DashObjectHeader {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// One authenticated opaque object relayed and retained by GlacialCast.
 pub struct DashObject {
+    /// Public metadata needed for routing, retention, and integrity checks.
     pub header: DashObjectHeader,
+    /// Encrypted media/cursor bytes or authenticated epoch/index metadata.
     pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
+/// Borrowed construction inputs for [`DashObject::authenticated`].
 pub struct NewDashObject<'a> {
+    /// Durable relay-assigned stream identity.
     pub stream_id: Uuid,
+    /// Capture and encryption epoch identity.
     pub epoch_id: Uuid,
+    /// Semantic object role.
     pub kind: DashObjectKind,
+    /// Monotonic sequence within the stream.
     pub sequence: u64,
+    /// Random-access segment group, or zero for epoch-level metadata.
     pub segment_number: u64,
+    /// Fragment index within a media segment.
     pub chunk_index: u16,
+    /// Start in the shared 90 kHz media timeline.
     pub timestamp: u64,
+    /// Duration in the shared 90 kHz media timeline.
     pub duration: u64,
+    /// Whether the object starts at a decodable random-access point.
     pub random_access: bool,
+    /// Short ASCII media type.
     pub mime: &'a str,
+    /// Opaque payload to hash and authenticate.
     pub payload: Vec<u8>,
 }
 
 impl DashObject {
+    /// Builds, validates, hashes, and authenticates a new object.
     pub fn authenticated(input: NewDashObject<'_>, keys: &EpochKeys) -> Result<Self> {
         let payload_len =
             u32::try_from(input.payload.len()).map_err(|_| ProtocolError::DashPayloadTooLarge)?;
@@ -220,6 +322,10 @@ impl DashObject {
         Ok(object)
     }
 
+    /// Validates public metadata, kind-specific invariants, length, and hash.
+    ///
+    /// This does not verify [`DashObjectHeader::authentication_tag`]; call
+    /// [`Self::verify_authentication`] when epoch keys are available.
     pub fn validate(&self) -> Result<()> {
         if self.header.format_version != DASH_FORMAT_VERSION {
             return Err(ProtocolError::UnsupportedDashVersion(
@@ -314,6 +420,7 @@ impl DashObject {
         Ok(())
     }
 
+    /// Validates this object and verifies its end-to-end authentication tag.
     pub fn verify_authentication(&self, keys: &EpochKeys) -> Result<()> {
         self.validate()?;
         let authentication_bytes = self.header.authentication_bytes()?;
@@ -328,6 +435,7 @@ impl DashObject {
         Ok(())
     }
 
+    /// Serializes this object as a bounded, independently transferable `GCO1` file.
     pub fn to_portable_bytes(&self) -> Result<Vec<u8>> {
         self.validate()?;
         let header = serde_json::to_vec(&self.header)
@@ -345,6 +453,10 @@ impl DashObject {
         Ok(bytes)
     }
 
+    /// Parses a `GCO1` file and validates its public metadata, length, and hash.
+    ///
+    /// End-to-end authentication remains a separate operation because the
+    /// offline transport does not possess the viewer-derived epoch keys.
     pub fn from_portable_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < 8 || &bytes[..4] != PORTABLE_DASH_MAGIC {
             return Err(ProtocolError::InvalidPortableDashObject);
@@ -376,47 +488,76 @@ impl DashObject {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Message sent from the relay to a publisher over [`NoiseSocket`].
 pub enum ServerMessage {
+    /// Accepts or rejects the initial [`StreamHello`] and reports resume state.
     HelloAck {
+        /// Whether the relay accepted the publisher.
         accepted: bool,
+        /// Bounded human-readable rejection reason, if any.
         reason: Option<String>,
+        /// Durable assigned stream identity when accepted.
         stream_id: Option<Uuid>,
+        /// Highest sequence durably retained or previously acknowledged.
         last_sequence: u64,
+        /// Relay Unix timestamp in milliseconds.
         server_time_ms: i64,
     },
+    /// Confirms durable storage through a sequence number.
     Ack {
+        /// Highest contiguous durably stored sequence.
         through_seq: u64,
     },
+    /// Requests retransmission of an inclusive object-sequence range.
     ResendRequest {
+        /// First sequence requested.
         from_seq: u64,
+        /// Last sequence requested.
         to_seq: u64,
     },
+    /// Asks a publisher to pause before sending more objects.
     Backpressure {
+        /// Requested pause duration in milliseconds.
         pause_ms: u64,
+        /// Human-readable reason suitable for diagnostics.
         reason: String,
     },
+    /// Replies to [`ClientMessage::Ping`].
     Pong {
+        /// Relay Unix timestamp in milliseconds.
         now_ms: i64,
     },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Browser control-channel notification about a stream lifecycle change.
 pub struct ControlEvent {
+    /// Event name, such as `stream_updated` or `stream_deleted`.
     pub event: String,
+    /// Stream affected by the event.
     pub stream_id: Uuid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Authorized, non-secret stream summary returned by the relay API.
 pub struct PublicStream {
+    /// Durable relay-assigned stream identity.
     pub stream_id: Uuid,
+    /// Publisher-provided human-readable label.
     pub display_name: String,
+    /// Public capture-source metadata.
     pub source: CaptureSource,
+    /// Whether a publisher currently owns an ingest connection.
     pub active: bool,
+    /// Last publisher activity as Unix milliseconds.
     pub last_seen_at_ms: Option<i64>,
+    /// Highest retained or durably observed DASH object sequence.
     pub last_object_sequence: Option<u64>,
+    /// Approximate bytes retained for this stream.
     pub retained_bytes: u64,
 }
 
+/// Returns the current Unix timestamp in milliseconds.
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -424,6 +565,7 @@ pub fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+/// Decodes an unpadded URL-safe base64 viewer key and enforces 32 bytes.
 pub fn decode_key_b64(key: &str) -> Result<[u8; 32]> {
     let decoded = URL_SAFE_NO_PAD.decode(key)?;
     if decoded.len() != 32 {
@@ -434,6 +576,9 @@ pub fn decode_key_b64(key: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
+/// Parses a non-negative decimal byte size with SI or IEC suffixes.
+///
+/// Accepted examples include `512MiB`, `1.5GB`, and `4096`.
 pub fn parse_human_bytes(value: &str) -> std::result::Result<u64, String> {
     let value = value.trim();
     if value.is_empty() {
@@ -468,6 +613,9 @@ pub fn parse_human_bytes(value: &str) -> std::result::Result<u64, String> {
     Ok(bytes.round() as u64)
 }
 
+/// Writes one length-prefixed unencrypted handshake packet.
+///
+/// The packet is bounded by Noise's 65,535-byte wire-message limit.
 pub async fn write_clear_frame<W: AsyncWrite + Unpin>(writer: &mut W, data: &[u8]) -> Result<()> {
     if data.len() > MAX_WIRE_PACKET_LEN {
         return Err(ProtocolError::FrameTooLarge(data.len()));
@@ -478,6 +626,7 @@ pub async fn write_clear_frame<W: AsyncWrite + Unpin>(writer: &mut W, data: &[u8
     Ok(())
 }
 
+/// Reads one bounded length-prefixed unencrypted handshake packet.
 pub async fn read_clear_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
     let len = reader.read_u32().await? as usize;
     if len > MAX_WIRE_PACKET_LEN {
@@ -488,6 +637,7 @@ pub async fn read_clear_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Ve
     Ok(data)
 }
 
+/// Parses the fixed Noise NK parameter suite used by GlacialCast ingest.
 pub fn noise_params() -> Result<NoiseParams> {
     NOISE_PATTERN
         .parse()
@@ -495,12 +645,16 @@ pub fn noise_params() -> Result<NoiseParams> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Persistent X25519 identity used by the Noise responder.
 pub struct NoiseKeypair {
+    /// Secret X25519 key; store only in a private regular file.
     pub private: [u8; NOISE_KEY_LEN],
+    /// Public X25519 key pinned by publishers.
     pub public: [u8; NOISE_KEY_LEN],
 }
 
 impl NoiseKeypair {
+    /// Proves that the public and private halves complete a Noise NK handshake.
     pub fn validate(&self) -> Result<()> {
         let mut initiator = build_noise_initiator(&self.public)?;
         let mut responder = build_noise_responder(&self.private)?;
@@ -522,6 +676,7 @@ impl NoiseKeypair {
     }
 }
 
+/// Generates and validates a new cryptographically random Noise identity.
 pub fn generate_noise_keypair() -> Result<NoiseKeypair> {
     let keypair = Builder::new(noise_params()?)
         .generate_keypair()
@@ -540,10 +695,12 @@ pub fn generate_noise_keypair() -> Result<NoiseKeypair> {
     Ok(keypair)
 }
 
+/// Encodes a Noise public key as unpadded URL-safe base64.
 pub fn encode_noise_public_key(key: &[u8; NOISE_KEY_LEN]) -> String {
     URL_SAFE_NO_PAD.encode(key)
 }
 
+/// Decodes an unpadded URL-safe base64 Noise public key.
 pub fn decode_noise_public_key(encoded: &str) -> Result<[u8; NOISE_KEY_LEN]> {
     let key = URL_SAFE_NO_PAD.decode(encoded.trim())?;
     let length = key.len();
@@ -551,6 +708,7 @@ pub fn decode_noise_public_key(encoded: &str) -> Result<[u8; NOISE_KEY_LEN]> {
         .map_err(|_| ProtocolError::InvalidNoiseKeyLength(length))
 }
 
+/// Builds the publisher side of a Noise NK handshake pinned to the relay key.
 pub fn build_noise_initiator(remote_public_key: &[u8; NOISE_KEY_LEN]) -> Result<HandshakeState> {
     Builder::new(noise_params()?)
         .remote_public_key(remote_public_key)
@@ -558,6 +716,7 @@ pub fn build_noise_initiator(remote_public_key: &[u8; NOISE_KEY_LEN]) -> Result<
         .map_err(|err| ProtocolError::Noise(format!("{err:?}")))
 }
 
+/// Builds the relay side of a Noise NK handshake using its private identity.
 pub fn build_noise_responder(local_private_key: &[u8; NOISE_KEY_LEN]) -> Result<HandshakeState> {
     Builder::new(noise_params()?)
         .local_private_key(local_private_key)
@@ -565,6 +724,10 @@ pub fn build_noise_responder(local_private_key: &[u8; NOISE_KEY_LEN]) -> Result<
         .map_err(|err| ProtocolError::Noise(format!("{err:?}")))
 }
 
+/// Performs the publisher side of the Noise NK handshake.
+///
+/// No credential or stream object should be sent until this returns a
+/// [`TransportState`], because the handshake authenticates the pinned relay.
 pub async fn initiator_handshake<S>(
     stream: &mut S,
     remote_public_key: &[u8; NOISE_KEY_LEN],
@@ -588,6 +751,7 @@ where
         .map_err(|err| ProtocolError::Noise(format!("{err:?}")))
 }
 
+/// Performs the relay side of the Noise NK handshake.
 pub async fn responder_handshake<S>(
     stream: &mut S,
     local_private_key: &[u8; NOISE_KEY_LEN],
@@ -610,6 +774,7 @@ where
         .map_err(|err| ProtocolError::Noise(format!("{err:?}")))
 }
 
+/// Bounded Postcard message transport over an established Noise session.
 pub struct NoiseSocket<S> {
     stream: S,
     transport: TransportState,
@@ -619,10 +784,12 @@ impl<S> NoiseSocket<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    /// Wraps an asynchronous byte stream and established Noise transport.
     pub fn new(stream: S, transport: TransportState) -> Self {
         Self { stream, transport }
     }
 
+    /// Serializes and writes one message, segmenting it across Noise records.
     pub async fn write<T: Serialize>(&mut self, message: &T) -> Result<()> {
         let plain = postcard::to_stdvec(message)?;
         if plain.len() > MAX_FRAME_LEN {
@@ -647,10 +814,15 @@ where
         }
     }
 
+    /// Reads and canonically decodes one message up to [`MAX_FRAME_LEN`].
     pub async fn read<T: for<'de> Deserialize<'de>>(&mut self) -> Result<T> {
         self.read_limited(MAX_FRAME_LEN).await
     }
 
+    /// Reads one message while applying a caller-specific preallocation limit.
+    ///
+    /// `max_len` is capped at [`MAX_FRAME_LEN`]. The declared total is checked
+    /// before reserving message storage.
     pub async fn read_limited<T: for<'de> Deserialize<'de>>(
         &mut self,
         max_len: usize,
@@ -696,6 +868,7 @@ where
         }
     }
 
+    /// Consumes the wrapper and returns the underlying byte stream.
     pub fn into_inner(self) -> S {
         self.stream
     }
@@ -733,6 +906,10 @@ fn parse_noise_segment(segment: &[u8]) -> Result<(usize, usize, &[u8])> {
     Ok((total_len, offset, &segment[NOISE_SEGMENT_HEADER_LEN..]))
 }
 
+/// Serializes a browser control event as JSON.
+///
+/// `ControlEvent` contains only serializable fields; the defensive fallback
+/// returns an empty JSON object if that invariant changes.
 pub fn encode_ws_event(event: &ControlEvent) -> String {
     serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string())
 }
