@@ -34,7 +34,7 @@ use std::{
     ptr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -1049,21 +1049,48 @@ fn parse_update_rate(value: &str) -> std::result::Result<f64, String> {
 }
 
 struct PipewireThreadStop {
-    mainloop_ptr: Arc<AtomicUsize>,
+    mainloop_ptr: Arc<Mutex<Option<usize>>>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PipewireThreadStop {
     fn stop(&mut self) {
-        let ptr = self.mainloop_ptr.swap(0, Ordering::SeqCst);
-        if ptr != 0 {
+        let mut mainloop_ptr = self
+            .mainloop_ptr
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(ptr) = mainloop_ptr.take() {
+            // SAFETY: the PipeWire thread clears this slot while holding the
+            // same mutex before it drops the main loop. Holding the lock here
+            // therefore keeps `ptr` alive for the duration of the call.
             unsafe {
                 pw::sys::pw_main_loop_quit(ptr as *mut _);
             }
         }
+        drop(mainloop_ptr);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+struct PublishedPipewireMainloop {
+    slot: Arc<Mutex<Option<usize>>>,
+}
+
+impl PublishedPipewireMainloop {
+    fn new(slot: Arc<Mutex<Option<usize>>>, ptr: usize) -> Self {
+        *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ptr);
+        Self { slot }
+    }
+}
+
+impl Drop for PublishedPipewireMainloop {
+    fn drop(&mut self) {
+        *self
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 }
 
@@ -1297,7 +1324,7 @@ impl NativePipewireCapture {
         .await?;
         let (cursor_tx, cursor_rx) = watch::channel(None);
         let pipewire_error = Arc::new(Mutex::new(None));
-        let thread_stop = Arc::new(AtomicUsize::new(0));
+        let thread_stop = Arc::new(Mutex::new(None));
         let thread_config = PipewireThreadConfig {
             node_id: capture.node_id,
             width: capture.width,
@@ -2364,7 +2391,7 @@ struct PipewireThreadConfig {
     cursor_hz: u64,
     require_cursor_metadata: bool,
     pipewire_error: Arc<Mutex<Option<String>>>,
-    mainloop_ptr_out: Arc<AtomicUsize>,
+    mainloop_ptr_out: Arc<Mutex<Option<usize>>>,
 }
 
 fn start_pipewire_thread(
@@ -2450,7 +2477,8 @@ fn run_pipewire_loop(
     };
     let portal_target = discover_portal_target_object(&mainloop, &core, node_id)?;
     let mainloop_ptr = mainloop.as_raw_ptr() as usize;
-    mainloop_ptr_out.store(mainloop_ptr, Ordering::SeqCst);
+    let _published_mainloop =
+        PublishedPipewireMainloop::new(mainloop_ptr_out.clone(), mainloop_ptr);
     let data = PipewireUserData {
         format: Default::default(),
         latest,
@@ -2777,7 +2805,6 @@ fn run_pipewire_loop(
     )?;
 
     mainloop.run();
-    mainloop_ptr_out.store(0, Ordering::SeqCst);
     Ok(())
 }
 
@@ -2808,7 +2835,8 @@ fn run_pipewire_video_loop(
     };
     let portal_target = discover_portal_target_object(&mainloop, &core, node_id)?;
     let mainloop_ptr = mainloop.as_raw_ptr() as usize;
-    mainloop_ptr_out.store(mainloop_ptr, Ordering::SeqCst);
+    let _published_mainloop =
+        PublishedPipewireMainloop::new(mainloop_ptr_out.clone(), mainloop_ptr);
     let data = PipewireVideoUserData {
         format: Default::default(),
         latest,
@@ -3121,7 +3149,6 @@ fn run_pipewire_video_loop(
     )?;
 
     mainloop.run();
-    mainloop_ptr_out.store(0, Ordering::SeqCst);
     Ok(())
 }
 
@@ -4309,6 +4336,16 @@ mod tests {
         assert_eq!(args.ingest_token.as_deref(), Some("-token"));
         assert_eq!(args.ingest_server_key.as_deref(), Some("-server-key"));
         assert_eq!(args.viewer_key.as_deref(), Some("-viewer-key"));
+    }
+
+    #[test]
+    fn published_pipewire_mainloop_clears_pointer_before_owner_drop() {
+        let slot = Arc::new(Mutex::new(None));
+        {
+            let _published = PublishedPipewireMainloop::new(slot.clone(), 42);
+            assert_eq!(*slot.lock().unwrap(), Some(42));
+        }
+        assert_eq!(*slot.lock().unwrap(), None);
     }
 
     #[test]
