@@ -291,6 +291,10 @@ conservative release-mode throughput and durable-object floors. Hardware
 checks require the corresponding host capabilities and are described in
 `docs/completion-audit.md`.
 
+For a staged checklist, interactive local demo, browser setup, real Wayland and
+VA-API gates, offline-file demonstration, deployed-host smoke test, and
+troubleshooting, see the [testing and demo guide](docs/testing-demo-guide.md).
+
 The protocol and compatibility contract is in `docs/architecture-v0.2.md`.
 The latest robustness, code-quality, and performance assessment is in
 `docs/robustness-performance-review.md`.
