@@ -1,0 +1,47 @@
+[Unit]
+Description=GlacialCast encrypted screen relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=glacialcast
+Group=glacialcast
+UMask=0077
+Environment=RUST_LOG=glacialcast_server=info,tower_http=info
+ExecStart=/usr/local/bin/glacialcast-server \
+    --config /etc/glacialcast/server.toml \
+    --control-addr 127.0.0.1:8899 \
+    --ingest-addr 0.0.0.0:8900 \
+    --data-dir /var/lib/glacialcast \
+    --retention-bytes-per-stream 512MiB \
+    --retention-seconds 1800
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+LimitNOFILE=8192
+
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+ReadWritePaths=/var/lib/glacialcast
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -19,8 +19,9 @@ The 0.2 MVP provides:
 The relay does not receive the viewer key and cannot decrypt media or cursor
 contents. The capture client pins the relay's Noise public key, so ingest
 credentials and objects are encrypted to the intended server. The current HTTP
-viewer and management interface are intended for a trusted LAN. Add HTTPS and
-viewer authorization before exposing the service to the Internet.
+viewer supports a fail-closed Internet profile with HTTPS proxying, signed
+viewer sessions, publisher-scoped authorization, admin controls, CSRF and
+origin enforcement, request/connection limits, and operational probes.
 
 GlacialCast 0.2 is video-only and view-only. Audio and remote input are outside
 the MVP.
@@ -58,8 +59,8 @@ The server creates a persistent Noise identity at
 Back up the private identity file with the server data. Clients must be updated
 if it is replaced. A different path can be selected with `--ingest-key-file`.
 
-The server reads `server.toml` when present. Ingest tokens are optional on a
-trusted LAN; enabling them is recommended:
+The server reads `server.toml` when present. Ingest tokens are optional only on
+a loopback or explicitly insecure trusted-LAN deployment:
 
 ```toml
 [ingest]
@@ -92,6 +93,29 @@ node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
 
 Neither key belongs in a URL, log, or server configuration. The ingest server
 key is public; the viewer key is secret.
+
+Configuration files containing credentials must be private regular files with
+mode `0600`. Unknown configuration keys are rejected.
+
+## Internet deployment
+
+For Internet use, the Rust HTTP listener remains on loopback and Caddy
+terminates public HTTPS. The publisher's separate TCP endpoint is protected by
+Noise with a pinned server identity and mandatory strong token.
+
+Start with:
+
+- `deploy/server.internet.toml.example`
+- `deploy/Caddyfile.example`
+- `deploy/glacialcast-server.service`
+- `docs/internet-deployment.md`
+
+Internet mode is enabled by setting an HTTPS `security.public_origin`. It
+requires viewer access tokens and authenticated ingest, emits secure cookies
+and HSTS, and refuses a non-loopback plaintext HTTP listener. Viewer tokens
+have `viewer` or `admin` roles and can be scoped to authenticated publisher
+names. TLS, enrollment, rotation, firewall, monitoring, and backup procedures
+are covered in the deployment guide.
 
 ## Run
 
@@ -173,7 +197,8 @@ Mirror the relay's opaque objects into independently transferable files:
 
 ```sh
 ./target/release/glacialcast-offline mirror \
-  --server http://127.0.0.1:8899 \
+  --server https://cast.example.com \
+  --access-token "$GLACIALCAST_ACCESS_TOKEN" \
   --stream-id <stream-uuid> \
   --output glacialcast-transfer \
   --follow
@@ -246,15 +271,19 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 node scripts/test-viewer-core.mjs
 scripts/verify-ingest-recovery.sh
+scripts/verify-internet-security.sh
 scripts/verify-performance.sh
 ```
 
 `scripts/verify-dash-e2e.sh` exercises an authenticated encrypted test stream
 against a temporary relay and portable offline viewer. The recovery gate
 crashes and restarts an authenticated relay under an active publisher. The
-performance gate runs conservative release-mode throughput and durable-object
-floors. Hardware and browser checks require the corresponding host capabilities
-and are described in `docs/completion-audit.md`.
+Internet gate exercises session and bearer authentication, authorization,
+origin and CSRF enforcement, throttling, security headers, protected mirroring,
+monitoring, and fail-closed configuration. The performance gate runs
+conservative release-mode throughput and durable-object floors. Hardware and
+browser checks require the corresponding host capabilities and are described
+in `docs/completion-audit.md`.
 
 The protocol and compatibility contract is in `docs/architecture-v0.2.md`.
 The latest robustness, code-quality, and performance assessment is in

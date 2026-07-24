@@ -1,0 +1,25 @@
+{
+	servers {
+		max_header_size 32KB
+	}
+}
+
+{$GLACIALCAST_DOMAIN} {
+	reverse_proxy 127.0.0.1:8899 {
+		# Caddy already discards untrusted inbound forwarding values. Keep this
+		# explicit single-address value aligned with trust_forwarded_for=true.
+		header_up X-Forwarded-For {remote_host}
+		health_uri /health/ready
+		health_interval 30s
+		health_timeout 5s
+	}
+
+	log {
+		output file /var/log/caddy/glacialcast-access.log {
+			roll_size 10MiB
+			roll_keep 10
+			roll_keep_for 720h
+		}
+		format json
+	}
+}

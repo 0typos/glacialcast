@@ -64,10 +64,26 @@ XDG portal / PipeWire
 
 The server is trusted for availability and authorization, but not with captured
 content. The ingest channel uses a pinned Noise NK server identity to encrypt
-the ingest token and stream objects in transit. HTTPS remains required for
-Internet deployment because the browser and management interfaces are separate
-from that channel. Content encryption remains necessary because transport
-encryption terminates at the server.
+the ingest token and stream objects in transit. In the Internet profile, Caddy
+terminates browser HTTPS and proxies to a loopback-only application listener.
+Content encryption remains necessary because browser transport encryption
+terminates at the server.
+
+Browser access uses independently rotatable high-entropy access tokens. A
+successful login creates a signed, expiring, `HttpOnly`, `Secure`,
+`SameSite=Strict` session. Viewer principals are scoped to authenticated
+publisher identities; administrators can manage all streams. WebSocket
+upgrades and mutations require the exact configured public origin, and
+cookie-authorized mutations also require a session-bound CSRF value. A
+principal's token, role, or scope change changes its session version and
+invalidates prior sessions after configuration reload through a relay restart.
+
+HTTP requests, browser WebSockets, publisher connections, login attempts, and
+authenticated request rates are bounded. Noise handshakes and idle publisher
+connections have deadlines. The publisher resolves DNS names and reconnects
+with capped exponential backoff and jitter. Health endpoints and
+administrator-only counters expose availability and rejection signals without
+exposing stream contents or credentials.
 
 ## Media Profile
 

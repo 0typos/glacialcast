@@ -1,0 +1,41 @@
+# Copy to /etc/glacialcast/server.toml, replace every example value, make it
+# owned by the glacialcast service account, and set mode 0600.
+
+[security]
+public_origin = "https://cast.example.com"
+trust_forwarded_for = true
+session_ttl_seconds = 43200
+
+[security.limits]
+max_http_in_flight = 128
+max_websockets = 64
+max_ingest_connections = 16
+login_attempts_per_minute = 10
+global_login_attempts_per_minute = 1000
+authenticated_requests_per_minute = 30000
+http_timeout_seconds = 30
+ingest_handshake_timeout_seconds = 10
+ingest_idle_timeout_seconds = 120
+
+[ingest]
+require_token = true
+
+[[ingest.tokens]]
+name = "workstation"
+token = "replace-with-32-or-more-random-bytes"
+# During a staged rotation, put the old value here, restart, update the
+# publisher, then remove the old value and restart again.
+previous_tokens = []
+
+[[access.tokens]]
+name = "operator"
+token = "replace-with-a-different-32-byte-random-token"
+role = "admin"
+
+[[access.tokens]]
+name = "viewer"
+token = "replace-with-another-32-byte-random-token"
+role = "viewer"
+# Values are authenticated ingest identity names, not display names.
+publishers = ["workstation"]
+previous_tokens = []

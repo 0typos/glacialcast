@@ -17,11 +17,12 @@ not directly provide the required retained/offline file stream and would add a
 larger runtime dependency boundary. A general media server or DASH player would
 reduce custom code but conflict with the project's dependency goals.
 
-This is not yet an appropriate public-Internet deployment. Before that, the
-HTTP/WebSocket surface needs TLS, viewer authorization, request and connection
-limits, origin policy, operational monitoring, and a viewer-key enrollment and
-rotation story. Clear Key supplies browser decryption, not DRM or access
-control.
+The subsequent Internet-readiness work added the missing deployment boundary:
+loopback-only application HTTP behind Caddy-managed HTTPS, viewer/admin access
+tokens, publisher-scoped authorization, signed sessions, exact origin and CSRF
+checks, request and connection limits, authentication throttling, monitoring,
+and documented access/E2EE key rotation. Clear Key supplies browser decryption,
+not DRM or access control.
 
 ## Correctness and Robustness Findings
 
@@ -118,7 +119,7 @@ history is pruned with relay retention.
   cursor, Noise-segment, and catalog parsers are the next useful test layer.
 - E2EE does not hide timing, dimensions, object sizes, activity, or availability
   from the relay. Internet deployment should document this traffic-analysis
-  boundary explicitly.
+  boundary explicitly; `internet-deployment.md` now does.
 
 ## Repeatable Commands
 
