@@ -240,3 +240,98 @@ pub async fn wait_for_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn socket_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "glacialcast-daemon-{label}-{}.sock",
+            Uuid::new_v4()
+        ))
+    }
+
+    async fn wait_for_path(path: &Path) {
+        for _ in 0..100 {
+            if path.exists() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("socket did not appear at {}", path.display());
+    }
+
+    #[test]
+    fn socket_components_are_filesystem_safe() {
+        assert_eq!(
+            sanitize_socket_component("Glacial Cast/one"),
+            "Glacial-Cast-one"
+        );
+        assert_eq!(sanitize_socket_component("--a__b--"), "a__b");
+        assert_eq!(sanitize_socket_component("☃"), "");
+        assert_eq!(sanitize_socket_component("abc-123_DEF"), "abc-123_DEF");
+    }
+
+    #[tokio::test]
+    async fn control_socket_handles_status_unknown_and_shutdown_commands() {
+        let path = socket_path("commands");
+        let (shutdown_tx, _) = watch::channel(false);
+        let server_path = path.clone();
+        let server_tx = shutdown_tx.clone();
+        let server =
+            tokio::spawn(async move { serve_control_socket(server_path, server_tx).await });
+        wait_for_path(&path).await;
+
+        let status = manager_command(&path, "status").await.unwrap();
+        assert_eq!(status, format!("pid {}\n", std::process::id()));
+        assert_eq!(
+            manager_command(&path, "not-a-command\n").await.unwrap(),
+            "error unknown command\n"
+        );
+        assert_eq!(
+            manager_command(&path, "shutdown").await.unwrap(),
+            "ok shutting down\n"
+        );
+
+        server.await.unwrap().unwrap();
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn socket_preparation_removes_stale_file_but_preserves_active_socket() {
+        let stale = socket_path("stale");
+        std::fs::write(&stale, b"stale").unwrap();
+        prepare_socket_path(&stale).await.unwrap();
+        assert!(!stale.exists());
+
+        let active = socket_path("active");
+        let listener = UnixListener::bind(&active).unwrap();
+        let error = prepare_socket_path(&active).await.unwrap_err();
+        assert!(error.to_string().contains("already active"));
+        assert!(active.exists());
+        drop(listener);
+        std::fs::remove_file(active).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_waiter_handles_preexisting_signal_and_sender_close() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(true);
+        wait_for_shutdown(&mut shutdown_rx).await;
+        drop(shutdown_rx);
+        drop(shutdown_tx);
+
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        drop(shutdown_tx);
+        wait_for_shutdown(&mut shutdown_rx).await;
+    }
+
+    #[tokio::test]
+    async fn manager_command_reports_missing_socket() {
+        let error = manager_command(&socket_path("missing"), "status")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("connecting daemon socket"));
+    }
+}

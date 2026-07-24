@@ -236,9 +236,17 @@ impl DashObject {
                 "epoch ID must not be nil",
             ));
         }
-        if self.header.mime.len() > 127 || !self.header.mime.is_ascii() {
+        if self.header.sequence == 0 {
             return Err(ProtocolError::InvalidDashMetadata(
-                "MIME type must be short ASCII",
+                "sequence must not be zero",
+            ));
+        }
+        if self.header.mime.is_empty()
+            || self.header.mime.len() > 127
+            || !self.header.mime.is_ascii()
+        {
+            return Err(ProtocolError::InvalidDashMetadata(
+                "MIME type must be nonempty short ASCII",
             ));
         }
         if self.payload.len() != self.header.payload_len as usize {
@@ -252,23 +260,53 @@ impl DashObject {
             return Err(ProtocolError::DashPayloadHash);
         }
         match self.header.kind {
+            DashObjectKind::Epoch
+                if self.header.segment_number != 0
+                    || self.header.chunk_index != 0
+                    || self.header.timestamp != 0
+                    || self.header.duration != 0
+                    || self.payload.is_empty() =>
+            {
+                return Err(ProtocolError::InvalidDashMetadata(
+                    "epoch object has invalid metadata",
+                ));
+            }
             DashObjectKind::Initialization
                 if self.header.segment_number != 0
                     || self.header.chunk_index != 0
-                    || self.header.duration != 0 =>
+                    || self.header.timestamp != 0
+                    || self.header.duration != 0
+                    || self.payload.is_empty() =>
             {
                 return Err(ProtocolError::InvalidDashMetadata(
-                    "initialization object has media timing",
+                    "initialization object has invalid metadata",
                 ));
             }
-            DashObjectKind::Media if self.header.duration == 0 => {
+            DashObjectKind::Media
+                if self.header.segment_number == 0
+                    || self.header.duration == 0
+                    || self.payload.is_empty() =>
+            {
                 return Err(ProtocolError::InvalidDashMetadata(
-                    "media object duration must not be zero",
+                    "media object has invalid metadata",
                 ));
             }
-            DashObjectKind::End if !self.payload.is_empty() => {
+            DashObjectKind::Cursor
+                if self.header.segment_number == 0
+                    || self.header.duration == 0
+                    || self.payload.is_empty() =>
+            {
                 return Err(ProtocolError::InvalidDashMetadata(
-                    "end object must not contain a payload",
+                    "cursor object has invalid metadata",
+                ));
+            }
+            DashObjectKind::End
+                if self.header.chunk_index != 0
+                    || self.header.duration != 0
+                    || !self.payload.is_empty() =>
+            {
+                return Err(ProtocolError::InvalidDashMetadata(
+                    "end object has invalid metadata",
                 ));
             }
             _ => {}
@@ -695,11 +733,85 @@ pub fn encode_ws_event(event: &ControlEvent) -> String {
 mod tests {
     use super::*;
 
+    fn media_fixture() -> (DashObject, EpochKeys) {
+        let stream_id = Uuid::from_u128(1);
+        let epoch_id = Uuid::from_u128(2);
+        let keys = EpochKeys::derive(&[7u8; 32], stream_id, epoch_id).unwrap();
+        let object = DashObject::authenticated(
+            NewDashObject {
+                stream_id,
+                epoch_id,
+                kind: DashObjectKind::Media,
+                sequence: 1,
+                segment_number: 1,
+                chunk_index: 0,
+                timestamp: 0,
+                duration: 90_000,
+                random_access: true,
+                mime: "video/iso.segment",
+                payload: vec![1, 2, 3],
+            },
+            &keys,
+        )
+        .unwrap();
+        (object, keys)
+    }
+
+    fn noise_transport_pair() -> (TransportState, TransportState) {
+        let keypair = generate_noise_keypair().unwrap();
+        let mut initiator = build_noise_initiator(&keypair.public).unwrap();
+        let mut responder = build_noise_responder(&keypair.private).unwrap();
+        let mut message = [0u8; 128];
+        let mut payload = [0u8; 128];
+        let length = initiator.write_message(&[], &mut message).unwrap();
+        responder
+            .read_message(&message[..length], &mut payload)
+            .unwrap();
+        let length = responder.write_message(&[], &mut message).unwrap();
+        initiator
+            .read_message(&message[..length], &mut payload)
+            .unwrap();
+        (
+            initiator.into_transport_mode().unwrap(),
+            responder.into_transport_mode().unwrap(),
+        )
+    }
+
+    async fn read_client_message_segments(segments: Vec<Vec<u8>>) -> Result<ClientMessage> {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (mut initiator, responder) = noise_transport_pair();
+        let send = tokio::spawn(async move {
+            for segment in segments {
+                let mut encrypted = vec![0; segment.len() + 16];
+                let length = initiator.write_message(&segment, &mut encrypted).unwrap();
+                write_clear_frame(&mut writer, &encrypted[..length])
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut socket = NoiseSocket::new(reader, responder);
+        let result = socket.read::<ClientMessage>().await;
+        send.await.unwrap();
+        result
+    }
+
     #[test]
     fn human_byte_sizes_parse_common_units() {
         assert_eq!(parse_human_bytes("50MB").unwrap(), 50_000_000);
         assert_eq!(parse_human_bytes("50MiB").unwrap(), 50 * 1024 * 1024);
         assert_eq!(parse_human_bytes("1.5KB").unwrap(), 1500);
+    }
+
+    #[test]
+    fn human_byte_sizes_reject_malformed_negative_and_overflowing_values() {
+        for value in ["", "-1", "NaN", "1.2.3MiB", "10XB", "1e1000TB"] {
+            assert!(parse_human_bytes(value).is_err(), "accepted {value:?}");
+        }
+        assert_eq!(parse_human_bytes("0").unwrap(), 0);
+        assert_eq!(
+            parse_human_bytes(" 2 GiB ").unwrap(),
+            2 * 1024 * 1024 * 1024
+        );
     }
 
     #[test]
@@ -717,6 +829,28 @@ mod tests {
         assert!(matches!(
             read_clear_frame(&mut advertised_length.as_slice()).await,
             Err(ProtocolError::FrameTooLarge(length)) if length == MAX_WIRE_PACKET_LEN + 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn clear_frame_round_trips_boundaries_and_reports_truncation() {
+        for payload in [Vec::new(), vec![7], vec![9; MAX_WIRE_PACKET_LEN]] {
+            let mut wire = Vec::new();
+            write_clear_frame(&mut wire, &payload).await.unwrap();
+            assert_eq!(
+                read_clear_frame(&mut wire.as_slice()).await.unwrap(),
+                payload
+            );
+        }
+        assert!(matches!(
+            write_clear_frame(&mut Vec::new(), &vec![0; MAX_WIRE_PACKET_LEN + 1]).await,
+            Err(ProtocolError::FrameTooLarge(_))
+        ));
+
+        let truncated = [0, 0, 0, 2, 1];
+        assert!(matches!(
+            read_clear_frame(&mut truncated.as_slice()).await,
+            Err(ProtocolError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof
         ));
     }
 
@@ -819,6 +953,204 @@ mod tests {
         assert!(matches!(
             no_duration.validate(),
             Err(ProtocolError::InvalidDashMetadata(_))
+        ));
+    }
+
+    #[test]
+    fn dash_object_validation_rejects_unusable_routing_metadata() {
+        let (object, _) = media_fixture();
+        let assert_metadata_error = |mutated: DashObject| {
+            assert!(matches!(
+                mutated.validate(),
+                Err(ProtocolError::InvalidDashMetadata(_))
+            ));
+        };
+
+        let mut invalid = object.clone();
+        invalid.header.stream_id = Uuid::nil();
+        assert_metadata_error(invalid);
+        let mut invalid = object.clone();
+        invalid.header.epoch_id = Uuid::nil();
+        assert_metadata_error(invalid);
+        let mut invalid = object.clone();
+        invalid.header.sequence = 0;
+        assert_metadata_error(invalid);
+        let mut invalid = object.clone();
+        invalid.header.mime.clear();
+        assert_metadata_error(invalid);
+        let mut invalid = object.clone();
+        invalid.header.mime = "é".to_string();
+        assert_metadata_error(invalid);
+        let mut invalid = object.clone();
+        invalid.header.mime = "x".repeat(128);
+        assert_metadata_error(invalid);
+        let mut invalid = object.clone();
+        invalid.header.segment_number = 0;
+        assert_metadata_error(invalid);
+        let mut invalid = object;
+        invalid.payload.clear();
+        invalid.header.payload_len = 0;
+        invalid.header.payload_sha256 = Sha256::digest([]).into();
+        assert_metadata_error(invalid);
+    }
+
+    #[test]
+    fn dash_object_kind_specific_metadata_is_enforced() {
+        let (media, keys) = media_fixture();
+        let create = |kind, payload: Vec<u8>| {
+            DashObject::authenticated(
+                NewDashObject {
+                    stream_id: media.header.stream_id,
+                    epoch_id: media.header.epoch_id,
+                    kind,
+                    sequence: 2,
+                    segment_number: match kind {
+                        DashObjectKind::Media | DashObjectKind::Cursor => 1,
+                        _ => 0,
+                    },
+                    chunk_index: 0,
+                    timestamp: 0,
+                    duration: match kind {
+                        DashObjectKind::Media | DashObjectKind::Cursor => 1,
+                        _ => 0,
+                    },
+                    random_access: true,
+                    mime: "application/octet-stream",
+                    payload,
+                },
+                &keys,
+            )
+        };
+
+        create(DashObjectKind::Epoch, vec![1]).unwrap();
+        create(DashObjectKind::Initialization, vec![1]).unwrap();
+        create(DashObjectKind::Media, vec![1]).unwrap();
+        create(DashObjectKind::Cursor, vec![1]).unwrap();
+        create(DashObjectKind::Index, vec![1]).unwrap();
+        create(DashObjectKind::End, Vec::new()).unwrap();
+        assert!(create(DashObjectKind::Epoch, Vec::new()).is_err());
+        assert!(create(DashObjectKind::Initialization, Vec::new()).is_err());
+        assert!(create(DashObjectKind::Media, Vec::new()).is_err());
+        assert!(create(DashObjectKind::Cursor, Vec::new()).is_err());
+        assert!(create(DashObjectKind::End, vec![1]).is_err());
+    }
+
+    #[test]
+    fn portable_dash_object_rejects_every_truncation_and_trailing_payload() {
+        let (object, _) = media_fixture();
+        let portable = object.to_portable_bytes().unwrap();
+        for end in 0..portable.len() {
+            assert!(
+                DashObject::from_portable_bytes(&portable[..end]).is_err(),
+                "accepted portable object truncated at byte {end}"
+            );
+        }
+        let mut trailing = portable;
+        trailing.push(0);
+        assert!(matches!(
+            DashObject::from_portable_bytes(&trailing),
+            Err(ProtocolError::DashPayloadLength)
+        ));
+    }
+
+    #[test]
+    fn portable_dash_object_rejects_invalid_magic_header_lengths_and_json() {
+        let (object, _) = media_fixture();
+        let mut portable = object.to_portable_bytes().unwrap();
+        portable[..4].copy_from_slice(b"NOPE");
+        assert!(matches!(
+            DashObject::from_portable_bytes(&portable),
+            Err(ProtocolError::InvalidPortableDashObject)
+        ));
+
+        for header_length in [0u32, MAX_PORTABLE_DASH_HEADER_LEN as u32 + 1] {
+            let mut malformed = Vec::from(&PORTABLE_DASH_MAGIC[..]);
+            malformed.extend_from_slice(&header_length.to_be_bytes());
+            assert!(matches!(
+                DashObject::from_portable_bytes(&malformed),
+                Err(ProtocolError::InvalidPortableDashObject)
+            ));
+        }
+
+        let mut invalid_json = Vec::from(&PORTABLE_DASH_MAGIC[..]);
+        invalid_json.extend_from_slice(&1u32.to_be_bytes());
+        invalid_json.push(b'{');
+        assert!(matches!(
+            DashObject::from_portable_bytes(&invalid_json),
+            Err(ProtocolError::InvalidPortableDashObject)
+        ));
+    }
+
+    #[test]
+    fn portable_dash_object_preserves_authentication_failure() {
+        let (mut object, keys) = media_fixture();
+        object.header.authentication_tag[0] ^= 1;
+        let restored =
+            DashObject::from_portable_bytes(&object.to_portable_bytes().unwrap()).unwrap();
+        assert!(matches!(
+            restored.verify_authentication(&keys),
+            Err(ProtocolError::DashAuthentication)
+        ));
+    }
+
+    #[test]
+    fn noise_segment_codec_rejects_malformed_offsets_and_headers() {
+        assert!(noise_segment(2, 0, &[1, 2]).is_ok());
+        assert!(matches!(
+            noise_segment(1, 1, &[1]),
+            Err(ProtocolError::MalformedFrame)
+        ));
+        for segment in [&b""[..], &b"GCN1"[..], &b"NOPE\0\0\0\0\0\0\0\0"[..]] {
+            assert!(matches!(
+                parse_noise_segment(segment),
+                Err(ProtocolError::MalformedFrame)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn noise_socket_rejects_inconsistent_segment_totals() {
+        let segments = vec![
+            noise_segment(2, 0, &[1]).unwrap(),
+            noise_segment(3, 1, &[2]).unwrap(),
+        ];
+        assert!(matches!(
+            read_client_message_segments(segments).await,
+            Err(ProtocolError::MalformedFrame)
+        ));
+    }
+
+    #[tokio::test]
+    async fn noise_socket_rejects_gaps_replays_and_zero_progress() {
+        for segments in [
+            vec![noise_segment(2, 1, &[1]).unwrap()],
+            vec![
+                noise_segment(2, 0, &[1]).unwrap(),
+                noise_segment(2, 0, &[2]).unwrap(),
+            ],
+            vec![noise_segment(1, 0, &[]).unwrap()],
+        ] {
+            assert!(matches!(
+                read_client_message_segments(segments).await,
+                Err(ProtocolError::MalformedFrame)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn noise_socket_rejects_oversized_and_noncanonical_messages() {
+        let oversized = noise_segment(MAX_FRAME_LEN + 1, 0, &[1]).unwrap();
+        assert!(matches!(
+            read_client_message_segments(vec![oversized]).await,
+            Err(ProtocolError::FrameTooLarge(length)) if length == MAX_FRAME_LEN + 1
+        ));
+
+        let mut encoded = postcard::to_stdvec(&ClientMessage::Ping { now_ms: 7 }).unwrap();
+        encoded.push(0);
+        let segment = noise_segment(encoded.len(), 0, &encoded).unwrap();
+        assert!(matches!(
+            read_client_message_segments(vec![segment]).await,
+            Err(ProtocolError::MalformedFrame)
         ));
     }
 
