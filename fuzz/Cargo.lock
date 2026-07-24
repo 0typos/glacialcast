@@ -572,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "glacialcast-dash"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "glacialcast-protocol"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -619,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "glacialcast-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
