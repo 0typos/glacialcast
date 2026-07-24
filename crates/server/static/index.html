@@ -19,6 +19,15 @@
     </div>
   </header>
   <main>
+    <section id="operations" class="operations" hidden>
+      <div class="summary">
+        <div>
+          <p class="eyebrow">Relay diagnostics</p>
+          <h2>Last 60 seconds</h2>
+        </div>
+      </div>
+      <div id="metric-cards" class="metric-cards" aria-live="polite"></div>
+    </section>
     <div class="summary">
       <h2 id="count">Streams</h2>
       <button id="refresh" type="button">Refresh</button>

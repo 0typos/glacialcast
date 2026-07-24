@@ -137,7 +137,8 @@ scripts/verify-quality.sh standard
 ```
 
 It enforces formatting, all Rust tests, warning-free Clippy, documented unsafe
-blocks, strict rustdoc, dependency policy, shell syntax, and viewer-core tests.
+blocks, strict rustdoc, dependency policy, shell syntax, viewer-core tests, and
+operations-dashboard helper tests.
 
 Before merging or releasing behavior changes, run:
 

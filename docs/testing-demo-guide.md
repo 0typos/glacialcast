@@ -59,7 +59,7 @@ Success means:
 
 - all Rust unit tests and checked rustdoc examples pass, while the release-only
   persistence performance test is ignored by the normal profile;
-- the viewer core reports `PASS viewer core: 14 tests`;
+- the viewer core and operations-dashboard helper tests report `PASS`;
 - Clippy produces no warnings; and
 - `cargo-deny` reports `advisories ok, bans ok, licenses ok, sources ok`.
 

@@ -25,6 +25,7 @@ standard_checks() {
   run cargo deny -L error check
   run bash -n scripts/*.sh
   run node scripts/test-viewer-core.mjs
+  run node scripts/test-index-ui.mjs
 }
 
 full_checks() {

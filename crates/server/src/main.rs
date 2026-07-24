@@ -11,6 +11,7 @@
 mod dash_store;
 mod security;
 mod storage;
+mod traffic;
 
 use crate::{
     dash_store::DashStore,
@@ -19,6 +20,7 @@ use crate::{
         Principal, SessionSigner, client_ip, normalize_public_origin, validate_request_origin,
     },
     storage::Store,
+    traffic::{TrafficMetrics, TrafficSnapshot},
 };
 use anyhow::{Context, Result};
 use axum::{
@@ -134,6 +136,7 @@ struct AppState {
     ingest_handshake_timeout: Duration,
     ingest_idle_timeout: Duration,
     metrics: Arc<ServerMetrics>,
+    traffic: TrafficMetrics,
     active_ingests: Arc<AsyncMutex<HashMap<Uuid, Uuid>>>,
     ingest_private_key: [u8; NOISE_KEY_LEN],
 }
@@ -588,6 +591,7 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
         ingest_handshake_timeout: Duration::from_secs(limits.ingest_handshake_timeout_seconds),
         ingest_idle_timeout: Duration::from_secs(limits.ingest_idle_timeout_seconds),
         metrics: metrics.clone(),
+        traffic: TrafficMetrics::default(),
         active_ingests: Arc::new(AsyncMutex::new(HashMap::new())),
         ingest_private_key: ingest_key.private,
     };
@@ -1001,6 +1005,7 @@ struct MetricsResponse {
     active_ingest_connections: u64,
     ingest_rejected: u64,
     ingest_auth_failures: u64,
+    traffic: TrafficSnapshot,
 }
 
 async fn admin_metrics(
@@ -1025,6 +1030,7 @@ async fn admin_metrics(
         active_ingest_connections: metrics.active_ingest_connections.load(Ordering::Relaxed),
         ingest_rejected: metrics.ingest_rejected.load(Ordering::Relaxed),
         ingest_auth_failures: metrics.ingest_auth_failures.load(Ordering::Relaxed),
+        traffic: state.traffic.snapshot(),
     }))
 }
 
@@ -1065,6 +1071,7 @@ async fn delete_stream(
     require_mutation_authority(&state, &headers, &identity)?;
     if state.store.delete_stream(stream_id)? {
         state.dash_store.delete_stream(stream_id)?;
+        state.traffic.forget_stream(stream_id);
         publish_stream_event(&state, "stream_deleted", stream_id);
         info!(
             principal = %identity.principal.name,
@@ -1688,8 +1695,14 @@ async fn ingest_loop(
                         .await?;
                     continue;
                 }
+                let is_new = object.header.sequence == expected_sequence;
+                let object_kind = object.header.kind;
+                let object_bytes = u64::from(object.header.payload_len);
                 let stored = state.dash_store.store(object)?;
                 last_seq = last_seq.max(stored.header.sequence);
+                if is_new {
+                    state.traffic.record(stream_id, object_kind, object_bytes);
+                }
                 let _ = state.dash_events.send(stored.header);
                 socket
                     .write(&ServerMessage::Ack {

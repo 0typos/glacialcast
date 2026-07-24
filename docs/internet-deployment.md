@@ -160,11 +160,19 @@ curl --fail \
 ```
 
 The counters include HTTP overload/timeouts, login failures and throttling,
-active/rejected WebSockets, and active/rejected ingest connections. Alert on
-readiness failures, repeated authentication failures, rate-limit growth,
-restart loops, storage exhaustion, and certificate-renewal failures. Caddy's
-example access log is JSON and rotates locally; ship it using the host's normal
-log pipeline without recording request bodies or authorization headers.
+active/rejected WebSockets, active/rejected ingest connections, and opaque
+ingest application bytes partitioned by stream and object kind. Traffic
+contains lifetime process counters and a bounded rolling 60-second window.
+Noise, TCP, HTTP, and TLS framing is intentionally excluded; use host network
+telemetry when exact on-the-wire usage matters. The administrator dashboard
+renders the same rolling media, cursor, per-stream, connection, and HTTP
+counters.
+
+Alert on readiness failures, repeated authentication failures, rate-limit
+growth, unexpected bandwidth growth, restart loops, storage exhaustion, and
+certificate-renewal failures. Caddy's example access log is JSON and rotates
+locally; ship it using the host's normal log pipeline without recording request
+bodies or authorization headers.
 
 Before an upgrade, back up `/var/lib/glacialcast`, deploy the new binary,
 restart the relay, confirm readiness, and run:
