@@ -1,5 +1,9 @@
 # niri PipeWire Cursor Metadata Report
 
+This is a historical environment report from the 0.1 investigation. The
+diagnosis remains relevant, but the current transport and verifier use
+encrypted DASH rather than the removed legacy video path.
+
 Generated from the Glacialcast cursor metadata verifier on 2026-05-04
 23:54:24-04:00.
 
@@ -54,7 +58,6 @@ From the Glacialcast repo:
 env \
   GLACIALCAST_VERIFY_SCREENCAST_BACKEND=mutter \
   GLACIALCAST_VERIFY_MONITOR_NAME=DP-3 \
-  GLACIALCAST_VERIFY_CAPTURE=wayland-video \
   scripts/verify-wayland-cursor-metadata.sh
 ```
 
@@ -66,14 +69,16 @@ target/debug/glacialcast-client \
   --ingest-addr 127.0.0.1:18900 \
   --client-id cursor-metadata-verify \
   --display-name "Cursor Metadata Verify" \
-  --capture wayland-video \
+  --capture dash-wayland \
+  --dash-encoder openh264 \
+  --ingest-server-key <server-public-key> \
+  --viewer-key <viewer-key> \
   --portal-source monitor \
   --screencast-backend mutter \
   --portal-cursor metadata \
   --require-cursor-metadata \
   --fps 1 \
-  --cursor-hz 15 \
-  --no-viewer-key \
+  --cursor-hz 30 \
   --monitor-name DP-3
 ```
 
@@ -145,8 +150,8 @@ PipeWire stream failed: PipeWire video buffer does not include SPA_META_Cursor w
 - Cursor bitmap and hotspot decoding are covered by a synthetic SPA buffer test.
 - Required cursor metadata mode now fails closed instead of sending a cursorless
   stream.
-- The H.264 path negotiates DMA-BUF and uses the VAAPI backend before CPU
-  fallback.
+- The current H.264 path negotiates DMA-BUF for direct VA-API import and uses
+  OpenH264 only when hardware is unavailable or explicitly disabled.
 - niri IPC was checked through the live compositor socket as a possible
   independent cursor source, but this niri version does not expose pointer
   position via `niri msg` commands or `event-stream`.

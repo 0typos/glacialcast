@@ -1,149 +1,99 @@
-# Glacialcast Goal Completion Audit
+# GlacialCast 0.2 Completion Audit
 
-Last updated: 2026-07-23.
+Last updated: 2026-07-24.
 
-## Objective
+## Decision
 
-Support PipeWire screen/video streaming at 1-15 fps with an independent mouse
-overlay running around 10-30 Hz; verify encrypted and unencrypted viewing
-end-to-end; prove transmitted frame bytes match what the viewer renders; and
-prefer hardware codecs with CPU fallback only when needed.
+The 0.2 MVP implementation is complete for the supported encrypted DASH path.
+The synthetic transport, live browser, retained history, and portable offline
+paths pass end to end in both Firefox and Chromium.
 
-## Success Criteria
+Real Wayland cursor metadata and VA-API/DMA-BUF acceptance remain
+host-dependent gates. They could not be run from the final audit shell because
+it had no `WAYLAND_DISPLAY` and no `/dev/dri` render node. The repository
+contains strict scripts for running both gates in a suitable compositor
+session.
 
-1. PipeWire capture can send screen/video frames at 1-15 fps.
-2. Cursor overlay is independent from the video frame cadence and can operate at
-   10-30 Hz.
-3. Cursor overlay carries compositor-authoritative position, and cursor
-   bitmap/hotspot when supplied.
-4. Client-to-server ingest works through the encrypted Noise transport.
-5. Browser viewing works for unencrypted frame payloads.
-6. Browser viewing works for end-to-end encrypted frame payloads.
-7. Viewer-rendered frame bytes are validated against the frame sent over the
-   wire.
-8. `wayland-video` uses hardware H.264 through VAAPI/DMA-BUF first.
-9. CPU encoding/readback is retained only as an explicit fallback/diagnostic
-   path.
-10. A hard verifier fails when real cursor metadata is missing.
-
-## Prompt-To-Artifact Checklist
+## Requirement Evidence
 
 | Requirement | Evidence | Status |
 | --- | --- | --- |
-| PipeWire 1-15 fps capture | `--fps` is parsed as `0.5..=15`; PipeWire cadence is computed in `pipewire_capture_rate`; verifier runs with `--fps 1`. | Implemented |
-| Independent 10-30 Hz cursor cadence | `--cursor-hz` drives a separate cursor tick and PipeWire cursor rate; `pipewire_capture_rate(1.0, 30) == 30.0` is covered by client tests; `scripts/verify-cursor-cadence.sh` passed with 1 frame and 10 cursor messages at 1 fps / 15 Hz. | Verified for app-layer transport |
-| Real cursor source | Client requests `SPA_META_Cursor`, parses cursor position, bitmap, and hotspot, and sends cursor messages separately. | Implemented, not environment-verified |
-| Cursor bitmap/hotspot transport | `CursorBitmap` is part of `CursorMessage`; client decodes `spa_meta_bitmap`; browser renders PNG with hotspot transform; server archives bitmap fields; protocol test `noise_socket_round_trips_frame_status_ack_then_cursors` verifies cursor messages survive Noise/Postcard framing after frame ACKs. | Verified for transport and storage |
-| Missing cursor metadata fails closed | `--require-cursor-metadata` holds frames during grace and exits if buffers lack `SPA_META_Cursor`; verifier script checks server cursor messages. | Implemented and failing correctly on current niri |
-| Encrypted ingest transport | Protocol uses Noise handshake/socket framing for client/server messages. | Implemented |
-| End-to-end frame encryption | `viewer_key_b64` enables AES-GCM payload encryption; protocol tests cover encrypt/decrypt and clear payload behavior; `scripts/verify-frame-integrity.sh` verifies an encrypted retained frame with viewer-side WebCrypto. | Verified |
-| Unencrypted browser viewing | `--no-viewer-key` clear frame path is supported; `scripts/verify-frame-integrity.sh` verifies a clear retained frame with viewer-side hash logic; `scripts/verify-browser-frame-render.sh` drives the dashboard in headless Chromium and verifies the displayed clear image blob hash. | Verified |
-| Encrypted browser viewing | Browser accepts viewer key and decrypts AES-GCM image frames before rendering; `scripts/verify-frame-integrity.sh` exercises the same WebCrypto decrypt/hash path in Node; `scripts/verify-browser-frame-render.sh` verifies keyed dashboard rendering in Chromium. | Verified |
-| Viewer sees transmitted frames | Frame manifests carry `content_hash`; browser checks rendered/decrypted bytes with `fastContentHash`; `scripts/verify-frame-integrity.sh` verifies clear and encrypted payloads against manifest hashes; `scripts/verify-browser-frame-render.sh` hashes the actual blob bytes backing the rendered `<img>`. | Verified |
-| Live H.264 viewer transport | Browser UI uses WebRTC for active video streams; viewer joins trigger a keyframe request, and client/server startup gates suppress incomplete access units until SPS/PPS/IDR is available. `scripts/verify-video-webrtc.sh` verifies the RTP random-access point, while `scripts/verify-browser-frame-render.sh` verifies decoded, painted pixels and sub-three-second reload recovery in Chrome and Firefox. | Browser-verified |
-| Hardware-first video | `wayland-video` with `ffmpeg-vaapi` uses DMA-BUF frames and VAAPI H.264 backend first; `scripts/verify-wayland-video-hardware.sh` requires a VAAPI/DMA-BUF attempt before accepting video output. | Verified |
-| Reduced CPU fallback | If DMA-BUF VAAPI fails but `h264_vaapi` is usable, the client restarts with CPU-readable PipeWire and uploads converted frames to VAAPI for hardware H.264 before using full software H.264. | Implemented, verifier distinguishes path |
-| CPU fallback | Software H.264 and CPU-readable PipeWire paths are fallback/diagnostic paths after VAAPI failure or explicit mode; `scripts/verify-wayland-video-hardware.sh` accepts fallback only after observing the VAAPI failure path unless strict hardware mode is enabled. The full software path now tries `h264_nvenc`, then `libx264`, `libopenh264`, then generic `h264`, and falls through if an advertised encoder cannot actually open. | Verified |
-| Direct niri/Mutter ScreenCast backend | `--screencast-backend mutter --monitor-name <connector>` calls `RecordMonitor` with metadata cursor mode. | Implemented |
-| Upstream/debug evidence | `docs/wayland-cursor-metadata-upstream-report.md` captures reproducer, environment, niri logs, and observed buffer metadata. | Complete |
+| Wayland capture | Native XDG Desktop Portal/PipeWire capture supports monitor/window selection; niri's Mutter-compatible API is an alternative backend. Capture and buffer negotiation have focused unit coverage. | Implemented; host gate pending |
+| Very low video cadence | `--fps` accepts 0.5 through 15 and defaults to 1. The DASH test and production capture share the same sampler and packager. | Verified |
+| Low live latency | `scripts/verify-dash-e2e.sh` rejects periodic capture-to-durable-relay acknowledgement above 250 ms. The latest maximum was 45 ms. The browser gate rejects live announcement-to-MSE-append above 250 ms; latest results were 16 ms in Firefox and 13 ms in Chromium. | Verified under local synthetic conditions |
+| Independent cursor | Video and cursor timers are separate. Cursor batches flush every 200 ms and carry their own media timestamps. The encrypted browser gate decoded dozens of cursor events while sparse video fragments arrived. | Verified synthetically |
+| Real cursor metadata | `dash-wayland` requests and parses `SPA_META_Cursor`, including position, visibility, bitmap, and hotspot. `--require-cursor-metadata` fails closed when the compositor omits it. | Implemented; compositor gate pending |
+| MPEG-DASH/fMP4 | The client emits an initialization segment plus immediate encrypted `moof`/`mdat` fragments and a dynamic MPD. Segment boundaries require an IDR. | Verified |
+| Server-blind E2EE | Media samples use CENC AES-CTR; cursor records use AES-256-GCM; every object is HMAC authenticated. Viewer keys are not sent to or logged by the relay. | Verified |
+| Authenticated ingest | Protocol version 5 uses Noise NK with a persistent `0600` relay identity. Clients pin the public key before sending tokens or objects. | Verified |
+| Bounded history | The relay evicts complete segment groups by both age and bytes, retains required epoch metadata and a persistent ingest sequence high-water mark, uses arrival time rather than UUID ordering, and reapplies policy at restart. | Verified |
+| Firefox primary target | Clear Key EME, MSE append, painted 320×180 video, live updates, and cursor decryption passed in Playwright Firefox. | Verified |
+| Chromium target | The same live checks passed in Playwright Chromium. | Verified |
+| Portable file stream | Relay objects mirror atomically to versioned `.gco` files. A following mirror and the self-contained offline server delivered continued playback without Internet access. | Verified |
+| Offline browser playback | Copied objects decoded and painted in both Firefox and Chromium. Latest live append results were 3 ms and 7 ms respectively after offline file announcements. | Verified |
+| Intel/AMD hardware path | The direct VA-API encoder and PipeWire DMA-BUF import/VPP conversion are implemented; buffer leases remain held until conversion synchronizes. | Unit/build verified; hardware gate pending |
+| Software fallback | Auto mode falls back to dynamically loaded OpenH264; no FFmpeg/GStreamer runtime is present. The complete synthetic gate uses this path. | Verified |
+| Focused dependencies | The runtime has no MediaMTX, FFmpeg, GStreamer, WebRTC, dash.js, or bincode dependency. Protocol envelopes use Postcard and opaque media is not re-encoded by the relay. | Verified |
 
-## Current Verification Commands
+## Green Gates
 
-Green gates run in this workspace:
+The final repository gate is:
 
 ```sh
 scripts/verify-prerequisites.sh
 cargo fmt --check
-cargo test --workspace --features ffmpeg-vaapi
-cargo clippy --workspace --all-targets --features ffmpeg-vaapi -- -D warnings
-bash -n scripts/verify-cursor-cadence.sh scripts/verify-frame-integrity.sh scripts/verify-browser-frame-render.sh scripts/verify-wayland-video-hardware.sh scripts/verify-wayland-cursor-metadata.sh
-scripts/verify-cursor-cadence.sh
-scripts/verify-frame-integrity.sh
-scripts/verify-browser-frame-render.sh
-scripts/verify-video-webrtc.sh
-GLACIALCAST_VERIFY_SCREENCAST_BACKEND=mutter GLACIALCAST_VERIFY_MONITOR_NAME=DP-3 scripts/verify-wayland-video-hardware.sh
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo doc --workspace --no-deps
+bash -n scripts/*.sh
+scripts/verify-dash-e2e.sh
 ```
 
-Recent verifier output:
-
-```text
-PASS: cargo test --workspace --features ffmpeg-vaapi (49 tests)
-PASS: server received 1 frame(s) and 10 cursor messages; cursor cadence is independent of frame cadence
-PASS: clear and encrypted dashboard image frames rendered in Google Chrome with matching displayed blob hashes
-PASS: live H.264 decoded and painted non-uniform 1280x720 pixels in Google Chrome and Firefox; reload recovery completed within 3 seconds
-PASS: WebRTC viewer received decodable H.264 random access point after 155 RTP packets (161926 payload bytes, 3 access units, nal_types=[7, 8, 5, ...])
-PASS: Wayland capture attempted DMA-BUF VAAPI and CPU-upload VAAPI before delivering H.264 through the software fallback
-```
-
-The Fedora FFmpeg 8 feature build was also validated against matching Fedora 44
-development headers extracted into a temporary local prefix. The host still
-needs the packages listed in the README installed system-wide before ordinary
-feature builds and the real Wayland hardware gate can run without that temporary
-`PKG_CONFIG_PATH`.
-
-The hard real-cursor gate still fails on this niri session:
+Browser playback is enabled when a Playwright installation is available:
 
 ```sh
-env \
-  GLACIALCAST_VERIFY_SCREENCAST_BACKEND=mutter \
-  GLACIALCAST_VERIFY_MONITOR_NAME=DP-3 \
-  GLACIALCAST_VERIFY_CAPTURE=wayland-video \
-  scripts/verify-wayland-cursor-metadata.sh
+GLACIALCAST_VERIFY_BROWSERS=firefox,chromium \
+GLACIALCAST_VERIFY_OFFLINE_BROWSERS=firefox,chromium \
+scripts/verify-dash-e2e.sh
 ```
 
-Observed failure:
+The current workspace has 60 unit tests: 32 client, 7 DASH, 1 offline, 7
+protocol, and 13 server tests.
 
-```text
-DIAG: NIRI_SOCKET is set but not reachable: /run/user/1000/niri.wayland-1.7608.sock
-DIAG: using discovered niri socket for IPC checks: /run/user/1000/niri.wayland-1.1294988.sock
-{"cli":"26.04 (8ed0da4)","compositor":"26.04 (8ed0da4)"}
-niri IPC: no cursor-position or pointer-position command is advertised
-DIAG: cursor metadata mode was requested, but PipeWire buffers did not include SPA_META_Cursor
-DIAG: first PipeWire buffer metadata summary contained only SPA_META_Busy
-DIAG: direct Mutter/niri ScreenCast opened successfully; this points at compositor-side cursor metadata emission
+## Environment-Specific Gates
+
+Run these inside the target graphical session:
+
+```sh
+scripts/verify-wayland-cursor-metadata.sh
+scripts/verify-wayland-video-hardware.sh
 ```
 
-Upstream documentation checked on 2026-05-06:
+For direct niri capture:
 
-- <https://github.com/niri-wm/niri/wiki/Screencasting> says niri's primary
-  screencasting interface is portals plus PipeWire, with wlr-screencopy as an
-  alternative for compatible tools. It does not document a separate
-  `SPA_META_Cursor` cursor metadata stream.
-- <https://github.com/niri-wm/niri/wiki/Configuration:-Debug-Options>
-  documents `debug { disable-cursor-plane }`, which renders the cursor together
-  with the rest of the frame. That can make cursor visibility more reliable for
-  embedded-cursor video, but it is not an independent overlay and cannot satisfy
-  the 10-30 Hz cursor cadence requirement when the video stream itself is
-  running at a lower frame rate.
+```sh
+GLACIALCAST_VERIFY_SCREENCAST_BACKEND=mutter \
+GLACIALCAST_VERIFY_MONITOR_NAME=DP-3 \
+scripts/verify-wayland-cursor-metadata.sh
 
-## Remaining Gap
+GLACIALCAST_VERIFY_SCREENCAST_BACKEND=mutter \
+GLACIALCAST_VERIFY_MONITOR_NAME=DP-3 \
+GLACIALCAST_VERIFY_REQUIRE_DMABUF=1 \
+scripts/verify-wayland-video-hardware.sh
+```
 
-The goal is not complete because the current compositor/session does not emit a
-usable compositor-authoritative cursor source:
+The cursor gate requires both encrypted media and a cursor object from the real
+PipeWire stream. The hardware gate requires the VA-API backend; optional strict
+mode also requires a compositor DMA-BUF to reach VA-API import.
 
-- XDG portal advertises metadata mode (`AvailableCursorModes = 7`), but buffers
-  still lack `SPA_META_Cursor`.
-- Direct niri/Mutter ScreenCast accepts `cursor-mode = Metadata`, but buffers
-  still lack `SPA_META_Cursor`.
-- `ext_image_copy_capture_manager_v1` is absent.
-- `scripts/verify-wayland-cursor-metadata.sh` now reports a stale or
-  unreachable `NIRI_SOCKET` explicitly and auto-discovers the live socket under
-  `/run/user/$(id -u)` for niri IPC checks.
-- With the live socket, `niri msg --help` still advertises no
-  cursor-position or pointer-position command, and `niri msg -j event-stream`
-  reports workspace/window/cast/config events rather than pointer-motion or
-  global cursor state.
-- `wayland-info` shows only cursor-shape, relative-pointer, and
-  virtual-pointer protocols beyond screencopy; those do not expose global
-  compositor cursor position/shape for an observer.
-- The XDG RemoteDesktop portal exposes pointer notification methods for input
-  injection, not cursor observation.
+## Deployment Boundary
 
-Until one of those sources becomes available, Glacialcast cannot prove the
-required independent 10-30 Hz cursor overlay end-to-end in this environment.
+The current deployment target is a trusted LAN. Noise protects and
+authenticates ingest, while viewer content remains end-to-end encrypted. The
+HTTP management and viewer surface does not yet provide viewer authorization,
+HTTPS termination, rate limiting, or Internet-facing operational hardening.
+Those are post-MVP requirements and must be added before public exposure.
 
-## Completion Decision
-
-Do not mark the goal complete yet. The implementation is ready to consume and
-transport independent cursor metadata, including bitmap/hotspot data, but the
-real compositor metadata gate has not passed.
+The relay can still observe routing metadata, dimensions, MIME types, timing,
+object sizes, and activity. E2EE protects screen pixels and cursor contents,
+not traffic analysis or availability.
