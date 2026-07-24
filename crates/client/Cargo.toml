@@ -11,8 +11,8 @@ chrono.workspace = true
 clap.workspace = true
 cros-codecs.workspace = true
 futures-util.workspace = true
-glacialcast-dash = { path = "../dash", version = "0.2.0" }
-glacialcast-protocol = { path = "../protocol", version = "0.2.0" }
+glacialcast-dash = { path = "../dash", version = "0.3.0" }
+glacialcast-protocol = { path = "../protocol", version = "0.3.0" }
 image.workspace = true
 libc.workspace = true
 openh264.workspace = true

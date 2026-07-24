@@ -1015,7 +1015,7 @@ dependencies = [
 
 [[package]]
 name = "glacialcast-client"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1043,7 +1043,7 @@ dependencies = [
 
 [[package]]
 name = "glacialcast-dash"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1061,7 +1061,7 @@ dependencies = [
 
 [[package]]
 name = "glacialcast-offline"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1079,7 +1079,7 @@ dependencies = [
 
 [[package]]
 name = "glacialcast-protocol"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1098,7 +1098,7 @@ dependencies = [
 
 [[package]]
 name = "glacialcast-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
