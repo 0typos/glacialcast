@@ -20,17 +20,17 @@ session.
 | --- | --- | --- |
 | Wayland capture | Native XDG Desktop Portal/PipeWire capture supports monitor/window selection; niri's Mutter-compatible API is an alternative backend. Capture and buffer negotiation have focused unit coverage. | Implemented; host gate pending |
 | Very low video cadence | `--fps` accepts 0.5 through 15 and defaults to 1. The DASH test and production capture share the same sampler and packager. | Verified |
-| Low live latency | `scripts/verify-dash-e2e.sh` rejects periodic capture-to-durable-relay acknowledgement above 250 ms. The latest maximum was 45 ms. The browser gate rejects live announcement-to-MSE-append above 250 ms; latest results were 16 ms in Firefox and 13 ms in Chromium. | Verified under local synthetic conditions |
-| Independent cursor | Video and cursor timers are separate. Cursor batches flush every 200 ms and carry their own media timestamps. The encrypted browser gate decoded dozens of cursor events while sparse video fragments arrived. | Verified synthetically |
+| Low live latency | `scripts/verify-dash-e2e.sh` rejects periodic capture-to-durable-relay acknowledgement above 250 ms. The final maximum was 46 ms. The browser gate rejects live announcement-to-MSE-append above 250 ms; the final live results were 13 ms in Firefox and 2 ms in Chromium. | Verified under local synthetic conditions |
+| Independent cursor | Video and cursor timers are separate. Cursor batches flush every 200 ms and carry their own media timestamps. Live and offline Firefox/Chromium gates require the overlay to paint, move independently, hide, and reappear. | Verified synthetically |
 | Real cursor metadata | `dash-wayland` requests and parses `SPA_META_Cursor`, including position, visibility, bitmap, and hotspot. `--require-cursor-metadata` fails closed when the compositor omits it. | Implemented; compositor gate pending |
 | MPEG-DASH/fMP4 | The client emits an initialization segment plus immediate encrypted `moof`/`mdat` fragments and a dynamic MPD. Segment boundaries require an IDR. | Verified |
 | Server-blind E2EE | Media samples use CENC AES-CTR; cursor records use AES-256-GCM; every object is HMAC authenticated. Viewer keys are not sent to or logged by the relay. | Verified |
 | Authenticated ingest | Protocol version 5 uses Noise NK with a persistent `0600` relay identity. Clients pin the public key before sending tokens or objects. | Verified |
-| Bounded history | The relay evicts complete segment groups by both age and bytes, retains required epoch metadata and a persistent ingest sequence high-water mark, uses arrival time rather than UUID ordering, and reapplies policy at restart. | Verified |
+| Bounded history | The relay evicts complete media/cursor groups by both age and bytes, including cursor-only groups; it retains required epoch metadata and a persistent ingest sequence high-water mark, uses arrival time rather than UUID ordering, and reapplies policy at restart. | Verified |
 | Firefox primary target | Clear Key EME, MSE append, painted 320×180 video, live updates, and cursor decryption passed in Playwright Firefox. | Verified |
 | Chromium target | The same live checks passed in Playwright Chromium. | Verified |
-| Portable file stream | Relay objects mirror atomically to versioned `.gco` files. A following mirror and the self-contained offline server delivered continued playback without Internet access. | Verified |
-| Offline browser playback | Copied objects decoded and painted in both Firefox and Chromium. Latest live append results were 3 ms and 7 ms respectively after offline file announcements. | Verified |
+| Portable file stream | Relay objects mirror atomically to versioned `.gco` files. The catalog rejects corruption, oversize files, symlinks, duplicate identities, and missing/duplicate media chunks. A following mirror and the self-contained offline server delivered continued playback without Internet access. | Verified |
+| Offline browser playback | Copied objects decoded and painted in both Firefox and Chromium. Final append results were 16 ms and 2 ms respectively after offline file announcements. | Verified |
 | Intel/AMD hardware path | The direct VA-API encoder and PipeWire DMA-BUF import/VPP conversion are implemented; buffer leases remain held until conversion synchronizes. | Unit/build verified; hardware gate pending |
 | Software fallback | Auto mode falls back to dynamically loaded OpenH264; no FFmpeg/GStreamer runtime is present. The complete synthetic gate uses this path. | Verified |
 | Focused dependencies | The runtime has no MediaMTX, FFmpeg, GStreamer, WebRTC, dash.js, or bincode dependency. Protocol envelopes use Postcard and opaque media is not re-encoded by the relay. | Verified |
@@ -46,7 +46,10 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo doc --workspace --no-deps
 bash -n scripts/*.sh
+node scripts/test-viewer-core.mjs
 scripts/verify-dash-e2e.sh
+scripts/verify-ingest-recovery.sh
+scripts/verify-performance.sh
 ```
 
 Browser playback is enabled when a Playwright installation is available:
@@ -57,8 +60,11 @@ GLACIALCAST_VERIFY_OFFLINE_BROWSERS=firefox,chromium \
 scripts/verify-dash-e2e.sh
 ```
 
-The current workspace has 60 unit tests: 32 client, 7 DASH, 1 offline, 7
-protocol, and 13 server tests.
+The current workspace has 112 normal Rust tests: 41 client, 16 DASH, 9 offline,
+23 protocol, and 23 server tests. The viewer core adds 14 dependency-free
+JavaScript tests. One additional ignored server test is run explicitly by the
+release performance gate. `cargo llvm-cov --workspace --summary-only` reports
+58.51% line coverage, up from the pre-hardening 44.98%.
 
 ## Environment-Specific Gates
 

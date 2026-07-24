@@ -146,7 +146,10 @@ change.
 Cursor batches use a compact, versioned binary payload. Position-only events
 do not repeat bitmap pixels; a bitmap is included only when its identity or
 content changes. Batches flush often enough to keep live cursor latency below
-250 ms without paying per-event object and authentication overhead.
+250 ms without paying per-event object and authentication overhead. Cursor
+events are validated for ordered timestamps, bounded source coordinates,
+visibility-state consistency, bitmap dimensions, hotspots, exact RGBA length,
+and authenticated stream/epoch/timing context before use.
 
 ## Retention
 
@@ -157,7 +160,8 @@ Retention is evaluated per stream. Objects are evicted when either:
 
 The default is 30 minutes and 512 MiB. Eviction operates on decodable segment
 groups and retains the epoch initialization object required by every surviving
-group. Cursor batches are evicted with their corresponding media time range.
+group. Cursor batches are evicted with their corresponding media time range,
+and cursor-only groups are subject to the same age and byte limits.
 
 Acknowledgement means an object is durably written and indexed, not merely
 queued in memory.
@@ -171,7 +175,10 @@ rendering follows the media playhead.
 
 The viewer maps cursor coordinates into the actual contained video rectangle,
 including letterbox and pillarbox offsets. A cursor bitmap is sent only when its
-identity or pixels change.
+identity or pixels change, with a periodic refresh so a retained-history viewer
+can recover the current shape. The browser converts a bitmap to a canvas surface
+once and reuses it; unchanged cursor states do not rebuild image data every
+animation frame.
 
 Metadata cursor mode is mandatory for the independent overlay. Embedded cursor
 mode may be exposed as an explicitly degraded diagnostic option, but it does not
@@ -190,7 +197,9 @@ The files can then be transferred by any out-of-band mechanism.
 `glacialcast-offline serve` watches a received directory and embeds the complete
 local viewer and MPEG-DASH endpoints in one binary. The offline host therefore
 needs only that binary, the object files, and an installed Firefox or Chromium
-browser; it does not need Internet access or third-party JavaScript.
+browser; it does not need Internet access or third-party JavaScript. The
+offline catalog accepts only bounded regular `.gco` files, rejects duplicate
+stream/sequence identities, and ignores symlinks and incomplete transfer files.
 
 ## Runtime Dependency Boundary
 

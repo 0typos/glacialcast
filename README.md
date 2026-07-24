@@ -244,11 +244,18 @@ For niri portal routing helpers and an upstream diagnostic template, see
 cargo fmt --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+node scripts/test-viewer-core.mjs
+scripts/verify-ingest-recovery.sh
+scripts/verify-performance.sh
 ```
 
 `scripts/verify-dash-e2e.sh` exercises an authenticated encrypted test stream
-against a temporary relay. Hardware and browser checks require the
-corresponding host capabilities and are described in
-`docs/completion-audit.md`.
+against a temporary relay and portable offline viewer. The recovery gate
+crashes and restarts an authenticated relay under an active publisher. The
+performance gate runs conservative release-mode throughput and durable-object
+floors. Hardware and browser checks require the corresponding host capabilities
+and are described in `docs/completion-audit.md`.
 
 The protocol and compatibility contract is in `docs/architecture-v0.2.md`.
+The latest robustness, code-quality, and performance assessment is in
+`docs/robustness-performance-review.md`.
