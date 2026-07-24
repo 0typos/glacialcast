@@ -878,7 +878,10 @@ where
                 .transport
                 .read_message(&encrypted, &mut segment)
                 .map_err(|err| ProtocolError::Noise(format!("{err:?}")))?;
-            let (total_len, offset, chunk) = parse_noise_segment(&segment[..len])?;
+            let segment = parse_noise_segment(&segment[..len])?;
+            let total_len = segment.total_len;
+            let offset = segment.offset;
+            let chunk = segment.chunk;
             if total_len > max_len {
                 return Err(ProtocolError::FrameTooLarge(total_len));
             }
@@ -930,7 +933,28 @@ fn noise_segment(total_len: usize, offset: usize, chunk: &[u8]) -> Result<Vec<u8
     Ok(segment)
 }
 
-fn parse_noise_segment(segment: &[u8]) -> Result<(usize, usize, &[u8])> {
+/// Borrowed fields decoded from one `GCN1` Noise transport segment.
+///
+/// This low-level view exists for conformance testing and independent
+/// implementations. [`NoiseSocket`] additionally enforces continuity,
+/// consistent totals, caller allocation limits, and canonical Postcard
+/// decoding across a complete segmented message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoiseSegment<'a> {
+    /// Declared byte length of the complete plaintext message.
+    pub total_len: usize,
+    /// Byte offset at which this segment's chunk begins.
+    pub offset: usize,
+    /// Borrowed plaintext bytes carried by this segment.
+    pub chunk: &'a [u8],
+}
+
+/// Parses the bounded header of one `GCN1` Noise transport segment.
+///
+/// This function rejects an incorrect magic value, a truncated header, and a
+/// chunk whose offset and length exceed the declared total. It does not enforce
+/// cross-segment continuity; [`NoiseSocket`] performs that stateful check.
+pub fn parse_noise_segment(segment: &[u8]) -> Result<NoiseSegment<'_>> {
     if segment.len() < NOISE_SEGMENT_HEADER_LEN || &segment[..4] != NOISE_SEGMENT_MAGIC {
         return Err(ProtocolError::MalformedFrame);
     }
@@ -944,7 +968,15 @@ fn parse_noise_segment(segment: &[u8]) -> Result<(usize, usize, &[u8])> {
             .try_into()
             .map_err(|_| ProtocolError::MalformedFrame)?,
     ) as usize;
-    Ok((total_len, offset, &segment[NOISE_SEGMENT_HEADER_LEN..]))
+    let chunk = &segment[NOISE_SEGMENT_HEADER_LEN..];
+    if offset > total_len || offset.saturating_add(chunk.len()) > total_len {
+        return Err(ProtocolError::MalformedFrame);
+    }
+    Ok(NoiseSegment {
+        total_len,
+        offset,
+        chunk,
+    })
 }
 
 /// Serializes a browser control event as JSON.
@@ -981,6 +1013,53 @@ mod tests {
         )
         .unwrap();
         (object, keys)
+    }
+
+    #[test]
+    fn protocol_golden_vector_is_stable_and_decodable() {
+        let vector: serde_json::Value =
+            serde_json::from_str(include_str!("../../../test-vectors/protocol-v5.json")).unwrap();
+        let string = |field: &str| vector[field].as_str().unwrap();
+        let viewer_key: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(string("viewer_key_b64"))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let stream_id = Uuid::parse_str(string("stream_id")).unwrap();
+        let epoch_id = Uuid::parse_str(string("epoch_id")).unwrap();
+        let keys = EpochKeys::derive(&viewer_key, stream_id, epoch_id).unwrap();
+
+        assert_eq!(vector["schema"], "glacialcast-protocol-golden-v1");
+        assert_eq!(vector["protocol_version"], PROTOCOL_VERSION);
+        assert_eq!(vector["dash_format_version"], DASH_FORMAT_VERSION);
+        assert_eq!(string("key_id_b64"), keys.key_id_b64());
+        assert_eq!(string("cenc_key_b64"), keys.cenc_key_b64());
+        assert_eq!(
+            string("cursor_key_b64"),
+            URL_SAFE_NO_PAD.encode(keys.cursor_key)
+        );
+        assert_eq!(
+            string("authentication_key_b64"),
+            URL_SAFE_NO_PAD.encode(keys.authentication_key)
+        );
+
+        let portable = URL_SAFE_NO_PAD
+            .decode(string("portable_object_b64"))
+            .unwrap();
+        assert_eq!(
+            string("portable_object_sha256_b64"),
+            URL_SAFE_NO_PAD.encode(Sha256::digest(&portable))
+        );
+        let object = DashObject::from_portable_bytes(&portable).unwrap();
+        object.verify_authentication(&keys).unwrap();
+        assert_eq!(object.header.stream_id, stream_id);
+        assert_eq!(object.header.epoch_id, epoch_id);
+        assert_eq!(object.header.sequence, 42);
+        assert_eq!(object.header.segment_number, 7);
+        assert_eq!(object.header.chunk_index, 2);
+        assert_eq!(object.header.timestamp, 1_234_567);
+        assert_eq!(object.header.duration, 90_000);
+        assert_eq!(object.payload, [0, 1, 2, 3, 252, 253, 254, 255]);
     }
 
     fn noise_transport_pair() -> (TransportState, TransportState) {

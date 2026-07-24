@@ -4,6 +4,8 @@
 /data-pipewire/
 /test-results/
 /playwright-report/
+/fuzz/artifacts/
+/fuzz/target/
 /-
 *.sqlite3
 *.sqlite3-shm

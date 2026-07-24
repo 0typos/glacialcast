@@ -746,7 +746,7 @@ impl DashStore {
                     "DASH catalog journal contains an empty or oversized complete record"
                 );
             }
-            let record: JournalRecord = serde_json::from_slice(&bytes[offset..end])
+            let record = decode_journal_record(&bytes[offset..end])
                 .with_context(|| format!("parsing {}", journal_path.display()))?;
             self.apply_catalog_transaction(stream_id, catalog, record)?;
             offset = end + 1;
@@ -772,12 +772,6 @@ impl DashStore {
         catalog: &mut StreamCatalog,
         record: JournalRecord,
     ) -> Result<()> {
-        let transaction_bytes = serde_json::to_vec(&record.transaction)
-            .context("serializing replayed DASH catalog transaction")?;
-        let expected_checksum: [u8; 32] = Sha256::digest(&transaction_bytes).into();
-        if record.checksum != expected_checksum {
-            anyhow::bail!("DASH catalog journal checksum mismatch");
-        }
         let transaction = record.transaction;
         if transaction.version != JOURNAL_VERSION
             || transaction.stream_id != stream_id
@@ -911,6 +905,26 @@ impl DashStore {
             .map(|(stream_id, catalog)| (*stream_id, Arc::clone(catalog)))
             .collect())
     }
+}
+
+fn decode_journal_record(bytes: &[u8]) -> Result<JournalRecord> {
+    if bytes.is_empty() || bytes.len() > MAX_JOURNAL_RECORD_LEN || bytes.contains(&b'\n') {
+        anyhow::bail!("DASH catalog journal record has an invalid length or delimiter");
+    }
+    let record: JournalRecord =
+        serde_json::from_slice(bytes).context("decoding DASH catalog journal record")?;
+    let transaction_bytes = serde_json::to_vec(&record.transaction)
+        .context("serializing replayed DASH catalog transaction")?;
+    let expected_checksum: [u8; 32] = Sha256::digest(&transaction_bytes).into();
+    if record.checksum != expected_checksum {
+        anyhow::bail!("DASH catalog journal checksum mismatch");
+    }
+    Ok(record)
+}
+
+#[doc(hidden)]
+pub fn fuzz_catalog_journal_record(bytes: &[u8]) {
+    let _ = decode_journal_record(bytes);
 }
 
 fn retention_groups(catalog: &StreamCatalog) -> BTreeMap<(Uuid, u64), i64> {

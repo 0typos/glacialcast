@@ -74,3 +74,35 @@ jobs:
           GLACIALCAST_VERIFY_BROWSERS: firefox,chromium
           GLACIALCAST_VERIFY_OFFLINE_BROWSERS: firefox,chromium
         run: scripts/verify-dash-e2e.sh
+
+  fuzz:
+    name: Parser fuzzing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            clang \
+            libclang-dev \
+            libgbm-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev \
+            libva-dev
+      - name: Install fuzz toolchain
+        run: |
+          rustup toolchain install nightly-2026-07-03
+          cargo install cargo-fuzz --locked
+      - name: Run parser fuzz targets
+        env:
+          GLACIALCAST_FUZZ_SECONDS: "60"
+        run: scripts/verify-fuzz.sh
+      - name: Preserve fuzz failures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parser-fuzz-failures
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

@@ -1,0 +1,52 @@
+[package]
+name = "glacialcast-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+glacialcast-dash = { path = "../crates/dash" }
+glacialcast-protocol = { path = "../crates/protocol" }
+glacialcast-server = { path = "../crates/server" }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "portable_object"
+path = "fuzz_targets/portable_object.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cursor_envelope"
+path = "fuzz_targets/cursor_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "noise_segment"
+path = "fuzz_targets/noise_segment.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "epoch_descriptor"
+path = "fuzz_targets/epoch_descriptor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "catalog_journal"
+path = "fuzz_targets/catalog_journal.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

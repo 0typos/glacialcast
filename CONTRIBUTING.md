@@ -82,6 +82,8 @@ Documentation is part of the compatibility and security surface.
   listener, credential, proxy, backup, or monitoring behavior changes.
 - Update `docs/testing-demo-guide.md` when a gate, prerequisite, or manual
   acceptance procedure changes.
+- Follow `docs/compatibility.md` for every wire, portable-object, epoch,
+  retained-storage, HTTP API, or configuration compatibility decision.
 - Do not copy volatile test counts, performance values, or environment-specific
   paths into multiple documents unless they are explicitly identified as a
   dated observation.
@@ -167,6 +169,12 @@ GLACIALCAST_SOAK_SECONDS=1800 scripts/verify-quality.sh soak
 Record compositor and GPU results with
 `scripts/record-platform-support.sh --run-gates`; a compilation result is not
 platform-validation evidence.
+
+Parser changes also run the bounded local fuzz suite:
+
+```sh
+GLACIALCAST_FUZZ_SECONDS=30 scripts/verify-fuzz.sh
+```
 
 The browser gate requires Docker and Playwright. Wayland and hardware gates
 must run inside the target graphical session; see

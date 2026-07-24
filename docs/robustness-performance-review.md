@@ -117,13 +117,15 @@ history is pruned with relay retention.
   per-stream mutexes. Long-retention deployments still need soak evidence on
   their target filesystem, but no longer rewrite the complete JSON catalog or
   serialize unrelated streams for every accepted object.
-- Client and server executables contain substantial logic directly in
-  `main.rs`. Moving orchestration into library modules would enable focused
-  HTTP/ingest state-machine tests and improve coverage without process spawning.
+- Client and server orchestration now lives in library modules with thin binary
+  wrappers. The remaining low-coverage boundary is the process, D-Bus, and
+  hardware wiring itself.
 - The custom constrained fMP4/CENC and viewer code intentionally avoids large
   dependencies, but that makes browser interoperability tests and format
-  fuzzing permanent maintenance requirements. Fuzz targets for portable,
-  cursor, Noise-segment, and catalog parsers are the next useful test layer.
+  fuzzing permanent maintenance requirements. Nightly targets now cover
+  portable objects, cursor envelopes, Noise segments, epoch descriptors, and
+  catalog-journal records; golden vectors detect accidental key and portable
+  format drift.
 - E2EE does not hide timing, dimensions, object sizes, activity, or availability
   from the relay. Internet deployment should document this traffic-analysis
   boundary explicitly; `internet-deployment.md` now does.
@@ -142,6 +144,7 @@ scripts/verify-ingest-recovery.sh
 scripts/verify-internet-security.sh
 scripts/verify-internet-browser.sh
 scripts/verify-performance.sh
+GLACIALCAST_FUZZ_SECONDS=30 scripts/verify-fuzz.sh
 cargo llvm-cov --workspace --summary-only
 ```
 

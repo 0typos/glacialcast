@@ -66,6 +66,20 @@ Success means:
 The dependency policy explicitly rejects `bincode`; GlacialCast protocol
 envelopes use version-gated Postcard.
 
+Parser changes should also run the bounded fuzz suite. It needs the pinned
+nightly and `cargo-fuzz` once:
+
+```sh
+rustup toolchain install nightly-2026-07-03
+cargo install cargo-fuzz --locked
+GLACIALCAST_FUZZ_SECONDS=30 scripts/verify-fuzz.sh
+```
+
+The script fuzzes portable objects, cursor envelopes, Noise segment headers,
+epoch descriptors, and relay catalog-journal records. It mutates a temporary
+copy of the reviewed seed corpus, so a normal run does not dirty the worktree.
+Any crashing input is retained in `fuzz/artifacts/`.
+
 ## 3. Run the headless end-to-end gates
 
 The canonical full local gate includes the standard checks and all deterministic
@@ -488,6 +502,7 @@ example, rather than stopping an unrelated service.
 ## Final acceptance checklist
 
 - [ ] All normal Rust and JavaScript tests pass.
+- [ ] Parser fuzzing passes and any new crash artifact has a regression test.
 - [ ] Dependency policy passes and the graph contains no `bincode`.
 - [ ] Synthetic live and offline E2E gates pass.
 - [ ] Forced-crash ingest recovery passes.

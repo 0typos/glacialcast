@@ -17,6 +17,7 @@ run() {
 
 standard_checks() {
   run cargo fmt --all -- --check
+  run cargo fmt --manifest-path fuzz/Cargo.toml -- --check
   run cargo test --workspace --all-features
   run cargo clippy --workspace --all-targets --all-features -- \
     -D warnings \

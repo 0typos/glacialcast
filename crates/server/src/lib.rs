@@ -13,6 +13,9 @@ mod security;
 mod storage;
 mod traffic;
 
+#[doc(hidden)]
+pub use dash_store::fuzz_catalog_journal_record;
+
 use crate::{
     dash_store::DashStore,
     security::{
