@@ -178,6 +178,20 @@ impl EpochKeys {
     ///
     /// Reusing a viewer key across epochs is safe because both identifiers are
     /// incorporated into the HKDF salt.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use glacialcast_dash::EpochKeys;
+    /// use uuid::Uuid;
+    ///
+    /// let stream_id = Uuid::from_u128(1);
+    /// let epoch_id = Uuid::from_u128(2);
+    /// let keys = EpochKeys::derive(&[7; 32], stream_id, epoch_id)?;
+    ///
+    /// assert_eq!(keys.key_id, *epoch_id.as_bytes());
+    /// # Ok::<(), glacialcast_dash::DashError>(())
+    /// ```
     pub fn derive(viewer_key: &[u8; 32], stream_id: Uuid, epoch_id: Uuid) -> Result<Self> {
         let mut salt_hasher = Sha256::new();
         salt_hasher.update(b"glacialcast epoch key salt");

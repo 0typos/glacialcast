@@ -288,6 +288,37 @@ pub struct NewDashObject<'a> {
 
 impl DashObject {
     /// Builds, validates, hashes, and authenticates a new object.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use glacialcast_dash::EpochKeys;
+    /// use glacialcast_protocol::{DashObject, DashObjectKind, NewDashObject};
+    /// use uuid::Uuid;
+    ///
+    /// let stream_id = Uuid::from_u128(1);
+    /// let epoch_id = Uuid::from_u128(2);
+    /// let keys = EpochKeys::derive(&[7; 32], stream_id, epoch_id)?;
+    /// let object = DashObject::authenticated(
+    ///     NewDashObject {
+    ///         stream_id,
+    ///         epoch_id,
+    ///         kind: DashObjectKind::Media,
+    ///         sequence: 1,
+    ///         segment_number: 1,
+    ///         chunk_index: 0,
+    ///         timestamp: 0,
+    ///         duration: 90_000,
+    ///         random_access: true,
+    ///         mime: "video/iso.segment",
+    ///         payload: vec![1, 2, 3],
+    ///     },
+    ///     &keys,
+    /// )?;
+    ///
+    /// object.verify_authentication(&keys)?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn authenticated(input: NewDashObject<'_>, keys: &EpochKeys) -> Result<Self> {
         let payload_len =
             u32::try_from(input.payload.len()).map_err(|_| ProtocolError::DashPayloadTooLarge)?;
@@ -579,6 +610,16 @@ pub fn decode_key_b64(key: &str) -> Result<[u8; 32]> {
 /// Parses a non-negative decimal byte size with SI or IEC suffixes.
 ///
 /// Accepted examples include `512MiB`, `1.5GB`, and `4096`.
+///
+/// # Examples
+///
+/// ```
+/// use glacialcast_protocol::parse_human_bytes;
+///
+/// assert_eq!(parse_human_bytes("1.5 MiB")?, 1_572_864);
+/// assert_eq!(parse_human_bytes("2GB")?, 2_000_000_000);
+/// # Ok::<(), String>(())
+/// ```
 pub fn parse_human_bytes(value: &str) -> std::result::Result<u64, String> {
     let value = value.trim();
     if value.is_empty() {
