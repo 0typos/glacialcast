@@ -1,47 +1,31 @@
-# Glacialcast
+# GlacialCast
 
-Rust screen streaming inspired by 1fps. The current implementation has a working
-protocol/server/client vertical slice:
+GlacialCast is a low-frame-rate screen stream for live viewing with bounded
+history. Its primary path captures Wayland through the desktop portal and
+PipeWire, encodes H.264 at about one frame per second, packages Common
+Encryption (CENC) fragmented MP4 as MPEG-DASH, and renders cursor metadata as an
+independent higher-rate overlay.
 
-- Custom Noise-encrypted ingest TCP protocol.
-- Server-assigned stream IDs keyed by client identity.
-- Optional server-enforced ingest tokens.
-- Low-latency browser live playback for encoded video through WebRTC.
-- Optional browser-decryptable AES-GCM image frame payloads.
-- Byte-bounded in-memory rings for live playback.
-- Background archival of frame/video/cursor metadata to SQLite and payload blobs
-  to disk.
-- Per-stream live byte retention with human-readable byte sizes.
-- Static browser dashboard with WebSocket updates, multi-stream layouts, per-slot
-  keys, independent scrubbers, fullscreen controls, and cursor overlay.
-- JPEG test-pattern and folder replay client modes for image-path debugging.
-- H.264 test video mode for exercising the WebRTC live path.
-- External Annex-B H.264 mode for plugging in a capture/encoder tool without
-  coupling the protocol to that tool.
-- Native Wayland capture through raw XDG Desktop Portal D-Bus calls and
-  `pipewire-rs` when the compositor provides CPU-readable buffers.
-- In-process Wayland video capture that imports PipeWire DMA-BUF frames into
-  FFmpeg/libavfilter and encodes H.264 with `h264_vaapi`, with a CPU-readable
-  VAAPI upload fallback before full software H.264.
+The current `0.2` vertical slice provides:
 
-The browser viewer key is owned by the client. Store it in the client config or
-pass `--viewer-key` to enable end-to-end AES-GCM frame encryption. If no viewer
-key is configured, frames are sent in the clear inside the Noise-encrypted ingest
-transport.
+- Native XDG Desktop Portal and PipeWire capture without GStreamer.
+- In-process OpenH264 software encoding without FFmpeg.
+- Authenticated, server-blind CENC media and AES-GCM cursor objects.
+- Durable, age-and-byte-bounded history on the relay.
+- A dependency-free browser viewer using MSE and EME Clear Key.
+- Verified encrypted playback in Firefox (the primary target) and Chromium.
+- 30 Hz cursor capture and overlay independent of the one FPS media stream.
+- Server-assigned stream IDs and optional ingest tokens.
 
-Wayland capture through `--capture wayland` is a CPU-readable fallback and
-diagnostic path. On niri and other DMA-BUF-first compositors it intentionally
-refuses non-mappable DMA-BUF frames instead of sending corrupted images. Use
-`--capture wayland-video` for the WebRTC path; it imports PipeWire DMA-BUF
-frames into FFmpeg's VAAPI filters and sends H.264 to the browser. If DMA-BUF
-VAAPI processing fails but `h264_vaapi` is usable, it restarts with CPU-readable
-PipeWire frames and uploads converted frames to VAAPI for hardware H.264 before
-falling all the way back to the full CPU/software path. That last path still
-prefers `h264_nvenc` when it can actually open, then falls through to `libx264`,
-`libopenh264`, or FFmpeg's generic `h264` encoder. Each backend must produce a
-complete SPS/PPS/IDR random-access point within two seconds or the client
-automatically advances to the next fallback. New and recovering browser viewers
-also request a fresh IDR instead of waiting for a periodic keyframe.
+The viewer key is owned by the capture client and is never sent to the relay.
+Store it in `client.toml` or pass `--viewer-key`; encrypted DASH capture refuses
+to start without it. The current relay and viewer are suitable for a trusted
+LAN. Authentication, TLS, and Internet-facing deployment hardening remain
+required before exposing them publicly.
+
+The earlier JPEG and WebRTC modes are retained as compatibility and diagnostic
+paths while the DASH implementation is completed. They are not the intended
+GlacialCast transport.
 
 Wayland capture prefers PipeWire cursor metadata so the browser can draw the
 cursor overlay independently from the captured frame rate, including cursor
@@ -70,14 +54,18 @@ compositor-authoritative cursor position source for an independent overlay.
 
 ## Fedora Host Dependencies
 
-On current Fedora hosts, native PipeWire capture needs the PipeWire development
-package before `glacialcast-client` can build:
+Native PipeWire capture needs the PipeWire development package to build, and
+the DASH software fallback loads the OpenH264 2.6 ABI at runtime:
 
 ```sh
-sudo dnf install pipewire-devel
+sudo dnf install pipewire-devel openh264
 ```
 
-The in-process VAAPI H.264 backend additionally needs FFmpeg/libva development
+`--openh264-library` can point at `libopenh264.so.8` or
+`libopenh264.so.2.6.0` when it is installed outside the standard library
+directories.
+
+The legacy `ffmpeg-vaapi` feature additionally needs FFmpeg/libva development
 packages. On Fedora systems using the Fedora `*-free` FFmpeg libraries, install
 the matching free devel packages instead of RPM Fusion `ffmpeg-devel`:
 
@@ -141,10 +129,10 @@ ingest_token = "replace-with-a-random-secret"
 viewer_key_b64 = "replace-with-client-generated-viewer-key"
 ```
 
-`viewer_key_b64` is optional. If omitted, client-to-browser frame encryption is
-disabled.
+`viewer_key_b64` must decode to 32 bytes for `dash-test` and `dash-wayland`.
+The legacy image mode still permits an omitted key.
 
-## Run
+## Run the encrypted DASH path
 
 Start the server:
 
@@ -154,7 +142,8 @@ cargo run -p glacialcast-server -- \
   --control-addr 127.0.0.1:8899 \
   --ingest-addr 127.0.0.1:8900 \
   --data-dir data \
-  --retention-bytes-per-stream 512MiB
+  --retention-bytes-per-stream 512MiB \
+  --retention-seconds 1800
 ```
 
 Run the server as a daemon and control it through its Unix socket:
@@ -171,7 +160,41 @@ Run the server as a daemon and control it through its Unix socket:
 ./target/release/glacialcast-server --daemon-stop --daemon-socket /tmp/glacialcast-server.sock
 ```
 
-Open the dashboard:
+Generate a viewer key once and save it in `client.toml`:
+
+```sh
+node -e "console.log(Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('base64url'))"
+```
+
+Publish a generated encrypted test stream:
+
+```sh
+cargo run -p glacialcast-client -- \
+  --ingest-addr 127.0.0.1:8900 \
+  --client-id dash-test \
+  --display-name "Encrypted DASH Test" \
+  --capture dash-test \
+  --viewer-key "$VIEWER_KEY" \
+  --fps 1 \
+  --cursor-hz 30
+```
+
+Publish the selected Wayland monitor or window:
+
+```sh
+cargo run -p glacialcast-client -- \
+  --ingest-addr 127.0.0.1:8900 \
+  --client-id workstation \
+  --display-name Workstation \
+  --capture dash-wayland \
+  --viewer-key "$VIEWER_KEY" \
+  --fps 1 \
+  --cursor-hz 30 \
+  --portal-cursor metadata \
+  --require-cursor-metadata
+```
+
+Open the dashboard, select the DASH stream, and enter the viewer key:
 
 ```text
 http://127.0.0.1:8899
@@ -186,9 +209,11 @@ Dashboard shortcuts:
 - `Shift+f`: request browser fullscreen for the active stream.
 - `l`: return the active stream to live playback.
 
-Streams marked `clear` start without a stream key. Streams marked `keyed`
-require the client's viewer key before the browser can decrypt retained image
-frames.
+The dedicated DASH viewer verifies every authenticated object before appending
+it, derives per-epoch keys locally, and never submits the viewer key to the
+server.
+
+## Compatibility and diagnostic paths
 
 Start a generated test stream:
 

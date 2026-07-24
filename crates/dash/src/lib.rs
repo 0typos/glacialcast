@@ -473,7 +473,8 @@ fn build_encrypted_sample_entry(config: &AvcConfig, key_id: [u8; 16]) -> Vec<u8>
             }));
             sinf.extend(mp4_box(*b"schi", |schi| {
                 schi.extend(full_box(*b"tenc", 0, 0, |out| {
-                    out.extend_from_slice(&[0; 3]);
+                    out.push(0);
+                    out.push(0);
                     out.push(1);
                     out.push(16);
                     out.extend_from_slice(&key_id);
@@ -866,6 +867,13 @@ mod tests {
             assert!(init.windows(4).any(|window| window == marker));
         }
         assert!(init.windows(16).any(|window| window == [3u8; 16]));
+
+        let tenc = find_box(&init, *b"tenc").unwrap();
+        assert_eq!(
+            &init[tenc + 8..tenc + 16],
+            &[0, 0, 0, 0, 0, 0, 1, 16],
+            "version/flags, reserved, pattern, protected, and IV-size fields"
+        );
     }
 
     #[test]

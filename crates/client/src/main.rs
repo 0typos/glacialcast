@@ -3,10 +3,17 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::{Parser, ValueEnum};
 use futures_util::StreamExt;
+use glacialcast_dash::{
+    CursorBatch as DashCursorBatch, CursorBitmap as DashCursorBitmap,
+    CursorContext as DashCursorContext, CursorEvent as DashCursorEvent, DASH_FORMAT_VERSION,
+    DEFAULT_SEGMENT_FRAMES, EpochDescriptor, EpochKeys, FragmentInput, MEDIA_TIMESCALE,
+    build_encrypted_fragment, build_encrypted_init_segment, encrypt_cursor_batch,
+};
 use glacialcast_protocol::{
-    BufferStatus, CaptureSource, ClientMessage, CursorBitmap, CursorMessage, FrameMessage,
-    H264ParameterSetCache, NoiseSocket, PROTOCOL_VERSION, ServerMessage, StreamHello,
-    StreamMediaKind, VideoChunkMessage, VideoCodec, VideoPacketization,
+    BufferStatus, CaptureSource, ClientMessage, CursorBitmap, CursorMessage, DashObject,
+    DashObjectKind, FrameMessage, H264ParameterSetCache, NewDashObject, NoiseSocket,
+    PROTOCOL_VERSION, ServerMessage, StreamHello, StreamMediaKind, VideoChunkMessage, VideoCodec,
+    VideoPacketization,
     daemon::{
         daemonize_if_requested, install_signal_handlers, manager_command,
         sanitize_socket_component, serve_control_socket, wait_for_shutdown,
@@ -15,12 +22,13 @@ use glacialcast_protocol::{
     protect_frame,
 };
 use image::{
-    ColorType, ImageBuffer, ImageEncoder, ImageReader, Rgb,
+    ColorType, ImageBuffer, ImageEncoder, ImageReader, Rgb, RgbaImage,
     codecs::{jpeg::JpegEncoder, png::PngEncoder},
     imageops::FilterType,
 };
 use pipewire as pw;
 use pw::{properties::properties, spa};
+use rand::{RngCore, rngs::OsRng};
 use serde::Deserialize;
 use std::{
     collections::VecDeque,
@@ -56,8 +64,11 @@ use glacialcast_protocol::inspect_h264_access_unit;
 #[cfg(feature = "ffmpeg-vaapi")]
 use std::os::fd::AsRawFd;
 
+mod dash_encoder;
 #[cfg(feature = "ffmpeg-vaapi")]
 mod ffmpeg_vaapi;
+
+use dash_encoder::SoftwareH264Encoder;
 
 const PORTAL_SOURCE_MONITOR: u32 = 1;
 const PORTAL_SOURCE_WINDOW: u32 = 2;
@@ -120,8 +131,14 @@ struct Args {
     min_frame_change_percent: f32,
     #[arg(long, value_parser = parse_update_rate, default_value = "1")]
     fps: f64,
-    #[arg(long, default_value_t = 15)]
+    #[arg(long, default_value_t = 30)]
     cursor_hz: u64,
+    #[arg(long, default_value_t = 250_000)]
+    video_bitrate: u32,
+    #[arg(long, default_value_t = DEFAULT_SEGMENT_FRAMES)]
+    segment_frames: u16,
+    #[arg(long)]
+    openh264_library: Option<PathBuf>,
     #[arg(long, value_parser = parse_human_bytes, default_value = "128MiB")]
     resend_bytes: u64,
     #[arg(long)]
@@ -161,6 +178,8 @@ struct CaptureEncodeSettings {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CaptureMode {
+    DashTest,
+    DashWayland,
     TestPattern,
     TestVideo,
     ExternalH264,
@@ -267,7 +286,6 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
     info!(
         client_id = %identity.client_id,
         e2e_encrypted = identity.viewer_key_b64.is_some(),
-        viewer_key = identity.viewer_key_b64.as_deref().unwrap_or("<disabled>"),
         "stream credentials ready"
     );
 
@@ -293,6 +311,27 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
         });
     }
 
+    if is_dash_capture_mode(args.capture) {
+        let viewer_key = viewer_key.as_ref().context(
+            "encrypted DASH capture requires --viewer-key or viewer_key_b64 in client.toml",
+        )?;
+        let mut capture: Box<dyn Capture> = match args.capture {
+            CaptureMode::DashTest => Box::new(TestPatternCapture::new(args.width, args.height)),
+            CaptureMode::DashWayland => Box::new(WaylandPipewireCapture::new(&args)),
+            _ => unreachable!("non-DASH modes do not enter the DASH client"),
+        };
+        let mut resend = DashResendBuffer::new(args.resend_bytes);
+        return run_dash_client(
+            &args,
+            &identity,
+            viewer_key,
+            capture.as_mut(),
+            &mut resend,
+            shutdown_rx,
+        )
+        .await;
+    }
+
     if is_video_capture_mode(args.capture) {
         if viewer_key.is_some() {
             warn!(
@@ -309,7 +348,11 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
 
     let mut capture: Box<dyn Capture> = match args.capture {
         CaptureMode::TestPattern => Box::new(TestPatternCapture::new(args.width, args.height)),
-        CaptureMode::TestVideo | CaptureMode::ExternalH264 | CaptureMode::WaylandVideo => {
+        CaptureMode::DashTest
+        | CaptureMode::DashWayland
+        | CaptureMode::TestVideo
+        | CaptureMode::ExternalH264
+        | CaptureMode::WaylandVideo => {
             unreachable!("video modes return early")
         }
         CaptureMode::ImageDir => Box::new(ImageDirCapture::new(expand_home(&args.image_dir))),
@@ -364,6 +407,604 @@ async fn sleep_or_shutdown(duration: Duration, shutdown_rx: &mut watch::Receiver
     }
 }
 
+async fn run_dash_client(
+    args: &Args,
+    identity: &ClientIdentity,
+    viewer_key: &[u8; 32],
+    capture: &mut dyn Capture,
+    resend: &mut DashResendBuffer,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    loop {
+        let source = match capture.source().await {
+            Ok(source) => source,
+            Err(err) => {
+                if is_fatal_capture_error(&err) {
+                    return Err(err.context("fatal DASH capture setup error"));
+                }
+                warn!(?err, "DASH capture source unavailable; retrying in 1s");
+                let mut retry_shutdown = shutdown_rx.clone();
+                if sleep_or_shutdown(Duration::from_secs(1), &mut retry_shutdown).await {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+        match run_dash_connection(
+            args,
+            identity,
+            viewer_key,
+            &source,
+            capture,
+            resend,
+            shutdown_rx.clone(),
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                if is_fatal_capture_error(&err) || is_fatal_dash_error(&err) {
+                    return Err(err.context("fatal encrypted DASH publisher error"));
+                }
+                warn!(?err, "DASH connection dropped; retrying in 1s");
+                let mut retry_shutdown = shutdown_rx.clone();
+                if sleep_or_shutdown(Duration::from_secs(1), &mut retry_shutdown).await {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+fn is_fatal_dash_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("OpenH264")
+            || message.contains("openh264")
+            || message.contains("encoder dimensions changed")
+            || message.contains("requires non-zero, even dimensions")
+            || message.contains("segment-frames")
+            || message.contains("does not fit MPEG-DASH")
+    })
+}
+
+async fn run_dash_connection(
+    args: &Args,
+    identity: &ClientIdentity,
+    viewer_key: &[u8; 32],
+    source: &CaptureSource,
+    capture: &mut dyn Capture,
+    resend: &mut DashResendBuffer,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    if args.segment_frames == 0 {
+        bail!("--segment-frames must be at least 1");
+    }
+    let mut stream = TcpStream::connect(args.ingest_addr).await?;
+    let transport = initiator_handshake(&mut stream).await?;
+    let mut socket = NoiseSocket::new(stream, transport);
+    let (low, high) = resend.range();
+    socket
+        .write(&ClientMessage::Hello(StreamHello {
+            protocol_version: PROTOCOL_VERSION,
+            client_id: identity.client_id.clone(),
+            auth_token: identity.auth_token.clone(),
+            display_name: identity.display_name.clone(),
+            source: source.clone(),
+            media_kind: StreamMediaKind::Dash,
+            frame_encrypted: true,
+            resend_low: low,
+            resend_high: high,
+        }))
+        .await?;
+    let (stream_id, server_last_sequence) = match socket.read::<ServerMessage>().await? {
+        ServerMessage::HelloAck {
+            accepted: true,
+            stream_id: Some(stream_id),
+            last_frame_seq,
+            ..
+        } => (stream_id, last_frame_seq),
+        ServerMessage::HelloAck { reason, .. } => bail!("server rejected hello: {reason:?}"),
+        other => bail!("server sent unexpected first response: {other:?}"),
+    };
+    resend.drop_other_streams(stream_id);
+    resend.ack(server_last_sequence);
+    let mut sequence = server_last_sequence;
+    if let Some(highest) = resend.range().1
+        && highest > server_last_sequence
+    {
+        let pending = resend.objects(server_last_sequence + 1, highest);
+        for object in pending {
+            socket
+                .write(&ClientMessage::DashObject(object))
+                .await
+                .context("resending unacknowledged DASH object")?;
+            sequence = wait_for_dash_ack(&mut socket, resend).await?.max(sequence);
+        }
+    }
+    sequence = sequence.max(resend.range().1.unwrap_or(0));
+
+    let first_image = normalize_dash_image(
+        capture
+            .capture_rgb(args.max_frame_width, args.max_frame_height)
+            .await?,
+        None,
+    );
+    let width = first_image.width();
+    let height = first_image.height();
+    let frame_duration = ((f64::from(MEDIA_TIMESCALE) / args.fps).round() as u64)
+        .clamp(1, u64::from(u32::MAX)) as u32;
+    let epoch_id = Uuid::new_v4();
+    let keys = EpochKeys::derive(viewer_key, stream_id, epoch_id)
+        .context("deriving encrypted DASH epoch keys")?;
+    let mut encoder = SoftwareH264Encoder::new(
+        args.openh264_library.as_deref(),
+        width,
+        height,
+        args.fps,
+        args.video_bitrate,
+        args.segment_frames,
+    )?;
+    let first_encoded = encoder.encode(&first_image, false)?;
+    if !first_encoded.keyframe {
+        bail!("OpenH264 did not begin the epoch with a random-access frame");
+    }
+    let avc_config = first_encoded
+        .config
+        .clone()
+        .context("OpenH264 did not provide an AVC decoder configuration")?;
+    let codec = avc_config
+        .codec_string()
+        .context("building AVC codec string")?;
+    let descriptor = EpochDescriptor {
+        format_version: DASH_FORMAT_VERSION,
+        stream_id,
+        epoch_id,
+        key_id: keys.key_id,
+        width: u16::try_from(width).context("video width does not fit MPEG-DASH metadata")?,
+        height: u16::try_from(height).context("video height does not fit MPEG-DASH metadata")?,
+        codec,
+        timescale: MEDIA_TIMESCALE,
+        segment_frames: args.segment_frames,
+        availability_start_time: chrono::Utc::now()
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    };
+    let epoch_started = Instant::now();
+    send_new_dash_object(
+        &mut socket,
+        resend,
+        next_dash_object(
+            &mut sequence,
+            &keys,
+            DashObjectSpec {
+                stream_id,
+                epoch_id,
+                kind: DashObjectKind::Epoch,
+                segment_number: 0,
+                chunk_index: 0,
+                timestamp: 0,
+                duration: 0,
+                random_access: true,
+                mime: "application/vnd.glacialcast.epoch+json",
+                payload: descriptor
+                    .to_json()
+                    .context("serializing DASH epoch descriptor")?,
+            },
+        )?,
+    )
+    .await?;
+    send_new_dash_object(
+        &mut socket,
+        resend,
+        next_dash_object(
+            &mut sequence,
+            &keys,
+            DashObjectSpec {
+                stream_id,
+                epoch_id,
+                kind: DashObjectKind::Initialization,
+                segment_number: 0,
+                chunk_index: 0,
+                timestamp: 0,
+                duration: 0,
+                random_access: true,
+                mime: "video/mp4",
+                payload: build_encrypted_init_segment(&avc_config, keys.key_id)
+                    .context("building encrypted DASH initialization segment")?,
+            },
+        )?,
+    )
+    .await?;
+    let first_media = build_dash_media_object(
+        &mut sequence,
+        &keys,
+        stream_id,
+        epoch_id,
+        0,
+        frame_duration,
+        args.segment_frames,
+        &first_encoded,
+    )?;
+    let first_bytes = first_media.payload.len();
+    send_new_dash_object(&mut socket, resend, first_media).await?;
+    info!(
+        %stream_id,
+        %epoch_id,
+        width,
+        height,
+        fps = args.fps,
+        bitrate = args.video_bitrate,
+        bytes = first_bytes,
+        "encrypted MPEG-DASH publisher started"
+    );
+
+    let frame_interval = Duration::from_secs_f64(1.0 / args.fps);
+    let mut frame_tick =
+        tokio::time::interval_at(tokio::time::Instant::now() + frame_interval, frame_interval);
+    frame_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let cursor_interval = Duration::from_secs_f64(1.0 / args.cursor_hz.max(1) as f64);
+    let mut cursor_tick = tokio::time::interval(cursor_interval);
+    cursor_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut cursor_flush_tick = tokio::time::interval(Duration::from_millis(100));
+    cursor_flush_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut media_index = 1u64;
+    let mut cursor_sequence = 0u64;
+    let mut pending_cursor_events = Vec::new();
+
+    loop {
+        tokio::select! {
+            _ = wait_for_shutdown(&mut shutdown_rx) => {
+                flush_dash_cursor_batch(
+                    &mut socket,
+                    resend,
+                    &mut sequence,
+                    &keys,
+                    stream_id,
+                    epoch_id,
+                    width,
+                    height,
+                    frame_duration,
+                    args.segment_frames,
+                    &mut pending_cursor_events,
+                ).await?;
+                info!(%stream_id, "shutdown requested; closing encrypted DASH stream");
+                return Ok(());
+            }
+            _ = frame_tick.tick() => {
+                let image = normalize_dash_image(
+                    capture.capture_rgb(args.max_frame_width, args.max_frame_height).await?,
+                    Some((width, height)),
+                );
+                let segment_start =
+                    media_index.is_multiple_of(u64::from(args.segment_frames));
+                let encoded = encoder.encode(&image, segment_start)?;
+                if segment_start && !encoded.keyframe {
+                    bail!("OpenH264 did not honor a segment-boundary keyframe request");
+                }
+                let object = build_dash_media_object(
+                    &mut sequence,
+                    &keys,
+                    stream_id,
+                    epoch_id,
+                    media_index,
+                    frame_duration,
+                    args.segment_frames,
+                    &encoded,
+                )?;
+                let bytes = object.payload.len();
+                let sent_sequence = object.header.sequence;
+                send_new_dash_object(&mut socket, resend, object).await?;
+                debug!(
+                    %stream_id,
+                    sequence = sent_sequence,
+                    media_index,
+                    keyframe = encoded.keyframe,
+                    bytes,
+                    "sent encrypted DASH media fragment"
+                );
+                media_index = media_index.saturating_add(1);
+            }
+            _ = cursor_tick.tick() => {
+                cursor_sequence = cursor_sequence.saturating_add(1);
+                if let Some(cursor) = capture.cursor(cursor_sequence, stream_id).await? {
+                    let timestamp = duration_to_media_ticks(epoch_started.elapsed());
+                    pending_cursor_events.push(cursor_to_dash_event(cursor, timestamp, width, height)?);
+                }
+            }
+            _ = cursor_flush_tick.tick() => {
+                flush_dash_cursor_batch(
+                    &mut socket,
+                    resend,
+                    &mut sequence,
+                    &keys,
+                    stream_id,
+                    epoch_id,
+                    width,
+                    height,
+                    frame_duration,
+                    args.segment_frames,
+                    &mut pending_cursor_events,
+                ).await?;
+            }
+        }
+    }
+}
+
+struct DashObjectSpec<'a> {
+    stream_id: Uuid,
+    epoch_id: Uuid,
+    kind: DashObjectKind,
+    segment_number: u64,
+    chunk_index: u16,
+    timestamp: u64,
+    duration: u64,
+    random_access: bool,
+    mime: &'a str,
+    payload: Vec<u8>,
+}
+
+fn next_dash_object(
+    sequence: &mut u64,
+    keys: &EpochKeys,
+    spec: DashObjectSpec<'_>,
+) -> Result<DashObject> {
+    *sequence = sequence.checked_add(1).context("DASH sequence exhausted")?;
+    DashObject::authenticated(
+        NewDashObject {
+            stream_id: spec.stream_id,
+            epoch_id: spec.epoch_id,
+            kind: spec.kind,
+            sequence: *sequence,
+            segment_number: spec.segment_number,
+            chunk_index: spec.chunk_index,
+            timestamp: spec.timestamp,
+            duration: spec.duration,
+            random_access: spec.random_access,
+            mime: spec.mime,
+            payload: spec.payload,
+        },
+        keys,
+    )
+    .context("authenticating DASH object")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_dash_media_object(
+    sequence: &mut u64,
+    keys: &EpochKeys,
+    stream_id: Uuid,
+    epoch_id: Uuid,
+    media_index: u64,
+    frame_duration: u32,
+    segment_frames: u16,
+    encoded: &dash_encoder::EncodedH264Frame,
+) -> Result<DashObject> {
+    let mut iv = [0u8; 16];
+    OsRng.fill_bytes(&mut iv);
+    let timestamp = media_index.saturating_mul(u64::from(frame_duration));
+    let fragment = build_encrypted_fragment(
+        &keys.cenc_key,
+        FragmentInput {
+            sequence: u32::try_from(media_index.saturating_add(1))
+                .context("DASH epoch has too many media fragments")?,
+            decode_time: timestamp,
+            duration: frame_duration,
+            keyframe: encoded.keyframe,
+            annex_b: &encoded.annex_b,
+            iv,
+        },
+    )
+    .context("building encrypted DASH media fragment")?;
+    let segment_frames = u64::from(segment_frames);
+    next_dash_object(
+        sequence,
+        keys,
+        DashObjectSpec {
+            stream_id,
+            epoch_id,
+            kind: DashObjectKind::Media,
+            segment_number: media_index / segment_frames + 1,
+            chunk_index: (media_index % segment_frames) as u16,
+            timestamp,
+            duration: u64::from(frame_duration),
+            random_access: encoded.keyframe,
+            mime: "video/iso.segment",
+            payload: fragment.bytes,
+        },
+    )
+}
+
+fn normalize_dash_image(
+    image: ImageBuffer<Rgb<u8>, Vec<u8>>,
+    target: Option<(u32, u32)>,
+) -> ImageBuffer<Rgb<u8>, Vec<u8>> {
+    let (width, height) = target.unwrap_or_else(|| {
+        let even_width = if image.width() < 2 {
+            2
+        } else {
+            image.width() & !1
+        };
+        let even_height = if image.height() < 2 {
+            2
+        } else {
+            image.height() & !1
+        };
+        (even_width, even_height)
+    });
+    if image.width() == width && image.height() == height {
+        image
+    } else {
+        image::imageops::resize(&image, width, height, FilterType::Triangle)
+    }
+}
+
+fn duration_to_media_ticks(duration: Duration) -> u64 {
+    let ticks = duration
+        .as_nanos()
+        .saturating_mul(u128::from(MEDIA_TIMESCALE))
+        / 1_000_000_000;
+    ticks.min(u128::from(u64::MAX)) as u64
+}
+
+fn cursor_to_dash_event(
+    cursor: CursorMessage,
+    timestamp: u64,
+    output_width: u32,
+    output_height: u32,
+) -> Result<DashCursorEvent> {
+    let source_width = cursor.source_width.max(1);
+    let source_height = cursor.source_height.max(1);
+    let x = (cursor.x * output_width as f32 / source_width as f32).clamp(0.0, output_width as f32);
+    let y =
+        (cursor.y * output_height as f32 / source_height as f32).clamp(0.0, output_height as f32);
+    let (bitmap_id, bitmap) = if let Some(bitmap) = cursor.bitmap {
+        let png = BASE64_STANDARD
+            .decode(bitmap.png_b64)
+            .context("decoding PipeWire cursor bitmap")?;
+        let rgba: RgbaImage = image::load_from_memory(&png)
+            .context("decoding PipeWire cursor PNG")?
+            .to_rgba8();
+        if rgba.width() != bitmap.width || rgba.height() != bitmap.height {
+            bail!("PipeWire cursor bitmap dimensions do not match its PNG");
+        }
+        (
+            cursor.seq.max(1),
+            Some(DashCursorBitmap {
+                width: bitmap.width,
+                height: bitmap.height,
+                hotspot_x: bitmap.hotspot_x,
+                hotspot_y: bitmap.hotspot_y,
+                rgba: rgba.into_raw(),
+            }),
+        )
+    } else {
+        (0, None)
+    };
+    Ok(DashCursorEvent {
+        timestamp,
+        x_micropixels: (f64::from(x) * 1_000_000.0).round() as i64,
+        y_micropixels: (f64::from(y) * 1_000_000.0).round() as i64,
+        visible: true,
+        bitmap_id,
+        bitmap,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn flush_dash_cursor_batch(
+    socket: &mut NoiseSocket<TcpStream>,
+    resend: &mut DashResendBuffer,
+    sequence: &mut u64,
+    keys: &EpochKeys,
+    stream_id: Uuid,
+    epoch_id: Uuid,
+    width: u32,
+    height: u32,
+    frame_duration: u32,
+    segment_frames: u16,
+    events: &mut Vec<DashCursorEvent>,
+) -> Result<()> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    let start_timestamp = events.first().map_or(0, |event| event.timestamp);
+    let end_timestamp = events
+        .last()
+        .map_or(start_timestamp, |event| event.timestamp);
+    let next_sequence = sequence.checked_add(1).context("DASH sequence exhausted")?;
+    let batch = DashCursorBatch {
+        source_width: width,
+        source_height: height,
+        events: std::mem::take(events),
+    };
+    let encrypted = encrypt_cursor_batch(
+        keys,
+        DashCursorContext {
+            stream_id,
+            epoch_id,
+            sequence: next_sequence,
+            start_timestamp,
+            source_width: width,
+            source_height: height,
+        },
+        &batch,
+    )
+    .context("encrypting cursor batch")?;
+    let segment_duration = u64::from(frame_duration).saturating_mul(u64::from(segment_frames));
+    let object = next_dash_object(
+        sequence,
+        keys,
+        DashObjectSpec {
+            stream_id,
+            epoch_id,
+            kind: DashObjectKind::Cursor,
+            segment_number: start_timestamp / segment_duration.max(1) + 1,
+            chunk_index: 0,
+            timestamp: start_timestamp,
+            duration: end_timestamp.saturating_sub(start_timestamp).max(1),
+            random_access: true,
+            mime: "application/vnd.glacialcast.cursor+json",
+            payload: serde_json::to_vec(&encrypted)
+                .context("serializing encrypted cursor batch")?,
+        },
+    )?;
+    send_new_dash_object(socket, resend, object).await
+}
+
+async fn send_new_dash_object(
+    socket: &mut NoiseSocket<TcpStream>,
+    resend: &mut DashResendBuffer,
+    object: DashObject,
+) -> Result<()> {
+    let stream_id = object.header.stream_id;
+    resend.push(object.clone());
+    socket.write(&ClientMessage::DashObject(object)).await?;
+    socket
+        .write(&ClientMessage::BufferStatus(BufferStatus {
+            stream_id,
+            lowest_seq: resend.range().0,
+            highest_seq: resend.range().1,
+            bytes: resend.bytes,
+        }))
+        .await?;
+    wait_for_dash_ack(socket, resend).await?;
+    Ok(())
+}
+
+async fn wait_for_dash_ack(
+    socket: &mut NoiseSocket<TcpStream>,
+    resend: &mut DashResendBuffer,
+) -> Result<u64> {
+    loop {
+        match socket.read::<ServerMessage>().await? {
+            ServerMessage::Ack { through_seq } => {
+                resend.ack(through_seq);
+                return Ok(through_seq);
+            }
+            ServerMessage::ResendRequest { from_seq, to_seq } => {
+                let objects = resend.objects(from_seq, to_seq);
+                let expected = to_seq.saturating_sub(from_seq).saturating_add(1);
+                if objects.len() as u64 != expected {
+                    bail!(
+                        "server requested DASH objects {from_seq}..={to_seq}, but the resend buffer no longer contains all of them"
+                    );
+                }
+                for object in objects {
+                    socket.write(&ClientMessage::DashObject(object)).await?;
+                }
+            }
+            ServerMessage::Backpressure { pause_ms, reason } => {
+                warn!(pause_ms, %reason, "server requested DASH publisher backpressure");
+                tokio::time::sleep(Duration::from_millis(pause_ms)).await;
+            }
+            ServerMessage::KeyframeRequest { reason, .. } => {
+                debug!(%reason, "server requested a keyframe; next DASH segment already starts with one");
+            }
+            ServerMessage::Pong { .. } | ServerMessage::HelloAck { .. } => {}
+        }
+    }
+}
+
 fn is_fatal_capture_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         let message = cause.to_string();
@@ -385,6 +1026,10 @@ fn is_video_capture_mode(mode: CaptureMode) -> bool {
         mode,
         CaptureMode::TestVideo | CaptureMode::ExternalH264 | CaptureMode::WaylandVideo
     )
+}
+
+fn is_dash_capture_mode(mode: CaptureMode) -> bool {
+    matches!(mode, CaptureMode::DashTest | CaptureMode::DashWayland)
 }
 
 fn build_video_capture(args: &Args) -> Result<Box<dyn VideoCapture>> {
@@ -1193,6 +1838,7 @@ enum WaylandVideoBackend {
     CpuSoftware,
 }
 
+#[cfg_attr(not(feature = "ffmpeg-vaapi"), allow(dead_code))]
 impl WaylandVaapiH264Capture {
     fn new(args: &Args) -> Self {
         Self {
@@ -1815,6 +2461,7 @@ impl VideoCapture for WaylandVaapiH264Capture {
     }
 }
 
+#[cfg_attr(not(feature = "ffmpeg-vaapi"), allow(dead_code))]
 impl WaylandVaapiH264Capture {
     fn next_cursor_sample(&mut self) -> Option<PipewireCursorSample> {
         let sample = self.cursor_latest.as_mut()?.borrow().clone()?;
@@ -1956,6 +2603,11 @@ fn h264_nal_type_at(bytes: &[u8], start: usize) -> Option<u8> {
 #[async_trait]
 trait Capture: Send {
     async fn source(&mut self) -> Result<CaptureSource>;
+    async fn capture_rgb(
+        &mut self,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<ImageBuffer<Rgb<u8>, Vec<u8>>>;
     async fn capture_jpeg(&mut self, settings: CaptureEncodeSettings) -> Result<EncodedFrame>;
     async fn cursor(&mut self, seq: u64, stream_id: Uuid) -> Result<Option<CursorMessage>>;
 }
@@ -2026,6 +2678,18 @@ impl TestPatternCapture {
             tick: 0,
         }
     }
+
+    fn next_rgb(&mut self) -> ImageBuffer<Rgb<u8>, Vec<u8>> {
+        self.tick = self.tick.wrapping_add(1);
+        let mut image = ImageBuffer::<Rgb<u8>, Vec<u8>>::new(self.width, self.height);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            let r = ((x + self.tick * 17) % 255) as u8;
+            let g = ((y + self.tick * 29) % 255) as u8;
+            let b = (((x / 8) + (y / 8) + self.tick * 11) % 255) as u8;
+            *pixel = Rgb([r, g, b]);
+        }
+        image
+    }
 }
 
 #[async_trait]
@@ -2040,15 +2704,19 @@ impl Capture for TestPatternCapture {
     }
 
     async fn capture_jpeg(&mut self, settings: CaptureEncodeSettings) -> Result<EncodedFrame> {
-        self.tick = self.tick.wrapping_add(1);
-        let mut image = ImageBuffer::<Rgb<u8>, Vec<u8>>::new(self.width, self.height);
-        for (x, y, pixel) in image.enumerate_pixels_mut() {
-            let r = ((x + self.tick * 17) % 255) as u8;
-            let g = ((y + self.tick * 29) % 255) as u8;
-            let b = (((x / 8) + (y / 8) + self.tick * 11) % 255) as u8;
-            *pixel = Rgb([r, g, b]);
-        }
-        encode_rgb_image_as_jpeg(image, settings)
+        encode_rgb_image_as_jpeg(self.next_rgb(), settings)
+    }
+
+    async fn capture_rgb(
+        &mut self,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<ImageBuffer<Rgb<u8>, Vec<u8>>> {
+        Ok(resize_rgb_image_to_fit(
+            self.next_rgb(),
+            max_width,
+            max_height,
+        ))
     }
 
     async fn cursor(&mut self, seq: u64, stream_id: Uuid) -> Result<Option<CursorMessage>> {
@@ -2175,6 +2843,18 @@ impl Capture for ImageDirCapture {
         self.encode_latest(settings)
     }
 
+    async fn capture_rgb(
+        &mut self,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<ImageBuffer<Rgb<u8>, Vec<u8>>> {
+        Ok(resize_rgb_image_to_fit(
+            self.load_latest_rgb()?,
+            max_width,
+            max_height,
+        ))
+    }
+
     async fn cursor(&mut self, seq: u64, stream_id: Uuid) -> Result<Option<CursorMessage>> {
         let t = seq as f32 / 24.0;
         Ok(Some(CursorMessage {
@@ -2244,6 +2924,21 @@ impl Capture for WaylandPipewireCapture {
         let capture = self.ensure_started().await?;
         match capture.next_jpeg(settings).await {
             Ok(jpeg) => Ok(jpeg),
+            Err(err) => {
+                self.inner = None;
+                Err(err)
+            }
+        }
+    }
+
+    async fn capture_rgb(
+        &mut self,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<ImageBuffer<Rgb<u8>, Vec<u8>>> {
+        let capture = self.ensure_started().await?;
+        match capture.next_rgb(max_width, max_height).await {
+            Ok(image) => Ok(image),
             Err(err) => {
                 self.inner = None;
                 Err(err)
@@ -2347,6 +3042,24 @@ impl NativePipewireCapture {
     }
 
     async fn next_jpeg(&mut self, settings: CaptureEncodeSettings) -> Result<EncodedFrame> {
+        let frame = self.next_frame().await?;
+        encode_raw_frame_as_jpeg(&frame, settings)
+    }
+
+    async fn next_rgb(
+        &mut self,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<ImageBuffer<Rgb<u8>, Vec<u8>>> {
+        let frame = self.next_frame().await?;
+        Ok(resize_rgb_image_to_fit(
+            raw_frame_to_rgb_image(&frame)?,
+            max_width,
+            max_height,
+        ))
+    }
+
+    async fn next_frame(&mut self) -> Result<RawFrame> {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(err) = self
@@ -2362,7 +3075,7 @@ impl NativePipewireCapture {
                 && frame.serial != self.last_encoded_serial
             {
                 self.last_encoded_serial = frame.serial;
-                return encode_raw_frame_as_jpeg(&frame, settings);
+                return Ok(frame);
             }
 
             if Instant::now() >= deadline {
@@ -5247,6 +5960,69 @@ impl VideoResendBuffer {
         (
             self.chunks.front().map(|chunk| chunk.seq),
             self.chunks.back().map(|chunk| chunk.seq),
+        )
+    }
+}
+
+struct DashResendBuffer {
+    max_bytes: u64,
+    bytes: u64,
+    objects: VecDeque<DashObject>,
+}
+
+impl DashResendBuffer {
+    fn new(max_bytes: u64) -> Self {
+        Self {
+            max_bytes,
+            bytes: 0,
+            objects: VecDeque::new(),
+        }
+    }
+
+    fn push(&mut self, object: DashObject) {
+        self.bytes = self.bytes.saturating_add(object.payload.len() as u64);
+        self.objects.push_back(object);
+        while self.bytes > self.max_bytes && self.objects.len() > 1 {
+            if let Some(old) = self.objects.pop_front() {
+                self.bytes = self.bytes.saturating_sub(old.payload.len() as u64);
+            }
+        }
+    }
+
+    fn ack(&mut self, through_seq: u64) {
+        while self
+            .objects
+            .front()
+            .is_some_and(|object| object.header.sequence <= through_seq)
+        {
+            if let Some(old) = self.objects.pop_front() {
+                self.bytes = self.bytes.saturating_sub(old.payload.len() as u64);
+            }
+        }
+    }
+
+    fn drop_other_streams(&mut self, stream_id: Uuid) {
+        self.objects
+            .retain(|object| object.header.stream_id == stream_id);
+        self.bytes = self
+            .objects
+            .iter()
+            .map(|object| object.payload.len() as u64)
+            .sum();
+    }
+
+    fn objects(&self, from_seq: u64, to_seq: u64) -> Vec<DashObject> {
+        self.objects
+            .iter()
+            .filter(|object| object.header.sequence >= from_seq && object.header.sequence <= to_seq)
+            .cloned()
+            .collect()
+    }
+
+    fn range(&self) -> (Option<u64>, Option<u64>) {
+        (
+            self.objects.front().map(|object| object.header.sequence),
+            self.objects.back().map(|object| object.header.sequence),
         )
     }
 }
