@@ -1,3 +1,17 @@
+//! GlacialCast Wayland capture and encrypted DASH publisher.
+//!
+//! The client captures a portal/PipeWire or deterministic test source, samples
+//! video at a deliberately low cadence, and processes cursor metadata on an
+//! independent higher-rate timeline. It packages H.264 into CENC fragmented
+//! MP4, encrypts cursor batches, authenticates complete stream objects, and
+//! publishes them through a relay-pinned Noise NK connection.
+//!
+//! Capture buffers remain leased until CPU or DMA-BUF conversion is complete.
+//! The relay receives neither the viewer key nor plaintext pixels or cursor
+//! contents.
+
+#![deny(missing_docs)]
+
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use clap::{Parser, ValueEnum};

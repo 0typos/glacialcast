@@ -1,3 +1,11 @@
+//! Durable opaque DASH-object storage and per-stream retention.
+//!
+//! An acknowledgement is issued only after an object and its catalog state are
+//! durable. Sequences are contiguous and immutable, publication never clobbers
+//! an untracked file, and retention removes complete decodable segment groups
+//! while preserving required epoch metadata. Catalog reload revalidates paths,
+//! hashes, sizes, media chunk continuity, and symlink boundaries.
+
 use anyhow::{Context, Result};
 use glacialcast_dash::{EpochDescriptor, MpdConfig, SegmentTimelineEntry, build_mpd};
 use glacialcast_protocol::{DashObject, DashObjectHeader, DashObjectKind};

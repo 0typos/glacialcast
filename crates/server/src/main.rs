@@ -1,3 +1,13 @@
+//! GlacialCast authenticated relay and bounded-history HTTP service.
+//!
+//! Publishers connect to the dedicated Noise-encrypted ingest listener.
+//! Browsers use the HTTP API, which stays on loopback in Internet mode behind
+//! the documented HTTPS reverse proxy. The relay authenticates and authorizes
+//! opaque stream objects but never receives the viewer-derived content keys.
+//! Work, connection counts, message sizes, and retained history are bounded.
+
+#![deny(missing_docs)]
+
 mod dash_store;
 mod security;
 mod storage;

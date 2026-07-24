@@ -1,3 +1,13 @@
+//! Portable GlacialCast object mirroring and disconnected browser playback.
+//!
+//! `mirror` downloads authorized opaque DASH objects and publishes each as an
+//! atomic `GCO1` file. `serve` watches a received directory, reconstructs the
+//! constrained DASH endpoints, and embeds the complete viewer for a local
+//! Firefox or Chromium installation. The viewer key remains in the browser,
+//! and the service refuses non-loopback exposure unless explicitly allowed.
+
+#![deny(missing_docs)]
+
 use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,

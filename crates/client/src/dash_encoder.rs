@@ -1,3 +1,11 @@
+//! Focused H.264 encoders for the constrained GlacialCast DASH profile.
+//!
+//! The hardware path uses VA-API directly and can import compatible compositor
+//! DMA-BUFs through video processing into an owned NV12 surface. The software
+//! path dynamically loads OpenH264. Both produce Annex-B access units with the
+//! keyframe and parameter-set behavior required by the in-process fMP4
+//! packager; neither path invokes FFmpeg or GStreamer.
+
 use anyhow::{Context, Result, anyhow, bail};
 use clap::ValueEnum;
 use cros_codecs::{

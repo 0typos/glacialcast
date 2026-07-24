@@ -1,3 +1,12 @@
+//! Viewer access control, signed sessions, origin checks, and abuse limits.
+//!
+//! Access tokens map to viewer or administrator principals and optional
+//! publisher scopes. Browser authority is carried by short-lived signed
+//! cookies and a session-bound CSRF value; bearer tokens remain available for
+//! non-browser tools. Credential comparison and session tags use constant-time
+//! verification, and changing a principal's credentials or scope changes its
+//! session version.
+
 use anyhow::{Context, Result, bail};
 use axum::http::{HeaderMap, header};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};

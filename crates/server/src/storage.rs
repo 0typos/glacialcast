@@ -1,3 +1,9 @@
+//! Durable stream identity and publisher-ownership catalog.
+//!
+//! This SQLite catalog stores public stream metadata and maps relay-assigned
+//! stream IDs to authenticated publisher identities. Encrypted DASH payloads
+//! and their retention catalog are managed separately by `dash_store`.
+
 use anyhow::{Context, Result};
 use glacialcast_protocol::{CaptureSource, PublicStream};
 use rusqlite::{Connection, OptionalExtension, params};
