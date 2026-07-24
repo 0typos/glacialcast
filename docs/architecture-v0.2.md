@@ -204,7 +204,11 @@ snapshots periodically compact the journal; recovery tolerates and truncates
 only an incomplete final record, rejects corrupt complete records, and safely
 ignores transactions already represented by a completed snapshot. Independent
 streams do not serialize their filesystem work through one global catalog
-mutex.
+mutex. Startup removes stale untracked payloads and interrupted temporary
+files, but preserves the single next sequence that could have been synchronized
+immediately before a crash. A publisher retry adopts that payload only when its
+bytes exactly match the authenticated object being resent; conflicting content
+is never replaced.
 
 ## Cursor Timing
 

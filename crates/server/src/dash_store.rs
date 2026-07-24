@@ -10,13 +10,14 @@
 
 use anyhow::{Context, Result};
 use glacialcast_dash::{EpochDescriptor, MpdConfig, SegmentTimelineEntry, build_mpd};
-use glacialcast_protocol::{DashObject, DashObjectHeader, DashObjectKind};
+use glacialcast_protocol::{DashObject, DashObjectHeader, DashObjectKind, MAX_FRAME_LEN};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs::{File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
     time::Duration,
@@ -146,25 +147,46 @@ impl DashStore {
             .with_context(|| format!("creating object directory {}", object_dir.display()))?;
         let relative_path = object_relative_path(object.header.sequence);
         let final_path = self.stream_dir(stream_id).join(&relative_path);
-        let temp_path = object_dir.join(format!(
-            ".{:020}-{}.tmp",
-            object.header.sequence,
-            Uuid::new_v4()
-        ));
-        write_durable_file(&temp_path, &object.payload)?;
-        if let Err(error) = std::fs::hard_link(&temp_path, &final_path) {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(error).with_context(|| {
-                format!(
-                    "publishing DASH object {} as {} without replacing an existing file",
-                    temp_path.display(),
-                    final_path.display()
-                )
-            });
-        }
-        std::fs::remove_file(&temp_path)
-            .with_context(|| format!("removing temporary object {}", temp_path.display()))?;
-        sync_directory(&object_dir)?;
+        let published_new_payload = match std::fs::symlink_metadata(&final_path) {
+            Ok(_) => {
+                let existing = read_bounded_regular_file(&final_path, object.payload.len() as u64)
+                    .context("reading a crash-stranded DASH object")?;
+                if existing != object.payload {
+                    anyhow::bail!(
+                        "DASH sequence {} has a conflicting untracked payload",
+                        object.header.sequence
+                    );
+                }
+                false
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let temp_path = object_dir.join(format!(
+                    ".{:020}-{}.tmp",
+                    object.header.sequence,
+                    Uuid::new_v4()
+                ));
+                write_durable_file(&temp_path, &object.payload)?;
+                if let Err(error) = std::fs::hard_link(&temp_path, &final_path) {
+                    let _ = std::fs::remove_file(&temp_path);
+                    return Err(error).with_context(|| {
+                        format!(
+                            "publishing DASH object {} as {} without replacing an existing file",
+                            temp_path.display(),
+                            final_path.display()
+                        )
+                    });
+                }
+                std::fs::remove_file(&temp_path).with_context(|| {
+                    format!("removing temporary object {}", temp_path.display())
+                })?;
+                sync_directory(&object_dir)?;
+                true
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspecting DASH object {}", final_path.display()));
+            }
+        };
 
         let stored = StoredDashObject {
             header: object.header,
@@ -201,7 +223,9 @@ impl DashStore {
             },
         );
         if let Err(error) = persistence {
-            let _ = std::fs::remove_file(&final_path);
+            if published_new_payload {
+                let _ = std::fs::remove_file(&final_path);
+            }
             return Err(error).context("persisting DASH catalog transaction");
         }
         next_catalog.journal_entries = next_catalog.journal_entries.saturating_add(1);
@@ -645,17 +669,15 @@ impl DashStore {
             if !removed.is_empty() {
                 self.persist_catalog(stream_id, &catalog)?;
                 catalog.journal_entries = 0;
-                for path in removed {
-                    match std::fs::remove_file(&path) {
-                        Ok(()) => {}
-                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(err) => tracing::warn!(
-                            ?err,
-                            path = %path.display(),
-                            "failed to remove expired DASH object while loading catalog"
-                        ),
-                    }
-                }
+                remove_retained_paths(removed, "DASH catalog startup retention");
+            }
+            let swept = self.sweep_untracked_payloads(stream_id, &catalog)?;
+            if swept > 0 {
+                tracing::warn!(
+                    %stream_id,
+                    swept,
+                    "removed untracked DASH payloads during recovery"
+                );
             }
             loaded.insert(stream_id, Arc::new(Mutex::new(catalog)));
         }
@@ -665,6 +687,67 @@ impl DashStore {
             .write()
             .map_err(|_| anyhow::anyhow!("DASH stream map lock poisoned"))? = loaded;
         Ok(())
+    }
+
+    fn sweep_untracked_payloads(&self, stream_id: Uuid, catalog: &StreamCatalog) -> Result<usize> {
+        let object_dir = self.stream_dir(stream_id).join("objects");
+        let entries = match std::fs::read_dir(&object_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading object directory {}", object_dir.display()));
+            }
+        };
+        let next_sequence = catalog
+            .last_sequence
+            .map(|sequence| sequence.saturating_add(1))
+            .unwrap_or(1);
+        let mut removed = 0usize;
+        for entry in entries {
+            let entry =
+                entry.with_context(|| format!("reading an entry in {}", object_dir.display()))?;
+            let filename = entry.file_name();
+            let Some(filename) = filename.to_str() else {
+                continue;
+            };
+            let temporary = object_temp_filename(filename);
+            let sequence = object_sequence_from_filename(filename);
+            let tracked = sequence.is_some_and(|sequence| catalog.objects.contains_key(&sequence));
+            let recoverable =
+                sequence.is_some_and(|sequence| sequence == next_sequence && !tracked);
+            if tracked {
+                continue;
+            }
+            if recoverable {
+                let metadata = std::fs::symlink_metadata(entry.path())?;
+                if !metadata.file_type().is_file() || metadata.len() > MAX_FRAME_LEN as u64 {
+                    anyhow::bail!(
+                        "recoverable untracked DASH payload is not a bounded regular file: {}",
+                        entry.path().display()
+                    );
+                }
+                continue;
+            }
+            if !temporary && sequence.is_none() {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(entry.path())?;
+            if metadata.file_type().is_dir() {
+                anyhow::bail!(
+                    "managed DASH payload path unexpectedly contains a directory: {}",
+                    entry.path().display()
+                );
+            }
+            std::fs::remove_file(entry.path()).with_context(|| {
+                format!("removing untracked payload {}", entry.path().display())
+            })?;
+            removed = removed.saturating_add(1);
+        }
+        if removed > 0 {
+            sync_directory(&object_dir)?;
+        }
+        Ok(removed)
     }
 
     fn persist_catalog(&self, stream_id: Uuid, catalog: &StreamCatalog) -> Result<()> {
@@ -890,13 +973,7 @@ impl DashStore {
             anyhow::bail!("stored DASH object exceeds its kind-specific size limit");
         }
         let path = self.stream_dir(stream_id).join(&stored.relative_path);
-        let metadata = std::fs::symlink_metadata(&path)
-            .with_context(|| format!("reading metadata for {}", path.display()))?;
-        if !metadata.file_type().is_file() || metadata.len() != u64::from(stored.header.payload_len)
-        {
-            anyhow::bail!("stored DASH object has an invalid file type or length");
-        }
-        std::fs::read(&path).with_context(|| {
+        read_bounded_regular_file(&path, u64::from(stored.header.payload_len)).with_context(|| {
             format!(
                 "reading DASH object {} for stream {stream_id}",
                 stored.header.sequence
@@ -986,6 +1063,30 @@ fn object_relative_path(sequence: u64) -> PathBuf {
     PathBuf::from("objects").join(format!("{sequence:020}.bin"))
 }
 
+fn object_sequence_from_filename(filename: &str) -> Option<u64> {
+    let digits = filename.strip_suffix(".bin")?;
+    if digits.len() != 20 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let sequence = digits.parse().ok()?;
+    (format!("{sequence:020}.bin") == filename).then_some(sequence)
+}
+
+fn object_temp_filename(filename: &str) -> bool {
+    let Some(stem) = filename
+        .strip_prefix('.')
+        .and_then(|filename| filename.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let Some((sequence, identifier)) = stem.split_once('-') else {
+        return false;
+    };
+    sequence.len() == 20
+        && sequence.bytes().all(|byte| byte.is_ascii_digit())
+        && Uuid::parse_str(identifier).is_ok()
+}
+
 fn validate_media_progression(catalog: &StreamCatalog, candidate: &DashObjectHeader) -> Result<()> {
     if candidate.kind != DashObjectKind::Media {
         return Ok(());
@@ -1021,6 +1122,31 @@ fn write_durable_file(path: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("writing {}", path.display()))?;
     file.sync_all()
         .with_context(|| format!("syncing {}", path.display()))
+}
+
+fn read_bounded_regular_file(path: &Path, expected_len: u64) -> Result<Vec<u8>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("reading metadata for {}", path.display()))?;
+    if !metadata.file_type().is_file() || metadata.len() != expected_len {
+        anyhow::bail!(
+            "file is not a regular file of the expected length: {}",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::with_capacity(expected_len.min(usize::MAX as u64) as usize);
+    file.take(expected_len.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {}", path.display()))?;
+    if bytes.len() as u64 != expected_len {
+        anyhow::bail!("file length changed while reading: {}", path.display());
+    }
+    Ok(bytes)
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
@@ -1757,6 +1883,123 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(std::fs::read(final_path).unwrap(), b"orphan");
         assert_eq!(store.last_sequence(stream_id).unwrap(), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn object_publication_adopts_an_identical_crash_stranded_payload() {
+        let (root, store) = test_store(1024);
+        let stream_id = Uuid::from_u128(51);
+        let epoch_id = Uuid::from_u128(52);
+        let keys = EpochKeys::derive(&[6; 32], stream_id, epoch_id).unwrap();
+        let candidate = object(
+            &keys,
+            stream_id,
+            epoch_id,
+            ObjectSpec {
+                kind: DashObjectKind::Media,
+                sequence: 1,
+                segment_number: 1,
+                chunk_index: 0,
+                random_access: true,
+                payload: vec![1, 2, 3],
+            },
+        );
+        let final_path = store.stream_dir(stream_id).join(object_relative_path(1));
+        std::fs::create_dir_all(final_path.parent().unwrap()).unwrap();
+        std::fs::write(&final_path, &candidate.payload).unwrap();
+
+        assert_eq!(
+            store.store(candidate.clone()).unwrap().header,
+            candidate.header
+        );
+        assert_eq!(store.get(stream_id, 1).unwrap().unwrap(), candidate);
+        drop(store);
+
+        let reopened = DashStore::open(root.clone(), 1024, Duration::from_secs(1800)).unwrap();
+        assert_eq!(reopened.last_sequence(stream_id).unwrap(), Some(1));
+        assert_eq!(reopened.get(stream_id, 1).unwrap().unwrap(), candidate);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn object_publication_never_adopts_an_untracked_symlink() {
+        let (root, store) = test_store(1024);
+        let stream_id = Uuid::from_u128(56);
+        let epoch_id = Uuid::from_u128(57);
+        let keys = EpochKeys::derive(&[8; 32], stream_id, epoch_id).unwrap();
+        let candidate = object(
+            &keys,
+            stream_id,
+            epoch_id,
+            ObjectSpec {
+                kind: DashObjectKind::Media,
+                sequence: 1,
+                segment_number: 1,
+                chunk_index: 0,
+                random_access: true,
+                payload: vec![1, 2, 3],
+            },
+        );
+        let target = root.join("outside.bin");
+        std::fs::write(&target, &candidate.payload).unwrap();
+        let final_path = store.stream_dir(stream_id).join(object_relative_path(1));
+        std::fs::create_dir_all(final_path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &final_path).unwrap();
+
+        assert!(store.store(candidate.clone()).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), candidate.payload);
+        assert!(
+            std::fs::symlink_metadata(final_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(store.last_sequence(stream_id).unwrap(), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_preserves_only_the_next_recoverable_untracked_payload() {
+        let (root, store) = test_store(1024);
+        let stream_id = Uuid::from_u128(53);
+        let epoch_id = Uuid::from_u128(54);
+        let keys = EpochKeys::derive(&[7; 32], stream_id, epoch_id).unwrap();
+        let media = |sequence| {
+            object(
+                &keys,
+                stream_id,
+                epoch_id,
+                ObjectSpec {
+                    kind: DashObjectKind::Media,
+                    sequence,
+                    segment_number: sequence,
+                    chunk_index: 0,
+                    random_access: true,
+                    payload: vec![sequence as u8],
+                },
+            )
+        };
+        store.store(media(1)).unwrap();
+        let object_dir = store.stream_dir(stream_id).join("objects");
+        let recoverable = media(2);
+        let recoverable_path = store.stream_dir(stream_id).join(object_relative_path(2));
+        std::fs::write(&recoverable_path, &recoverable.payload).unwrap();
+        let future_path = store.stream_dir(stream_id).join(object_relative_path(3));
+        std::fs::write(&future_path, &media(3).payload).unwrap();
+        let temporary_path = object_dir.join(format!(".{:020}-{}.tmp", 4, Uuid::from_u128(55)));
+        std::fs::write(&temporary_path, b"temporary").unwrap();
+        drop(store);
+
+        let reopened = DashStore::open(root.clone(), 1024, Duration::from_secs(1800)).unwrap();
+        assert!(recoverable_path.exists());
+        assert!(!future_path.exists());
+        assert!(!temporary_path.exists());
+        assert_eq!(
+            reopened.store(recoverable.clone()).unwrap().header,
+            recoverable.header
+        );
+        assert_eq!(reopened.last_sequence(stream_id).unwrap(), Some(2));
         std::fs::remove_dir_all(root).unwrap();
     }
 
