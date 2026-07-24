@@ -1,0 +1,1410 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Glacialcast</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0c0e12;
+      --surface: #141820;
+      --surface-2: #1b222d;
+      --surface-3: #242d39;
+      --text: #eef2f6;
+      --muted: #9da8b8;
+      --line: #303846;
+      --accent: #32c58f;
+      --accent-2: #5aa9ff;
+      --danger: #f05d72;
+      --warn: #e6b450;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-width: 320px;
+    }
+    button, input {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      min-height: 34px;
+      font: inherit;
+      color: var(--text);
+      background: var(--surface-2);
+    }
+    button {
+      display: inline-grid;
+      place-items: center;
+      min-width: 34px;
+      padding: 0 10px;
+      cursor: pointer;
+      user-select: none;
+    }
+    button:hover { border-color: #4b596d; background: var(--surface-3); }
+    button:disabled { cursor: default; opacity: .48; }
+    input {
+      width: 100%;
+      min-width: 0;
+      padding: 0 10px;
+    }
+    input[type="range"] {
+      padding: 0;
+      accent-color: var(--accent);
+    }
+    header {
+      height: 56px;
+      display: grid;
+      grid-template-columns: auto minmax(140px, 1fr) auto;
+      align-items: center;
+      gap: 12px;
+      padding: 0 14px;
+      border-bottom: 1px solid var(--line);
+      background: #10141a;
+    }
+    h1 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 650;
+      letter-spacing: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+      min-width: 0;
+    }
+    .segment {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: var(--surface);
+    }
+    .segment button {
+      min-height: 28px;
+      min-width: 34px;
+      padding: 0 8px;
+      border-color: transparent;
+      background: transparent;
+    }
+    .segment button.active {
+      background: var(--accent);
+      color: #06110d;
+    }
+    .status {
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .app {
+      height: calc(100vh - 56px);
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(260px, 350px) minmax(0, 1fr);
+    }
+    .app.sidebar-hidden {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .app.sidebar-hidden aside { display: none; }
+    aside {
+      min-height: 0;
+      overflow: auto;
+      padding: 12px;
+      border-right: 1px solid var(--line);
+      background: var(--surface);
+    }
+    .stream-list {
+      display: grid;
+      gap: 14px;
+    }
+    .stream-section {
+      display: grid;
+      gap: 8px;
+    }
+    .stream-heading {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+    .stream-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 34px;
+      gap: 6px;
+      align-items: stretch;
+    }
+    .stream {
+      min-width: 0;
+      width: 100%;
+      height: auto;
+      padding: 9px 10px;
+      display: grid;
+      gap: 2px;
+      text-align: left;
+      place-items: stretch;
+      background: #11161d;
+    }
+    .stream[draggable="true"] { cursor: grab; }
+    .stream.active {
+      outline: 2px solid var(--accent);
+      outline-offset: -2px;
+    }
+    .stream.assigned {
+      border-color: var(--accent-2);
+    }
+    .stream strong {
+      min-width: 0;
+      overflow-wrap: anywhere;
+      font-weight: 650;
+    }
+    .delete {
+      padding: 0;
+      color: var(--danger);
+      background: #24161d;
+    }
+    .meta {
+      color: var(--muted);
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+    .viewer {
+      min-width: 0;
+      min-height: 0;
+      background: #07090d;
+      overflow: hidden;
+    }
+    .view-grid {
+      height: 100%;
+      min-height: 0;
+      display: grid;
+      gap: 8px;
+      padding: 8px;
+    }
+    .view-grid.layout-1 {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: minmax(0, 1fr);
+    }
+    .view-grid.layout-2 {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-rows: minmax(0, 1fr);
+    }
+    .view-grid.layout-4 {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-rows: repeat(2, minmax(0, 1fr));
+    }
+    .view-grid.focus-mode {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: minmax(0, 1fr);
+    }
+    .view-grid.focus-mode .tile:not(.focused) { display: none; }
+    .tile {
+      min-width: 0;
+      min-height: 0;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      background: #0f1319;
+    }
+    .tile.active {
+      border-color: var(--accent);
+      box-shadow: inset 0 0 0 1px var(--accent);
+    }
+    .tile.drag-over {
+      border-color: var(--accent-2);
+      box-shadow: inset 0 0 0 2px var(--accent-2);
+    }
+    .tile-head {
+      min-width: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 8px;
+      min-height: 40px;
+      padding: 6px 8px 6px 10px;
+      border-bottom: 1px solid var(--line);
+      background: #121820;
+    }
+    .tile-title {
+      min-width: 0;
+      display: grid;
+      gap: 1px;
+    }
+    .tile-title strong {
+      min-width: 0;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      font-weight: 650;
+    }
+    .tile-actions {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .tile-actions button {
+      width: 32px;
+      height: 30px;
+      min-height: 30px;
+      min-width: 32px;
+      padding: 0;
+    }
+    .stage {
+      position: relative;
+      min-width: 0;
+      min-height: 0;
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+      background: #020305;
+    }
+    .screen-media {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      image-rendering: auto;
+      background: #020305;
+    }
+    .cursor {
+      position: absolute;
+      width: 14px;
+      height: 22px;
+      transform: translate(-1px, -1px);
+      pointer-events: none;
+      filter: drop-shadow(0 1px 2px #000);
+      background-repeat: no-repeat;
+      background-size: 100% 100%;
+    }
+    .cursor::before {
+      content: "";
+      display: block;
+      width: 0;
+      height: 0;
+      border-top: 18px solid white;
+      border-right: 10px solid transparent;
+    }
+    .cursor.has-image::before { display: none; }
+    .empty {
+      max-width: min(440px, 90%);
+      color: var(--muted);
+      text-align: center;
+      padding: 18px;
+    }
+    .key-panel {
+      width: min(420px, calc(100% - 28px));
+      display: grid;
+      gap: 9px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+    .key-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+    }
+    .key-error {
+      min-height: 18px;
+      color: var(--warn);
+      font-size: 12px;
+    }
+    .controls {
+      display: grid;
+      grid-template-columns: auto minmax(80px, 1fr) auto auto auto;
+      align-items: center;
+      gap: 7px;
+      padding: 7px;
+      border-top: 1px solid var(--line);
+      background: #10151c;
+    }
+    .controls button {
+      min-height: 30px;
+      min-width: 32px;
+      padding: 0 8px;
+    }
+    .frame-info {
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .slot-key-editor {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      padding: 7px;
+      border-top: 1px solid var(--line);
+      background: #121820;
+    }
+    @media (max-width: 900px) {
+      header {
+        grid-template-columns: auto minmax(80px, 1fr);
+      }
+      .toolbar {
+        grid-column: 1 / -1;
+        justify-content: flex-start;
+        overflow-x: auto;
+        padding-bottom: 8px;
+      }
+      header {
+        height: auto;
+        min-height: 56px;
+        padding-top: 10px;
+      }
+      .app {
+        height: calc(100vh - 98px);
+        grid-template-columns: minmax(210px, 300px) minmax(0, 1fr);
+      }
+      .view-grid.layout-2 {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-rows: repeat(2, minmax(0, 1fr));
+      }
+    }
+    @media (max-width: 680px) {
+      .app {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-rows: auto minmax(0, 1fr);
+      }
+      .app:not(.sidebar-hidden) aside {
+        max-height: 34vh;
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+      .view-grid.layout-4 {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-rows: repeat(4, minmax(220px, 1fr));
+        overflow: auto;
+      }
+      .controls {
+        grid-template-columns: auto minmax(60px, 1fr) auto auto;
+      }
+      .controls .frame-info {
+        grid-column: 1 / -1;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <button id="toggleSidebar" title="Toggle stream list" aria-label="Toggle stream list">☰</button>
+    <h1>Glacialcast</h1>
+    <div class="toolbar">
+      <div class="segment" aria-label="Layout">
+        <button data-layout="1" title="1 stream">1</button>
+        <button data-layout="2" title="2 streams">2</button>
+        <button data-layout="4" title="4 streams">4</button>
+      </div>
+      <span class="status" id="status">disconnected</span>
+    </div>
+  </header>
+  <main class="app" id="app">
+    <aside id="sidebar">
+      <div class="stream-list" id="streams"></div>
+    </aside>
+    <section class="viewer" aria-label="Stream viewers">
+      <div class="view-grid layout-1" id="viewGrid"></div>
+    </section>
+  </main>
+  <script>
+    const MAX_SLOTS = 4;
+    const LIVE_FRAME_LAG = 2;
+
+    const state = {
+      streams: [],
+      layout: Number(localStorage.getItem('glacialcast-layout') || 1),
+      sidebarHidden: localStorage.getItem('glacialcast-sidebar') === 'hidden',
+      activeSlot: Number(localStorage.getItem('glacialcast-active-slot') || 0),
+      focusSlot: null,
+      streamRefreshTimer: null,
+      slots: Array.from({ length: MAX_SLOTS }, (_, index) => createSlotState(index)),
+    };
+
+    const els = {
+      app: document.getElementById('app'),
+      status: document.getElementById('status'),
+      streams: document.getElementById('streams'),
+      toggleSidebar: document.getElementById('toggleSidebar'),
+      viewGrid: document.getElementById('viewGrid'),
+      layoutButtons: Array.from(document.querySelectorAll('[data-layout]')),
+    };
+
+    normalizeLayout();
+    renderShell();
+    renderGrid();
+    connectWs();
+    refreshStreams().catch(showGlobalError);
+
+    function createSlotState(index) {
+      return {
+        index,
+        streamId: null,
+        frames: [],
+        cursors: [],
+        cursorBitmap: null,
+        live: true,
+        keyConfirmed: false,
+        editingKey: false,
+        imageUrl: null,
+        renderToken: 0,
+        cursorAnimationId: null,
+        refreshTimer: null,
+        peerConnection: null,
+        webRtcStream: null,
+        webRtcState: 'idle',
+        webRtcStartupTimer: null,
+        webRtcRetryTimer: null,
+        decodedFrames: 0,
+        lastVideoSeq: null,
+      };
+    }
+
+    function normalizeLayout() {
+      if (![1, 2, 4].includes(state.layout)) state.layout = 1;
+      if (state.activeSlot >= state.layout) state.activeSlot = 0;
+      if (state.focusSlot !== null && state.focusSlot >= state.layout) state.focusSlot = null;
+    }
+
+    function renderShell() {
+      els.app.classList.toggle('sidebar-hidden', state.sidebarHidden);
+      els.layoutButtons.forEach(button => {
+        button.classList.toggle('active', Number(button.dataset.layout) === state.layout);
+      });
+    }
+
+    function renderGrid() {
+      normalizeLayout();
+      els.viewGrid.className = `view-grid layout-${state.layout}${state.focusSlot !== null ? ' focus-mode' : ''}`;
+      els.viewGrid.innerHTML = '';
+      for (const slot of visibleSlots()) {
+        const tile = document.createElement('article');
+        tile.className = tileClass(slot);
+        tile.dataset.slot = String(slot.index);
+        tile.tabIndex = 0;
+        tile.addEventListener('click', () => setActiveSlot(slot.index));
+        tile.addEventListener('dragover', event => {
+          event.preventDefault();
+          tile.classList.add('drag-over');
+        });
+        tile.addEventListener('dragleave', () => tile.classList.remove('drag-over'));
+        tile.addEventListener('drop', event => {
+          event.preventDefault();
+          tile.classList.remove('drag-over');
+          const streamId = event.dataTransfer.getData('text/plain');
+          if (streamId) assignStreamToSlot(slot.index, streamId);
+        });
+        els.viewGrid.appendChild(tile);
+        renderSlot(slot);
+        ensureVisibleSlotPlayback(slot);
+      }
+      renderStreams();
+    }
+
+    function tileClass(slot) {
+      const classes = ['tile'];
+      if (slot.index === state.activeSlot) classes.push('active');
+      if (slot.index === state.focusSlot) classes.push('focused');
+      return classes.join(' ');
+    }
+
+    function visibleSlots() {
+      return state.slots.slice(0, state.layout);
+    }
+
+    function slotEl(slot) {
+      return document.querySelector(`[data-slot="${slot.index}"]`);
+    }
+
+    function slotStream(slot) {
+      return state.streams.find(stream => stream.stream_id === slot.streamId) || null;
+    }
+
+    function streamUsesWebRtc(stream) {
+      return stream && stream.media_kind === 'Video' && stream.active;
+    }
+
+    function streamRequiresKey(stream) {
+      return Boolean(stream && stream.frame_encrypted);
+    }
+
+    function renderSlot(slot) {
+      const tile = slotEl(slot);
+      if (!tile) return;
+      const stream = slotStream(slot);
+      const keyRequired = streamRequiresKey(stream);
+      tile.className = tileClass(slot);
+      tile.innerHTML = `
+        <div class="tile-head">
+          <div class="tile-title">
+            <strong>${stream ? escapeHtml(stream.display_name) : `Slot ${slot.index + 1}`}</strong>
+            <span class="meta">${stream ? streamMeta(stream) : 'Empty'}</span>
+          </div>
+          <div class="tile-actions">
+            <button data-action="focus" title="Fullscreen in window">□</button>
+            <button data-action="browser-fullscreen" title="Browser fullscreen">⛶</button>
+            <button data-action="settings" title="Stream key settings" ${stream && keyRequired ? '' : 'disabled'}>⚙</button>
+            <button data-action="clear" title="Clear slot" ${stream ? '' : 'disabled'}>×</button>
+          </div>
+        </div>
+        <div class="stage" data-role="stage">${stageMarkup(slot, stream)}</div>
+        <div class="controls">
+          <button data-action="live" title="Live" ${stream ? '' : 'disabled'}>Live</button>
+          <input data-role="timeline" type="range" min="0" max="${Math.max(0, slot.frames.length - 1)}" value="${timelineValue(slot)}" ${controlsDisabled(slot, stream)}>
+          <span class="frame-info" data-role="frame-info">${frameInfo(slot, stream)}</span>
+          <button data-action="prev" title="Previous frame" ${imageControlsDisabled(slot, stream)}>‹</button>
+          <button data-action="next" title="Next frame" ${imageControlsDisabled(slot, stream)}>›</button>
+        </div>
+        ${slot.editingKey && stream ? keyEditorMarkup(slot, 'slot-key-editor') : ''}
+      `;
+      bindSlotControls(slot, tile);
+      attachSlotMedia(slot);
+      syncSlotTimeline(slot);
+      if (slot.keyConfirmed) scheduleCursor(slot);
+    }
+
+    function stageMarkup(slot, stream) {
+      if (!stream) return '<div class="empty">Empty slot</div>';
+      if (!slot.keyConfirmed) {
+        return streamRequiresKey(stream) ? keyEditorMarkup(slot, 'key-panel') : '<div class="empty">Starting unencrypted stream.</div>';
+      }
+      if (slot.webRtcStream) {
+        return '<video class="screen-media" autoplay playsinline muted></video><div class="cursor"></div>';
+      }
+      if (streamUsesWebRtc(stream)) return '<div class="empty">Connecting.</div>';
+      if (slot.imageUrl) return `<img class="screen-media" src="${slot.imageUrl}" alt=""><div class="cursor"></div>`;
+      return '<div class="empty">Waiting for frames.</div>';
+    }
+
+    function keyEditorMarkup(slot, className) {
+      const key = escapeHtml(storedKey(slot.streamId));
+      return `
+        <div class="${className}">
+          <div class="key-row">
+            <input data-role="key-input" value="${key}" type="password" autocomplete="off" placeholder="stream key">
+            <button data-action="confirm-key">${slot.keyConfirmed ? 'Save' : 'Start'}</button>
+          </div>
+          <div class="key-error" data-role="key-error"></div>
+        </div>
+      `;
+    }
+
+    function controlsDisabled(slot, stream) {
+      return stream && slot.keyConfirmed && !streamUsesWebRtc(stream) ? '' : 'disabled';
+    }
+
+    function imageControlsDisabled(slot, stream) {
+      return stream && slot.keyConfirmed && !streamUsesWebRtc(stream) && slot.frames.length > 0 ? '' : 'disabled';
+    }
+
+    function timelineValue(slot) {
+      if (slot.frames.length === 0) return 0;
+      return slot.live ? liveFrameIndex(slot) : Math.min(slot.frames.length - 1, Math.max(0, Number(slot.timelineIndex || 0)));
+    }
+
+    function frameInfo(slot, stream) {
+      if (!stream) return 'no stream';
+      if (!slot.keyConfirmed) return streamRequiresKey(stream) ? 'locked' : 'starting';
+      if (streamUsesWebRtc(stream)) {
+        const seq = slot.lastVideoSeq ? ` · seq ${slot.lastVideoSeq}` : '';
+        const frames = slot.decodedFrames ? ` · ${slot.decodedFrames} decoded` : '';
+        return `${slot.webRtcState === 'idle' ? 'connecting' : slot.webRtcState}${seq}${frames}`;
+      }
+      if (slot.frames.length === 0) return 'no frame';
+      const index = timelineValue(slot);
+      const frame = slot.frames[index] || slot.frames[slot.frames.length - 1];
+      return `seq ${frame.seq}${slot.live ? ' · live' : ''}`;
+    }
+
+    function bindSlotControls(slot, tile) {
+      tile.querySelector('[data-action="focus"]').onclick = event => {
+        event.stopPropagation();
+        toggleFocusSlot(slot.index);
+      };
+      tile.querySelector('[data-action="browser-fullscreen"]').onclick = event => {
+        event.stopPropagation();
+        requestTileFullscreen(slot);
+      };
+      tile.querySelector('[data-action="settings"]').onclick = event => {
+        event.stopPropagation();
+        slot.editingKey = !slot.editingKey;
+        renderSlot(slot);
+      };
+      tile.querySelector('[data-action="clear"]').onclick = event => {
+        event.stopPropagation();
+        clearSlot(slot);
+      };
+      tile.querySelector('[data-action="live"]').onclick = event => {
+        event.stopPropagation();
+        goSlotLive(slot).catch(showGlobalError);
+      };
+      tile.querySelector('[data-action="prev"]').onclick = event => {
+        event.stopPropagation();
+        stepSlotFrame(slot, -1).catch(showGlobalError);
+      };
+      tile.querySelector('[data-action="next"]').onclick = event => {
+        event.stopPropagation();
+        stepSlotFrame(slot, 1).catch(showGlobalError);
+      };
+      const timeline = tile.querySelector('[data-role="timeline"]');
+      timeline.oninput = () => {
+        slot.live = false;
+        slot.timelineIndex = Number(timeline.value);
+        renderSlotFrame(slot, slot.timelineIndex).catch(showGlobalError);
+      };
+      const keyInput = tile.querySelector('[data-role="key-input"]');
+      const keyButton = tile.querySelector('[data-action="confirm-key"]');
+      if (keyInput && keyButton) {
+        const updateButton = () => {
+          keyButton.disabled = keyInput.value.trim().length === 0;
+        };
+        keyInput.oninput = updateButton;
+        keyInput.onkeydown = event => {
+          if (event.key === 'Enter' && keyInput.value.trim()) confirmSlotKey(slot, keyInput.value).catch(showGlobalError);
+        };
+        keyButton.onclick = event => {
+          event.stopPropagation();
+          confirmSlotKey(slot, keyInput.value).catch(showGlobalError);
+        };
+        updateButton();
+      }
+    }
+
+    function attachSlotMedia(slot) {
+      const tile = slotEl(slot);
+      if (!tile) return;
+      const video = tile.querySelector('video.screen-media');
+      if (video && slot.webRtcStream) {
+        video.srcObject = slot.webRtcStream;
+        video.onloadeddata = () => markSlotVideoDecoded(slot, video, slot.peerConnection);
+        video.onplaying = () => {
+          if (slot.decodedFrames === 0 && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+            markSlotVideoDecoded(slot, video, slot.peerConnection);
+          }
+        };
+        video.onerror = () => {
+          const detail = video.error?.message || `media error ${video.error?.code || 'unknown'}`;
+          setSlotVideoState(slot, `decode error: ${detail}`);
+        };
+        monitorDecodedVideoFrames(slot, video, slot.peerConnection);
+        video.play().catch(err => setSlotVideoState(slot, `playback blocked: ${err.message || err}`));
+      }
+    }
+
+    async function confirmSlotKey(slot, key) {
+      key = key.trim();
+      const stream = slotStream(slot);
+      if (streamRequiresKey(stream) && !key) {
+        const error = slotEl(slot)?.querySelector('[data-role="key-error"]');
+        if (error) error.textContent = 'Stream key required.';
+        return;
+      }
+      if (key) saveKey(slot.streamId, key);
+      await unlockSlot(slot);
+    }
+
+    async function unlockSlot(slot) {
+      slot.keyConfirmed = true;
+      slot.editingKey = false;
+      slot.live = true;
+      renderSlot(slot);
+      await refreshSlot(slot);
+      const stream = slotStream(slot);
+      if (streamUsesWebRtc(stream)) await startSlotWebRtc(slot);
+    }
+
+    async function assignStreamToSlot(slotIndex, streamId, options = {}) {
+      const slot = state.slots[slotIndex];
+      if (!slot) return;
+      setActiveSlot(slotIndex);
+      if (options.key) saveKey(streamId, options.key);
+      if (slot.streamId !== streamId) {
+        stopSlot(slot);
+        slot.streamId = streamId;
+        slot.frames = [];
+        slot.cursors = [];
+        slot.cursorBitmap = null;
+        slot.live = true;
+        slot.timelineIndex = 0;
+        slot.keyConfirmed = false;
+        slot.editingKey = false;
+        slot.webRtcState = 'idle';
+        slot.decodedFrames = 0;
+        slot.lastVideoSeq = null;
+      }
+      renderStreams();
+      renderSlot(slot);
+      if (options.autoStart && storedKey(streamId)) await confirmSlotKey(slot, storedKey(streamId));
+      const stream = slotStream(slot);
+      if (stream && !streamRequiresKey(stream)) await unlockSlot(slot);
+    }
+
+    function clearSlot(slot) {
+      stopSlot(slot);
+      slot.streamId = null;
+      slot.frames = [];
+      slot.cursors = [];
+      slot.cursorBitmap = null;
+      slot.live = true;
+      slot.keyConfirmed = false;
+      slot.editingKey = false;
+      slot.webRtcState = 'idle';
+      slot.decodedFrames = 0;
+      slot.lastVideoSeq = null;
+      if (state.focusSlot === slot.index) state.focusSlot = null;
+      renderGrid();
+    }
+
+    function stopSlot(slot) {
+      stopSlotWebRtc(slot);
+      cancelSlotCursor(slot);
+      slot.renderToken++;
+      if (slot.imageUrl) {
+        URL.revokeObjectURL(slot.imageUrl);
+        slot.imageUrl = null;
+      }
+      if (slot.refreshTimer) {
+        clearTimeout(slot.refreshTimer);
+        slot.refreshTimer = null;
+      }
+    }
+
+    async function refreshStreams(options = {}) {
+      const renderSlots = options.renderSlots !== false;
+      state.streamRefreshTimer = null;
+      const res = await fetch('/api/streams');
+      if (!res.ok) throw new Error(await res.text());
+      state.streams = await res.json();
+      renderStreams();
+      if (!renderSlots) return;
+      for (const slot of visibleSlots()) {
+        if (slot.streamId && !state.streams.some(stream => stream.stream_id === slot.streamId)) {
+          clearSlot(slot);
+        } else {
+          renderSlot(slot);
+          const stream = slotStream(slot);
+          if (stream && !slot.keyConfirmed && !streamRequiresKey(stream)) await unlockSlot(slot);
+        }
+      }
+      const frag = parseFragment();
+      if (frag.stream && !visibleSlots().some(slot => slot.streamId === frag.stream)) {
+        await assignStreamToSlot(0, frag.stream, { key: frag.key || '', autoStart: Boolean(frag.key) });
+      }
+    }
+
+    function renderStreams() {
+      els.streams.innerHTML = '';
+      if (state.streams.length === 0) {
+        els.streams.innerHTML = '<div class="empty">Waiting for clients.</div>';
+        return;
+      }
+      renderStreamSection('Active', state.streams.filter(stream => stream.active));
+      renderStreamSection('Archive', state.streams.filter(stream => !stream.active));
+    }
+
+    function renderStreamSection(title, streams) {
+      if (streams.length === 0) return;
+      const section = document.createElement('div');
+      section.className = 'stream-section';
+      section.innerHTML = `<div class="stream-heading">${title}</div>`;
+      for (const stream of streams) {
+        const row = document.createElement('div');
+        row.className = 'stream-row';
+        const button = document.createElement('button');
+        const assigned = visibleSlots().some(slot => slot.streamId === stream.stream_id);
+        const active = visibleSlots()[state.activeSlot]?.streamId === stream.stream_id;
+        button.className = `stream${active ? ' active' : ''}${assigned ? ' assigned' : ''}`;
+        button.draggable = true;
+        button.innerHTML = `
+          <strong>${escapeHtml(stream.display_name)}</strong>
+          <div class="meta">${streamMeta(stream)}</div>
+          <div class="meta">${stream.last_frame_seq ? `seq ${stream.last_frame_seq}` : 'no frames'} · ${formatBytes(stream.retained_bytes)}</div>
+        `;
+        button.onclick = () => assignStreamToSlot(state.activeSlot, stream.stream_id);
+        button.ondragstart = event => {
+          event.dataTransfer.effectAllowed = 'copy';
+          event.dataTransfer.setData('text/plain', stream.stream_id);
+        };
+        const remove = document.createElement('button');
+        remove.className = 'delete';
+        remove.textContent = '×';
+        remove.title = 'Delete stream and retained data';
+        remove.onclick = event => {
+          event.stopPropagation();
+          deleteStream(stream.stream_id).catch(showGlobalError);
+        };
+        row.appendChild(button);
+        row.appendChild(remove);
+        section.appendChild(row);
+      }
+      els.streams.appendChild(section);
+    }
+
+    function streamMeta(stream) {
+      const kind = stream.media_kind === 'Video' ? 'video' : 'images';
+      const key = streamRequiresKey(stream) ? 'keyed' : 'clear';
+      const backend = stream.source?.backend || 'inactive';
+      const width = stream.source?.width || 0;
+      const height = stream.source?.height || 0;
+      const seen = stream.last_seen_at_ms ? ` · ${new Date(stream.last_seen_at_ms).toLocaleTimeString()}` : '';
+      return `${kind} · ${key} · ${backend} ${width}x${height}${seen}`;
+    }
+
+    async function refreshSlot(slot) {
+      slot.refreshTimer = null;
+      if (!slot.streamId || !slot.keyConfirmed) return;
+      const [framesRes, cursorsRes] = await Promise.all([
+        fetch(`/api/streams/${slot.streamId}/frames`),
+        fetch(`/api/streams/${slot.streamId}/cursors`),
+      ]);
+      if (!framesRes.ok) throw new Error(await framesRes.text());
+      if (!cursorsRes.ok) throw new Error(await cursorsRes.text());
+      slot.frames = await framesRes.json();
+      slot.cursors = (await cursorsRes.json()).sort((a, b) => a.seq - b.seq);
+      syncSlotTimeline(slot);
+      const stream = slotStream(slot);
+      if (streamUsesWebRtc(stream)) {
+        scheduleCursor(slot);
+        return;
+      }
+      if (slot.live) slot.timelineIndex = liveFrameIndex(slot);
+      await renderSlotFrame(slot, slot.timelineIndex || 0);
+    }
+
+    function scheduleSlotRefresh(slot, delay = 100) {
+      if (slot.refreshTimer) return;
+      slot.refreshTimer = setTimeout(() => {
+        refreshSlot(slot).catch(showGlobalError);
+      }, delay);
+    }
+
+    function liveFrameIndex(slot) {
+      return Math.max(0, slot.frames.length - 1 - LIVE_FRAME_LAG);
+    }
+
+    function syncSlotTimeline(slot) {
+      const tile = slotEl(slot);
+      if (!tile) return;
+      const timeline = tile.querySelector('[data-role="timeline"]');
+      if (!timeline) return;
+      timeline.max = String(Math.max(0, slot.frames.length - 1));
+      timeline.value = String(timelineValue(slot));
+      const prev = tile.querySelector('[data-action="prev"]');
+      const next = tile.querySelector('[data-action="next"]');
+      const stream = slotStream(slot);
+      const disabled = imageControlsDisabled(slot, stream) === 'disabled';
+      if (prev) prev.disabled = disabled;
+      if (next) next.disabled = disabled;
+    }
+
+    function upsertSlotFrame(slot, manifest) {
+      const index = slot.frames.findIndex(frame => frame.seq === manifest.seq);
+      if (index >= 0) slot.frames[index] = manifest;
+      else slot.frames.push(manifest);
+      slot.frames.sort((a, b) => a.seq - b.seq);
+      syncSlotTimeline(slot);
+    }
+
+    function appendSlotCursor(slot, cursor) {
+      const last = slot.cursors[slot.cursors.length - 1];
+      if (!last || last.seq !== cursor.seq) slot.cursors.push(cursor);
+      if (slot.cursors.length > 5000) slot.cursors.splice(0, slot.cursors.length - 5000);
+      scheduleCursor(slot);
+    }
+
+    async function renderSlotFrame(slot, index) {
+      const renderToken = ++slot.renderToken;
+      const tile = slotEl(slot);
+      if (!tile || !slot.streamId || !slot.keyConfirmed) return;
+      const stage = tile.querySelector('[data-role="stage"]');
+      const info = tile.querySelector('[data-role="frame-info"]');
+      if (!stage || !info) return;
+      if (slot.frames.length === 0) {
+        cancelSlotCursor(slot);
+        stage.innerHTML = '<div class="empty">Waiting for frames.</div>';
+        info.textContent = 'no frame';
+        return;
+      }
+      index = Math.min(slot.frames.length - 1, Math.max(0, Number(index) || 0));
+      slot.timelineIndex = index;
+      const manifest = slot.frames[index] || slot.frames[slot.frames.length - 1];
+      const keyText = storedKey(slot.streamId);
+      if (frameIsEncrypted(manifest) && !keyText) {
+        cancelSlotCursor(slot);
+        stage.innerHTML = '<div class="empty">Viewer key required.</div>';
+        info.textContent = `seq ${manifest.seq}`;
+        return;
+      }
+      try {
+        const payloadRes = await fetch(`/api/streams/${slot.streamId}/frames/${manifest.seq}`);
+        if (!payloadRes.ok) throw new Error(await payloadRes.text());
+        const payload = await payloadRes.arrayBuffer();
+        const plain = frameIsEncrypted(manifest) ? await decryptFrame(manifest, payload, keyText) : payload;
+        if (renderToken !== slot.renderToken) return;
+        const plainBytes = new Uint8Array(plain);
+        if (!frameHashMatches(manifest, plainBytes)) throw new Error('frame content hash mismatch');
+        if (slot.imageUrl) URL.revokeObjectURL(slot.imageUrl);
+        slot.imageUrl = URL.createObjectURL(new Blob([plain], { type: manifest.mime }));
+        stage.innerHTML = `<img class="screen-media" src="${slot.imageUrl}" alt=""><div class="cursor"></div>`;
+        const liveText = slot.live ? ` · live -${Math.min(LIVE_FRAME_LAG, Math.max(0, slot.frames.length - 1))}` : '';
+        info.textContent = `seq ${manifest.seq}${liveText} · ${new Date(manifest.captured_at_ms).toLocaleTimeString()}`;
+        syncSlotTimeline(slot);
+        scheduleCursor(slot);
+      } catch (err) {
+        if (renderToken !== slot.renderToken) return;
+        cancelSlotCursor(slot);
+        stage.innerHTML = `<div class="empty">${frameIsEncrypted(manifest) ? 'Unable to decrypt this frame.' : 'Frame failed reconstruction check.'}</div>`;
+        info.textContent = `seq ${manifest.seq}`;
+      }
+    }
+
+    async function goSlotLive(slot) {
+      if (!slot.streamId || !slot.keyConfirmed) return;
+      slot.live = true;
+      const stream = slotStream(slot);
+      if (streamUsesWebRtc(stream)) {
+        await startSlotWebRtc(slot);
+        return;
+      }
+      slot.timelineIndex = liveFrameIndex(slot);
+      await renderSlotFrame(slot, slot.timelineIndex);
+    }
+
+    async function stepSlotFrame(slot, direction) {
+      if (!slot.streamId || !slot.keyConfirmed || slot.frames.length === 0) return;
+      slot.live = false;
+      const next = Math.min(slot.frames.length - 1, Math.max(0, timelineValue(slot) + direction));
+      await renderSlotFrame(slot, next);
+    }
+
+    async function startSlotWebRtc(slot) {
+      const streamId = slot.streamId;
+      if (!streamId) return;
+      stopSlotWebRtc(slot);
+      slot.decodedFrames = 0;
+      setSlotVideoState(slot, 'connecting');
+      const pc = new RTCPeerConnection({ iceServers: [] });
+      slot.peerConnection = pc;
+      pc.addTransceiver('video', { direction: 'recvonly' });
+      pc.ontrack = event => {
+        if (slot.streamId !== streamId || slot.peerConnection !== pc) return;
+        slot.webRtcStream = event.streams[0] || new MediaStream([event.track]);
+        setSlotVideoState(slot, 'track connected · waiting for decoded frame');
+        const tile = slotEl(slot);
+        const stage = tile?.querySelector('[data-role="stage"]');
+        if (stage) {
+          stage.innerHTML = '<video class="screen-media" autoplay playsinline muted></video><div class="cursor"></div>';
+          attachSlotMedia(slot);
+          scheduleCursor(slot);
+        }
+      };
+      pc.onconnectionstatechange = () => {
+        if (slot.peerConnection !== pc) return;
+        if (pc.connectionState === 'connected' && slot.decodedFrames === 0) {
+          setSlotVideoState(slot, 'WebRTC connected · waiting for decoded frame');
+        } else if (pc.connectionState === 'failed' || pc.connectionState === 'closed' || pc.connectionState === 'disconnected') {
+          setSlotVideoState(slot, `WebRTC ${pc.connectionState}`);
+        }
+      };
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await waitForIceGathering(pc);
+      if (slot.streamId !== streamId || slot.peerConnection !== pc) {
+        pc.close();
+        return;
+      }
+      const res = await fetch(`/api/streams/${streamId}/webrtc/offer`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const answer = await res.json();
+      if (slot.streamId !== streamId || slot.peerConnection !== pc) {
+        pc.close();
+        return;
+      }
+      await pc.setRemoteDescription(answer);
+      slot.webRtcStartupTimer = setTimeout(() => {
+        if (slot.peerConnection !== pc || slot.decodedFrames > 0) return;
+        stopSlotWebRtc(slot);
+        setSlotVideoState(slot, 'no decoded frame within 3s · retrying');
+        slot.webRtcRetryTimer = setTimeout(() => {
+          slot.webRtcRetryTimer = null;
+          if (slot.streamId === streamId && slot.live) {
+            startSlotWebRtc(slot).catch(showGlobalError);
+          }
+        }, 250);
+      }, 3000);
+    }
+
+    function stopSlotWebRtc(slot) {
+      if (slot.webRtcStartupTimer) {
+        clearTimeout(slot.webRtcStartupTimer);
+        slot.webRtcStartupTimer = null;
+      }
+      if (slot.webRtcRetryTimer) {
+        clearTimeout(slot.webRtcRetryTimer);
+        slot.webRtcRetryTimer = null;
+      }
+      if (slot.peerConnection) {
+        slot.peerConnection.close();
+        slot.peerConnection = null;
+      }
+      slot.webRtcStream = null;
+    }
+
+    function setSlotVideoState(slot, status) {
+      slot.webRtcState = status;
+      const tile = slotEl(slot);
+      if (tile) {
+        tile.dataset.videoState = status;
+        tile.dataset.decodedFrames = String(slot.decodedFrames);
+      }
+      const info = tile?.querySelector('[data-role="frame-info"]');
+      if (info) info.textContent = frameInfo(slot, slotStream(slot));
+    }
+
+    function markSlotVideoDecoded(slot, video, pc) {
+      if (!pc || slot.peerConnection !== pc || video.videoWidth === 0 || video.videoHeight === 0) return;
+      slot.decodedFrames += 1;
+      if (slot.webRtcStartupTimer) {
+        clearTimeout(slot.webRtcStartupTimer);
+        slot.webRtcStartupTimer = null;
+      }
+      setSlotVideoState(slot, `live video ${video.videoWidth}x${video.videoHeight}`);
+    }
+
+    function monitorDecodedVideoFrames(slot, video, pc) {
+      if (!video.requestVideoFrameCallback) return;
+      const onFrame = () => {
+        if (slot.peerConnection !== pc || video.srcObject !== slot.webRtcStream) return;
+        markSlotVideoDecoded(slot, video, pc);
+        video.requestVideoFrameCallback(onFrame);
+      };
+      video.requestVideoFrameCallback(onFrame);
+    }
+
+    function ensureVisibleSlotPlayback(slot) {
+      const stream = slotStream(slot);
+      if (!slot.keyConfirmed || !streamUsesWebRtc(stream) || slot.peerConnection) return;
+      startSlotWebRtc(slot).catch(showGlobalError);
+    }
+
+    function waitForIceGathering(pc) {
+      if (pc.iceGatheringState === 'complete') return Promise.resolve();
+      return new Promise(resolve => {
+        let timer = null;
+        const finish = () => {
+          pc.removeEventListener('icegatheringstatechange', done);
+          if (timer) clearTimeout(timer);
+          resolve();
+        };
+        const done = () => {
+          if (pc.iceGatheringState === 'complete') finish();
+        };
+        pc.addEventListener('icegatheringstatechange', done);
+        timer = setTimeout(finish, 1000);
+      });
+    }
+
+    function scheduleCursor(slot) {
+      if (!slotEl(slot) || !slot.streamId || !slot.keyConfirmed || slot.cursorAnimationId || slot.cursors.length === 0) return;
+      slot.cursorAnimationId = requestAnimationFrame(() => {
+        slot.cursorAnimationId = null;
+        updateCursorPosition(slot);
+        scheduleCursor(slot);
+      });
+    }
+
+    function cancelSlotCursor(slot) {
+      if (slot.cursorAnimationId) {
+        cancelAnimationFrame(slot.cursorAnimationId);
+        slot.cursorAnimationId = null;
+      }
+    }
+
+    function updateCursorPosition(slot) {
+      const tile = slotEl(slot);
+      const stage = tile?.querySelector('[data-role="stage"]');
+      const media = tile?.querySelector('.screen-media');
+      const cursor = tile?.querySelector('.cursor');
+      if (!stage || !media || !cursor || slot.cursors.length === 0) return;
+      const now = Date.now();
+      const latest = slot.cursors[slot.cursors.length - 1];
+      const prev = slot.cursors[slot.cursors.length - 2] || latest;
+      const span = Math.max(1, latest.captured_at_ms - prev.captured_at_ms);
+      const alpha = Math.min(1, Math.max(0, (now - latest.captured_at_ms) / span));
+      const x = prev.x + (latest.x - prev.x) * alpha;
+      const y = prev.y + (latest.y - prev.y) * alpha;
+      const box = media.getBoundingClientRect();
+      const stageBox = stage.getBoundingClientRect();
+      const scaleX = box.width / latest.source_width;
+      const scaleY = box.height / latest.source_height;
+      cursor.style.left = `${box.left - stageBox.left + x * scaleX}px`;
+      cursor.style.top = `${box.top - stageBox.top + y * scaleY}px`;
+      if (latest.bitmap) slot.cursorBitmap = latest.bitmap;
+      if (slot.cursorBitmap) {
+        const bitmap = slot.cursorBitmap;
+        cursor.classList.add('has-image');
+        cursor.style.width = `${Math.max(1, bitmap.width * scaleX)}px`;
+        cursor.style.height = `${Math.max(1, bitmap.height * scaleY)}px`;
+        cursor.style.transform = `translate(${-bitmap.hotspot_x * scaleX}px, ${-bitmap.hotspot_y * scaleY}px)`;
+        cursor.style.backgroundImage = `url(data:image/png;base64,${bitmap.png_b64})`;
+      } else {
+        cursor.classList.remove('has-image');
+        cursor.style.width = '';
+        cursor.style.height = '';
+        cursor.style.transform = '';
+        cursor.style.backgroundImage = '';
+      }
+    }
+
+    async function deleteStream(streamId) {
+      await fetch(`/api/streams/${streamId}`, { method: 'DELETE' });
+      for (const slot of state.slots) {
+        if (slot.streamId === streamId) clearSlot(slot);
+      }
+      await refreshStreams();
+    }
+
+    function connectWs() {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const ws = new WebSocket(`${proto}//${location.host}/api/ws`);
+      ws.onopen = () => els.status.textContent = 'connected';
+      ws.onclose = () => {
+        els.status.textContent = 'disconnected';
+        setTimeout(connectWs, 1000);
+      };
+      ws.onmessage = event => handleWsMessage(JSON.parse(event.data)).catch(showGlobalError);
+    }
+
+    async function handleWsMessage(msg) {
+      if (msg.event === 'stream_created' || msg.event === 'stream_connected' || msg.event === 'stream_disconnected' || msg.event === 'stream_deleted') {
+        scheduleStreamRefresh();
+        for (const slot of slotsForStream(msg.stream_id)) scheduleSlotRefresh(slot);
+        return;
+      }
+      if (msg.event === 'frame') {
+        const slots = slotsForStream(msg.stream_id);
+        if (msg.frame) {
+          for (const slot of slots) {
+            upsertSlotFrame(slot, msg.frame);
+            if (slot.live && slot.keyConfirmed) {
+              slot.timelineIndex = liveFrameIndex(slot);
+              await renderSlotFrame(slot, slot.timelineIndex);
+            }
+          }
+        } else {
+          for (const slot of slots) scheduleSlotRefresh(slot);
+        }
+        scheduleStreamRefresh(250, { renderSlots: false });
+        return;
+      }
+      if (msg.event === 'video') {
+        for (const slot of slotsForStream(msg.stream_id)) {
+          slot.lastVideoSeq = msg.seq || slot.lastVideoSeq;
+          if (slot.keyConfirmed) setSlotVideoState(slot, slot.webRtcState);
+        }
+        scheduleStreamRefresh(250, { renderSlots: false });
+        return;
+      }
+      if (msg.event === 'cursor') {
+        for (const slot of slotsForStream(msg.stream_id)) {
+          if (msg.cursor) appendSlotCursor(slot, msg.cursor);
+          else scheduleSlotRefresh(slot, 500);
+        }
+      }
+    }
+
+    function slotsForStream(streamId) {
+      return state.slots.filter(slot => slot.streamId === streamId);
+    }
+
+    function scheduleStreamRefresh(delay = 100, options = {}) {
+      if (state.streamRefreshTimer) return;
+      state.streamRefreshTimer = setTimeout(() => {
+        refreshStreams(options).catch(showGlobalError);
+      }, delay);
+    }
+
+    function setLayout(layout) {
+      const previousLayout = state.layout;
+      state.layout = layout;
+      if (state.layout < previousLayout) {
+        for (const slot of state.slots.slice(state.layout)) {
+          stopSlotWebRtc(slot);
+          cancelSlotCursor(slot);
+        }
+      }
+      normalizeLayout();
+      localStorage.setItem('glacialcast-layout', String(state.layout));
+      renderShell();
+      renderGrid();
+    }
+
+    function setActiveSlot(index) {
+      if (index < 0 || index >= state.layout) return;
+      state.activeSlot = index;
+      localStorage.setItem('glacialcast-active-slot', String(index));
+      for (const slot of visibleSlots()) {
+        const tile = slotEl(slot);
+        if (tile) tile.className = tileClass(slot);
+      }
+      renderStreams();
+    }
+
+    function focusPreviousSlot() {
+      setActiveSlot((state.activeSlot + state.layout - 1) % state.layout);
+    }
+
+    function focusNextSlot() {
+      setActiveSlot((state.activeSlot + 1) % state.layout);
+    }
+
+    function toggleFocusSlot(index) {
+      state.focusSlot = state.focusSlot === index ? null : index;
+      renderGrid();
+    }
+
+    async function requestTileFullscreen(slot) {
+      const tile = slotEl(slot);
+      if (!tile) return;
+      setActiveSlot(slot.index);
+      if (document.fullscreenElement === tile) {
+        await document.exitFullscreen();
+      } else {
+        await tile.requestFullscreen();
+      }
+    }
+
+    function parseFragment() {
+      const raw = location.hash.replace(/^#/, '');
+      const params = new URLSearchParams(raw);
+      return { stream: params.get('stream'), key: params.get('key') };
+    }
+
+    function saveKey(streamId, key) {
+      if (streamId && key) localStorage.setItem(`glacialcast-key-${streamId}`, key);
+    }
+
+    function storedKey(streamId) {
+      return streamId ? localStorage.getItem(`glacialcast-key-${streamId}`) || '' : '';
+    }
+
+    function b64urlToBytes(value) {
+      const padded = value.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((value.length + 3) % 4);
+      const binary = atob(padded);
+      const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
+      if (bytes.length !== 32) throw new Error(`viewer key must decode to 32 bytes, got ${bytes.length}`);
+      return bytes;
+    }
+
+    async function decryptFrame(manifest, ciphertext, keyText) {
+      const key = await crypto.subtle.importKey('raw', b64urlToBytes(keyText), 'AES-GCM', false, ['decrypt']);
+      return await crypto.subtle.decrypt({ name: 'AES-GCM', iv: new Uint8Array(manifest.nonce) }, key, ciphertext);
+    }
+
+    function frameIsEncrypted(manifest) {
+      return Boolean(manifest.key_id);
+    }
+
+    function fastContentHash(bytes) {
+      let hash = 0x811c9dc5;
+      for (const byte of bytes) {
+        hash ^= byte;
+        hash = Math.imul(hash, 0x01000193) >>> 0;
+      }
+      return hash >>> 0;
+    }
+
+    function frameHashMatches(manifest, bytes) {
+      return !manifest.content_hash || fastContentHash(bytes) === manifest.content_hash;
+    }
+
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+    }
+
+    function formatBytes(value) {
+      if (value < 1024) return `${value} B`;
+      if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
+      return `${(value / 1024 / 1024).toFixed(1)} MiB`;
+    }
+
+    function showGlobalError(err) {
+      console.error(err);
+      els.status.textContent = err?.message || String(err);
+    }
+
+    els.toggleSidebar.onclick = () => {
+      state.sidebarHidden = !state.sidebarHidden;
+      localStorage.setItem('glacialcast-sidebar', state.sidebarHidden ? 'hidden' : 'shown');
+      renderShell();
+    };
+
+    els.layoutButtons.forEach(button => {
+      button.onclick = () => setLayout(Number(button.dataset.layout));
+    });
+
+    document.addEventListener('keydown', event => {
+      if (isTypingTarget(event.target)) return;
+      if (event.altKey && /^[1-4]$/.test(event.key)) {
+        const index = Number(event.key) - 1;
+        if (index < state.layout) setActiveSlot(index);
+        event.preventDefault();
+        return;
+      }
+      if (!event.altKey && !event.ctrlKey && !event.metaKey && ['1', '2', '4'].includes(event.key)) {
+        setLayout(Number(event.key));
+        event.preventDefault();
+        return;
+      }
+      if (event.key === '[') {
+        focusPreviousSlot();
+        event.preventDefault();
+        return;
+      }
+      if (event.key === ']') {
+        focusNextSlot();
+        event.preventDefault();
+        return;
+      }
+      const slot = state.slots[state.activeSlot];
+      if (!slot) return;
+      if (event.key.toLowerCase() === 'f' && event.shiftKey) {
+        requestTileFullscreen(slot).catch(showGlobalError);
+        event.preventDefault();
+      } else if (event.key.toLowerCase() === 'f') {
+        toggleFocusSlot(slot.index);
+        event.preventDefault();
+      } else if (event.key.toLowerCase() === 'l') {
+        goSlotLive(slot).catch(showGlobalError);
+        event.preventDefault();
+      } else if (event.key === 'Escape' && state.focusSlot !== null) {
+        state.focusSlot = null;
+        renderGrid();
+      }
+    });
+
+    function isTypingTarget(target) {
+      const tag = target?.tagName;
+      return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target?.isContentEditable;
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,29 @@
+[package]
+name = "glacialcast-client"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+clap.workspace = true
+ffmpeg-sys-next = { workspace = true, optional = true }
+futures-util.workspace = true
+glacialcast-protocol = { path = "../protocol" }
+image.workspace = true
+libc.workspace = true
+pipewire.workspace = true
+serde.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+zbus.workspace = true
+zvariant.workspace = true
+
+[features]
+default = []
+ffmpeg-vaapi = ["dep:ffmpeg-sys-next"]

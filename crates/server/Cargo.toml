@@ -1,0 +1,28 @@
+[package]
+name = "glacialcast-server"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+bytes.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+glacialcast-protocol = { path = "../protocol" }
+media.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+webrtc.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true
+rtp.workspace = true
