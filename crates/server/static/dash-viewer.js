@@ -28,13 +28,19 @@ const els = {
 
 const state = {
   descriptor: null,
-  epochKeys: null,
+  viewerKey: null,
+  epochs: new Map(),
+  epochOrder: [],
   headers: [],
   seenSequences: new Set(),
   cursorEvents: [],
   cursorBitmaps: new Map(),
   mediaSource: null,
   sourceBuffer: null,
+  sourceBufferContentType: null,
+  mediaKeys: null,
+  keyEpochs: new Set(),
+  keySessions: [],
   mediaQueue: Promise.resolve(),
   liveQueue: Promise.resolve(),
   liveSocket: null,
@@ -80,24 +86,23 @@ requestAnimationFrame(renderCursor);
 async function start(viewerKeyText) {
   setStatus('Loading stream metadata…');
   validatePlatform();
+  state.viewerKey = base64UrlToBytes(viewerKeyText, 32);
   const headers = await fetchHeaders();
-  const epochHeader = [...headers].reverse().find(header => header.kind === 'Epoch');
-  if (!epochHeader) throw new Error('The stream has not published an epoch descriptor.');
-
-  const epochPayload = await fetchObject(epochHeader.sequence);
-  const epochKeys = await deriveEpochKeys(viewerKeyText, streamId, epochHeader.epoch_id);
-  state.epochKeys = epochKeys;
-  await verifyObject(epochHeader, epochPayload);
-
-  const descriptor = JSON.parse(decoder.decode(epochPayload));
-  validateDescriptor(descriptor, epochHeader);
-  state.descriptor = descriptor;
   state.headers = headers;
+  await loadEpochDescriptors(headers);
+  const timeline = installInitialEpochTimeline(headers);
+  if (timeline.length === 0) {
+    throw new Error('No retained random-access media is available.');
+  }
+  state.descriptor = state.epochs.get(timeline.at(-1).epoch_id).descriptor;
+  const descriptor = state.descriptor;
   els.streamLabel.textContent = `${streamId} · ${descriptor.width}×${descriptor.height} · ${descriptor.codec}`;
 
-  const contentType = `video/mp4; codecs="${descriptor.codec}"`;
-  await installClearKey(contentType, epochKeys);
-  await initializeMediaSource(contentType, headers);
+  await initializeKeySystem();
+  for (const epochId of state.epochOrder) {
+    await installEpochKey(state.epochs.get(epochId));
+  }
+  await initializeMediaSource(timeline);
 
   els.unlockPanel.hidden = true;
   els.playerPanel.hidden = false;
@@ -105,6 +110,63 @@ async function start(viewerKeyText) {
   connectLive();
   setStatus('Live encrypted DASH playback ready.');
   updateMetrics();
+}
+
+async function loadEpochDescriptors(headers) {
+  const epochHeaders = headers.filter(header => header.kind === 'Epoch');
+  if (epochHeaders.length === 0) {
+    throw new Error('The stream has not published an epoch descriptor.');
+  }
+  for (const header of epochHeaders) {
+    await loadEpochDescriptor(header);
+  }
+}
+
+async function loadEpochDescriptor(header) {
+  if (state.epochs.has(header.epoch_id)) return state.epochs.get(header.epoch_id);
+  const keys = await deriveEpochKeys(state.viewerKey, streamId, header.epoch_id);
+  const epoch = {
+    descriptor: null,
+    keys,
+    mediaStart: null,
+    mediaEnd: null,
+    offset: null,
+    globalStart: null,
+    globalEnd: null,
+    initializationAppended: false,
+    cursorBoundaryAdded: false,
+  };
+  state.epochs.set(header.epoch_id, epoch);
+  state.epochOrder.push(header.epoch_id);
+  try {
+    const payload = await fetchObject(header.sequence);
+    await verifyObject(header, payload);
+    const descriptor = JSON.parse(decoder.decode(payload));
+    validateDescriptor(descriptor, header);
+    epoch.descriptor = descriptor;
+    state.seenSequences.add(header.sequence);
+    return epoch;
+  } catch (error) {
+    state.epochs.delete(header.epoch_id);
+    state.epochOrder = state.epochOrder.filter(epochId => epochId !== header.epoch_id);
+    throw error;
+  }
+}
+
+function installInitialEpochTimeline(headers) {
+  const timeline = ViewerCore.buildEpochTimeline(headers);
+  for (const planned of timeline) {
+    const epoch = state.epochs.get(planned.epoch_id);
+    if (!epoch?.descriptor) {
+      throw new Error(`Epoch ${planned.epoch_id} has no authenticated descriptor.`);
+    }
+    epoch.mediaStart = planned.media_start;
+    epoch.mediaEnd = planned.media_end;
+    epoch.offset = planned.offset;
+    epoch.globalStart = planned.global_start;
+    epoch.globalEnd = planned.global_end;
+  }
+  return timeline;
 }
 
 function validatePlatform() {
@@ -134,8 +196,7 @@ async function fetchObject(sequence) {
   return new Uint8Array(await response.arrayBuffer());
 }
 
-async function deriveEpochKeys(viewerKeyText, stream, epoch) {
-  const viewerKey = base64UrlToBytes(viewerKeyText, 32);
+async function deriveEpochKeys(viewerKey, stream, epoch) {
   const saltInput = concatBytes(
     encoder.encode('glacialcast epoch key salt'),
     uuidToBytes(stream),
@@ -176,9 +237,11 @@ async function verifyObject(header, payload) {
   if (header.format_version !== FORMAT_VERSION) {
     throw new Error(`Unsupported DASH object version ${header.format_version}.`);
   }
-  if (header.stream_id !== streamId || header.epoch_id !== state.descriptor?.epoch_id && state.descriptor) {
-    throw new Error(`Object ${header.sequence} belongs to a different stream epoch.`);
+  if (header.stream_id !== streamId) {
+    throw new Error(`Object ${header.sequence} belongs to a different stream.`);
   }
+  const epoch = state.epochs.get(header.epoch_id);
+  if (!epoch) throw new Error(`Object ${header.sequence} belongs to an unknown stream epoch.`);
   if (payload.byteLength !== header.payload_len) {
     throw new Error(`Object ${header.sequence} has an invalid payload length.`);
   }
@@ -189,7 +252,7 @@ async function verifyObject(header, payload) {
   const authenticated = concatBytes(authenticationBytes(header), payload);
   const valid = await crypto.subtle.verify(
     'HMAC',
-    state.epochKeys.authenticationKey,
+    epoch.keys.authenticationKey,
     new Uint8Array(header.authentication_tag),
     authenticated,
   );
@@ -244,29 +307,45 @@ function validateDescriptor(descriptor, header) {
   }
 }
 
-async function installClearKey(contentType, keys) {
-  if (!MediaSource.isTypeSupported(contentType)) {
-    throw new Error(`This browser cannot play ${contentType}.`);
+async function initializeKeySystem() {
+  const contentTypes = [...new Set(state.epochOrder.map(epochId => {
+    const descriptor = state.epochs.get(epochId).descriptor;
+    return contentTypeForDescriptor(descriptor);
+  }))];
+  for (const contentType of contentTypes) {
+    if (!MediaSource.isTypeSupported(contentType)) {
+      throw new Error(`This browser cannot play ${contentType}.`);
+    }
   }
-  const capability = { contentType, robustness: '', encryptionScheme: 'cenc' };
+  const capabilities = contentTypes.map(contentType => ({
+    contentType,
+    robustness: '',
+    encryptionScheme: 'cenc',
+  }));
   const configuration = [{
     initDataTypes: ['keyids', 'cenc'],
     distinctiveIdentifier: 'not-allowed',
     persistentState: 'not-allowed',
     sessionTypes: ['temporary'],
-    videoCapabilities: [capability],
+    videoCapabilities: capabilities,
   }];
   let access;
   try {
     access = await navigator.requestMediaKeySystemAccess('org.w3.clearkey', configuration);
   } catch (error) {
-    delete capability.encryptionScheme;
+    for (const capability of capabilities) delete capability.encryptionScheme;
     access = await navigator.requestMediaKeySystemAccess('org.w3.clearkey', configuration)
       .catch(() => { throw error; });
   }
-  const mediaKeys = await access.createMediaKeys();
-  await els.video.setMediaKeys(mediaKeys);
-  const session = mediaKeys.createSession('temporary');
+  state.mediaKeys = await access.createMediaKeys();
+  await els.video.setMediaKeys(state.mediaKeys);
+}
+
+async function installEpochKey(epoch) {
+  const epochId = epoch.descriptor.epoch_id;
+  if (state.keyEpochs.has(epochId)) return;
+  if (!state.mediaKeys) throw new Error('The Clear Key system is not initialized.');
+  const session = state.mediaKeys.createSession('temporary');
   const message = new Promise((resolve, reject) => {
     session.addEventListener('message', resolve, { once: true });
     session.addEventListener('keystatuseschange', () => {
@@ -278,43 +357,40 @@ async function installClearKey(contentType, keys) {
     });
   });
   await session.generateRequest('keyids', encoder.encode(JSON.stringify({
-    kids: [bytesToBase64Url(keys.keyId)],
+    kids: [bytesToBase64Url(epoch.keys.keyId)],
     type: 'temporary',
   })));
   await message;
   await session.update(encoder.encode(JSON.stringify({
     keys: [{
       kty: 'oct',
-      kid: bytesToBase64Url(keys.keyId),
-      k: bytesToBase64Url(keys.cencKey),
+      kid: bytesToBase64Url(epoch.keys.keyId),
+      k: bytesToBase64Url(epoch.keys.cencKey),
     }],
     type: 'temporary',
   })));
+  state.keySessions.push(session);
+  state.keyEpochs.add(epochId);
 }
 
-async function initializeMediaSource(contentType, headers) {
+function contentTypeForDescriptor(descriptor) {
+  return `video/mp4; codecs="${descriptor.codec}"`;
+}
+
+async function initializeMediaSource(timeline) {
   const mediaSource = new MediaSource();
   state.mediaSource = mediaSource;
   els.video.src = URL.createObjectURL(mediaSource);
   await once(mediaSource, 'sourceopen');
+  const firstEpoch = state.epochs.get(timeline[0].epoch_id);
+  const contentType = contentTypeForDescriptor(firstEpoch.descriptor);
   const sourceBuffer = mediaSource.addSourceBuffer(contentType);
   sourceBuffer.mode = 'segments';
   state.sourceBuffer = sourceBuffer;
+  state.sourceBufferContentType = contentType;
 
-  const epoch = state.descriptor.epoch_id;
-  const initHeader = [...headers].reverse().find(header =>
-    header.kind === 'Initialization' && header.epoch_id === epoch
-  );
-  if (!initHeader) throw new Error('The stream has no initialization segment.');
-  await fetchVerifyAppend(initHeader);
-
-  const media = headers.filter(header =>
-    header.kind === 'Media' && header.epoch_id === epoch
-  );
-  const firstRandomAccess = media.findIndex(header => header.random_access);
-  if (firstRandomAccess < 0) throw new Error('No retained random-access segment is available.');
-  for (const header of media.slice(firstRandomAccess)) {
-    await fetchVerifyAppend(header);
+  for (const planned of timeline) {
+    await appendEpochMedia(state.epochs.get(planned.epoch_id), planned.media);
   }
   updateTimelineBounds();
   seekToLiveEdge();
@@ -323,20 +399,66 @@ async function initializeMediaSource(contentType, headers) {
   });
 }
 
-async function fetchVerifyAppend(header) {
+async function appendEpochMedia(epoch, allMedia) {
+  const firstRandomAccess = allMedia.findIndex(header => header.random_access);
+  if (firstRandomAccess < 0) return;
+  const media = allMedia.slice(firstRandomAccess);
+  if (epoch.offset === null) {
+    const previousEnd = Math.max(
+      0,
+      ...[...state.epochs.values()]
+        .map(candidate => candidate.globalEnd)
+        .filter(value => value !== null),
+    );
+    epoch.mediaStart = media[0].timestamp;
+    epoch.offset = previousEnd - epoch.mediaStart;
+    epoch.globalStart = previousEnd;
+  }
+  const mediaEnd = media.reduce(
+    (end, header) => Math.max(end, header.timestamp + header.duration),
+    epoch.mediaStart,
+  );
+  epoch.mediaEnd = Math.max(epoch.mediaEnd ?? epoch.mediaStart, mediaEnd);
+  epoch.globalEnd = epoch.offset + epoch.mediaEnd;
+  ensureEpochCursorBoundary(epoch);
+
+  const initHeader = [...state.headers].reverse().find(header =>
+    header.kind === 'Initialization' && header.epoch_id === epoch.descriptor.epoch_id
+  );
+  if (!initHeader) throw new Error(`Epoch ${epoch.descriptor.epoch_id} has no initialization segment.`);
+  if (!epoch.initializationAppended) {
+    await fetchVerifyAppend(initHeader, epoch);
+    epoch.initializationAppended = true;
+  }
+  for (const header of media) {
+    if (header.timestamp < epoch.mediaStart) continue;
+    await fetchVerifyAppend(header, epoch);
+  }
+}
+
+async function fetchVerifyAppend(header, epoch) {
   if (state.seenSequences.has(header.sequence)) return;
   const payload = await fetchObject(header.sequence);
   await verifyObject(header, payload);
-  await appendMedia(payload);
+  await appendMedia(payload, epoch);
   state.seenSequences.add(header.sequence);
   if (header.kind === 'Media') state.appendedMedia += 1;
   updateMetrics();
 }
 
-function appendMedia(bytes) {
+function appendMedia(bytes, epoch) {
   state.mediaQueue = state.mediaQueue.then(async () => {
     if (!state.sourceBuffer || state.mediaSource?.readyState !== 'open') return;
     if (state.sourceBuffer.updating) await once(state.sourceBuffer, 'updateend');
+    const contentType = contentTypeForDescriptor(epoch.descriptor);
+    if (state.sourceBufferContentType !== contentType) {
+      if (typeof state.sourceBuffer.changeType !== 'function') {
+        throw new Error(`This browser cannot transition playback to ${contentType}.`);
+      }
+      state.sourceBuffer.changeType(contentType);
+      state.sourceBufferContentType = contentType;
+    }
+    state.sourceBuffer.timestampOffset = epoch.offset / TIMESCALE;
     state.sourceBuffer.appendBuffer(bytes);
     await once(state.sourceBuffer, 'updateend');
     updateTimelineBounds();
@@ -346,9 +468,12 @@ function appendMedia(bytes) {
 }
 
 async function loadHistoricalCursors(headers) {
-  const cursors = headers.filter(header =>
-    header.kind === 'Cursor' && header.epoch_id === state.descriptor.epoch_id
-  );
+  const cursors = headers.filter(header => {
+    const epoch = state.epochs.get(header.epoch_id);
+    return header.kind === 'Cursor'
+      && epoch?.offset !== null
+      && !state.seenSequences.has(header.sequence);
+  });
   const concurrency = 12;
   for (let index = 0; index < cursors.length; index += concurrency) {
     const decoded = await Promise.all(
@@ -361,26 +486,38 @@ async function loadHistoricalCursors(headers) {
 }
 
 async function decodeCursorObject(header) {
+  const epoch = state.epochs.get(header.epoch_id);
+  if (!epoch?.descriptor || epoch.offset === null) {
+    throw new Error(`Cursor object ${header.sequence} belongs to an unplayable epoch.`);
+  }
   const payload = await fetchObject(header.sequence);
   await verifyObject(header, payload);
   const encrypted = ViewerCore.parseEncryptedCursorPayload(payload);
   const plaintext = await crypto.subtle.decrypt({
     name: 'AES-GCM',
     iv: encrypted.nonce,
-    additionalData: cursorAad(header),
+    additionalData: cursorAad(header, epoch.descriptor),
     tagLength: 128,
-  }, state.epochKeys.cursorKey, encrypted.ciphertext);
-  return ViewerCore.parseCursorBatch(new Uint8Array(plaintext), {
-    sourceWidth: state.descriptor.width,
-    sourceHeight: state.descriptor.height,
+  }, epoch.keys.cursorKey, encrypted.ciphertext);
+  const batch = ViewerCore.parseCursorBatch(new Uint8Array(plaintext), {
+    sourceWidth: epoch.descriptor.width,
+    sourceHeight: epoch.descriptor.height,
     startTimestamp: header.timestamp,
   });
+  for (const event of batch.events) {
+    event.timestamp += epoch.offset;
+    event.epoch_id = header.epoch_id;
+    event.source_width = epoch.descriptor.width;
+    event.source_height = epoch.descriptor.height;
+    event.bitmap_key = `${header.epoch_id}:${event.bitmap_id}`;
+  }
+  return batch;
 }
 
 function commitCursorObject(header, batch) {
   if (state.seenSequences.has(header.sequence)) return;
   for (const event of batch.events) {
-    if (event.bitmap) cacheCursorBitmap(event.bitmap_id, event.bitmap);
+    if (event.bitmap) cacheCursorBitmap(event.bitmap_key, event.bitmap);
   }
   state.cursorEvents = ViewerCore.mergeSortedCursorEvents(state.cursorEvents, batch.events);
   state.seenSequences.add(header.sequence);
@@ -393,7 +530,7 @@ async function loadCursorObject(header) {
   commitCursorObject(header, await decodeCursorObject(header));
 }
 
-function cacheCursorBitmap(bitmapId, bitmap) {
+function cacheCursorBitmap(bitmapKey, bitmap) {
   const surface = typeof OffscreenCanvas === 'function'
     ? new OffscreenCanvas(bitmap.width, bitmap.height)
     : Object.assign(document.createElement('canvas'), {
@@ -408,7 +545,7 @@ function cacheCursorBitmap(bitmapId, bitmap) {
     bitmap.rgba.byteLength,
   );
   context.putImageData(new ImageData(pixels, bitmap.width, bitmap.height), 0, 0);
-  state.cursorBitmaps.set(bitmapId, {
+  state.cursorBitmaps.set(bitmapKey, {
     width: bitmap.width,
     height: bitmap.height,
     hotspot_x: bitmap.hotspot_x,
@@ -417,15 +554,15 @@ function cacheCursorBitmap(bitmapId, bitmap) {
   });
 }
 
-function cursorAad(header) {
+function cursorAad(header, descriptor) {
   return concatBytes(
     encoder.encode('glacial-cursor-v1'),
     uuidToBytes(header.stream_id),
     uuidToBytes(header.epoch_id),
     unsignedBigEndian(header.sequence, 8),
     unsignedBigEndian(header.timestamp, 8),
-    unsignedBigEndian(state.descriptor.width, 4),
-    unsignedBigEndian(state.descriptor.height, 4),
+    unsignedBigEndian(descriptor.width, 4),
+    unsignedBigEndian(descriptor.height, 4),
   );
 }
 
@@ -467,20 +604,30 @@ function queueLiveTask(task) {
 
 async function reconcileLiveHeaders() {
   const headers = await fetchHeaders();
-  const latestEpoch = [...headers].reverse().find(header => header.kind === 'Epoch');
-  if (latestEpoch && latestEpoch.epoch_id !== state.descriptor.epoch_id) {
-    setStatus('The capture epoch changed. Reloading is required.');
-    return;
+  state.headers = headers;
+  for (const header of headers.filter(header => header.kind === 'Epoch')) {
+    const epoch = await loadEpochDescriptor(header);
+    await installEpochKey(epoch);
   }
 
-  const epochHeaders = headers.filter(
-    header => header.epoch_id === state.descriptor.epoch_id
-  );
-  for (const header of epochHeaders) {
-    await handleLiveHeader(header);
+  for (const epochId of state.epochOrder) {
+    const epoch = state.epochs.get(epochId);
+    const media = headers.filter(
+      header => header.kind === 'Media' && header.epoch_id === epochId,
+    );
+    if (media.length > 0) await appendEpochMedia(epoch, media);
+  }
+  await loadHistoricalCursors(headers);
+  const latestPlayable = [...state.epochOrder]
+    .reverse()
+    .map(epochId => state.epochs.get(epochId))
+    .find(epoch => epoch.offset !== null);
+  if (latestPlayable) {
+    state.descriptor = latestPlayable.descriptor;
+    refreshStreamLabel();
   }
 
-  const retainedSequences = new Set(epochHeaders.map(header => header.sequence));
+  const retainedSequences = new Set(headers.map(header => header.sequence));
   const listedHighWater = headers.at(-1)?.sequence || 0;
   state.seenSequences = new Set(
     [...state.seenSequences].filter(
@@ -488,25 +635,72 @@ async function reconcileLiveHeaders() {
     )
   );
 
-  const firstRandomAccess = epochHeaders.find(
+  const firstRandomAccess = headers.find(
     header => header.kind === 'Media' && header.random_access
   );
   if (firstRandomAccess) {
-    await trimPlaybackHistory(firstRandomAccess.timestamp);
+    const epoch = state.epochs.get(firstRandomAccess.epoch_id);
+    if (epoch?.offset !== null) {
+      await trimPlaybackHistory(epoch.offset + firstRandomAccess.timestamp);
+    }
   }
 }
 
 async function handleLiveHeader(header) {
   if (header.stream_id !== streamId || state.seenSequences.has(header.sequence)) return;
-  if (header.epoch_id !== state.descriptor.epoch_id) {
-    setStatus('The capture epoch changed. Reloading is required.');
+  if (!state.headers.some(candidate => candidate.sequence === header.sequence)) {
+    state.headers.push(header);
+    state.headers.sort((left, right) => left.sequence - right.sequence);
+  }
+  if (header.kind === 'Epoch') {
+    const epoch = await loadEpochDescriptor(header);
+    await installEpochKey(epoch);
+    state.descriptor = epoch.descriptor;
+    refreshStreamLabel();
+    setStatus('A new capture epoch is ready.');
+    return;
+  }
+  const epoch = state.epochs.get(header.epoch_id);
+  if (!epoch) {
+    await reconcileLiveHeaders();
     return;
   }
   if (header.kind === 'Media') {
-    await fetchVerifyAppend(header);
+    const media = state.headers.filter(
+      candidate => candidate.kind === 'Media' && candidate.epoch_id === header.epoch_id,
+    );
+    await appendEpochMedia(epoch, media);
+    await loadHistoricalCursors(
+      state.headers.filter(candidate => candidate.epoch_id === header.epoch_id),
+    );
+    state.descriptor = epoch.descriptor;
+    refreshStreamLabel();
   } else if (header.kind === 'Cursor') {
-    await loadCursorObject(header);
+    if (epoch.offset !== null) await loadCursorObject(header);
+  } else if (header.kind === 'Initialization') {
+    const media = state.headers.filter(
+      candidate => candidate.kind === 'Media' && candidate.epoch_id === header.epoch_id,
+    );
+    if (media.length > 0) await appendEpochMedia(epoch, media);
   }
+}
+
+function ensureEpochCursorBoundary(epoch) {
+  if (epoch.cursorBoundaryAdded) return;
+  const epochId = epoch.descriptor.epoch_id;
+  state.cursorEvents = ViewerCore.mergeSortedCursorEvents(state.cursorEvents, [{
+    timestamp: epoch.globalStart,
+    x_micropixels: 0,
+    y_micropixels: 0,
+    visible: false,
+    bitmap_id: 0,
+    bitmap: null,
+    epoch_id: epochId,
+    source_width: epoch.descriptor.width,
+    source_height: epoch.descriptor.height,
+    bitmap_key: `${epochId}:0`,
+  }]);
+  epoch.cursorBoundaryAdded = true;
 }
 
 async function trimPlaybackHistory(cutoffTimestamp) {
@@ -547,7 +741,7 @@ function renderCursor() {
   const canvasWidth = Math.round(width * ratio);
   const canvasHeight = Math.round(height * ratio);
   const event = currentCursorEvent();
-  const bitmap = event?.visible ? state.cursorBitmaps.get(event.bitmap_id) : undefined;
+  const bitmap = event?.visible ? state.cursorBitmaps.get(event.bitmap_key) : undefined;
   const layout = `${canvasWidth}:${canvasHeight}:${ratio}`;
   if (
     state.lastRenderedCursor === event
@@ -574,9 +768,14 @@ function renderCursor() {
   context.clearRect(0, 0, width, height);
 
   if (event?.visible) {
-    const rectangle = containedVideoRectangle(width, height);
-    const scaleX = rectangle.width / state.descriptor.width;
-    const scaleY = rectangle.height / state.descriptor.height;
+    const rectangle = containedVideoRectangle(
+      width,
+      height,
+      event.source_width,
+      event.source_height,
+    );
+    const scaleX = rectangle.width / event.source_width;
+    const scaleY = rectangle.height / event.source_height;
     const x = rectangle.left + event.x_micropixels / 1_000_000 * scaleX;
     const y = rectangle.top + event.y_micropixels / 1_000_000 * scaleY;
     if (bitmap) {
@@ -609,12 +808,12 @@ function currentCursorEvent() {
   );
 }
 
-function containedVideoRectangle(width, height) {
+function containedVideoRectangle(width, height, videoWidth, videoHeight) {
   return ViewerCore.containedVideoRectangle(
     width,
     height,
-    state.descriptor.width,
-    state.descriptor.height,
+    videoWidth,
+    videoHeight,
   );
 }
 
@@ -647,8 +846,19 @@ function seekToLiveEdge() {
 }
 
 function updateMetrics() {
+  const playableEpochs = [...state.epochs.values()]
+    .filter(epoch => epoch.offset !== null)
+    .length;
   els.metrics.textContent =
-    `${state.appendedMedia} media fragments · ${state.cursorEvents.length} cursor events`;
+    `${state.appendedMedia} media fragments · ${state.cursorEvents.length} cursor events`
+    + ` · ${playableEpochs} capture epoch${playableEpochs === 1 ? '' : 's'}`;
+}
+
+function refreshStreamLabel() {
+  const descriptor = state.descriptor;
+  if (!descriptor) return;
+  els.streamLabel.textContent =
+    `${streamId} · ${descriptor.width}×${descriptor.height} · ${descriptor.codec}`;
 }
 
 function setStatus(message) {

@@ -290,6 +290,88 @@ test('cursor retention keeps one predecessor and referenced bitmaps', () => {
   assert.equal(core.retainCursorHistory(events, 0), events);
 });
 
+test('epoch timeline joins retained random-access ranges without overlap', () => {
+  const headers = [
+    { kind: 'Epoch', epoch_id: 'first', sequence: 1 },
+    {
+      kind: 'Media',
+      epoch_id: 'first',
+      sequence: 2,
+      timestamp: 90_000,
+      duration: 90_000,
+      random_access: false,
+    },
+    {
+      kind: 'Media',
+      epoch_id: 'first',
+      sequence: 3,
+      timestamp: 180_000,
+      duration: 90_000,
+      random_access: true,
+    },
+    {
+      kind: 'Media',
+      epoch_id: 'first',
+      sequence: 4,
+      timestamp: 270_000,
+      duration: 90_000,
+      random_access: false,
+    },
+    { kind: 'Epoch', epoch_id: 'second', sequence: 5 },
+    {
+      kind: 'Media',
+      epoch_id: 'second',
+      sequence: 6,
+      timestamp: 0,
+      duration: 45_000,
+      random_access: true,
+    },
+  ];
+  const timeline = core.buildEpochTimeline(headers);
+  assert.deepEqual(
+    timeline.map(epoch => ({
+      id: epoch.epoch_id,
+      mediaStart: epoch.media_start,
+      offset: epoch.offset,
+      globalStart: epoch.global_start,
+      globalEnd: epoch.global_end,
+      sequences: epoch.media.map(header => header.sequence),
+    })),
+    [{
+      id: 'first',
+      mediaStart: 180_000,
+      offset: -180_000,
+      globalStart: 0,
+      globalEnd: 180_000,
+      sequences: [3, 4],
+    }, {
+      id: 'second',
+      mediaStart: 0,
+      offset: 180_000,
+      globalStart: 180_000,
+      globalEnd: 225_000,
+      sequences: [6],
+    }],
+  );
+});
+
+test('epoch timeline rejects unusable or unsafe media ranges', () => {
+  assert.deepEqual(core.buildEpochTimeline([
+    { kind: 'Epoch', epoch_id: 'empty', sequence: 1 },
+  ]), []);
+  assert.throws(() => core.buildEpochTimeline([
+    { kind: 'Epoch', epoch_id: 'bad', sequence: 1 },
+    {
+      kind: 'Media',
+      epoch_id: 'bad',
+      sequence: 2,
+      timestamp: Number.MAX_SAFE_INTEGER,
+      duration: 1,
+      random_access: true,
+    },
+  ]), /invalid media timeline/);
+});
+
 test('contained video geometry handles letterboxing and pillarboxing', () => {
   assert.deepEqual(core.containedVideoRectangle(1600, 900, 1920, 1080), {
     left: 0,

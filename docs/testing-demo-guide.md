@@ -173,9 +173,11 @@ For each browser, expect output reporting:
 
 - a 320×180 decoded video;
 - a nonempty buffered range;
-- media fragments and cursor events;
+- media fragments, cursor events, and multiple capture epochs;
 - a painted cursor that moved, hid, and returned; and
-- live-append latency below 250 ms.
+- live-append latency below 250 ms; and
+- continued playback after the gate restarts the publisher once per browser,
+  without a page reload, in both the relay and copied-file viewers.
 
 The final Internet-browser line should report that Firefox and Chromium
 authenticated through HTTPS and played the E2EE stream.
@@ -287,6 +289,12 @@ Repeat the publisher with `--test-pattern static --idle-heartbeat-seconds 4`.
 The cursor should remain smooth, the media-fragment count should rise only on
 the heartbeat, and history playback should still span the complete idle time.
 The nightly Firefox/Chromium matrix exercises both motion and static profiles.
+
+While leaving a viewer open, stop and restart the publisher with the same
+client ID and viewer key. The capture-epoch count should increase, playback
+should continue at the live edge without reloading, and the timeline should
+still seek into the previous epoch. Cursor state resets at the epoch boundary
+and resumes when the new capture publishes cursor metadata.
 
 Repeat in Chromium. Also try a wrong viewer key: playback should fail without
 revealing decrypted content.

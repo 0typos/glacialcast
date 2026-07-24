@@ -30,8 +30,9 @@ The MVP is complete when all of the following are true:
 6. Cursor records use authenticated encryption and share the media timebase.
 7. The server relays opaque stream objects and retains them using both a maximum
    age and a maximum byte count per stream.
-8. A reconnecting viewer can begin at the newest retained random-access point
-   and scrub through the retained window.
+8. A reconnecting viewer can begin at the oldest usable retained random-access
+   point and scrub through every retained capture epoch. Publisher reconnects
+   append a newly keyed epoch without reloading the viewer.
 9. A self-contained `glacialcast-offline` executable serves a copied stream
    bundle on loopback for playback by an installed Firefox or Chromium without
    Internet access.
@@ -287,10 +288,12 @@ Release verification covers:
 - the wlroots portal family
 - niri's supported portal path
 
-The browser gate verifies MSE fragmented-MP4 playback, EME Clear Key decryption,
-live append, reconnect from a retained random-access point, history seeking, and
-cursor synchronization. The compositor gate records portal source selection,
-PipeWire buffer types, video damage metadata, and cursor metadata availability.
+The browser gate verifies MSE fragmented-MP4 playback, an EME Clear Key keyring,
+live append across forced publisher reconnects, retained multi-epoch history
+seeking, and cursor synchronization in both live and copied-file viewers. Each
+epoch's zero-based media and cursor clocks are rebased into one continuous
+viewer timeline. The compositor gate records portal source selection, PipeWire
+buffer types, video damage metadata, and cursor metadata availability.
 
 ## Completed Replacement
 

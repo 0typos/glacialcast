@@ -30,8 +30,13 @@ server_pid=""
 client_pid=""
 offline_pid=""
 mirror_pid=""
+browser_pid=""
 
 cleanup() {
+  if [[ -n "${browser_pid}" ]] && kill -0 "${browser_pid}" 2>/dev/null; then
+    kill "${browser_pid}" 2>/dev/null || true
+    wait "${browser_pid}" 2>/dev/null || true
+  fi
   if [[ -n "${mirror_pid}" ]] && kill -0 "${mirror_pid}" 2>/dev/null; then
     kill "${mirror_pid}" 2>/dev/null || true
     wait "${mirror_pid}" 2>/dev/null || true
@@ -60,6 +65,126 @@ ingest_server_key="$(
 )"
 viewer_key="$(node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))")"
 
+start_client() {
+  RUST_LOG=glacialcast_client=debug target/debug/glacialcast-client \
+    --config "${work_dir}/missing-client.toml" \
+    --ingest-addr "${ingest_addr}" \
+    "--ingest-server-key=${ingest_server_key}" \
+    "--viewer-key=${viewer_key}" \
+    --client-id dash-e2e \
+    --display-name "DASH E2E" \
+    --capture dash-test \
+    --test-pattern "${test_pattern}" \
+    --dash-encoder openh264 \
+    --width 320 \
+    --height 180 \
+    --fps 2 \
+    --idle-heartbeat-seconds "${idle_heartbeat_seconds}" \
+    --cursor-hz 30 \
+    --segment-frames 2 \
+    >>"${client_log}" 2>&1 &
+  client_pid="$!"
+}
+
+restart_client() {
+  kill "${client_pid}"
+  wait "${client_pid}" 2>/dev/null || true
+  client_pid=""
+  start_client
+}
+
+wait_for_epoch_count() {
+  local expected_epochs="$1"
+  node - "${origin}" "${offline_origin}" "${stream_id}" "${expected_epochs}" <<'NODE'
+const origins = process.argv.slice(2, 4);
+const streamId = process.argv[4];
+const expectedEpochs = Number(process.argv[5]);
+const deadline = Date.now() + 30_000;
+while (Date.now() < deadline) {
+  let ready = true;
+  for (const origin of origins) {
+    try {
+      const headers = await fetch(
+        `${origin}/api/dash/streams/${streamId}/objects`,
+        { cache: 'no-store' },
+      ).then(response => {
+        if (!response.ok) throw new Error(`object list returned ${response.status}`);
+        return response.json();
+      });
+      const epochs = headers.filter(header => header.kind === 'Epoch');
+      const playableEpochs = epochs.filter(epoch =>
+        headers.some(header =>
+          header.epoch_id === epoch.epoch_id
+          && header.kind === 'Initialization'
+        )
+        && headers.some(header =>
+          header.epoch_id === epoch.epoch_id
+          && header.kind === 'Media'
+          && header.random_access
+        )
+        && headers.some(header =>
+          header.epoch_id === epoch.epoch_id
+          && header.kind === 'Cursor'
+        )
+      );
+      if (playableEpochs.length < expectedEpochs) ready = false;
+    } catch {
+      ready = false;
+    }
+  }
+  if (ready) process.exit(0);
+  await new Promise(resolve => setTimeout(resolve, 100));
+}
+throw new Error(
+  `live and offline viewers did not receive ${expectedEpochs} playable capture epochs`,
+);
+NODE
+}
+
+run_browser_with_epoch_transition() {
+  local browser_origin="$1"
+  local browser="$2"
+  local marker="${work_dir}/epoch-transition-${browser}-${expected_epochs}"
+  local browser_log="${marker}.log"
+  GLACIALCAST_VERIFY_MIN_EPOCHS="${expected_epochs}" \
+  GLACIALCAST_VERIFY_EPOCH_TRANSITION_MARKER="${marker}" \
+    node scripts/verify-dash-browser.mjs \
+      "${browser_origin}" \
+      "${stream_id}" \
+      "${viewer_key}" \
+      "${browser}" \
+      >"${browser_log}" 2>&1 &
+  browser_pid="$!"
+  for _ in $(seq 1 300); do
+    if [[ -f "${marker}.ready" ]]; then
+      break
+    fi
+    if ! kill -0 "${browser_pid}" 2>/dev/null; then
+      sed -n '1,240p' "${browser_log}" >&2
+      wait "${browser_pid}" 2>/dev/null || true
+      browser_pid=""
+      return 1
+    fi
+    sleep 0.1
+  done
+  if [[ ! -f "${marker}.ready" ]]; then
+    echo "${browser} did not become ready for an epoch transition" >&2
+    sed -n '1,240p' "${browser_log}" >&2
+    return 1
+  fi
+  restart_client
+  expected_epochs=$((expected_epochs + 1))
+  wait_for_epoch_count "${expected_epochs}"
+  touch "${marker}.continue"
+  if ! wait "${browser_pid}"; then
+    sed -n '1,320p' "${browser_log}" >&2
+    browser_pid=""
+    return 1
+  fi
+  browser_pid=""
+  sed -n '1,320p' "${browser_log}"
+}
+
 target/debug/glacialcast-server \
   --config "${work_dir}/missing-server.toml" \
   --control-addr "${control_addr}" \
@@ -83,24 +208,8 @@ for _ in $(seq 1 100); do
 done
 curl -fsS "${origin}/api/streams" >/dev/null
 
-RUST_LOG=glacialcast_client=debug target/debug/glacialcast-client \
-  --config "${work_dir}/missing-client.toml" \
-  --ingest-addr "${ingest_addr}" \
-  "--ingest-server-key=${ingest_server_key}" \
-  "--viewer-key=${viewer_key}" \
-  --client-id dash-e2e \
-  --display-name "DASH E2E" \
-  --capture dash-test \
-  --test-pattern "${test_pattern}" \
-  --dash-encoder openh264 \
-  --width 320 \
-  --height 180 \
-  --fps 2 \
-  --idle-heartbeat-seconds "${idle_heartbeat_seconds}" \
-  --cursor-hz 30 \
-  --segment-frames 2 \
-  >"${client_log}" 2>&1 &
-client_pid="$!"
+: >"${client_log}"
+start_client
 
 stream_id="$(
   node - "${origin}" <<'NODE'
@@ -221,25 +330,21 @@ for _ in $(seq 1 100); do
 done
 curl -fsS "${offline_origin}/api/dash/streams/${stream_id}/manifest.mpd" >/dev/null
 
+restart_client
+expected_epochs=2
+wait_for_epoch_count "${expected_epochs}"
+
 if [[ -n "${GLACIALCAST_VERIFY_BROWSERS:-}" ]]; then
   IFS=',' read -r -a browsers <<<"${GLACIALCAST_VERIFY_BROWSERS}"
   for browser in "${browsers[@]}"; do
-    node scripts/verify-dash-browser.mjs \
-      "${origin}" \
-      "${stream_id}" \
-      "${viewer_key}" \
-      "${browser}"
+    run_browser_with_epoch_transition "${origin}" "${browser}"
   done
 fi
 
 if [[ -n "${GLACIALCAST_VERIFY_OFFLINE_BROWSERS:-}" ]]; then
   IFS=',' read -r -a offline_browsers <<<"${GLACIALCAST_VERIFY_OFFLINE_BROWSERS}"
   for browser in "${offline_browsers[@]}"; do
-    node scripts/verify-dash-browser.mjs \
-      "${offline_origin}" \
-      "${stream_id}" \
-      "${viewer_key}" \
-      "${browser}"
+    run_browser_with_epoch_transition "${offline_origin}" "${browser}"
   done
 fi
 

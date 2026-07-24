@@ -278,7 +278,62 @@
   }
 
   function referencedBitmapIds(events) {
-    return new Set(events.filter(event => event.bitmap_id !== 0).map(event => event.bitmap_id));
+    return new Set(
+      events
+        .filter(event => event.bitmap_id !== 0)
+        .map(event => event.bitmap_key || event.bitmap_id),
+    );
+  }
+
+  function buildEpochTimeline(headers) {
+    if (!Array.isArray(headers)) throw new TypeError('DASH headers must be an array.');
+    const epochIds = [];
+    const seenEpochs = new Set();
+    for (const header of headers) {
+      if (header.kind !== 'Epoch' || seenEpochs.has(header.epoch_id)) continue;
+      seenEpochs.add(header.epoch_id);
+      epochIds.push(header.epoch_id);
+    }
+
+    let globalEnd = 0;
+    const epochs = [];
+    for (const epochId of epochIds) {
+      const allMedia = headers.filter(
+        header => header.kind === 'Media' && header.epoch_id === epochId,
+      );
+      const firstRandomAccess = allMedia.findIndex(header => header.random_access);
+      if (firstRandomAccess < 0) continue;
+      const media = allMedia.slice(firstRandomAccess);
+      const mediaStart = media[0].timestamp;
+      const mediaEnd = media.reduce(
+        (end, header) => Math.max(end, header.timestamp + header.duration),
+        mediaStart,
+      );
+      if (
+        !Number.isSafeInteger(mediaStart)
+        || !Number.isSafeInteger(mediaEnd)
+        || mediaStart < 0
+        || mediaEnd <= mediaStart
+      ) {
+        throw new Error(`Epoch ${epochId} has an invalid media timeline.`);
+      }
+      const offset = globalEnd - mediaStart;
+      const globalStart = globalEnd;
+      globalEnd += mediaEnd - mediaStart;
+      if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(globalEnd)) {
+        throw new Error('The retained media timeline exceeds JavaScript integer limits.');
+      }
+      epochs.push({
+        epoch_id: epochId,
+        media_start: mediaStart,
+        media_end: mediaEnd,
+        offset,
+        global_start: globalStart,
+        global_end: globalEnd,
+        media,
+      });
+    }
+    return epochs;
   }
 
   function containedVideoRectangle(stageWidth, stageHeight, videoWidth, videoHeight) {
@@ -312,6 +367,7 @@
     MAX_CURSOR_BITMAP_SIDE,
     MAX_CURSOR_PAYLOAD,
     MAX_CURSOR_PLAINTEXT,
+    buildEpochTimeline,
     containedVideoRectangle,
     findCursorEvent,
     mergeSortedCursorEvents,

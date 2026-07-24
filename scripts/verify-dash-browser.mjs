@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { createRequire } from 'node:module';
+import fs from 'node:fs';
 
 const require = createRequire(import.meta.url);
 const playwrightModule = process.env.GLACIALCAST_PLAYWRIGHT_MODULE || 'playwright';
@@ -8,11 +9,16 @@ const { chromium, firefox } = require(playwrightModule);
 
 const [origin, streamId, viewerKey, browserName = 'firefox'] = process.argv.slice(2);
 const accessToken = process.env.GLACIALCAST_VERIFY_ACCESS_TOKEN;
+const minimumEpochs = Number(process.env.GLACIALCAST_VERIFY_MIN_EPOCHS || 1);
+const epochTransitionMarker = process.env.GLACIALCAST_VERIFY_EPOCH_TRANSITION_MARKER;
 if (!origin || !streamId || !viewerKey || !['firefox', 'chromium'].includes(browserName)) {
   console.error(
     'usage: verify-dash-browser.mjs ORIGIN STREAM_ID VIEWER_KEY [firefox|chromium]',
   );
   process.exit(2);
+}
+if (!Number.isSafeInteger(minimumEpochs) || minimumEpochs < 1) {
+  throw new Error('GLACIALCAST_VERIFY_MIN_EPOCHS must be a positive integer');
 }
 
 const browserType = browserName === 'firefox' ? firefox : chromium;
@@ -72,7 +78,7 @@ try {
   await page.locator('#viewer-key').fill(viewerKey);
   await page.locator('#unlock-form button').click();
   try {
-    await page.waitForFunction(() => {
+    await page.waitForFunction(expectedEpochs => {
       const video = document.querySelector('#video');
       const metrics = document.querySelector('#metrics')?.textContent || '';
       const status = document.querySelector('#status')?.textContent || '';
@@ -81,11 +87,12 @@ try {
         && video.buffered.length > 0
         && /[1-9]\d* media fragments/.test(metrics)
         && /[1-9]\d* cursor events/.test(metrics)
+        && Number(metrics.match(/(\d+) capture epochs?/)?.[1] || 0) >= expectedEpochs
         && (
           status.includes('playback ready')
           || status.includes('Connected to live')
         );
-    }, null, { timeout: 30_000 });
+    }, minimumEpochs, { timeout: 30_000 });
   } catch (error) {
     const diagnostic = await page.evaluate(() => {
       const video = document.querySelector('#video');
@@ -107,6 +114,28 @@ try {
     );
   }
   console.log('encrypted media and cursor events reached the browser');
+  if (minimumEpochs > 1) {
+    await page.evaluate(async () => {
+      const video = document.querySelector('#video');
+      video.currentTime = video.buffered.start(0) + 0.01;
+      if (video.paused) await video.play();
+      if (typeof video.requestVideoFrameCallback === 'function') {
+        await Promise.race([
+          new Promise(resolve => video.requestVideoFrameCallback(resolve)),
+          new Promise((_, reject) => {
+            setTimeout(() => reject(new Error('historical epoch did not paint')), 2_000);
+          }),
+        ]);
+      } else {
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+    });
+    const historicalFrame = await page.locator('#video').screenshot();
+    if (historicalFrame.byteLength < 5_000) {
+      throw new Error('the earliest retained capture epoch did not paint');
+    }
+    await page.locator('#live-button').click();
+  }
   const cursorMotion = await page.evaluate(async () => {
     const canvas = document.querySelector('#cursor-layer');
     const bounds = () => {
@@ -182,6 +211,29 @@ try {
     `cursor overlay painted ${cursorMotion.paintedPixels} pixels and moved `
       + `${cursorMotion.movedX.toFixed(1)},${cursorMotion.movedY.toFixed(1)}`,
   );
+  if (epochTransitionMarker) {
+    const initialEpochs = await page.evaluate(() => {
+      const metrics = document.querySelector('#metrics')?.textContent || '';
+      return Number(metrics.match(/(\d+) capture epochs?/)?.[1] || 0);
+    });
+    fs.writeFileSync(`${epochTransitionMarker}.ready`, `${initialEpochs}\n`);
+    const transitionDeadline = Date.now() + 30_000;
+    while (!fs.existsSync(`${epochTransitionMarker}.continue`)) {
+      if (Date.now() >= transitionDeadline) {
+        throw new Error('timed out waiting for the publisher epoch transition');
+      }
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    await page.waitForFunction(previousEpochs => {
+      const metrics = document.querySelector('#metrics')?.textContent || '';
+      const status = document.querySelector('#status')?.textContent || '';
+      const epochs = Number(metrics.match(/(\d+) capture epochs?/)?.[1] || 0);
+      return epochs > previousEpochs
+        && !status.includes('Reloading is required')
+        && !document.querySelector('#status')?.classList.contains('error');
+    }, initialEpochs, { timeout: 30_000 });
+    console.log(`viewer continued live playback across capture epoch ${initialEpochs + 1}`);
+  }
   const initialMediaCount = await page.evaluate(() => {
     const match = (document.querySelector('#metrics')?.textContent || '')
       .match(/(\d+) media fragments/);
