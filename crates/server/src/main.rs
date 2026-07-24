@@ -1,3 +1,4 @@
+mod dash_store;
 mod storage;
 
 use anyhow::{Context, Result};
@@ -16,8 +17,9 @@ use bytes::Bytes;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use glacialcast_protocol::{
-    ClientMessage, ControlEvent, FrameManifest, H264ParameterSetCache, ServerMessage, StreamHello,
-    StreamMediaKind, VideoChunkManifest, VideoChunkMessage, VideoCodec, VideoPacketization,
+    ClientMessage, ControlEvent, DashObjectHeader, FrameManifest, H264ParameterSetCache,
+    ServerMessage, StreamHello, StreamMediaKind, VideoChunkManifest, VideoChunkMessage, VideoCodec,
+    VideoPacketization,
     daemon::{
         daemonize_if_requested, install_signal_handlers, manager_command, serve_control_socket,
         wait_for_shutdown,
@@ -53,7 +55,10 @@ use webrtc::{
     track::track_local::track_local_static_sample::TrackLocalStaticSample,
 };
 
-use crate::storage::{Store, StoredFrame, StoredVideoChunk};
+use crate::{
+    dash_store::DashStore,
+    storage::{Store, StoredFrame, StoredVideoChunk},
+};
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -80,6 +85,8 @@ struct Args {
         default_value = "512MiB"
     )]
     retention_bytes_per_stream: u64,
+    #[arg(long, env = "GLACIALCAST_RETENTION_SECONDS", default_value_t = 1800)]
+    retention_seconds: u64,
     #[arg(long)]
     daemon: bool,
     #[arg(long, hide = true)]
@@ -95,7 +102,9 @@ struct Args {
 #[derive(Clone)]
 struct AppState {
     store: Store,
+    dash_store: DashStore,
     events: broadcast::Sender<ControlEvent>,
+    dash_events: broadcast::Sender<DashObjectHeader>,
     auth: AuthConfig,
     rtc: RtcHub,
     ingest_controls: Arc<AsyncMutex<HashMap<Uuid, IngestControl>>>,
@@ -442,10 +451,18 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
         .with_context(|| format!("creating data dir {}", args.data_dir.display()))?;
 
     let store = Store::open(args.data_dir.clone(), args.retention_bytes_per_stream)?;
+    let dash_store = DashStore::open(
+        args.data_dir.join("dash"),
+        args.retention_bytes_per_stream,
+        Duration::from_secs(args.retention_seconds),
+    )?;
     let (events, _) = broadcast::channel(1024);
+    let (dash_events, _) = broadcast::channel(1024);
     let state = AppState {
         store,
+        dash_store,
         events,
+        dash_events,
         auth: AuthConfig::from_config(config.ingest)?,
         rtc: RtcHub::default(),
         ingest_controls: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -482,6 +499,27 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
         .route("/api/streams/{stream_id}/webrtc/offer", post(webrtc_offer))
         .route("/api/streams/{stream_id}/cursors", get(list_cursors))
         .route("/api/ws", get(control_ws))
+        .route(
+            "/api/dash/streams/{stream_id}/manifest.mpd",
+            get(dash_manifest),
+        )
+        .route(
+            "/api/dash/streams/{stream_id}/objects",
+            get(list_dash_objects),
+        )
+        .route(
+            "/api/dash/streams/{stream_id}/objects/{sequence}",
+            get(get_dash_object),
+        )
+        .route(
+            "/api/dash/streams/{stream_id}/epochs/{epoch_id}/init.mp4",
+            get(get_dash_initialization),
+        )
+        .route(
+            "/api/dash/streams/{stream_id}/epochs/{epoch_id}/media/{segment_file}",
+            get(get_dash_segment),
+        )
+        .route("/api/dash/streams/{stream_id}/live", get(dash_live_ws))
         .nest_service("/assets", ServeDir::new("crates/server/static"))
         .with_state(state);
 
@@ -507,7 +545,18 @@ async fn favicon() -> StatusCode {
 async fn list_streams(
     State(state): State<AppState>,
 ) -> Result<axum::Json<Vec<glacialcast_protocol::PublicStream>>, AppError> {
-    Ok(axum::Json(state.store.list_streams()?))
+    let mut streams = state.store.list_streams()?;
+    let dash_summaries = state.dash_store.summaries()?;
+    for stream in &mut streams {
+        if let Some(summary) = dash_summaries.get(&stream.stream_id) {
+            stream.retained_bytes = stream.retained_bytes.max(summary.bytes);
+            stream.last_frame_seq = match (stream.last_frame_seq, summary.last_sequence) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (left, right) => left.or(right),
+            };
+        }
+    }
+    Ok(axum::Json(streams))
 }
 
 async fn delete_stream(
@@ -515,6 +564,7 @@ async fn delete_stream(
     Path(stream_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     if state.store.delete_stream(stream_id)? {
+        state.dash_store.delete_stream(stream_id)?;
         state.rtc.close_stream(stream_id).await;
         publish_stream_event(&state, "stream_deleted", stream_id);
         Ok(StatusCode::NO_CONTENT)
@@ -542,6 +592,136 @@ async fn list_cursors(
     Path(stream_id): Path<Uuid>,
 ) -> Result<axum::Json<Vec<glacialcast_protocol::CursorMessage>>, AppError> {
     Ok(axum::Json(state.store.list_cursors(stream_id, 5000)?))
+}
+
+async fn dash_manifest(
+    State(state): State<AppState>,
+    Path(stream_id): Path<Uuid>,
+) -> Result<Response, AppError> {
+    let manifest = state
+        .dash_store
+        .manifest(stream_id, true)?
+        .ok_or(AppError::NotFound)?;
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/dash+xml")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(manifest))
+        .expect("static DASH response headers are valid"))
+}
+
+async fn list_dash_objects(
+    State(state): State<AppState>,
+    Path(stream_id): Path<Uuid>,
+) -> Result<Json<Vec<DashObjectHeader>>, AppError> {
+    Ok(Json(
+        state
+            .dash_store
+            .list(stream_id)?
+            .into_iter()
+            .map(|object| object.header)
+            .collect(),
+    ))
+}
+
+async fn get_dash_object(
+    State(state): State<AppState>,
+    Path((stream_id, sequence)): Path<(Uuid, u64)>,
+) -> Result<Response, AppError> {
+    let object = state
+        .dash_store
+        .get(stream_id, sequence)?
+        .ok_or(AppError::NotFound)?;
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(
+            header::CACHE_CONTROL,
+            "private, max-age=31536000, immutable",
+        )
+        .body(Body::from(object.payload))
+        .expect("static DASH response headers are valid"))
+}
+
+async fn get_dash_initialization(
+    State(state): State<AppState>,
+    Path((stream_id, epoch_id)): Path<(Uuid, Uuid)>,
+) -> Result<Response, AppError> {
+    let initialization = state
+        .dash_store
+        .initialization(stream_id, epoch_id)?
+        .ok_or(AppError::NotFound)?;
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "video/mp4")
+        .header(
+            header::CACHE_CONTROL,
+            "private, max-age=31536000, immutable",
+        )
+        .body(Body::from(initialization))
+        .expect("static DASH response headers are valid"))
+}
+
+async fn get_dash_segment(
+    State(state): State<AppState>,
+    Path((stream_id, epoch_id, segment_file)): Path<(Uuid, Uuid, String)>,
+) -> Result<Response, AppError> {
+    let segment_number = segment_file
+        .strip_suffix(".m4s")
+        .ok_or_else(|| anyhow::anyhow!("DASH segment path must end in .m4s"))?
+        .parse::<u64>()
+        .context("parsing DASH segment number")?;
+    let segment = state
+        .dash_store
+        .media_segment(stream_id, epoch_id, segment_number)?
+        .ok_or(AppError::NotFound)?;
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "video/iso.segment")
+        .header(
+            header::CACHE_CONTROL,
+            "private, max-age=31536000, immutable",
+        )
+        .body(Body::from(segment))
+        .expect("static DASH response headers are valid"))
+}
+
+async fn dash_live_ws(
+    State(state): State<AppState>,
+    Path(stream_id): Path<Uuid>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| dash_live_socket(socket, state, stream_id))
+}
+
+async fn dash_live_socket(socket: WebSocket, state: AppState, stream_id: Uuid) {
+    let mut rx = state.dash_events.subscribe();
+    let (mut sender, mut receiver) = socket.split();
+    let send_task = tokio::spawn(async move {
+        loop {
+            let header = match rx.recv().await {
+                Ok(header) => header,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
+            if header.stream_id != stream_id {
+                continue;
+            }
+            let Ok(json) = serde_json::to_string(&header) else {
+                continue;
+            };
+            if sender.send(Message::Text(json.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    while let Some(Ok(message)) = receiver.next().await {
+        if matches!(message, Message::Close(_)) {
+            break;
+        }
+    }
+    send_task.abort();
 }
 
 async fn get_frame(
@@ -794,7 +974,13 @@ async fn handle_ingest(mut stream: TcpStream, state: AppState) -> Result<()> {
         hello.media_kind,
         hello.frame_encrypted,
     )?;
-    let last_seq = state.store.last_frame_seq(stream_id)?.unwrap_or(0);
+    let last_seq = state
+        .store
+        .last_frame_seq(stream_id)?
+        .into_iter()
+        .chain(state.dash_store.last_sequence(stream_id)?)
+        .max()
+        .unwrap_or(0);
     socket
         .write(&ServerMessage::HelloAck {
             accepted: true,
@@ -825,15 +1011,17 @@ async fn handle_ingest(mut stream: TcpStream, state: AppState) -> Result<()> {
     )
     .await;
     let mut controls = state.ingest_controls.lock().await;
-    if controls
+    let owns_connection = controls
         .get(&stream_id)
-        .is_some_and(|control| control.connection_id == connection_id)
-    {
+        .is_some_and(|control| control.connection_id == connection_id);
+    if owns_connection {
         controls.remove(&stream_id);
     }
     drop(controls);
-    state.store.mark_stream_inactive(stream_id)?;
-    publish_stream_event(&state, "stream_disconnected", stream_id);
+    if owns_connection {
+        state.store.mark_stream_inactive(stream_id)?;
+        publish_stream_event(&state, "stream_disconnected", stream_id);
+    }
     if let Err(err) = &result {
         debug!(%stream_id, ?err, "ingest loop ended with error");
     }
@@ -936,8 +1124,33 @@ async fn ingest_loop(
                     .await?;
                 debug!(stream_id = %stream_id, through_seq = last_seq, "ingest sent video ack");
             }
-            Ok(ClientMessage::DashObject(_)) => {
-                anyhow::bail!("DASH ingest is not enabled by this server build");
+            Ok(ClientMessage::DashObject(object)) => {
+                object.validate().context("validating DASH ingest object")?;
+                if !state.store.stream_exists(stream_id)? {
+                    anyhow::bail!("stream was deleted");
+                }
+                if hello.media_kind != StreamMediaKind::Dash {
+                    anyhow::bail!("DASH object received for a non-DASH stream");
+                }
+                if object.header.stream_id != stream_id {
+                    anyhow::bail!("DASH object stream_id does not match assigned stream");
+                }
+                if object.header.sequence > last_seq + 1 && last_seq > 0 {
+                    socket
+                        .write(&ServerMessage::ResendRequest {
+                            from_seq: last_seq + 1,
+                            to_seq: object.header.sequence - 1,
+                        })
+                        .await?;
+                }
+                let stored = state.dash_store.store(object)?;
+                last_seq = last_seq.max(stored.header.sequence);
+                let _ = state.dash_events.send(stored.header);
+                socket
+                    .write(&ServerMessage::Ack {
+                        through_seq: last_seq,
+                    })
+                    .await?;
             }
             Ok(ClientMessage::Cursor(cursor)) => {
                 debug!(stream_id = %stream_id, seq = cursor.seq, x = cursor.x, y = cursor.y, "ingest received cursor");

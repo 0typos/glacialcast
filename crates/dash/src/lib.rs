@@ -48,9 +48,56 @@ pub enum DashError {
     Base64(#[from] base64::DecodeError),
     #[error("viewer key must decode to 32 bytes, got {0}")]
     InvalidViewerKey(usize),
+    #[error("invalid DASH epoch descriptor")]
+    InvalidEpochDescriptor,
 }
 
 pub type Result<T> = std::result::Result<T, DashError>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpochDescriptor {
+    pub format_version: u16,
+    pub stream_id: Uuid,
+    pub epoch_id: Uuid,
+    pub key_id: [u8; 16],
+    pub width: u16,
+    pub height: u16,
+    pub codec: String,
+    pub timescale: u32,
+    pub segment_frames: u16,
+    pub availability_start_time: String,
+}
+
+impl EpochDescriptor {
+    pub fn validate(&self) -> Result<()> {
+        if self.format_version != DASH_FORMAT_VERSION
+            || self.stream_id.is_nil()
+            || self.epoch_id.is_nil()
+            || self.key_id != *self.epoch_id.as_bytes()
+            || self.width == 0
+            || self.height == 0
+            || self.timescale != MEDIA_TIMESCALE
+            || self.segment_frames == 0
+            || !self.codec.starts_with("avc1.")
+            || self.codec.len() > 32
+            || self.availability_start_time.len() > 64
+        {
+            return Err(DashError::InvalidEpochDescriptor);
+        }
+        Ok(())
+    }
+
+    pub fn to_json(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        Ok(serde_json::to_vec(self)?)
+    }
+
+    pub fn from_json(bytes: &[u8]) -> Result<Self> {
+        let descriptor: Self = serde_json::from_slice(bytes)?;
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpochKeys {
