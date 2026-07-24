@@ -107,6 +107,7 @@ struct CursorMessage {
 }
 
 #[derive(Debug, Parser)]
+#[command(version)]
 struct Args {
     #[arg(long, default_value = "client.toml")]
     config: PathBuf,

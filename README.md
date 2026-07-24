@@ -242,6 +242,19 @@ refuses a non-loopback listener unless
 `--allow-non-loopback` is supplied explicitly; use that escape hatch only on a
 trusted network.
 
+## Release archive
+
+Build and validate a versioned Linux archive with:
+
+```sh
+scripts/verify-packaging.sh
+```
+
+The ignored `dist/` output contains all three binaries, deployment examples,
+operator documentation, an SPDX 2.3 SBOM, and a SHA-256 checksum. Optional
+Minisign signing, installation, backup, upgrade, and rollback procedures are in
+the [release operations runbook](docs/release-operations.md).
+
 ## Daemon mode
 
 Both network processes support a local Unix control socket:

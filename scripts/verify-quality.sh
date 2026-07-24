@@ -24,7 +24,7 @@ standard_checks() {
     -D clippy::undocumented_unsafe_blocks
   run env "RUSTDOCFLAGS=-D warnings -D missing-docs" cargo doc --workspace --no-deps
   run cargo deny -L error check
-  run bash -n scripts/*.sh
+  run bash -n scripts/*.sh packaging/*.sh
   run node scripts/test-viewer-core.mjs
   run node scripts/test-index-ui.mjs
 }
@@ -36,6 +36,7 @@ full_checks() {
   run scripts/verify-internet-security.sh
   run scripts/verify-bandwidth.sh
   run scripts/verify-performance.sh
+  run scripts/verify-packaging.sh
 }
 
 case "${profile}" in

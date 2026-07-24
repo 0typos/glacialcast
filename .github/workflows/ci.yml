@@ -76,3 +76,5 @@ jobs:
         run: scripts/verify-soak.sh
       - name: Enforce low-bandwidth profile
         run: scripts/verify-bandwidth.sh
+      - name: Build and verify release archive
+        run: scripts/verify-packaging.sh

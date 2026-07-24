@@ -66,6 +66,16 @@ Success means:
 The dependency policy explicitly rejects `bincode`; GlacialCast protocol
 envelopes use version-gated Postcard.
 
+Release packaging has its own deterministic gate:
+
+```sh
+scripts/verify-packaging.sh
+```
+
+It builds the versioned Linux archive, verifies its checksum, packaged binary
+versions, SPDX SBOM, required operator files, and systemd unit. The full quality
+profile runs this gate automatically.
+
 Parser changes should also run the bounded fuzz suite. It needs the pinned
 nightly and `cargo-fuzz` once:
 

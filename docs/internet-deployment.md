@@ -28,21 +28,26 @@ resistance.
 
 ## Host setup
 
-Build the release binaries, create a dedicated service account, and install the
-server:
+Build and verify the release archive, create a dedicated service account, and
+install the server:
 
 ```sh
-cargo build --workspace --release
+scripts/verify-packaging.sh
+tar -xzf dist/glacialcast-v*-x86_64-unknown-linux-gnu.tar.gz
 sudo useradd --system --home-dir /var/lib/glacialcast --shell /usr/sbin/nologin glacialcast
 sudo install -D -o root -g root -m 0755 \
-  target/release/glacialcast-server /usr/local/bin/glacialcast-server
+  glacialcast-v*/bin/glacialcast-server /usr/local/bin/glacialcast-server
 sudo install -d -o glacialcast -g glacialcast -m 0700 /var/lib/glacialcast
 sudo install -d -o root -g glacialcast -m 0750 /etc/glacialcast
 sudo install -o glacialcast -g glacialcast -m 0600 \
-  deploy/server.internet.toml.example /etc/glacialcast/server.toml
+  glacialcast-v*/deploy/server.internet.toml.example /etc/glacialcast/server.toml
 sudo install -o root -g root -m 0644 \
-  deploy/glacialcast-server.service /etc/systemd/system/glacialcast-server.service
+  glacialcast-v*/deploy/glacialcast-server.service /etc/systemd/system/glacialcast-server.service
 ```
+
+Verify the archive checksum before extracting it. See the
+[release operations runbook](release-operations.md) for SBOM, optional
+signature, backup, upgrade, and rollback procedures.
 
 Generate independent values for every token:
 

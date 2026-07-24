@@ -73,6 +73,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
+#[command(version)]
 struct Args {
     #[arg(long, env = "GLACIALCAST_CONFIG", default_value = "server.toml")]
     config: PathBuf,

@@ -1,0 +1,48 @@
+name: Release archive
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    name: Linux release archive
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            clang \
+            libclang-dev \
+            libgbm-dev \
+            libopenh264-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev \
+            libva-dev
+      - name: Select stable Rust
+        run: |
+          rustup update stable
+          rustup default stable
+      - name: Build and verify archive
+        run: scripts/verify-packaging.sh
+      - name: Upload archive, checksum, and optional signatures
+        uses: actions/upload-artifact@v4
+        with:
+          name: glacialcast-linux-${{ github.sha }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/*.minisig
+          if-no-files-found: error
