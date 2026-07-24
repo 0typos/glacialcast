@@ -14,10 +14,10 @@ This repository uses Conventional Commits:
 Examples:
 
 ```text
-feat(viewer): recover stalled video negotiation
-fix(capture): wait for a complete H264 random-access point
-test(browser): cover Firefox video reload recovery
-docs: document Fedora FFmpeg prerequisites
+feat(viewer): recover live DASH playback
+fix(capture): retain DMA-BUF until conversion completes
+test(browser): cover Firefox history seeking
+docs: document VA-API prerequisites
 ```
 
 Scopes are encouraged when they clarify the affected subsystem, but are not
@@ -64,11 +64,12 @@ Run the checks relevant to the change. The complete local quality gate is:
 
 ```sh
 cargo fmt --check
-cargo test --workspace --features ffmpeg-vaapi
-cargo clippy --workspace --all-targets --features ffmpeg-vaapi -- -D warnings
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 bash -n scripts/*.sh
+scripts/verify-dash-e2e.sh
 ```
 
-The FFmpeg-enabled commands require the development packages documented in
-`README.md`. Never commit build output, retained stream data, test reports,
+The Wayland, VA-API, and browser gates require the host capabilities documented
+in `README.md`. Never commit build output, retained stream data, test reports,
 credentials, or local configuration containing secrets.

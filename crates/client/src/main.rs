@@ -601,6 +601,7 @@ async fn run_dash_connection(
                 return Ok(());
             }
             _ = frame_tick.tick() => {
+                let publish_started = Instant::now();
                 let frame = normalize_dash_input(
                     capture.capture_dash_frame(args.max_frame_width, args.max_frame_height).await?,
                     Some((width, height)),
@@ -624,12 +625,14 @@ async fn run_dash_connection(
                 let bytes = object.payload.len();
                 let sent_sequence = object.header.sequence;
                 send_new_dash_object(&mut socket, resend, object).await?;
+                let capture_to_ack_ms = publish_started.elapsed().as_millis();
                 debug!(
                     %stream_id,
                     sequence = sent_sequence,
                     media_index,
                     keyframe = encoded.keyframe,
                     bytes,
+                    capture_to_ack_ms,
                     "sent encrypted DASH media fragment"
                 );
                 media_index = media_index.saturating_add(1);

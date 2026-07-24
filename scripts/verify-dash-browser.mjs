@@ -32,6 +32,8 @@ const browser = await browserType.launch({
 try {
   const page = await browser.newPage();
   const errors = [];
+  let resolveNextLiveMedia = null;
+  let minimumLiveSequence = Number.MAX_SAFE_INTEGER;
   page.on('pageerror', error => errors.push(error.message));
   page.on('console', message => {
     if (
@@ -40,6 +42,20 @@ try {
     ) {
       errors.push(message.text());
     }
+  });
+  page.on('websocket', socket => {
+    socket.on('framereceived', event => {
+      if (!resolveNextLiveMedia || typeof event.payload !== 'string') return;
+      try {
+        const header = JSON.parse(event.payload);
+        if (header.kind !== 'Media' || header.sequence <= minimumLiveSequence) return;
+        const resolve = resolveNextLiveMedia;
+        resolveNextLiveMedia = null;
+        resolve(Date.now());
+      } catch {
+        // Non-JSON frames are diagnosed by the viewer itself.
+      }
+    });
   });
 
   await page.goto(`${origin}/dash/${streamId}`, { waitUntil: 'domcontentloaded' });
@@ -82,6 +98,40 @@ try {
     );
   }
   console.log('encrypted media and cursor events reached the browser');
+  const initialMediaCount = await page.evaluate(() => {
+    const match = (document.querySelector('#metrics')?.textContent || '')
+      .match(/(\d+) media fragments/);
+    return Number(match?.[1] || 0);
+  });
+  minimumLiveSequence = await page.evaluate(async id => {
+    const headers = await fetch(`/api/dash/streams/${id}/objects`, {
+      cache: 'no-store',
+    }).then(response => response.json());
+    return Math.max(0, ...headers.map(header => header.sequence));
+  }, streamId);
+  const announcedAt = await Promise.race([
+    new Promise(resolve => {
+      resolveNextLiveMedia = resolve;
+    }),
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('timed out waiting for a live media announcement')), 3_000);
+    }),
+  ]);
+  await page.waitForFunction(
+    previous => {
+      const match = (document.querySelector('#metrics')?.textContent || '')
+        .match(/(\d+) media fragments/);
+      return Number(match?.[1] || 0) > previous;
+    },
+    initialMediaCount,
+    { timeout: 3_000 },
+  );
+  const liveAppendLatencyMs = Date.now() - announcedAt;
+  if (liveAppendLatencyMs > 250) {
+    throw new Error(
+      `live media append took ${liveAppendLatencyMs} ms after its relay announcement`,
+    );
+  }
   await page.evaluate(async () => {
     const video = document.querySelector('#video');
     const start = video.buffered.start(0);
@@ -111,6 +161,7 @@ try {
       status: document.querySelector('#status')?.textContent || '',
     };
   });
+  result.liveAppendLatencyMs = liveAppendLatencyMs;
   const paintedVideo = await page.locator('#video').screenshot();
   result.paintedVideoBytes = paintedVideo.byteLength;
   if (paintedVideo.byteLength < 5_000) {
@@ -125,7 +176,8 @@ try {
   console.log(
     `PASS ${browserName}: ${result.width}x${result.height}, `
       + `buffer=${result.bufferedStart.toFixed(3)}..${result.bufferedEnd.toFixed(3)}, `
-      + `painted=${result.paintedVideoBytes} bytes, ${result.metrics}, status=${result.status}`,
+      + `live-append=${result.liveAppendLatencyMs}ms, painted=${result.paintedVideoBytes} bytes, `
+      + `${result.metrics}, status=${result.status}`,
   );
 } finally {
   await browser.close();
