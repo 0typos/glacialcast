@@ -97,11 +97,15 @@ struct Args {
     config: PathBuf,
     #[arg(long, default_value = "127.0.0.1:8900")]
     ingest_addr: SocketAddr,
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     ingest_token: Option<String>,
-    #[arg(long, env = "GLACIALCAST_INGEST_SERVER_KEY")]
+    #[arg(
+        long,
+        env = "GLACIALCAST_INGEST_SERVER_KEY",
+        allow_hyphen_values = true
+    )]
     ingest_server_key: Option<String>,
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     viewer_key: Option<String>,
     #[arg(long, conflicts_with = "viewer_key")]
     no_viewer_key: bool,
@@ -4286,6 +4290,23 @@ fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_line_accepts_url_safe_keys_that_begin_with_hyphens() {
+        let args = Args::try_parse_from([
+            "glacialcast-client",
+            "--ingest-token",
+            "-token",
+            "--ingest-server-key",
+            "-server-key",
+            "--viewer-key",
+            "-viewer-key",
+        ])
+        .unwrap();
+        assert_eq!(args.ingest_token.as_deref(), Some("-token"));
+        assert_eq!(args.ingest_server_key.as_deref(), Some("-server-key"));
+        assert_eq!(args.viewer_key.as_deref(), Some("-viewer-key"));
+    }
 
     #[test]
     fn unavailable_required_portal_cursor_metadata_is_fatal() {
