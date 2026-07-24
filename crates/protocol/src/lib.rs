@@ -15,6 +15,7 @@ pub mod daemon;
 
 pub const PROTOCOL_VERSION: u16 = 5;
 pub const MAX_FRAME_LEN: usize = 32 * 1024 * 1024;
+const MAX_WIRE_PACKET_LEN: usize = 65_535;
 pub const PORTABLE_DASH_MAGIC: &[u8; 4] = b"GCO1";
 const MAX_PORTABLE_DASH_HEADER_LEN: usize = 64 * 1024;
 const MAX_NOISE_PLAINTEXT_LEN: usize = 60 * 1024;
@@ -430,7 +431,7 @@ pub fn parse_human_bytes(value: &str) -> std::result::Result<u64, String> {
 }
 
 pub async fn write_clear_frame<W: AsyncWrite + Unpin>(writer: &mut W, data: &[u8]) -> Result<()> {
-    if data.len() > MAX_FRAME_LEN {
+    if data.len() > MAX_WIRE_PACKET_LEN {
         return Err(ProtocolError::FrameTooLarge(data.len()));
     }
     writer.write_u32(data.len() as u32).await?;
@@ -441,7 +442,7 @@ pub async fn write_clear_frame<W: AsyncWrite + Unpin>(writer: &mut W, data: &[u8
 
 pub async fn read_clear_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
     let len = reader.read_u32().await? as usize;
-    if len > MAX_FRAME_LEN {
+    if len > MAX_WIRE_PACKET_LEN {
         return Err(ProtocolError::FrameTooLarge(len));
     }
     let mut data = vec![0u8; len];
@@ -707,6 +708,15 @@ mod tests {
         assert!(matches!(
             decode_key_b64(&short),
             Err(ProtocolError::InvalidKeyLength(31))
+        ));
+    }
+
+    #[tokio::test]
+    async fn clear_frame_rejects_oversized_wire_packet_before_reading_payload() {
+        let advertised_length = (MAX_WIRE_PACKET_LEN as u32 + 1).to_be_bytes();
+        assert!(matches!(
+            read_clear_frame(&mut advertised_length.as_slice()).await,
+            Err(ProtocolError::FrameTooLarge(length)) if length == MAX_WIRE_PACKET_LEN + 1
         ));
     }
 
