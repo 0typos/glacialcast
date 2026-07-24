@@ -31,7 +31,9 @@ const browser = await browserType.launch({
 });
 
 try {
-  const page = await browser.newPage();
+  const page = await browser.newPage({
+    ignoreHTTPSErrors: process.env.GLACIALCAST_VERIFY_IGNORE_HTTPS_ERRORS === '1',
+  });
   const errors = [];
   let resolveNextLiveMedia = null;
   let minimumLiveSequence = Number.MAX_SAFE_INTEGER;
