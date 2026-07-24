@@ -1,10 +1,7 @@
 mod dash_store;
 mod storage;
 
-use crate::{
-    dash_store::DashStore,
-    storage::{Store, StoredFrame, StoredVideoChunk},
-};
+use crate::{dash_store::DashStore, storage::Store};
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
@@ -20,14 +17,14 @@ use axum::{
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use glacialcast_protocol::{
-    ClientMessage, ControlEvent, DashObjectHeader, FrameManifest, NOISE_KEY_LEN, NoiseKeypair,
-    ServerMessage, StreamHello, StreamMediaKind, VideoChunkManifest,
+    ClientMessage, ControlEvent, DashObjectHeader, NOISE_KEY_LEN, NoiseKeypair, ServerMessage,
+    StreamHello,
     daemon::{
         daemonize_if_requested, install_signal_handlers, manager_command, serve_control_socket,
         wait_for_shutdown,
     },
-    encode_noise_public_key, encode_ws_event, frame_is_encrypted, generate_noise_keypair, now_ms,
-    parse_human_bytes, responder_handshake,
+    encode_noise_public_key, encode_ws_event, generate_noise_keypair, now_ms, parse_human_bytes,
+    responder_handshake,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -328,7 +325,7 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
         return Ok(());
     }
 
-    let store = Store::open(args.data_dir.clone(), args.retention_bytes_per_stream)?;
+    let store = Store::open(args.data_dir.clone())?;
     let dash_store = DashStore::open(
         args.data_dir.join("dash"),
         args.retention_bytes_per_stream,
@@ -371,11 +368,6 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
         .route("/favicon.ico", get(favicon))
         .route("/api/streams", get(list_streams))
         .route("/api/streams/{stream_id}", delete(delete_stream))
-        .route("/api/streams/{stream_id}/frames", get(list_frames))
-        .route("/api/streams/{stream_id}/frames/{seq}", get(get_frame))
-        .route("/api/streams/{stream_id}/video", get(list_video_chunks))
-        .route("/api/streams/{stream_id}/video/{seq}", get(get_video_chunk))
-        .route("/api/streams/{stream_id}/cursors", get(list_cursors))
         .route("/api/ws", get(control_ws))
         .route(
             "/api/dash/streams/{stream_id}/manifest.mpd",
@@ -447,10 +439,7 @@ async fn list_streams(
     for stream in &mut streams {
         if let Some(summary) = dash_summaries.get(&stream.stream_id) {
             stream.retained_bytes = stream.retained_bytes.max(summary.bytes);
-            stream.last_frame_seq = match (stream.last_frame_seq, summary.last_sequence) {
-                (Some(left), Some(right)) => Some(left.max(right)),
-                (left, right) => left.or(right),
-            };
+            stream.last_object_sequence = summary.last_sequence;
         }
     }
     Ok(axum::Json(streams))
@@ -467,27 +456,6 @@ async fn delete_stream(
     } else {
         Err(AppError::NotFound)
     }
-}
-
-async fn list_frames(
-    State(state): State<AppState>,
-    Path(stream_id): Path<Uuid>,
-) -> Result<axum::Json<Vec<glacialcast_protocol::FrameManifest>>, AppError> {
-    Ok(axum::Json(state.store.list_frames(stream_id)?))
-}
-
-async fn list_video_chunks(
-    State(state): State<AppState>,
-    Path(stream_id): Path<Uuid>,
-) -> Result<axum::Json<Vec<glacialcast_protocol::VideoChunkManifest>>, AppError> {
-    Ok(axum::Json(state.store.list_video_chunks(stream_id)?))
-}
-
-async fn list_cursors(
-    State(state): State<AppState>,
-    Path(stream_id): Path<Uuid>,
-) -> Result<axum::Json<Vec<glacialcast_protocol::CursorMessage>>, AppError> {
-    Ok(axum::Json(state.store.list_cursors(stream_id, 5000)?))
 }
 
 async fn dash_manifest(
@@ -620,38 +588,6 @@ async fn dash_live_socket(socket: WebSocket, state: AppState, stream_id: Uuid) {
     send_task.abort();
 }
 
-async fn get_frame(
-    State(state): State<AppState>,
-    Path((stream_id, seq)): Path<(Uuid, u64)>,
-) -> Result<Response, AppError> {
-    let payload = state
-        .store
-        .get_frame_payload(stream_id, seq)?
-        .ok_or(AppError::NotFound)?;
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .header("x-glacialcast-mime", payload.frame.mime)
-        .body(Body::from(payload.bytes))
-        .unwrap())
-}
-
-async fn get_video_chunk(
-    State(state): State<AppState>,
-    Path((stream_id, seq)): Path<(Uuid, u64)>,
-) -> Result<Response, AppError> {
-    let payload = state
-        .store
-        .get_video_chunk_payload(stream_id, seq)?
-        .ok_or(AppError::NotFound)?;
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .header("x-glacialcast-mime", payload.chunk.mime)
-        .body(Body::from(payload.bytes))
-        .unwrap())
-}
-
 async fn control_ws(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(move |socket| control_socket(socket, state))
 }
@@ -713,7 +649,7 @@ async fn handle_ingest(mut stream: TcpStream, state: AppState) -> Result<()> {
                     accepted: false,
                     reason: Some(format!("expected hello, got {other:?}")),
                     stream_id: None,
-                    last_frame_seq: 0,
+                    last_sequence: 0,
                     server_time_ms: now_ms(),
                 })
                 .await?;
@@ -729,7 +665,7 @@ async fn handle_ingest(mut stream: TcpStream, state: AppState) -> Result<()> {
                     accepted: false,
                     reason: Some(err.to_string()),
                     stream_id: None,
-                    last_frame_seq: 0,
+                    last_sequence: 0,
                     server_time_ms: now_ms(),
                 })
                 .await?;
@@ -740,22 +676,14 @@ async fn handle_ingest(mut stream: TcpStream, state: AppState) -> Result<()> {
         &authenticated.identity,
         &hello.display_name,
         &hello.source,
-        hello.media_kind,
-        hello.frame_encrypted,
     )?;
-    let last_seq = state
-        .store
-        .last_frame_seq(stream_id)?
-        .into_iter()
-        .chain(state.dash_store.last_sequence(stream_id)?)
-        .max()
-        .unwrap_or(0);
+    let last_seq = state.dash_store.last_sequence(stream_id)?.unwrap_or(0);
     socket
         .write(&ServerMessage::HelloAck {
             accepted: true,
             reason: None,
             stream_id: Some(stream_id),
-            last_frame_seq: last_seq,
+            last_sequence: last_seq,
             server_time_ms: now_ms(),
         })
         .await?;
@@ -810,76 +738,10 @@ async fn ingest_loop(
     loop {
         let message = socket.read::<ClientMessage>().await;
         match message {
-            Ok(ClientMessage::Frame(frame)) => {
-                debug!(stream_id = %stream_id, seq = frame.seq, bytes = frame.ciphertext.len(), "ingest received image frame");
-                if !state.store.stream_exists(stream_id)? {
-                    anyhow::bail!("stream was deleted");
-                }
-                if hello.media_kind != StreamMediaKind::Image {
-                    anyhow::bail!("image frame received for a non-image stream");
-                }
-                if frame.stream_id != stream_id {
-                    anyhow::bail!("frame stream_id does not match assigned stream");
-                }
-                if frame.seq > last_seq + 1 && last_seq > 0 {
-                    socket
-                        .write(&ServerMessage::ResendRequest {
-                            from_seq: last_seq + 1,
-                            to_seq: frame.seq - 1,
-                        })
-                        .await?;
-                }
-                let stored = StoredFrame::from_message(&frame);
-                state.store.store_frame(stored, &frame.ciphertext)?;
-                last_seq = last_seq.max(frame.seq);
-                publish_frame_event(state, &frame);
-                socket
-                    .write(&ServerMessage::Ack {
-                        through_seq: last_seq,
-                    })
-                    .await?;
-                debug!(stream_id = %stream_id, through_seq = last_seq, "ingest sent image ack");
-            }
-            Ok(ClientMessage::VideoChunk(chunk)) => {
-                debug!(stream_id = %stream_id, seq = chunk.seq, bytes = chunk.payload.len(), "ingest received video chunk");
-                if !state.store.stream_exists(stream_id)? {
-                    anyhow::bail!("stream was deleted");
-                }
-                if hello.media_kind != StreamMediaKind::Video {
-                    anyhow::bail!("video chunk received for a non-video stream");
-                }
-                if chunk.stream_id != stream_id {
-                    anyhow::bail!("video chunk stream_id does not match assigned stream");
-                }
-                if frame_is_encrypted(&chunk.key_id) {
-                    anyhow::bail!("video chunks must not use application-level frame encryption");
-                }
-                if chunk.seq > last_seq + 1 && last_seq > 0 {
-                    socket
-                        .write(&ServerMessage::ResendRequest {
-                            from_seq: last_seq + 1,
-                            to_seq: chunk.seq - 1,
-                        })
-                        .await?;
-                }
-                let stored = StoredVideoChunk::from_message(&chunk);
-                state.store.store_video_chunk(stored, &chunk.payload)?;
-                last_seq = last_seq.max(chunk.seq);
-                publish_video_event(state, &chunk);
-                socket
-                    .write(&ServerMessage::Ack {
-                        through_seq: last_seq,
-                    })
-                    .await?;
-                debug!(stream_id = %stream_id, through_seq = last_seq, "ingest sent video ack");
-            }
             Ok(ClientMessage::DashObject(object)) => {
                 object.validate().context("validating DASH ingest object")?;
                 if !state.store.stream_exists(stream_id)? {
                     anyhow::bail!("stream was deleted");
-                }
-                if hello.media_kind != StreamMediaKind::Dash {
-                    anyhow::bail!("DASH object received for a non-DASH stream");
                 }
                 if object.header.stream_id != stream_id {
                     anyhow::bail!("DASH object stream_id does not match assigned stream");
@@ -901,26 +763,6 @@ async fn ingest_loop(
                     })
                     .await?;
             }
-            Ok(ClientMessage::Cursor(cursor)) => {
-                debug!(stream_id = %stream_id, seq = cursor.seq, x = cursor.x, y = cursor.y, "ingest received cursor");
-                if !state.store.stream_exists(stream_id)? {
-                    anyhow::bail!("stream was deleted");
-                }
-                if cursor.stream_id != stream_id {
-                    anyhow::bail!("cursor stream_id does not match assigned stream");
-                }
-                state.store.store_cursor(&cursor)?;
-                publish_cursor_event(state, &cursor);
-            }
-            Ok(ClientMessage::BufferStatus(status)) => {
-                debug!(
-                    stream_id = %stream_id,
-                    lowest_seq = ?status.lowest_seq,
-                    highest_seq = ?status.highest_seq,
-                    bytes = status.bytes,
-                    "ingest received buffer status"
-                );
-            }
             Ok(ClientMessage::Ping { .. }) => {
                 socket
                     .write(&ServerMessage::Pong { now_ms: now_ms() })
@@ -933,97 +775,37 @@ async fn ingest_loop(
 }
 
 fn publish_stream_event(state: &AppState, event: &str, stream_id: Uuid) {
-    publish_stream_event_with_seq(state, event, stream_id, None, None);
-}
-
-fn publish_stream_event_with_seq(
-    state: &AppState,
-    event: &str,
-    stream_id: Uuid,
-    seq: Option<u64>,
-    captured_at_ms: Option<i64>,
-) {
     let _ = state.events.send(ControlEvent {
         event: event.to_string(),
         stream_id,
-        seq,
-        captured_at_ms,
-        frame: None,
-        video: None,
-        cursor: None,
-    });
-}
-
-fn publish_frame_event(state: &AppState, frame: &glacialcast_protocol::FrameMessage) {
-    let manifest = FrameManifest {
-        stream_id: frame.stream_id,
-        seq: frame.seq,
-        captured_at_ms: frame.captured_at_ms,
-        width: frame.width,
-        height: frame.height,
-        mime: frame.mime.clone(),
-        key_id: frame.key_id.clone(),
-        nonce: frame.nonce,
-        content_hash: frame.content_hash,
-        size_bytes: frame.ciphertext.len() as u64,
-    };
-    let _ = state.events.send(ControlEvent {
-        event: "frame".to_string(),
-        stream_id: frame.stream_id,
-        seq: Some(frame.seq),
-        captured_at_ms: Some(frame.captured_at_ms),
-        frame: Some(manifest),
-        video: None,
-        cursor: None,
-    });
-}
-
-fn publish_video_event(state: &AppState, chunk: &glacialcast_protocol::VideoChunkMessage) {
-    let manifest = VideoChunkManifest {
-        stream_id: chunk.stream_id,
-        seq: chunk.seq,
-        captured_at_ms: chunk.captured_at_ms,
-        pts_ms: chunk.pts_ms,
-        duration_ms: chunk.duration_ms,
-        width: chunk.width,
-        height: chunk.height,
-        source_width: chunk.source_width,
-        source_height: chunk.source_height,
-        codec: chunk.codec,
-        packetization: chunk.packetization,
-        keyframe: chunk.keyframe,
-        mime: chunk.mime.clone(),
-        key_id: chunk.key_id.clone(),
-        nonce: chunk.nonce,
-        content_hash: chunk.content_hash,
-        size_bytes: chunk.payload.len() as u64,
-    };
-    let _ = state.events.send(ControlEvent {
-        event: "video".to_string(),
-        stream_id: chunk.stream_id,
-        seq: Some(chunk.seq),
-        captured_at_ms: Some(chunk.captured_at_ms),
-        frame: None,
-        video: Some(manifest),
-        cursor: None,
-    });
-}
-
-fn publish_cursor_event(state: &AppState, cursor: &glacialcast_protocol::CursorMessage) {
-    let _ = state.events.send(ControlEvent {
-        event: "cursor".to_string(),
-        stream_id: cursor.stream_id,
-        seq: Some(cursor.seq),
-        captured_at_ms: Some(cursor.captured_at_ms),
-        frame: None,
-        video: None,
-        cursor: Some(cursor.clone()),
     });
 }
 
 async fn authenticate_hello(state: &AppState, hello: &StreamHello) -> Result<AuthenticatedClient> {
     if hello.protocol_version != glacialcast_protocol::PROTOCOL_VERSION {
         anyhow::bail!("unsupported protocol version {}", hello.protocol_version);
+    }
+    if hello.display_name.trim().is_empty() || hello.display_name.len() > 256 {
+        anyhow::bail!("display_name must contain 1 to 256 bytes");
+    }
+    if hello.source.backend.trim().is_empty() || hello.source.backend.len() > 128 {
+        anyhow::bail!("source backend must contain 1 to 128 bytes");
+    }
+    if hello.source.description.trim().is_empty() || hello.source.description.len() > 1024 {
+        anyhow::bail!("source description must contain 1 to 1024 bytes");
+    }
+    if hello.source.width == 0
+        || hello.source.height == 0
+        || hello.source.width > 16_384
+        || hello.source.height > 16_384
+    {
+        anyhow::bail!("source dimensions must be between 1 and 16384");
+    }
+    if matches!(
+        (hello.resend_low, hello.resend_high),
+        (Some(low), Some(high)) if low > high
+    ) {
+        anyhow::bail!("resend range is inverted");
     }
 
     let identity = state

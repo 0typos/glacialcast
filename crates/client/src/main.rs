@@ -10,9 +10,8 @@ use glacialcast_dash::{
     build_encrypted_fragment, build_encrypted_init_segment, encrypt_cursor_batch,
 };
 use glacialcast_protocol::{
-    BufferStatus, CaptureSource, ClientMessage, CursorBitmap, CursorMessage, DashObject,
-    DashObjectKind, NewDashObject, NoiseSocket, PROTOCOL_VERSION, ServerMessage, StreamHello,
-    StreamMediaKind,
+    CaptureSource, ClientMessage, DashObject, DashObjectKind, NewDashObject, NoiseSocket,
+    PROTOCOL_VERSION, ServerMessage, StreamHello,
     daemon::{
         daemonize_if_requested, install_signal_handlers, manager_command,
         sanitize_socket_component, serve_control_socket, wait_for_shutdown,
@@ -73,6 +72,24 @@ const DMA_BUF_SYNC_READ: u64 = 1 << 0;
 const DMA_BUF_SYNC_END: u64 = 1 << 2;
 const PIPEWIRE_CURSOR_DEFAULT_BITMAP_SIDE: usize = 64;
 const PIPEWIRE_CURSOR_METADATA_GRACE: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CursorBitmap {
+    width: u32,
+    height: u32,
+    hotspot_x: i32,
+    hotspot_y: i32,
+    png_b64: String,
+}
+
+#[derive(Debug, Clone)]
+struct CursorMessage {
+    x: f32,
+    y: f32,
+    source_width: u32,
+    source_height: u32,
+    bitmap: Option<CursorBitmap>,
+}
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -398,8 +415,6 @@ async fn run_dash_connection(
             auth_token: identity.auth_token.clone(),
             display_name: identity.display_name.clone(),
             source: source.clone(),
-            media_kind: StreamMediaKind::Dash,
-            frame_encrypted: true,
             resend_low: low,
             resend_high: high,
         }))
@@ -408,9 +423,9 @@ async fn run_dash_connection(
         ServerMessage::HelloAck {
             accepted: true,
             stream_id: Some(stream_id),
-            last_frame_seq,
+            last_sequence,
             ..
-        } => (stream_id, last_frame_seq),
+        } => (stream_id, last_sequence),
         ServerMessage::HelloAck { reason, .. } => bail!("server rejected hello: {reason:?}"),
         other => bail!("server sent unexpected first response: {other:?}"),
     };
@@ -617,7 +632,7 @@ async fn run_dash_connection(
             }
             _ = cursor_tick.tick() => {
                 cursor_sequence = cursor_sequence.saturating_add(1);
-                if let Some(cursor) = capture.cursor(cursor_sequence, stream_id).await? {
+                if let Some(cursor) = capture.cursor(cursor_sequence).await? {
                     let timestamp = duration_to_media_ticks(epoch_started.elapsed());
                     pending_cursor_events.push(cursor_to_dash_event(
                         cursor,
@@ -900,14 +915,7 @@ async fn send_new_dash_object(
     let stream_id = object.header.stream_id;
     resend.push(object.clone());
     socket.write(&ClientMessage::DashObject(object)).await?;
-    socket
-        .write(&ClientMessage::BufferStatus(BufferStatus {
-            stream_id,
-            lowest_seq: resend.range().0,
-            highest_seq: resend.range().1,
-            bytes: resend.bytes,
-        }))
-        .await?;
+    debug!(%stream_id, buffered_bytes = resend.bytes, "DASH object queued for acknowledgement");
     wait_for_dash_ack(socket, resend).await?;
     Ok(())
 }
@@ -937,9 +945,6 @@ async fn wait_for_dash_ack(
             ServerMessage::Backpressure { pause_ms, reason } => {
                 warn!(pause_ms, %reason, "server requested DASH publisher backpressure");
                 tokio::time::sleep(Duration::from_millis(pause_ms)).await;
-            }
-            ServerMessage::KeyframeRequest { reason, .. } => {
-                debug!(%reason, "server requested a keyframe; next DASH segment already starts with one");
             }
             ServerMessage::Pong { .. } | ServerMessage::HelloAck { .. } => {}
         }
@@ -1078,7 +1083,7 @@ trait Capture: Send {
             self.capture_rgb(max_width, max_height).await?,
         ))
     }
-    async fn cursor(&mut self, seq: u64, stream_id: Uuid) -> Result<Option<CursorMessage>>;
+    async fn cursor(&mut self, seq: u64) -> Result<Option<CursorMessage>>;
 }
 
 struct TestPatternCapture {
@@ -1132,12 +1137,9 @@ impl Capture for TestPatternCapture {
         ))
     }
 
-    async fn cursor(&mut self, seq: u64, stream_id: Uuid) -> Result<Option<CursorMessage>> {
+    async fn cursor(&mut self, seq: u64) -> Result<Option<CursorMessage>> {
         let t = seq as f32 / 30.0;
         Ok(Some(CursorMessage {
-            stream_id,
-            seq,
-            captured_at_ms: now_ms(),
             x: ((t.sin() + 1.0) * 0.5) * self.width as f32,
             y: ((t.cos() + 1.0) * 0.5) * self.height as f32,
             source_width: self.width,
@@ -1231,12 +1233,12 @@ impl Capture for WaylandPipewireCapture {
         }
     }
 
-    async fn cursor(&mut self, seq: u64, stream_id: Uuid) -> Result<Option<CursorMessage>> {
+    async fn cursor(&mut self, _seq: u64) -> Result<Option<CursorMessage>> {
         Ok(self
             .ensure_started()
             .await?
             .next_cursor_sample()
-            .map(|sample| sample.to_message(seq, stream_id)))
+            .map(|sample| sample.to_message()))
     }
 }
 
@@ -1465,7 +1467,6 @@ struct RawFrame {
 #[derive(Clone)]
 struct PipewireCursorSample {
     serial: u64,
-    captured_at_ms: i64,
     x: f32,
     y: f32,
     source_width: u32,
@@ -1474,11 +1475,8 @@ struct PipewireCursorSample {
 }
 
 impl PipewireCursorSample {
-    fn to_message(&self, seq: u64, stream_id: Uuid) -> CursorMessage {
+    fn to_message(&self) -> CursorMessage {
         CursorMessage {
-            stream_id,
-            seq,
-            captured_at_ms: self.captured_at_ms,
             x: self.x,
             y: self.y,
             source_width: self.source_width,
@@ -1690,7 +1688,6 @@ fn pipewire_cursor_sample(
     *cursor_serial = cursor_serial.wrapping_add(1);
     let sample = PipewireCursorSample {
         serial: *cursor_serial,
-        captured_at_ms: now_ms(),
         x: state.x.clamp(0, source_width.min(i32::MAX as u32) as i32) as f32,
         y: state.y.clamp(0, source_height.min(i32::MAX as u32) as i32) as f32,
         source_width,
@@ -4524,10 +4521,7 @@ mod tests {
             hotspot_y: 0,
             png_b64: encode_cursor_png_b64(2, 1, &rgba).unwrap(),
         };
-        let message = |seq, bitmap| CursorMessage {
-            stream_id: Uuid::from_u128(1),
-            seq,
-            captured_at_ms: 0,
+        let message = |bitmap| CursorMessage {
             x: 10.0,
             y: 20.0,
             source_width: 100,
@@ -4536,12 +4530,10 @@ mod tests {
         };
         let mut state = DashCursorBitmapState::default();
         let first =
-            cursor_to_dash_event(message(1, Some(bitmap.clone())), 10, 100, 100, &mut state)
-                .unwrap();
+            cursor_to_dash_event(message(Some(bitmap.clone())), 10, 100, 100, &mut state).unwrap();
         let repeated =
-            cursor_to_dash_event(message(2, Some(bitmap)), 20, 100, 100, &mut state).unwrap();
-        let position_only =
-            cursor_to_dash_event(message(3, None), 30, 100, 100, &mut state).unwrap();
+            cursor_to_dash_event(message(Some(bitmap)), 20, 100, 100, &mut state).unwrap();
+        let position_only = cursor_to_dash_event(message(None), 30, 100, 100, &mut state).unwrap();
 
         assert!(first.bitmap.is_some());
         assert!(repeated.bitmap.is_none());

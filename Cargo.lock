@@ -1081,14 +1081,12 @@ dependencies = [
 name = "glacialcast-protocol"
 version = "0.2.0"
 dependencies = [
- "aes-gcm",
  "anyhow",
  "base64",
  "bytes",
  "glacialcast-dash",
  "libc",
  "postcard",
- "rand 0.8.6",
  "serde",
  "serde_json",
  "sha2",

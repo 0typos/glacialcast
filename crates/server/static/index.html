@@ -171,14 +171,14 @@
       const metadata = appendText(
         details,
         'meta',
-        `${status} · ${stream.media_kind} · ${formatBytes(stream.retained_bytes)} retained`
+        `${status} · encrypted DASH · ${formatBytes(stream.retained_bytes)} retained`
       );
       const badge = document.createElement('span');
       badge.className = `badge${stream.active ? '' : ' offline'}`;
       badge.textContent = status;
       metadata.textContent = '';
       metadata.append(badge, document.createTextNode(
-        `${stream.media_kind} · ${formatBytes(stream.retained_bytes)} retained`
+        `encrypted DASH · ${formatBytes(stream.retained_bytes)} retained`
       ));
       appendText(
         details,
@@ -188,13 +188,11 @@
 
       const actions = document.createElement('div');
       actions.className = 'actions';
-      if (stream.media_kind === 'Dash') {
-        const open = document.createElement('a');
-        open.className = 'action';
-        open.href = `/dash/${encodeURIComponent(stream.stream_id)}`;
-        open.textContent = 'Open viewer';
-        actions.append(open);
-      }
+      const open = document.createElement('a');
+      open.className = 'action';
+      open.href = `/dash/${encodeURIComponent(stream.stream_id)}`;
+      open.textContent = 'Open viewer';
+      actions.append(open);
       const remove = document.createElement('button');
       remove.className = 'danger';
       remove.type = 'button';
