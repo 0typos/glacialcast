@@ -23,6 +23,14 @@ pub const DEFAULT_FRAME_DURATION: u32 = MEDIA_TIMESCALE;
 pub const DEFAULT_SEGMENT_FRAMES: u16 = 4;
 pub const MAX_MEDIA_PAYLOAD: usize = 32 * 1024 * 1024;
 pub const MAX_CURSOR_PAYLOAD: usize = 4 * 1024 * 1024;
+pub const MAX_CURSOR_BITMAP_SIDE: u32 = 512;
+const ENCRYPTED_CURSOR_HEADER_LEN: usize = 16;
+const AES_GCM_TAG_LEN: usize = 16;
+const MAX_CURSOR_PLAINTEXT: usize =
+    MAX_CURSOR_PAYLOAD - ENCRYPTED_CURSOR_HEADER_LEN - AES_GCM_TAG_LEN;
+const CURSOR_BATCH_HEADER_LEN: usize = 14;
+const CURSOR_EVENT_LEN: usize = 33;
+const CURSOR_BITMAP_HEADER_LEN: usize = 20;
 
 #[derive(Debug, Error)]
 pub enum DashError {
@@ -195,11 +203,8 @@ pub struct EncryptedCursorBatch {
 
 impl EncryptedCursorBatch {
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        const HEADER_LEN: usize = 16;
-        if self.ciphertext.len().saturating_add(HEADER_LEN) > MAX_CURSOR_PAYLOAD {
-            return Err(DashError::CursorTooLarge);
-        }
-        let mut bytes = Vec::with_capacity(HEADER_LEN + self.ciphertext.len());
+        validate_encrypted_cursor_batch(self)?;
+        let mut bytes = Vec::with_capacity(ENCRYPTED_CURSOR_HEADER_LEN + self.ciphertext.len());
         bytes.extend_from_slice(b"GCE1");
         bytes.extend_from_slice(&self.nonce);
         bytes.extend_from_slice(&self.ciphertext);
@@ -207,7 +212,10 @@ impl EncryptedCursorBatch {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < 16 || bytes.len() > MAX_CURSOR_PAYLOAD || &bytes[..4] != b"GCE1" {
+        if bytes.len() < ENCRYPTED_CURSOR_HEADER_LEN + AES_GCM_TAG_LEN
+            || bytes.len() > MAX_CURSOR_PAYLOAD
+            || &bytes[..4] != b"GCE1"
+        {
             return Err(DashError::InvalidCursorPayload);
         }
         let mut nonce = [0u8; 12];
@@ -235,10 +243,8 @@ pub fn encrypt_cursor_batch(
     batch: &CursorBatch,
 ) -> Result<EncryptedCursorBatch> {
     validate_cursor_batch(batch)?;
+    validate_cursor_context(batch, context)?;
     let plaintext = encode_cursor_batch(batch)?;
-    if plaintext.len() > MAX_CURSOR_PAYLOAD {
-        return Err(DashError::CursorTooLarge);
-    }
     let mut nonce = [0u8; 12];
     OsRng.fill_bytes(&mut nonce);
     let cipher = Aes256Gcm::new((&keys.cursor_key).into());
@@ -259,6 +265,7 @@ pub fn decrypt_cursor_batch(
     context: CursorContext,
     encrypted: &EncryptedCursorBatch,
 ) -> Result<CursorBatch> {
+    validate_encrypted_cursor_batch(encrypted)?;
     let cipher = Aes256Gcm::new((&keys.cursor_key).into());
     let plaintext = cipher
         .decrypt(
@@ -271,12 +278,14 @@ pub fn decrypt_cursor_batch(
         .map_err(|_| DashError::Crypto)?;
     let batch = decode_cursor_batch(&plaintext)?;
     validate_cursor_batch(&batch)?;
+    validate_cursor_context(&batch, context)?;
     Ok(batch)
 }
 
 fn encode_cursor_batch(batch: &CursorBatch) -> Result<Vec<u8>> {
+    let encoded_len = cursor_batch_encoded_len(batch)?;
     let event_count = u16::try_from(batch.events.len()).map_err(|_| DashError::CursorTooLarge)?;
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(encoded_len);
     bytes.extend_from_slice(b"GCC1");
     bytes.extend_from_slice(&batch.source_width.to_be_bytes());
     bytes.extend_from_slice(&batch.source_height.to_be_bytes());
@@ -301,15 +310,13 @@ fn encode_cursor_batch(batch: &CursorBatch) -> Result<Vec<u8>> {
             bytes.extend_from_slice(&rgba_len.to_be_bytes());
             bytes.extend_from_slice(&bitmap.rgba);
         }
-        if bytes.len() > MAX_CURSOR_PAYLOAD {
-            return Err(DashError::CursorTooLarge);
-        }
     }
+    debug_assert_eq!(bytes.len(), encoded_len);
     Ok(bytes)
 }
 
 fn decode_cursor_batch(bytes: &[u8]) -> Result<CursorBatch> {
-    if bytes.len() > MAX_CURSOR_PAYLOAD {
+    if bytes.len() > MAX_CURSOR_PLAINTEXT {
         return Err(DashError::CursorTooLarge);
     }
     let mut reader = CursorReader::new(bytes);
@@ -319,6 +326,12 @@ fn decode_cursor_batch(bytes: &[u8]) -> Result<CursorBatch> {
     let source_width = reader.u32()?;
     let source_height = reader.u32()?;
     let event_count = reader.u16()?;
+    let minimum_event_bytes = usize::from(event_count)
+        .checked_mul(CURSOR_EVENT_LEN)
+        .ok_or(DashError::InvalidCursorPayload)?;
+    if reader.remaining() < minimum_event_bytes {
+        return Err(DashError::InvalidCursorPayload);
+    }
     let mut events = Vec::with_capacity(usize::from(event_count));
     for _ in 0..event_count {
         let timestamp = reader.u64()?;
@@ -435,14 +448,55 @@ impl<'a> CursorReader<'a> {
     fn is_empty(&self) -> bool {
         self.offset == self.bytes.len()
     }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
+    }
 }
 
 fn validate_cursor_batch(batch: &CursorBatch) -> Result<()> {
-    if batch.source_width == 0 || batch.source_height == 0 {
-        return Err(DashError::CursorTooLarge);
+    if batch.source_width == 0
+        || batch.source_height == 0
+        || batch.source_width > u32::from(u16::MAX)
+        || batch.source_height > u32::from(u16::MAX)
+        || batch.events.is_empty()
+    {
+        return Err(DashError::InvalidCursorPayload);
     }
+    let max_x = i64::from(batch.source_width)
+        .checked_mul(1_000_000)
+        .ok_or(DashError::InvalidCursorPayload)?;
+    let max_y = i64::from(batch.source_height)
+        .checked_mul(1_000_000)
+        .ok_or(DashError::InvalidCursorPayload)?;
+    let mut previous_timestamp = None;
     for event in &batch.events {
+        if previous_timestamp.is_some_and(|previous| event.timestamp < previous) {
+            return Err(DashError::InvalidCursorPayload);
+        }
+        previous_timestamp = Some(event.timestamp);
+        if event.visible {
+            if !(0..=max_x).contains(&event.x_micropixels)
+                || !(0..=max_y).contains(&event.y_micropixels)
+            {
+                return Err(DashError::InvalidCursorPayload);
+            }
+        } else if event.x_micropixels != 0 || event.y_micropixels != 0 || event.bitmap.is_some() {
+            return Err(DashError::InvalidCursorPayload);
+        }
         if let Some(bitmap) = &event.bitmap {
+            if event.bitmap_id == 0
+                || bitmap.width == 0
+                || bitmap.height == 0
+                || bitmap.width > MAX_CURSOR_BITMAP_SIDE
+                || bitmap.height > MAX_CURSOR_BITMAP_SIDE
+                || bitmap.hotspot_x < 0
+                || bitmap.hotspot_y < 0
+                || bitmap.hotspot_x >= bitmap.width as i32
+                || bitmap.hotspot_y >= bitmap.height as i32
+            {
+                return Err(DashError::InvalidCursorPayload);
+            }
             let expected = usize::try_from(bitmap.width)
                 .ok()
                 .and_then(|width| {
@@ -452,9 +506,57 @@ fn validate_cursor_batch(batch: &CursorBatch) -> Result<()> {
                 })
                 .and_then(|pixels| pixels.checked_mul(4));
             if expected != Some(bitmap.rgba.len()) {
-                return Err(DashError::CursorTooLarge);
+                return Err(DashError::InvalidCursorPayload);
             }
         }
+    }
+    cursor_batch_encoded_len(batch)?;
+    Ok(())
+}
+
+fn validate_cursor_context(batch: &CursorBatch, context: CursorContext) -> Result<()> {
+    if context.stream_id.is_nil()
+        || context.epoch_id.is_nil()
+        || batch.source_width != context.source_width
+        || batch.source_height != context.source_height
+        || batch.events.first().map(|event| event.timestamp) != Some(context.start_timestamp)
+    {
+        return Err(DashError::InvalidCursorPayload);
+    }
+    Ok(())
+}
+
+fn cursor_batch_encoded_len(batch: &CursorBatch) -> Result<usize> {
+    u16::try_from(batch.events.len()).map_err(|_| DashError::CursorTooLarge)?;
+    let mut length = CURSOR_BATCH_HEADER_LEN;
+    for event in &batch.events {
+        length = length
+            .checked_add(CURSOR_EVENT_LEN)
+            .ok_or(DashError::CursorTooLarge)?;
+        if let Some(bitmap) = &event.bitmap {
+            length = length
+                .checked_add(CURSOR_BITMAP_HEADER_LEN)
+                .and_then(|length| length.checked_add(bitmap.rgba.len()))
+                .ok_or(DashError::CursorTooLarge)?;
+        }
+        if length > MAX_CURSOR_PLAINTEXT {
+            return Err(DashError::CursorTooLarge);
+        }
+    }
+    Ok(length)
+}
+
+fn validate_encrypted_cursor_batch(encrypted: &EncryptedCursorBatch) -> Result<()> {
+    if encrypted.ciphertext.len() < AES_GCM_TAG_LEN {
+        return Err(DashError::InvalidCursorPayload);
+    }
+    if encrypted
+        .ciphertext
+        .len()
+        .saturating_add(ENCRYPTED_CURSOR_HEADER_LEN)
+        > MAX_CURSOR_PAYLOAD
+    {
+        return Err(DashError::CursorTooLarge);
     }
     Ok(())
 }
@@ -1012,6 +1114,48 @@ mod tests {
         }
     }
 
+    fn cursor_fixture() -> CursorBatch {
+        CursorBatch {
+            source_width: 320,
+            source_height: 180,
+            events: vec![
+                CursorEvent {
+                    timestamp: 100,
+                    x_micropixels: 1_500_000,
+                    y_micropixels: 250_000,
+                    visible: true,
+                    bitmap_id: 9,
+                    bitmap: Some(CursorBitmap {
+                        width: 2,
+                        height: 1,
+                        hotspot_x: 1,
+                        hotspot_y: 0,
+                        rgba: vec![1, 2, 3, 4, 5, 6, 7, 8],
+                    }),
+                },
+                CursorEvent {
+                    timestamp: 200,
+                    x_micropixels: 0,
+                    y_micropixels: 0,
+                    visible: false,
+                    bitmap_id: 9,
+                    bitmap: None,
+                },
+            ],
+        }
+    }
+
+    fn cursor_context(batch: &CursorBatch) -> CursorContext {
+        CursorContext {
+            stream_id: Uuid::from_u128(1),
+            epoch_id: Uuid::from_u128(2),
+            sequence: 4,
+            start_timestamp: batch.events[0].timestamp,
+            source_width: batch.source_width,
+            source_height: batch.source_height,
+        }
+    }
+
     #[test]
     fn epoch_keys_are_stable_and_scoped() {
         let viewer_key = [7u8; 32];
@@ -1033,7 +1177,7 @@ mod tests {
             stream_id: Uuid::from_u128(1),
             epoch_id: Uuid::from_u128(2),
             sequence: 4,
-            start_timestamp: 90_000,
+            start_timestamp: 91_500,
             source_width: 1920,
             source_height: 1080,
         };
@@ -1064,41 +1208,14 @@ mod tests {
 
     #[test]
     fn cursor_batch_binary_encoding_is_compact_and_round_trips_bitmaps() {
-        let batch = CursorBatch {
-            source_width: 320,
-            source_height: 180,
-            events: vec![
-                CursorEvent {
-                    timestamp: 100,
-                    x_micropixels: 1_500_000,
-                    y_micropixels: -250_000,
-                    visible: true,
-                    bitmap_id: 9,
-                    bitmap: Some(CursorBitmap {
-                        width: 2,
-                        height: 1,
-                        hotspot_x: 1,
-                        hotspot_y: 0,
-                        rgba: vec![1, 2, 3, 4, 5, 6, 7, 8],
-                    }),
-                },
-                CursorEvent {
-                    timestamp: 200,
-                    x_micropixels: 2_500_000,
-                    y_micropixels: 750_000,
-                    visible: false,
-                    bitmap_id: 9,
-                    bitmap: None,
-                },
-            ],
-        };
+        let batch = cursor_fixture();
         let encoded = encode_cursor_batch(&batch).unwrap();
         assert_eq!(decode_cursor_batch(&encoded).unwrap(), batch);
         assert!(encoded.len() < serde_json::to_vec(&batch).unwrap().len());
 
         let encrypted = EncryptedCursorBatch {
             nonce: [7; 12],
-            ciphertext: encoded,
+            ciphertext: vec![8; AES_GCM_TAG_LEN],
         };
         let payload = encrypted.to_bytes().unwrap();
         assert_eq!(
@@ -1106,6 +1223,233 @@ mod tests {
             encrypted
         );
         assert!(EncryptedCursorBatch::from_bytes(&payload[..15]).is_err());
+    }
+
+    #[test]
+    fn cursor_batch_rejects_context_mismatches_before_encryption() {
+        let keys = EpochKeys::derive(&[9u8; 32], Uuid::from_u128(1), Uuid::from_u128(2)).unwrap();
+        let batch = cursor_fixture();
+        let context = cursor_context(&batch);
+
+        for invalid in [
+            CursorContext {
+                stream_id: Uuid::nil(),
+                ..context
+            },
+            CursorContext {
+                epoch_id: Uuid::nil(),
+                ..context
+            },
+            CursorContext {
+                start_timestamp: context.start_timestamp + 1,
+                ..context
+            },
+            CursorContext {
+                source_width: context.source_width + 1,
+                ..context
+            },
+            CursorContext {
+                source_height: context.source_height + 1,
+                ..context
+            },
+        ] {
+            assert!(matches!(
+                encrypt_cursor_batch(&keys, invalid, &batch),
+                Err(DashError::InvalidCursorPayload)
+            ));
+        }
+    }
+
+    #[test]
+    fn cursor_batch_rejects_invalid_timeline_and_positions() {
+        let assert_invalid = |batch: CursorBatch| {
+            assert!(matches!(
+                validate_cursor_batch(&batch),
+                Err(DashError::InvalidCursorPayload)
+            ));
+        };
+
+        let mut batch = cursor_fixture();
+        batch.events.clear();
+        assert_invalid(batch);
+
+        let mut batch = cursor_fixture();
+        batch.events[1].timestamp = batch.events[0].timestamp - 1;
+        assert_invalid(batch);
+
+        for (x, y) in [
+            (-1, 0),
+            (0, -1),
+            (i64::from(cursor_fixture().source_width) * 1_000_000 + 1, 0),
+            (0, i64::from(cursor_fixture().source_height) * 1_000_000 + 1),
+        ] {
+            let mut batch = cursor_fixture();
+            batch.events[0].x_micropixels = x;
+            batch.events[0].y_micropixels = y;
+            assert_invalid(batch);
+        }
+
+        let mut batch = cursor_fixture();
+        batch.events[1].x_micropixels = 1;
+        assert_invalid(batch);
+
+        let mut batch = cursor_fixture();
+        batch.events[1].bitmap = batch.events[0].bitmap.clone();
+        assert_invalid(batch);
+
+        let mut batch = cursor_fixture();
+        batch.source_width = 0;
+        assert_invalid(batch);
+
+        let mut batch = cursor_fixture();
+        batch.source_height = u32::from(u16::MAX) + 1;
+        assert_invalid(batch);
+    }
+
+    #[test]
+    fn cursor_batch_accepts_position_boundaries() {
+        let mut batch = cursor_fixture();
+        batch.events[0].x_micropixels = i64::from(batch.source_width) * 1_000_000;
+        batch.events[0].y_micropixels = i64::from(batch.source_height) * 1_000_000;
+        validate_cursor_batch(&batch).unwrap();
+    }
+
+    #[test]
+    fn cursor_batch_rejects_invalid_bitmap_metadata() {
+        let assert_invalid_bitmap = |mutate: fn(&mut CursorEvent, &mut CursorBitmap)| {
+            let mut batch = cursor_fixture();
+            let mut bitmap = batch.events[0].bitmap.take().unwrap();
+            mutate(&mut batch.events[0], &mut bitmap);
+            batch.events[0].bitmap = Some(bitmap);
+            assert!(matches!(
+                validate_cursor_batch(&batch),
+                Err(DashError::InvalidCursorPayload)
+            ));
+        };
+
+        assert_invalid_bitmap(|event, _| event.bitmap_id = 0);
+        assert_invalid_bitmap(|_, bitmap| bitmap.width = 0);
+        assert_invalid_bitmap(|_, bitmap| bitmap.height = MAX_CURSOR_BITMAP_SIDE + 1);
+        assert_invalid_bitmap(|_, bitmap| bitmap.hotspot_x = -1);
+        assert_invalid_bitmap(|_, bitmap| bitmap.hotspot_y = bitmap.height as i32);
+        assert_invalid_bitmap(|_, bitmap| {
+            bitmap.rgba.pop();
+        });
+    }
+
+    #[test]
+    fn cursor_batch_rejects_payloads_that_exceed_encrypted_limit() {
+        let rgba = vec![0; MAX_CURSOR_BITMAP_SIDE as usize * MAX_CURSOR_BITMAP_SIDE as usize * 4];
+        let bitmap = CursorBitmap {
+            width: MAX_CURSOR_BITMAP_SIDE,
+            height: MAX_CURSOR_BITMAP_SIDE,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            rgba,
+        };
+        let mut batch = CursorBatch {
+            source_width: 320,
+            source_height: 180,
+            events: Vec::new(),
+        };
+        for timestamp in 0..4 {
+            batch.events.push(CursorEvent {
+                timestamp,
+                x_micropixels: 0,
+                y_micropixels: 0,
+                visible: true,
+                bitmap_id: timestamp + 1,
+                bitmap: Some(bitmap.clone()),
+            });
+        }
+        assert!(matches!(
+            validate_cursor_batch(&batch),
+            Err(DashError::CursorTooLarge)
+        ));
+    }
+
+    #[test]
+    fn cursor_binary_decoder_rejects_all_truncations_and_trailing_data() {
+        let encoded = encode_cursor_batch(&cursor_fixture()).unwrap();
+        for end in 0..encoded.len() {
+            assert!(
+                decode_cursor_batch(&encoded[..end]).is_err(),
+                "accepted cursor payload truncated at byte {end}"
+            );
+        }
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(matches!(
+            decode_cursor_batch(&trailing),
+            Err(DashError::InvalidCursorPayload)
+        ));
+
+        let mut bad_flags = encoded;
+        bad_flags[CURSOR_BATCH_HEADER_LEN + 24] = 0x80;
+        assert!(matches!(
+            decode_cursor_batch(&bad_flags),
+            Err(DashError::InvalidCursorPayload)
+        ));
+    }
+
+    #[test]
+    fn cursor_binary_decoder_preflights_claimed_event_count() {
+        let mut payload = Vec::from(&b"GCC1"[..]);
+        payload.extend_from_slice(&320u32.to_be_bytes());
+        payload.extend_from_slice(&180u32.to_be_bytes());
+        payload.extend_from_slice(&u16::MAX.to_be_bytes());
+        assert!(matches!(
+            decode_cursor_batch(&payload),
+            Err(DashError::InvalidCursorPayload)
+        ));
+    }
+
+    #[test]
+    fn encrypted_cursor_envelope_enforces_magic_tag_and_size() {
+        let too_short = EncryptedCursorBatch {
+            nonce: [0; 12],
+            ciphertext: vec![0; AES_GCM_TAG_LEN - 1],
+        };
+        assert!(matches!(
+            too_short.to_bytes(),
+            Err(DashError::InvalidCursorPayload)
+        ));
+
+        let too_large = EncryptedCursorBatch {
+            nonce: [0; 12],
+            ciphertext: vec![0; MAX_CURSOR_PAYLOAD - ENCRYPTED_CURSOR_HEADER_LEN + 1],
+        };
+        assert!(matches!(
+            too_large.to_bytes(),
+            Err(DashError::CursorTooLarge)
+        ));
+
+        let mut wrong_magic = vec![0; ENCRYPTED_CURSOR_HEADER_LEN + AES_GCM_TAG_LEN];
+        wrong_magic[..4].copy_from_slice(b"NOPE");
+        assert!(matches!(
+            EncryptedCursorBatch::from_bytes(&wrong_magic),
+            Err(DashError::InvalidCursorPayload)
+        ));
+    }
+
+    #[test]
+    fn cursor_decryption_rejects_malformed_envelopes_before_crypto() {
+        let batch = cursor_fixture();
+        let keys = EpochKeys::derive(
+            &[9u8; 32],
+            cursor_context(&batch).stream_id,
+            cursor_context(&batch).epoch_id,
+        )
+        .unwrap();
+        let malformed = EncryptedCursorBatch {
+            nonce: [0; 12],
+            ciphertext: vec![0; AES_GCM_TAG_LEN - 1],
+        };
+        assert!(matches!(
+            decrypt_cursor_batch(&keys, cursor_context(&batch), &malformed),
+            Err(DashError::InvalidCursorPayload)
+        ));
     }
 
     #[test]
