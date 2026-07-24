@@ -510,10 +510,20 @@ pub fn client_ip(headers: &HeaderMap, peer: IpAddr, trust_forwarded_for: bool) -
     else {
         return peer;
     };
-    if value.contains(',') || value.trim() != value {
+    if value.len() > 512 || value.trim() != value {
         return peer;
     }
-    value.parse().unwrap_or(peer)
+    let addresses: Option<Vec<IpAddr>> = value
+        .split(',')
+        .map(|value| value.trim().parse::<IpAddr>().ok())
+        .collect();
+    let Some(addresses) = addresses else {
+        return peer;
+    };
+    if addresses.is_empty() || addresses.len() > 16 {
+        return peer;
+    }
+    addresses[0]
 }
 
 fn unix_time_seconds() -> Result<u64> {
@@ -768,6 +778,11 @@ mod tests {
             "x-forwarded-for",
             "198.51.100.2, 203.0.113.8".parse().unwrap(),
         );
+        assert_eq!(
+            client_ip(&headers, peer, true),
+            "198.51.100.2".parse::<IpAddr>().unwrap()
+        );
+        headers.insert("x-forwarded-for", "invalid, 203.0.113.8".parse().unwrap());
         assert_eq!(client_ip(&headers, peer, true), peer);
     }
 }

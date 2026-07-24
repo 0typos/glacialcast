@@ -79,11 +79,13 @@ principal's token, role, or scope change changes its session version and
 invalidates prior sessions after configuration reload through a relay restart.
 
 HTTP requests, browser WebSockets, publisher connections, login attempts, and
-authenticated request rates are bounded. Noise handshakes and idle publisher
-connections have deadlines. The publisher resolves DNS names and reconnects
-with capped exponential backoff and jitter. Health endpoints and
-administrator-only counters expose availability and rejection signals without
-exposing stream contents or credentials.
+authenticated request rates are bounded. Per-principal WebSocket and
+per-source-address ingest limits prevent one credential or host from consuming
+the global connection pools. Noise handshakes and idle publisher connections
+have deadlines. The publisher resolves DNS names and reconnects with capped
+exponential backoff and jitter. Health endpoints and administrator-only
+counters expose availability and rejection signals without exposing stream
+contents or credentials.
 
 ## Media Profile
 

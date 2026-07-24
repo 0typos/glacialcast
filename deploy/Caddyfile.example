@@ -6,9 +6,6 @@
 
 {$GLACIALCAST_DOMAIN} {
 	reverse_proxy 127.0.0.1:8899 {
-		# Caddy already discards untrusted inbound forwarding values. Keep this
-		# explicit single-address value aligned with trust_forwarded_for=true.
-		header_up X-Forwarded-For {remote_host}
 		health_uri /health/ready
 		health_interval 30s
 		health_timeout 5s

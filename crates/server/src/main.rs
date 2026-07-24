@@ -43,8 +43,8 @@ use std::{
     net::SocketAddr,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path as FsPath, PathBuf},
-    sync::Arc,
     sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 use subtle::ConstantTimeEq;
@@ -115,8 +115,12 @@ struct AppState {
     login_limiter: FixedWindowLimiter,
     global_login_limiter: FixedWindowLimiter,
     request_limiter: FixedWindowLimiter,
+    websocket_attempt_limiter: FixedWindowLimiter,
+    ingest_attempt_limiter: FixedWindowLimiter,
     websocket_slots: Arc<Semaphore>,
     ingest_slots: Arc<Semaphore>,
+    websocket_principals: KeyedConnectionTracker,
+    ingest_peers: KeyedConnectionTracker,
     ingest_handshake_timeout: Duration,
     ingest_idle_timeout: Duration,
     metrics: Arc<ServerMetrics>,
@@ -159,10 +163,14 @@ impl Default for SecurityConfig {
 struct LimitsConfig {
     max_http_in_flight: usize,
     max_websockets: usize,
+    max_websockets_per_principal: usize,
     max_ingest_connections: usize,
+    max_ingest_connections_per_ip: usize,
     login_attempts_per_minute: u32,
     global_login_attempts_per_minute: u32,
     authenticated_requests_per_minute: u32,
+    websocket_attempts_per_minute: u32,
+    ingest_attempts_per_minute: u32,
     http_timeout_seconds: u64,
     ingest_handshake_timeout_seconds: u64,
     ingest_idle_timeout_seconds: u64,
@@ -173,10 +181,14 @@ impl Default for LimitsConfig {
         Self {
             max_http_in_flight: 128,
             max_websockets: 64,
+            max_websockets_per_principal: 4,
             max_ingest_connections: 16,
+            max_ingest_connections_per_ip: 4,
             login_attempts_per_minute: 10,
             global_login_attempts_per_minute: 1000,
             authenticated_requests_per_minute: 30_000,
+            websocket_attempts_per_minute: 120,
+            ingest_attempts_per_minute: 60,
             http_timeout_seconds: 30,
             ingest_handshake_timeout_seconds: 10,
             ingest_idle_timeout_seconds: 120,
@@ -529,8 +541,23 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
             Duration::from_secs(60),
             10_000,
         )?,
+        websocket_attempt_limiter: FixedWindowLimiter::new(
+            limits.websocket_attempts_per_minute,
+            Duration::from_secs(60),
+            10_000,
+        )?,
+        ingest_attempt_limiter: FixedWindowLimiter::new(
+            limits.ingest_attempts_per_minute,
+            Duration::from_secs(60),
+            10_000,
+        )?,
         websocket_slots,
         ingest_slots,
+        websocket_principals: KeyedConnectionTracker::new(
+            limits.max_websockets_per_principal,
+            10_000,
+        )?,
+        ingest_peers: KeyedConnectionTracker::new(limits.max_ingest_connections_per_ip, 10_000)?,
         ingest_handshake_timeout: Duration::from_secs(limits.ingest_handshake_timeout_seconds),
         ingest_idle_timeout: Duration::from_secs(limits.ingest_idle_timeout_seconds),
         metrics: metrics.clone(),
@@ -652,10 +679,16 @@ fn validate_private_config_file(path: &FsPath) -> Result<()> {
 fn validate_limits(limits: &LimitsConfig) -> Result<()> {
     if limits.max_http_in_flight == 0
         || limits.max_websockets == 0
+        || limits.max_websockets_per_principal == 0
+        || limits.max_websockets_per_principal > limits.max_websockets
         || limits.max_ingest_connections == 0
+        || limits.max_ingest_connections_per_ip == 0
+        || limits.max_ingest_connections_per_ip > limits.max_ingest_connections
         || limits.login_attempts_per_minute == 0
         || limits.global_login_attempts_per_minute < limits.login_attempts_per_minute
         || limits.authenticated_requests_per_minute == 0
+        || limits.websocket_attempts_per_minute == 0
+        || limits.ingest_attempts_per_minute == 0
         || !(1..=300).contains(&limits.http_timeout_seconds)
         || !(1..=60).contains(&limits.ingest_handshake_timeout_seconds)
         || !(30..=3600).contains(&limits.ingest_idle_timeout_seconds)
@@ -1136,7 +1169,7 @@ async fn dash_live_ws(
     if !validate_request_origin(&headers, state.public_origin.as_deref()) {
         return Err(AppError::Forbidden);
     }
-    let guard = websocket_guard(&state)?;
+    let guard = websocket_guard(&state, &identity.principal.name)?;
     Ok(ws
         .on_upgrade(move |socket| dash_live_socket(socket, state, stream_id, guard))
         .into_response())
@@ -1186,7 +1219,7 @@ async fn control_ws(
     if !validate_request_origin(&headers, state.public_origin.as_deref()) {
         return Err(AppError::Forbidden);
     }
-    let guard = websocket_guard(&state)?;
+    let guard = websocket_guard(&state, &identity.principal.name)?;
     Ok(ws
         .on_upgrade(move |socket| control_socket(socket, state, identity.principal, guard))
         .into_response())
@@ -1289,6 +1322,7 @@ fn require_mutation_authority(
 
 struct ConnectionGuard {
     _permit: OwnedSemaphorePermit,
+    _keyed: KeyedConnectionGuard,
     metrics: Arc<ServerMetrics>,
     kind: ConnectionKind,
 }
@@ -1302,6 +1336,7 @@ enum ConnectionKind {
 impl ConnectionGuard {
     fn new(
         permit: OwnedSemaphorePermit,
+        keyed: KeyedConnectionGuard,
         metrics: Arc<ServerMetrics>,
         kind: ConnectionKind,
     ) -> Self {
@@ -1317,6 +1352,7 @@ impl ConnectionGuard {
         }
         Self {
             _permit: permit,
+            _keyed: keyed,
             metrics,
             kind,
         }
@@ -1340,7 +1376,79 @@ impl Drop for ConnectionGuard {
     }
 }
 
-fn websocket_guard(state: &AppState) -> Result<ConnectionGuard, AppError> {
+#[derive(Clone)]
+struct KeyedConnectionTracker {
+    counts: Arc<StdMutex<HashMap<String, usize>>>,
+    per_key_limit: usize,
+    max_keys: usize,
+}
+
+impl KeyedConnectionTracker {
+    fn new(per_key_limit: usize, max_keys: usize) -> Result<Self> {
+        if per_key_limit == 0 || max_keys == 0 {
+            anyhow::bail!("connection tracker limits must be nonzero");
+        }
+        Ok(Self {
+            counts: Arc::new(StdMutex::new(HashMap::new())),
+            per_key_limit,
+            max_keys,
+        })
+    }
+
+    fn try_acquire(&self, key: impl Into<String>) -> Option<KeyedConnectionGuard> {
+        let key = key.into();
+        let mut counts = self.counts.lock().ok()?;
+        let existing = counts.get(&key).copied().unwrap_or(0);
+        if existing >= self.per_key_limit || (existing == 0 && counts.len() >= self.max_keys) {
+            return None;
+        }
+        counts.insert(key.clone(), existing + 1);
+        drop(counts);
+        Some(KeyedConnectionGuard {
+            tracker: self.clone(),
+            key,
+        })
+    }
+}
+
+struct KeyedConnectionGuard {
+    tracker: KeyedConnectionTracker,
+    key: String,
+}
+
+impl Drop for KeyedConnectionGuard {
+    fn drop(&mut self) {
+        let Ok(mut counts) = self.tracker.counts.lock() else {
+            return;
+        };
+        let Some(count) = counts.get_mut(&self.key) else {
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            counts.remove(&self.key);
+        }
+    }
+}
+
+fn websocket_guard(state: &AppState, principal_name: &str) -> Result<ConnectionGuard, AppError> {
+    if !state.websocket_attempt_limiter.check(principal_name) {
+        state
+            .metrics
+            .websocket_rejected
+            .fetch_add(1, Ordering::Relaxed);
+        return Err(AppError::TooManyRequests);
+    }
+    let keyed = state
+        .websocket_principals
+        .try_acquire(principal_name)
+        .ok_or_else(|| {
+            state
+                .metrics
+                .websocket_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            AppError::TooManyRequests
+        })?;
     let permit = state
         .websocket_slots
         .clone()
@@ -1354,6 +1462,7 @@ fn websocket_guard(state: &AppState) -> Result<ConnectionGuard, AppError> {
         })?;
     Ok(ConnectionGuard::new(
         permit,
+        keyed,
         state.metrics.clone(),
         ConnectionKind::WebSocket,
     ))
@@ -1371,6 +1480,23 @@ async fn run_ingest(
             accepted = listener.accept() => accepted?,
             _ = wait_for_shutdown(&mut shutdown_rx) => break,
         };
+        let peer_key = peer.ip().to_string();
+        if !state.ingest_attempt_limiter.check(&peer_key) {
+            state
+                .metrics
+                .ingest_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(%peer, "ingest connection rate limit reached");
+            continue;
+        }
+        let Some(keyed) = state.ingest_peers.try_acquire(peer_key) else {
+            state
+                .metrics
+                .ingest_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(%peer, "ingest per-address connection limit reached");
+            continue;
+        };
         let permit = match state.ingest_slots.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
@@ -1385,7 +1511,8 @@ async fn run_ingest(
         if let Err(err) = stream.set_nodelay(true) {
             debug!(%peer, ?err, "could not enable TCP_NODELAY for ingest");
         }
-        let guard = ConnectionGuard::new(permit, state.metrics.clone(), ConnectionKind::Ingest);
+        let guard =
+            ConnectionGuard::new(permit, keyed, state.metrics.clone(), ConnectionKind::Ingest);
         let state = state.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_ingest(stream, state, guard).await {
@@ -1658,6 +1785,35 @@ mod tests {
                 .unwrap(),
             "laptop"
         );
+    }
+
+    #[test]
+    fn keyed_connection_tracker_enforces_per_key_and_memory_limits() {
+        let tracker = KeyedConnectionTracker::new(2, 2).unwrap();
+        let first = tracker.try_acquire("one").unwrap();
+        let second = tracker.try_acquire("one").unwrap();
+        assert!(tracker.try_acquire("one").is_none());
+        let other = tracker.try_acquire("two").unwrap();
+        assert!(tracker.try_acquire("three").is_none());
+        drop(first);
+        assert!(tracker.try_acquire("one").is_some());
+        drop(second);
+        drop(other);
+        assert!(tracker.try_acquire("three").is_some());
+    }
+
+    #[test]
+    fn security_limits_reject_unsafe_or_inconsistent_values() {
+        let mut limits = LimitsConfig::default();
+        assert!(validate_limits(&limits).is_ok());
+        limits.max_websockets_per_principal = limits.max_websockets + 1;
+        assert!(validate_limits(&limits).is_err());
+        limits = LimitsConfig::default();
+        limits.max_ingest_connections_per_ip = 0;
+        assert!(validate_limits(&limits).is_err());
+        limits = LimitsConfig::default();
+        limits.ingest_idle_timeout_seconds = 29;
+        assert!(validate_limits(&limits).is_err());
     }
 
     #[test]

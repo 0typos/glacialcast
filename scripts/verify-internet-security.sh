@@ -39,10 +39,14 @@ session_ttl_seconds = 3600
 [security.limits]
 max_http_in_flight = 32
 max_websockets = 4
+max_websockets_per_principal = 2
 max_ingest_connections = 2
+max_ingest_connections_per_ip = 1
 login_attempts_per_minute = 2
 global_login_attempts_per_minute = 20
 authenticated_requests_per_minute = 10000
+websocket_attempts_per_minute = 20
+ingest_attempts_per_minute = 20
 http_timeout_seconds = 10
 ingest_handshake_timeout_seconds = 2
 ingest_idle_timeout_seconds = 30
