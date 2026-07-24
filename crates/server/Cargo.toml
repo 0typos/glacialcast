@@ -7,12 +7,10 @@ version.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
-bytes.workspace = true
 clap.workspace = true
 futures-util.workspace = true
 glacialcast-dash = { path = "../dash" }
 glacialcast-protocol = { path = "../protocol" }
-media.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -23,8 +21,3 @@ tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
-webrtc.workspace = true
-
-[dev-dependencies]
-reqwest.workspace = true
-rtp.workspace = true

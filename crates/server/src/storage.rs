@@ -794,35 +794,6 @@ impl Store {
         Ok(Some(StoredVideoChunkPayload { chunk, bytes }))
     }
 
-    pub fn latest_video_keyframe_payload(
-        &self,
-        stream_id: Uuid,
-    ) -> Result<Option<StoredVideoChunkPayload>> {
-        if let Some(chunk) = self.live_latest_video_keyframe(stream_id)? {
-            return Ok(Some(StoredVideoChunkPayload {
-                chunk: chunk.chunk,
-                bytes: chunk.bytes.as_ref().clone(),
-            }));
-        }
-        let conn = self.conn()?;
-        let seq = conn
-            .query_row(
-                r#"
-                SELECT seq FROM video_chunks
-                WHERE stream_id = ?1 AND keyframe = 1
-                ORDER BY seq DESC LIMIT 1
-                "#,
-                params![stream_id.to_string()],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?;
-        let Some(seq) = seq else {
-            return Ok(None);
-        };
-        drop(conn);
-        self.get_video_chunk_payload(stream_id, seq as u64)
-    }
-
     pub fn list_frames(&self, stream_id: Uuid) -> Result<Vec<FrameManifest>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
@@ -1056,17 +1027,6 @@ impl Store {
                     .find(|chunk| chunk.chunk.seq == seq)
             })
             .cloned())
-    }
-
-    fn live_latest_video_keyframe(&self, stream_id: Uuid) -> Result<Option<LiveVideoChunk>> {
-        Ok(self.live()?.get(&stream_id).and_then(|stream| {
-            stream
-                .video_chunks
-                .iter()
-                .rev()
-                .find(|chunk| chunk.chunk.keyframe)
-                .cloned()
-        }))
     }
 
     fn live_video_chunk_manifests(&self, stream_id: Uuid) -> Result<Vec<VideoChunkManifest>> {

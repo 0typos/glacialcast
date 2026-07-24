@@ -1,6 +1,10 @@
 mod dash_store;
 mod storage;
 
+use crate::{
+    dash_store::DashStore,
+    storage::{Store, StoredFrame, StoredVideoChunk},
+};
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
@@ -11,24 +15,20 @@ use axum::{
     },
     http::{StatusCode, header},
     response::{Html, IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get},
 };
-use bytes::Bytes;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use glacialcast_protocol::{
-    ClientMessage, ControlEvent, DashObjectHeader, FrameManifest, H264ParameterSetCache,
-    ServerMessage, StreamHello, StreamMediaKind, VideoChunkManifest, VideoChunkMessage, VideoCodec,
-    VideoPacketization,
+    ClientMessage, ControlEvent, DashObjectHeader, FrameManifest, ServerMessage, StreamHello,
+    StreamMediaKind, VideoChunkManifest,
     daemon::{
         daemonize_if_requested, install_signal_handlers, manager_command, serve_control_socket,
         wait_for_shutdown,
     },
-    encode_ws_event, fast_content_hash, frame_is_encrypted, inspect_h264_access_unit, now_ms,
-    parse_human_bytes, responder_handshake,
+    encode_ws_event, frame_is_encrypted, now_ms, parse_human_bytes, responder_handshake,
 };
-use media::Sample;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
@@ -39,26 +39,11 @@ use std::{
 };
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{Mutex as AsyncMutex, broadcast, mpsc, watch},
+    sync::{Mutex as AsyncMutex, broadcast, watch},
 };
 use tower_http::services::ServeDir;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
-use webrtc::{
-    api::{APIBuilder, media_engine::MediaEngine},
-    peer_connection::{
-        RTCPeerConnection, configuration::RTCConfiguration,
-        peer_connection_state::RTCPeerConnectionState,
-        sdp::session_description::RTCSessionDescription,
-    },
-    rtp_transceiver::rtp_codec::RTCRtpCodecCapability,
-    track::track_local::track_local_static_sample::TrackLocalStaticSample,
-};
-
-use crate::{
-    dash_store::DashStore,
-    storage::{Store, StoredFrame, StoredVideoChunk},
-};
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -106,200 +91,7 @@ struct AppState {
     events: broadcast::Sender<ControlEvent>,
     dash_events: broadcast::Sender<DashObjectHeader>,
     auth: AuthConfig,
-    rtc: RtcHub,
-    ingest_controls: Arc<AsyncMutex<HashMap<Uuid, IngestControl>>>,
-}
-
-#[derive(Clone, Default)]
-struct RtcHub {
-    streams: Arc<AsyncMutex<HashMap<Uuid, HashMap<Uuid, RtcSubscriber>>>>,
-    parameter_sets: Arc<AsyncMutex<HashMap<Uuid, H264ParameterSetCache>>>,
-    random_access_ready: Arc<AsyncMutex<HashSet<Uuid>>>,
-}
-
-#[derive(Clone)]
-struct IngestControl {
-    connection_id: Uuid,
-    tx: mpsc::Sender<ServerMessage>,
-}
-
-impl AppState {
-    async fn request_keyframe(&self, stream_id: Uuid, reason: impl Into<String>) {
-        let control = self.ingest_controls.lock().await.get(&stream_id).cloned();
-        let Some(control) = control else {
-            debug!(%stream_id, "cannot request keyframe without an active ingest connection");
-            return;
-        };
-        let message = ServerMessage::KeyframeRequest {
-            stream_id,
-            reason: reason.into(),
-        };
-        if let Err(err) = control.tx.try_send(message) {
-            warn!(%stream_id, ?err, "failed to queue keyframe request for ingest client");
-        }
-    }
-}
-
-#[derive(Clone)]
-struct RtcSubscriber {
-    peer: Arc<RTCPeerConnection>,
-    track: Arc<TrackLocalStaticSample>,
-    codec: VideoCodec,
-}
-
-impl RtcHub {
-    async fn begin_ingest(&self, stream_id: Uuid) {
-        self.parameter_sets.lock().await.remove(&stream_id);
-        self.random_access_ready.lock().await.remove(&stream_id);
-    }
-
-    async fn normalize_video_chunk(&self, chunk: &mut VideoChunkMessage) {
-        if chunk.codec != VideoCodec::H264
-            || chunk.packetization != VideoPacketization::AnnexB
-            || frame_is_encrypted(&chunk.key_id)
-        {
-            return;
-        }
-        let payload = self
-            .parameter_sets
-            .lock()
-            .await
-            .entry(chunk.stream_id)
-            .or_default()
-            .normalize_access_unit(std::mem::take(&mut chunk.payload), chunk.keyframe);
-        let info = inspect_h264_access_unit(&payload);
-        if chunk.keyframe != info.has_idr {
-            warn!(
-                stream_id = %chunk.stream_id,
-                seq = chunk.seq,
-                declared_keyframe = chunk.keyframe,
-                nal_keyframe = info.has_idr,
-                nal_types = ?info.nal_types,
-                "correcting H.264 keyframe metadata from Annex-B NAL contents"
-            );
-        }
-        chunk.keyframe = info.has_idr;
-        chunk.content_hash = fast_content_hash(&payload);
-        chunk.payload = payload;
-        if info.is_decodable_random_access_point() {
-            self.random_access_ready
-                .lock()
-                .await
-                .insert(chunk.stream_id);
-        }
-    }
-
-    async fn stream_is_ready(&self, stream_id: Uuid) -> bool {
-        self.random_access_ready.lock().await.contains(&stream_id)
-    }
-
-    async fn add_subscriber(&self, stream_id: Uuid, subscriber: RtcSubscriber) -> Uuid {
-        let id = Uuid::new_v4();
-        self.streams
-            .lock()
-            .await
-            .entry(stream_id)
-            .or_default()
-            .insert(id, subscriber);
-        id
-    }
-
-    async fn remove_subscriber(&self, stream_id: Uuid, subscriber_id: Uuid) {
-        let mut streams = self.streams.lock().await;
-        if let Some(stream) = streams.get_mut(&stream_id) {
-            stream.remove(&subscriber_id);
-            if stream.is_empty() {
-                streams.remove(&stream_id);
-            }
-        }
-    }
-
-    async fn publish_video_chunk(&self, chunk: &VideoChunkMessage) {
-        if frame_is_encrypted(&chunk.key_id) {
-            return;
-        }
-        if chunk.codec == VideoCodec::H264 && !self.stream_is_ready(chunk.stream_id).await {
-            debug!(
-                stream_id = %chunk.stream_id,
-                seq = chunk.seq,
-                "not relaying H.264 until a decodable SPS/PPS/IDR access point arrives"
-            );
-            return;
-        }
-        let payload = self
-            .rtp_payload_for_chunk(
-                chunk.stream_id,
-                chunk.codec,
-                chunk.packetization,
-                &chunk.key_id,
-                chunk.keyframe,
-                chunk.payload.clone(),
-            )
-            .await;
-        let data = Bytes::from(payload);
-        let subscribers: Vec<(Uuid, RtcSubscriber)> = {
-            let streams = self.streams.lock().await;
-            streams
-                .get(&chunk.stream_id)
-                .map(|stream| stream.iter().map(|(id, sub)| (*id, sub.clone())).collect())
-                .unwrap_or_default()
-        };
-        let mut stale = Vec::new();
-        for (id, subscriber) in subscribers {
-            if subscriber.codec != chunk.codec {
-                continue;
-            }
-            let sample = Sample {
-                data: data.clone(),
-                duration: Duration::from_millis(chunk.duration_ms.max(1)),
-                ..Default::default()
-            };
-            if let Err(err) = subscriber.track.write_sample(&sample).await {
-                warn!(?err, stream_id = %chunk.stream_id, "dropping failed WebRTC subscriber");
-                stale.push(id);
-            }
-        }
-        for id in stale {
-            self.remove_subscriber(chunk.stream_id, id).await;
-        }
-    }
-
-    async fn rtp_payload_for_chunk(
-        &self,
-        stream_id: Uuid,
-        codec: VideoCodec,
-        packetization: VideoPacketization,
-        key_id: &str,
-        keyframe: bool,
-        payload: Vec<u8>,
-    ) -> Vec<u8> {
-        if codec != VideoCodec::H264
-            || packetization != VideoPacketization::AnnexB
-            || frame_is_encrypted(key_id)
-        {
-            return payload;
-        }
-
-        self.parameter_sets
-            .lock()
-            .await
-            .entry(stream_id)
-            .or_default()
-            .normalize_access_unit(payload, keyframe)
-    }
-
-    async fn close_stream(&self, stream_id: Uuid) {
-        let subscribers = self.streams.lock().await.remove(&stream_id);
-        if let Some(subscribers) = subscribers {
-            for subscriber in subscribers.into_values() {
-                if let Err(err) = subscriber.peer.close().await {
-                    warn!(?err, %stream_id, "failed to close WebRTC peer");
-                }
-            }
-        }
-        self.parameter_sets.lock().await.remove(&stream_id);
-        self.random_access_ready.lock().await.remove(&stream_id);
-    }
+    active_ingests: Arc<AsyncMutex<HashMap<Uuid, Uuid>>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -464,8 +256,7 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
         events,
         dash_events,
         auth: AuthConfig::from_config(config.ingest)?,
-        rtc: RtcHub::default(),
-        ingest_controls: Arc::new(AsyncMutex::new(HashMap::new())),
+        active_ingests: Arc::new(AsyncMutex::new(HashMap::new())),
     };
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     tokio::spawn(install_signal_handlers(shutdown_tx.clone()));
@@ -497,7 +288,6 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
         .route("/api/streams/{stream_id}/frames/{seq}", get(get_frame))
         .route("/api/streams/{stream_id}/video", get(list_video_chunks))
         .route("/api/streams/{stream_id}/video/{seq}", get(get_video_chunk))
-        .route("/api/streams/{stream_id}/webrtc/offer", post(webrtc_offer))
         .route("/api/streams/{stream_id}/cursors", get(list_cursors))
         .route("/api/ws", get(control_ws))
         .route(
@@ -580,7 +370,6 @@ async fn delete_stream(
 ) -> Result<StatusCode, AppError> {
     if state.store.delete_stream(stream_id)? {
         state.dash_store.delete_stream(stream_id)?;
-        state.rtc.close_stream(stream_id).await;
         publish_stream_event(&state, "stream_deleted", stream_id);
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -771,133 +560,6 @@ async fn get_video_chunk(
         .unwrap())
 }
 
-#[derive(Debug, Deserialize)]
-struct WebRtcOffer {
-    sdp: String,
-}
-
-#[derive(Debug, Serialize)]
-struct WebRtcAnswer {
-    sdp: String,
-    #[serde(rename = "type")]
-    kind: String,
-}
-
-async fn webrtc_offer(
-    State(state): State<AppState>,
-    Path(stream_id): Path<Uuid>,
-    Json(offer): Json<WebRtcOffer>,
-) -> Result<Json<WebRtcAnswer>, AppError> {
-    if !state.store.stream_exists(stream_id)? {
-        return Err(AppError::NotFound);
-    }
-    let (peer, track) = create_video_peer(VideoCodec::H264).await?;
-    let rtp_sender = peer.add_track(track.clone()).await?;
-    tokio::spawn(async move { while rtp_sender.read_rtcp().await.is_ok() {} });
-
-    let offer = RTCSessionDescription::offer(offer.sdp)?;
-    peer.set_remote_description(offer).await?;
-    let answer = peer.create_answer(None).await?;
-    let mut gather_complete = peer.gathering_complete_promise().await;
-    peer.set_local_description(answer).await?;
-    let _ = gather_complete.recv().await;
-    let local = peer
-        .local_description()
-        .await
-        .ok_or_else(|| anyhow::anyhow!("WebRTC local description was not set"))?;
-
-    let subscriber_id = state
-        .rtc
-        .add_subscriber(
-            stream_id,
-            RtcSubscriber {
-                peer: peer.clone(),
-                track: track.clone(),
-                codec: VideoCodec::H264,
-            },
-        )
-        .await;
-    let rtc = state.rtc.clone();
-    peer.on_peer_connection_state_change(Box::new(move |peer_state| {
-        let rtc = rtc.clone();
-        Box::pin(async move {
-            if matches!(
-                peer_state,
-                RTCPeerConnectionState::Disconnected
-                    | RTCPeerConnectionState::Failed
-                    | RTCPeerConnectionState::Closed
-            ) {
-                rtc.remove_subscriber(stream_id, subscriber_id).await;
-            }
-        })
-    }));
-    state
-        .request_keyframe(
-            stream_id,
-            "WebRTC viewer joined and needs a fresh random-access point",
-        )
-        .await;
-    if let Some(keyframe) = state.store.latest_video_keyframe_payload(stream_id)?
-        && keyframe.chunk.codec == VideoCodec::H264
-        && !frame_is_encrypted(&keyframe.chunk.key_id)
-    {
-        let payload = state
-            .rtc
-            .rtp_payload_for_chunk(
-                keyframe.chunk.stream_id,
-                keyframe.chunk.codec,
-                keyframe.chunk.packetization,
-                &keyframe.chunk.key_id,
-                keyframe.chunk.keyframe,
-                keyframe.bytes,
-            )
-            .await;
-        let sample = Sample {
-            data: Bytes::from(payload),
-            duration: Duration::from_millis(keyframe.chunk.duration_ms.max(1)),
-            ..Default::default()
-        };
-        if let Err(err) = track.write_sample(&sample).await {
-            warn!(?err, %stream_id, "failed to seed WebRTC subscriber with latest keyframe");
-        }
-    }
-
-    Ok(Json(WebRtcAnswer {
-        sdp: local.sdp,
-        kind: "answer".to_string(),
-    }))
-}
-
-async fn create_video_peer(
-    codec: VideoCodec,
-) -> Result<(Arc<RTCPeerConnection>, Arc<TrackLocalStaticSample>)> {
-    let mut media_engine = MediaEngine::default();
-    media_engine.register_default_codecs()?;
-    let api = APIBuilder::new().with_media_engine(media_engine).build();
-    let peer = Arc::new(api.new_peer_connection(RTCConfiguration::default()).await?);
-    let track = Arc::new(TrackLocalStaticSample::new(
-        RTCRtpCodecCapability {
-            mime_type: codec.webrtc_mime().to_string(),
-            clock_rate: 90_000,
-            channels: 0,
-            sdp_fmtp_line: sdp_fmtp_line_for_codec(codec).to_string(),
-            rtcp_feedback: vec![],
-        },
-        "video".to_string(),
-        "glacialcast".to_string(),
-    ));
-    Ok((peer, track))
-}
-
-fn sdp_fmtp_line_for_codec(codec: VideoCodec) -> &'static str {
-    match codec {
-        VideoCodec::H264 => {
-            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
-        }
-        VideoCodec::Vp8 | VideoCodec::Av1 => "",
-    }
-}
-
 async fn control_ws(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(move |socket| control_socket(socket, state))
 }
@@ -1005,34 +667,20 @@ async fn handle_ingest(mut stream: TcpStream, state: AppState) -> Result<()> {
             server_time_ms: now_ms(),
         })
         .await?;
-    state.rtc.begin_ingest(stream_id).await;
     let connection_id = Uuid::new_v4();
-    let (control_tx, mut control_rx) = mpsc::channel(16);
-    state.ingest_controls.lock().await.insert(
-        stream_id,
-        IngestControl {
-            connection_id,
-            tx: control_tx,
-        },
-    );
+    state
+        .active_ingests
+        .lock()
+        .await
+        .insert(stream_id, connection_id);
     publish_stream_event(&state, "stream_connected", stream_id);
-    let result = ingest_loop(
-        &state,
-        &mut socket,
-        &mut control_rx,
-        stream_id,
-        &hello,
-        last_seq,
-    )
-    .await;
-    let mut controls = state.ingest_controls.lock().await;
-    let owns_connection = controls
-        .get(&stream_id)
-        .is_some_and(|control| control.connection_id == connection_id);
+    let result = ingest_loop(&state, &mut socket, stream_id, &hello, last_seq).await;
+    let mut active_ingests = state.active_ingests.lock().await;
+    let owns_connection = active_ingests.get(&stream_id) == Some(&connection_id);
     if owns_connection {
-        controls.remove(&stream_id);
+        active_ingests.remove(&stream_id);
     }
-    drop(controls);
+    drop(active_ingests);
     if owns_connection {
         state.store.mark_stream_inactive(stream_id)?;
         publish_stream_event(&state, "stream_disconnected", stream_id);
@@ -1052,7 +700,6 @@ async fn handle_ingest(mut stream: TcpStream, state: AppState) -> Result<()> {
 async fn ingest_loop(
     state: &AppState,
     socket: &mut glacialcast_protocol::NoiseSocket<TcpStream>,
-    control_rx: &mut mpsc::Receiver<ServerMessage>,
     stream_id: Uuid,
     hello: &StreamHello,
     mut last_seq: u64,
@@ -1069,9 +716,6 @@ async fn ingest_loop(
     }
 
     loop {
-        while let Ok(control) = control_rx.try_recv() {
-            socket.write(&control).await?;
-        }
         let message = socket.read::<ClientMessage>().await;
         match message {
             Ok(ClientMessage::Frame(frame)) => {
@@ -1104,7 +748,7 @@ async fn ingest_loop(
                     .await?;
                 debug!(stream_id = %stream_id, through_seq = last_seq, "ingest sent image ack");
             }
-            Ok(ClientMessage::VideoChunk(mut chunk)) => {
+            Ok(ClientMessage::VideoChunk(chunk)) => {
                 debug!(stream_id = %stream_id, seq = chunk.seq, bytes = chunk.payload.len(), "ingest received video chunk");
                 if !state.store.stream_exists(stream_id)? {
                     anyhow::bail!("stream was deleted");
@@ -1118,7 +762,6 @@ async fn ingest_loop(
                 if frame_is_encrypted(&chunk.key_id) {
                     anyhow::bail!("video chunks must not use application-level frame encryption");
                 }
-                state.rtc.normalize_video_chunk(&mut chunk).await;
                 if chunk.seq > last_seq + 1 && last_seq > 0 {
                     socket
                         .write(&ServerMessage::ResendRequest {
@@ -1131,7 +774,6 @@ async fn ingest_loop(
                 state.store.store_video_chunk(stored, &chunk.payload)?;
                 last_seq = last_seq.max(chunk.seq);
                 publish_video_event(state, &chunk);
-                state.rtc.publish_video_chunk(&chunk).await;
                 socket
                     .write(&ServerMessage::Ack {
                         through_seq: last_seq,
@@ -1343,49 +985,6 @@ mod tests {
     fn invalid_token_is_rejected_even_when_optional() {
         let auth = AuthConfig::from_config(token_config(false)).unwrap();
         assert!(auth.authenticate(Some("wrong"), "desk").is_err());
-    }
-
-    #[tokio::test]
-    async fn h264_ingest_waits_for_a_decodable_random_access_point() {
-        let hub = RtcHub::default();
-        let stream_id = Uuid::new_v4();
-        hub.begin_ingest(stream_id).await;
-        let mut chunk = VideoChunkMessage {
-            stream_id,
-            seq: 1,
-            captured_at_ms: 1,
-            pts_ms: 0,
-            duration_ms: 200,
-            width: 1280,
-            height: 720,
-            source_width: 1280,
-            source_height: 720,
-            codec: VideoCodec::H264,
-            packetization: VideoPacketization::AnnexB,
-            keyframe: true,
-            mime: "video/h264".to_string(),
-            key_id: String::new(),
-            nonce: [0; 12],
-            content_hash: 0,
-            payload: vec![
-                0, 0, 0, 1, 9, 0x10, // AUD
-                0, 0, 1, 1, 0x88, 0x84, // non-IDR slice
-            ],
-        };
-
-        hub.normalize_video_chunk(&mut chunk).await;
-        assert!(!chunk.keyframe);
-        assert!(!hub.stream_is_ready(stream_id).await);
-
-        chunk.seq = 2;
-        chunk.payload = vec![
-            0, 0, 1, 7, 1, 2, 3, // SPS
-            0, 0, 1, 8, 4, 5, // PPS
-            0, 0, 1, 5, 6, 7, // IDR
-        ];
-        hub.normalize_video_chunk(&mut chunk).await;
-        assert!(chunk.keyframe);
-        assert!(hub.stream_is_ready(stream_id).await);
     }
 }
 
