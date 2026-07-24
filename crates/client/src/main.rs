@@ -1,6 +1,5 @@
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::{Parser, ValueEnum};
 use futures_util::StreamExt;
 use glacialcast_dash::{
@@ -18,10 +17,7 @@ use glacialcast_protocol::{
     },
     decode_key_b64, decode_noise_public_key, initiator_handshake, now_ms, parse_human_bytes,
 };
-use image::{
-    ColorType, ImageBuffer, ImageEncoder, Rgb, RgbaImage, codecs::png::PngEncoder,
-    imageops::FilterType,
-};
+use image::{ImageBuffer, Rgb, imageops::FilterType};
 use pipewire as pw;
 use pw::{properties::properties, spa};
 use rand::{RngCore, rngs::OsRng};
@@ -71,6 +67,8 @@ const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x4008_6200;
 const DMA_BUF_SYNC_READ: u64 = 1 << 0;
 const DMA_BUF_SYNC_END: u64 = 1 << 2;
 const PIPEWIRE_CURSOR_DEFAULT_BITMAP_SIDE: usize = 64;
+const PIPEWIRE_CURSOR_MAX_BITMAP_SIDE: usize = 512;
+const CURSOR_BITMAP_REFRESH_TICKS: u64 = MEDIA_TIMESCALE as u64 * 60;
 const PIPEWIRE_CURSOR_METADATA_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,16 +77,17 @@ struct CursorBitmap {
     height: u32,
     hotspot_x: i32,
     hotspot_y: i32,
-    png_b64: String,
+    rgba: Arc<[u8]>,
 }
 
 #[derive(Debug, Clone)]
 struct CursorMessage {
     x: f32,
     y: f32,
+    visible: bool,
     source_width: u32,
     source_height: u32,
-    bitmap: Option<CursorBitmap>,
+    bitmap: Option<Arc<CursorBitmap>>,
 }
 
 #[derive(Debug, Parser)]
@@ -807,52 +806,80 @@ fn cursor_to_dash_event(
 ) -> Result<DashCursorEvent> {
     let source_width = cursor.source_width.max(1);
     let source_height = cursor.source_height.max(1);
-    let x = (cursor.x * output_width as f32 / source_width as f32).clamp(0.0, output_width as f32);
-    let y =
-        (cursor.y * output_height as f32 / source_height as f32).clamp(0.0, output_height as f32);
+    let x_micropixels =
+        scaled_cursor_coordinate(cursor.x, source_width, output_width, cursor.visible);
+    let y_micropixels =
+        scaled_cursor_coordinate(cursor.y, source_height, output_height, cursor.visible);
     let (bitmap_id, bitmap) = match cursor.bitmap {
         Some(bitmap) if bitmap_state.last.as_ref() == Some(&bitmap) => {
-            (bitmap_state.current_id, None)
+            let refresh_due = bitmap_state
+                .last_sent_timestamp
+                .is_none_or(|last| timestamp.saturating_sub(last) >= CURSOR_BITMAP_REFRESH_TICKS);
+            if refresh_due {
+                bitmap_state.last_sent_timestamp = Some(timestamp);
+                (bitmap_state.current_id, Some(dash_cursor_bitmap(&bitmap)?))
+            } else {
+                (bitmap_state.current_id, None)
+            }
         }
         Some(bitmap) => {
-            let png = BASE64_STANDARD
-                .decode(&bitmap.png_b64)
-                .context("decoding PipeWire cursor bitmap")?;
-            let rgba: RgbaImage = image::load_from_memory(&png)
-                .context("decoding PipeWire cursor PNG")?
-                .to_rgba8();
-            if rgba.width() != bitmap.width || rgba.height() != bitmap.height {
-                bail!("PipeWire cursor bitmap dimensions do not match its PNG");
-            }
             bitmap_state.current_id = bitmap_state.current_id.wrapping_add(1).max(1);
-            bitmap_state.last = Some(bitmap.clone());
-            (
-                bitmap_state.current_id,
-                Some(DashCursorBitmap {
-                    width: bitmap.width,
-                    height: bitmap.height,
-                    hotspot_x: bitmap.hotspot_x,
-                    hotspot_y: bitmap.hotspot_y,
-                    rgba: rgba.into_raw(),
-                }),
-            )
+            bitmap_state.last = Some(Arc::clone(&bitmap));
+            bitmap_state.last_sent_timestamp = Some(timestamp);
+            (bitmap_state.current_id, Some(dash_cursor_bitmap(&bitmap)?))
         }
         None => (bitmap_state.current_id, None),
     };
     Ok(DashCursorEvent {
         timestamp,
-        x_micropixels: (f64::from(x) * 1_000_000.0).round() as i64,
-        y_micropixels: (f64::from(y) * 1_000_000.0).round() as i64,
-        visible: true,
+        x_micropixels,
+        y_micropixels,
+        visible: cursor.visible,
         bitmap_id,
         bitmap,
+    })
+}
+
+fn scaled_cursor_coordinate(
+    value: f32,
+    source_extent: u32,
+    output_extent: u32,
+    visible: bool,
+) -> i64 {
+    if !visible || !value.is_finite() || output_extent == 0 {
+        return 0;
+    }
+    let scaled = f64::from(value) * f64::from(output_extent) / f64::from(source_extent.max(1));
+    (scaled.clamp(0.0, f64::from(output_extent)) * 1_000_000.0).round() as i64
+}
+
+fn dash_cursor_bitmap(bitmap: &CursorBitmap) -> Result<DashCursorBitmap> {
+    let expected_len = usize::try_from(bitmap.width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(bitmap.height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(4))
+        .context("PipeWire cursor bitmap dimensions overflow")?;
+    if bitmap.rgba.len() != expected_len {
+        bail!("PipeWire cursor bitmap dimensions do not match its RGBA payload");
+    }
+    Ok(DashCursorBitmap {
+        width: bitmap.width,
+        height: bitmap.height,
+        hotspot_x: bitmap.hotspot_x,
+        hotspot_y: bitmap.hotspot_y,
+        rgba: bitmap.rgba.to_vec(),
     })
 }
 
 #[derive(Default)]
 struct DashCursorBitmapState {
     current_id: u64,
-    last: Option<CursorBitmap>,
+    last: Option<Arc<CursorBitmap>>,
+    last_sent_timestamp: Option<u64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1187,6 +1214,7 @@ impl Capture for TestPatternCapture {
         Ok(Some(CursorMessage {
             x: ((t.sin() + 1.0) * 0.5) * self.width as f32,
             y: ((t.cos() + 1.0) * 0.5) * self.height as f32,
+            visible: true,
             source_width: self.width,
             source_height: self.height,
             bitmap: None,
@@ -1514,9 +1542,10 @@ struct PipewireCursorSample {
     serial: u64,
     x: f32,
     y: f32,
+    visible: bool,
     source_width: u32,
     source_height: u32,
-    bitmap: Option<CursorBitmap>,
+    bitmap: Option<Arc<CursorBitmap>>,
 }
 
 impl PipewireCursorSample {
@@ -1524,6 +1553,7 @@ impl PipewireCursorSample {
         CursorMessage {
             x: self.x,
             y: self.y,
+            visible: self.visible,
             source_width: self.source_width,
             source_height: self.source_height,
             bitmap: self.bitmap.clone(),
@@ -1536,9 +1566,14 @@ struct PipewireCursorState {
     id: u32,
     x: i32,
     y: i32,
-    hotspot_x: i32,
-    hotspot_y: i32,
-    bitmap: Option<CursorBitmap>,
+    bitmap: Option<Arc<CursorBitmap>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PipewireCursorUpdate {
+    Unchanged,
+    Hidden,
+    Visible(PipewireCursorState),
 }
 
 struct DequeuedPipewireBuffer<'a> {
@@ -1624,8 +1659,6 @@ fn maybe_emit_pipewire_cursor(
         source_height,
         &mut user_data.cursor_serial,
         &mut user_data.last_cursor_state,
-        &mut user_data.last_cursor_sent_at,
-        user_data.min_cursor_interval,
     ) {
         let _ = user_data.cursor_latest.send(Some(sample));
     }
@@ -1664,8 +1697,6 @@ fn maybe_emit_pipewire_video_cursor(
         source_height,
         &mut user_data.cursor_serial,
         &mut user_data.last_cursor_state,
-        &mut user_data.last_cursor_sent_at,
-        user_data.min_cursor_interval,
     ) {
         let _ = user_data.cursor_latest.send(Some(sample));
     }
@@ -1686,7 +1717,7 @@ fn pipewire_cursor_metadata_gate(
     missing_since: &mut Option<Instant>,
     now: Instant,
 ) -> PipewireCursorMetadataGate {
-    if !required || *verified {
+    if !required {
         return PipewireCursorMetadataGate::Ready;
     }
     if pipewire_buffer_has_cursor_meta(buffer) {
@@ -1708,49 +1739,62 @@ fn pipewire_cursor_sample(
     source_height: u32,
     cursor_serial: &mut u64,
     last_cursor_state: &mut Option<PipewireCursorState>,
-    last_cursor_sent_at: &mut Option<Instant>,
-    min_cursor_interval: Duration,
 ) -> Option<PipewireCursorSample> {
-    let mut state = pipewire_cursor_state(buffer)?;
-    if state.bitmap.is_none()
-        && let Some(previous) = last_cursor_state.as_ref()
-        && previous.id == state.id
-    {
-        state.bitmap = previous.bitmap.clone();
+    match pipewire_cursor_update(buffer) {
+        PipewireCursorUpdate::Unchanged => None,
+        PipewireCursorUpdate::Hidden => {
+            let previous = last_cursor_state.take()?;
+            *cursor_serial = cursor_serial.wrapping_add(1).max(1);
+            Some(PipewireCursorSample {
+                serial: *cursor_serial,
+                x: clamped_cursor_position(previous.x, source_width),
+                y: clamped_cursor_position(previous.y, source_height),
+                visible: false,
+                source_width,
+                source_height,
+                bitmap: None,
+            })
+        }
+        PipewireCursorUpdate::Visible(mut state) => {
+            if state.bitmap.is_none()
+                && let Some(previous) = last_cursor_state.as_ref()
+                && previous.id == state.id
+            {
+                state.bitmap = previous.bitmap.clone();
+            }
+            if last_cursor_state
+                .as_ref()
+                .is_some_and(|last| *last == state)
+            {
+                return None;
+            }
+            *cursor_serial = cursor_serial.wrapping_add(1).max(1);
+            let sample = PipewireCursorSample {
+                serial: *cursor_serial,
+                x: clamped_cursor_position(state.x, source_width),
+                y: clamped_cursor_position(state.y, source_height),
+                visible: true,
+                source_width,
+                source_height,
+                bitmap: state.bitmap.clone(),
+            };
+            *last_cursor_state = Some(state);
+            Some(sample)
+        }
     }
-    if last_cursor_state
-        .as_ref()
-        .is_some_and(|last| *last == state)
-    {
-        return None;
-    }
-    let now = Instant::now();
-    if let Some(last_sent) = *last_cursor_sent_at
-        && now.duration_since(last_sent) < min_cursor_interval
-    {
-        return None;
-    }
-    *cursor_serial = cursor_serial.wrapping_add(1);
-    let sample = PipewireCursorSample {
-        serial: *cursor_serial,
-        x: state.x.clamp(0, source_width.min(i32::MAX as u32) as i32) as f32,
-        y: state.y.clamp(0, source_height.min(i32::MAX as u32) as i32) as f32,
-        source_width,
-        source_height,
-        bitmap: state.bitmap.clone(),
-    };
-    *last_cursor_state = Some(state);
-    *last_cursor_sent_at = Some(now);
-    Some(sample)
 }
 
-fn pipewire_cursor_state(buffer: *const spa::sys::spa_buffer) -> Option<PipewireCursorState> {
+fn clamped_cursor_position(position: i32, extent: u32) -> f32 {
+    position.clamp(0, extent.min(i32::MAX as u32) as i32) as f32
+}
+
+fn pipewire_cursor_update(buffer: *const spa::sys::spa_buffer) -> PipewireCursorUpdate {
     if buffer.is_null() {
-        return None;
+        return PipewireCursorUpdate::Unchanged;
     }
     unsafe {
         if (*buffer).n_metas == 0 || (*buffer).metas.is_null() {
-            return None;
+            return PipewireCursorUpdate::Unchanged;
         }
         let metas = std::slice::from_raw_parts((*buffer).metas, (*buffer).n_metas as usize);
         for meta in metas {
@@ -1762,25 +1806,23 @@ fn pipewire_cursor_state(buffer: *const spa::sys::spa_buffer) -> Option<Pipewire
             }
             let cursor = &*(meta.data as *const spa::sys::spa_meta_cursor);
             if cursor.id == 0 {
-                continue;
+                return PipewireCursorUpdate::Hidden;
             }
-            return Some(PipewireCursorState {
+            return PipewireCursorUpdate::Visible(PipewireCursorState {
                 id: cursor.id,
                 x: cursor.position.x,
                 y: cursor.position.y,
-                hotspot_x: cursor.hotspot.x,
-                hotspot_y: cursor.hotspot.y,
                 bitmap: pipewire_cursor_bitmap(meta, cursor),
             });
         }
     }
-    None
+    PipewireCursorUpdate::Unchanged
 }
 
 fn pipewire_cursor_bitmap(
     meta: &spa::sys::spa_meta,
     cursor: &spa::sys::spa_meta_cursor,
-) -> Option<CursorBitmap> {
+) -> Option<Arc<CursorBitmap>> {
     let cursor_meta_size = std::mem::size_of::<spa::sys::spa_meta_cursor>();
     let bitmap_meta_size = std::mem::size_of::<spa::sys::spa_meta_bitmap>();
     let meta_size = meta.size as usize;
@@ -1802,6 +1844,8 @@ fn pipewire_cursor_bitmap(
         if bitmap.format == spa::sys::SPA_VIDEO_FORMAT_UNKNOWN
             || width == 0
             || height == 0
+            || width as usize > PIPEWIRE_CURSOR_MAX_BITMAP_SIDE
+            || height as usize > PIPEWIRE_CURSOR_MAX_BITMAP_SIDE
             || bitmap.stride <= 0
             || bitmap.offset < bitmap_meta_size as u32
         {
@@ -1829,37 +1873,33 @@ fn pipewire_cursor_bitmap(
                 rgba.extend_from_slice(&cursor_pixel_as_rgba(bitmap.format, pixel)?);
             }
         }
-        let png_b64 = encode_cursor_png_b64(width as u32, height as u32, &rgba)?;
-        Some(CursorBitmap {
+        let hotspot_x = cursor.hotspot.x.clamp(0, width.saturating_sub(1) as i32);
+        let hotspot_y = cursor.hotspot.y.clamp(0, height.saturating_sub(1) as i32);
+        Some(Arc::new(CursorBitmap {
             width: width as u32,
             height: height as u32,
-            hotspot_x: cursor.hotspot.x,
-            hotspot_y: cursor.hotspot.y,
-            png_b64,
-        })
+            hotspot_x,
+            hotspot_y,
+            rgba: rgba.into(),
+        }))
     }
 }
 
 fn cursor_pixel_as_rgba(format: spa::sys::spa_video_format, pixel: &[u8]) -> Option<[u8; 4]> {
+    let [first, second, third, fourth] = *pixel else {
+        return None;
+    };
     match format {
-        x if x == spa::sys::SPA_VIDEO_FORMAT_RGBA => Some([pixel[0], pixel[1], pixel[2], pixel[3]]),
-        x if x == spa::sys::SPA_VIDEO_FORMAT_BGRA => Some([pixel[2], pixel[1], pixel[0], pixel[3]]),
-        x if x == spa::sys::SPA_VIDEO_FORMAT_ARGB => Some([pixel[1], pixel[2], pixel[3], pixel[0]]),
-        x if x == spa::sys::SPA_VIDEO_FORMAT_ABGR => Some([pixel[3], pixel[2], pixel[1], pixel[0]]),
-        x if x == spa::sys::SPA_VIDEO_FORMAT_RGBx => Some([pixel[0], pixel[1], pixel[2], 255]),
-        x if x == spa::sys::SPA_VIDEO_FORMAT_BGRx => Some([pixel[2], pixel[1], pixel[0], 255]),
-        x if x == spa::sys::SPA_VIDEO_FORMAT_xRGB => Some([pixel[1], pixel[2], pixel[3], 255]),
-        x if x == spa::sys::SPA_VIDEO_FORMAT_xBGR => Some([pixel[3], pixel[2], pixel[1], 255]),
+        x if x == spa::sys::SPA_VIDEO_FORMAT_RGBA => Some([first, second, third, fourth]),
+        x if x == spa::sys::SPA_VIDEO_FORMAT_BGRA => Some([third, second, first, fourth]),
+        x if x == spa::sys::SPA_VIDEO_FORMAT_ARGB => Some([second, third, fourth, first]),
+        x if x == spa::sys::SPA_VIDEO_FORMAT_ABGR => Some([fourth, third, second, first]),
+        x if x == spa::sys::SPA_VIDEO_FORMAT_RGBx => Some([first, second, third, 255]),
+        x if x == spa::sys::SPA_VIDEO_FORMAT_BGRx => Some([third, second, first, 255]),
+        x if x == spa::sys::SPA_VIDEO_FORMAT_xRGB => Some([second, third, fourth, 255]),
+        x if x == spa::sys::SPA_VIDEO_FORMAT_xBGR => Some([fourth, third, second, 255]),
         _ => None,
     }
-}
-
-fn encode_cursor_png_b64(width: u32, height: u32, rgba: &[u8]) -> Option<String> {
-    let mut png = Vec::new();
-    PngEncoder::new(&mut png)
-        .write_image(rgba, width, height, ColorType::Rgba8.into())
-        .ok()?;
-    Some(BASE64_STANDARD.encode(png))
 }
 
 fn log_pipewire_buffer_metas_once(
@@ -1894,9 +1934,11 @@ fn pipewire_buffer_has_cursor_meta(buffer: *const spa::sys::spa_buffer) -> bool 
             return false;
         }
         let metas = std::slice::from_raw_parts((*buffer).metas, (*buffer).n_metas as usize);
-        metas
-            .iter()
-            .any(|meta| meta.type_ == spa::sys::SPA_META_Cursor)
+        metas.iter().any(|meta| {
+            meta.type_ == spa::sys::SPA_META_Cursor
+                && !meta.data.is_null()
+                && meta.size >= std::mem::size_of::<spa::sys::spa_meta_cursor>() as u32
+        })
     }
 }
 
@@ -2498,10 +2540,8 @@ fn run_pipewire_loop(
         expected_width: width,
         expected_height: height,
         min_frame_interval: Duration::from_secs_f64(1.0 / fps.clamp(0.5, 15.0)),
-        min_cursor_interval: cursor_interval(cursor_hz),
         require_cursor_metadata,
         last_frame_copied_at: None,
-        last_cursor_sent_at: None,
         last_cursor_state: None,
         cursor_meta_missing_since: None,
         cursor_meta_verified: false,
@@ -2856,10 +2896,8 @@ fn run_pipewire_video_loop(
         expected_width: width,
         expected_height: height,
         min_frame_interval: Duration::from_secs_f64(1.0 / fps.clamp(0.5, 15.0)),
-        min_cursor_interval: cursor_interval(cursor_hz),
         require_cursor_metadata,
         last_frame_copied_at: None,
-        last_cursor_sent_at: None,
         last_cursor_state: None,
         cursor_meta_missing_since: None,
         cursor_meta_verified: false,
@@ -3419,10 +3457,6 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
 
 fn pipewire_capture_rate(frame_fps: f64, cursor_hz: u64) -> f64 {
     frame_fps.max(cursor_hz.max(1) as f64).clamp(0.5, 60.0)
-}
-
-fn cursor_interval(cursor_hz: u64) -> Duration {
-    Duration::from_secs_f64(1.0 / cursor_hz.max(1) as f64)
 }
 
 fn serialize_pod_object(obj: spa::pod::Object) -> Result<Vec<u8>> {
@@ -4045,10 +4079,8 @@ struct PipewireUserData {
     expected_width: u32,
     expected_height: u32,
     min_frame_interval: Duration,
-    min_cursor_interval: Duration,
     require_cursor_metadata: bool,
     last_frame_copied_at: Option<Instant>,
-    last_cursor_sent_at: Option<Instant>,
     last_cursor_state: Option<PipewireCursorState>,
     cursor_meta_missing_since: Option<Instant>,
     cursor_meta_verified: bool,
@@ -4067,10 +4099,8 @@ struct PipewireVideoUserData {
     expected_width: u32,
     expected_height: u32,
     min_frame_interval: Duration,
-    min_cursor_interval: Duration,
     require_cursor_metadata: bool,
     last_frame_copied_at: Option<Instant>,
-    last_cursor_sent_at: Option<Instant>,
     last_cursor_state: Option<PipewireCursorState>,
     cursor_meta_missing_since: Option<Instant>,
     cursor_meta_verified: bool,
@@ -4511,7 +4541,7 @@ mod tests {
     }
 
     #[test]
-    fn pipewire_cursor_metadata_decodes_and_rate_limits() {
+    fn pipewire_cursor_metadata_coalesces_duplicates_without_losing_changes() {
         let mut cursor = spa::sys::spa_meta_cursor {
             id: 7,
             flags: 0,
@@ -4532,37 +4562,24 @@ mod tests {
         };
         let mut serial = 0;
         let mut last_state = None;
-        let mut last_sent = None;
 
-        let first = pipewire_cursor_sample(
-            &buffer,
-            100,
-            80,
-            &mut serial,
-            &mut last_state,
-            &mut last_sent,
-            Duration::from_secs(10),
-        )
-        .expect("first cursor sample");
+        let first = pipewire_cursor_sample(&buffer, 100, 80, &mut serial, &mut last_state)
+            .expect("first cursor sample");
         assert_eq!(first.serial, 1);
         assert_eq!(first.x, 25.0);
         assert_eq!(first.y, 40.0);
+        assert!(first.visible);
         assert!(first.bitmap.is_none());
+        assert!(pipewire_cursor_sample(&buffer, 100, 80, &mut serial, &mut last_state).is_none());
 
-        cursor.position.x = 30;
-        assert_eq!(cursor.position.x, 30);
-        assert!(
-            pipewire_cursor_sample(
-                &buffer,
-                100,
-                80,
-                &mut serial,
-                &mut last_state,
-                &mut last_sent,
-                Duration::from_secs(10),
-            )
-            .is_none()
-        );
+        // SAFETY: `meta.data` points to the live `cursor` fixture.
+        unsafe {
+            (*meta.data.cast::<spa::sys::spa_meta_cursor>()).position.x = 30;
+        }
+        let moved = pipewire_cursor_sample(&buffer, 100, 80, &mut serial, &mut last_state)
+            .expect("changed cursor sample");
+        assert_eq!(moved.serial, 2);
+        assert_eq!(moved.x, 30.0);
     }
 
     #[test]
@@ -4610,53 +4627,214 @@ mod tests {
             datas: ptr::null_mut(),
         };
 
-        let state = pipewire_cursor_state(&buffer).expect("cursor state");
+        let PipewireCursorUpdate::Visible(state) = pipewire_cursor_update(&buffer) else {
+            panic!("expected visible cursor state");
+        };
         let bitmap = state.bitmap.expect("cursor bitmap");
-        assert_eq!(state.hotspot_x, 3);
-        assert_eq!(state.hotspot_y, 4);
         assert_eq!(bitmap.width, 2);
         assert_eq!(bitmap.height, 2);
-        assert_eq!(bitmap.hotspot_x, 3);
-        assert_eq!(bitmap.hotspot_y, 4);
-        let png = BASE64_STANDARD.decode(bitmap.png_b64).unwrap();
-        let decoded = image::load_from_memory(&png).unwrap().to_rgba8();
-        assert_eq!(decoded.as_raw(), &rgba_pixels);
+        assert_eq!(bitmap.hotspot_x, 1);
+        assert_eq!(bitmap.hotspot_y, 1);
+        assert_eq!(bitmap.rgba.as_ref(), &rgba_pixels);
+
+        let mut serial = 0;
+        let mut last_state = None;
+        let first = pipewire_cursor_sample(&buffer, 100, 80, &mut serial, &mut last_state)
+            .expect("bitmap cursor sample");
+        // SAFETY: `meta.data` points to the live cursor fixture.
+        unsafe {
+            let cursor = &mut *meta.data.cast::<spa::sys::spa_meta_cursor>();
+            cursor.position.x = 26;
+            cursor.bitmap_offset = 0;
+        }
+        let moved = pipewire_cursor_sample(&buffer, 100, 80, &mut serial, &mut last_state)
+            .expect("position-only cursor sample");
+        assert!(Arc::ptr_eq(
+            first.bitmap.as_ref().unwrap(),
+            moved.bitmap.as_ref().unwrap()
+        ));
     }
 
     #[test]
-    fn dash_cursor_sends_bitmap_pixels_only_when_the_bitmap_changes() {
+    fn dash_cursor_sends_bitmap_pixels_on_change_and_periodic_refresh() {
         let rgba = [255, 0, 0, 255, 0, 255, 0, 255];
-        let bitmap = CursorBitmap {
+        let bitmap = Arc::new(CursorBitmap {
             width: 2,
             height: 1,
             hotspot_x: 1,
             hotspot_y: 0,
-            png_b64: encode_cursor_png_b64(2, 1, &rgba).unwrap(),
-        };
+            rgba: Arc::from(rgba),
+        });
         let message = |bitmap| CursorMessage {
             x: 10.0,
             y: 20.0,
+            visible: true,
             source_width: 100,
             source_height: 100,
             bitmap,
         };
         let mut state = DashCursorBitmapState::default();
         let first =
-            cursor_to_dash_event(message(Some(bitmap.clone())), 10, 100, 100, &mut state).unwrap();
+            cursor_to_dash_event(message(Some(Arc::clone(&bitmap))), 10, 100, 100, &mut state)
+                .unwrap();
         let repeated =
-            cursor_to_dash_event(message(Some(bitmap)), 20, 100, 100, &mut state).unwrap();
-        let position_only = cursor_to_dash_event(message(None), 30, 100, 100, &mut state).unwrap();
+            cursor_to_dash_event(message(Some(Arc::clone(&bitmap))), 20, 100, 100, &mut state)
+                .unwrap();
+        let refreshed = cursor_to_dash_event(
+            message(Some(bitmap)),
+            CURSOR_BITMAP_REFRESH_TICKS + 10,
+            100,
+            100,
+            &mut state,
+        )
+        .unwrap();
+        let position_only = cursor_to_dash_event(
+            message(None),
+            CURSOR_BITMAP_REFRESH_TICKS + 20,
+            100,
+            100,
+            &mut state,
+        )
+        .unwrap();
 
         assert!(first.bitmap.is_some());
         assert!(repeated.bitmap.is_none());
+        assert!(refreshed.bitmap.is_some());
         assert_eq!(repeated.bitmap_id, first.bitmap_id);
+        assert_eq!(refreshed.bitmap_id, first.bitmap_id);
         assert_eq!(position_only.bitmap_id, first.bitmap_id);
     }
 
     #[test]
-    fn pipewire_cursor_metadata_ignores_zero_id() {
+    fn dash_cursor_scales_clamps_and_hides_coordinates() {
+        let message = |x, y, visible| CursorMessage {
+            x,
+            y,
+            visible,
+            source_width: 200,
+            source_height: 100,
+            bitmap: None,
+        };
+        let mut state = DashCursorBitmapState::default();
+
+        let scaled =
+            cursor_to_dash_event(message(50.0, 25.0, true), 1, 100, 200, &mut state).unwrap();
+        assert_eq!(scaled.x_micropixels, 25_000_000);
+        assert_eq!(scaled.y_micropixels, 50_000_000);
+        assert!(scaled.visible);
+
+        let clamped =
+            cursor_to_dash_event(message(-10.0, f32::INFINITY, true), 2, 100, 200, &mut state)
+                .unwrap();
+        assert_eq!(clamped.x_micropixels, 0);
+        assert_eq!(clamped.y_micropixels, 0);
+
+        let hidden =
+            cursor_to_dash_event(message(50.0, 25.0, false), 3, 100, 200, &mut state).unwrap();
+        assert_eq!(hidden.x_micropixels, 0);
+        assert_eq!(hidden.y_micropixels, 0);
+        assert!(!hidden.visible);
+    }
+
+    #[test]
+    fn dash_cursor_rejects_inconsistent_bitmap_dimensions() {
+        let cursor = CursorMessage {
+            x: 0.0,
+            y: 0.0,
+            visible: true,
+            source_width: 1,
+            source_height: 1,
+            bitmap: Some(Arc::new(CursorBitmap {
+                width: 2,
+                height: 2,
+                hotspot_x: 0,
+                hotspot_y: 0,
+                rgba: Arc::from([0u8; 15]),
+            })),
+        };
+        assert!(
+            cursor_to_dash_event(cursor, 0, 1, 1, &mut DashCursorBitmapState::default()).is_err()
+        );
+    }
+
+    #[test]
+    fn pipewire_cursor_pixel_formats_convert_without_panicking_on_short_input() {
+        let pixel = [10, 20, 30, 40];
+        for (format, expected) in [
+            (spa::sys::SPA_VIDEO_FORMAT_RGBA, [10, 20, 30, 40]),
+            (spa::sys::SPA_VIDEO_FORMAT_BGRA, [30, 20, 10, 40]),
+            (spa::sys::SPA_VIDEO_FORMAT_ARGB, [20, 30, 40, 10]),
+            (spa::sys::SPA_VIDEO_FORMAT_ABGR, [40, 30, 20, 10]),
+            (spa::sys::SPA_VIDEO_FORMAT_RGBx, [10, 20, 30, 255]),
+            (spa::sys::SPA_VIDEO_FORMAT_BGRx, [30, 20, 10, 255]),
+            (spa::sys::SPA_VIDEO_FORMAT_xRGB, [20, 30, 40, 255]),
+            (spa::sys::SPA_VIDEO_FORMAT_xBGR, [40, 30, 20, 255]),
+        ] {
+            assert_eq!(cursor_pixel_as_rgba(format, &pixel), Some(expected));
+        }
+        assert_eq!(
+            cursor_pixel_as_rgba(spa::sys::SPA_VIDEO_FORMAT_RGBA, &[1, 2, 3]),
+            None
+        );
+        assert_eq!(
+            cursor_pixel_as_rgba(spa::sys::SPA_VIDEO_FORMAT_UNKNOWN, &pixel),
+            None
+        );
+    }
+
+    #[test]
+    fn pipewire_cursor_bitmap_rejects_malformed_layouts_and_excessive_dimensions() {
+        #[repr(C)]
+        struct CursorMetaFixture {
+            cursor: spa::sys::spa_meta_cursor,
+            bitmap: spa::sys::spa_meta_bitmap,
+            pixels: [u8; 16],
+        }
+
+        let bitmap_offset = std::mem::offset_of!(CursorMetaFixture, bitmap);
+        let pixel_offset = std::mem::offset_of!(CursorMetaFixture, pixels) - bitmap_offset;
+        let mut fixture = CursorMetaFixture {
+            cursor: spa::sys::spa_meta_cursor {
+                id: 1,
+                flags: 0,
+                position: spa::sys::spa_point { x: 0, y: 0 },
+                hotspot: spa::sys::spa_point { x: 0, y: 0 },
+                bitmap_offset: bitmap_offset as u32,
+            },
+            bitmap: spa::sys::spa_meta_bitmap {
+                format: spa::sys::SPA_VIDEO_FORMAT_RGBA,
+                size: spa::sys::spa_rectangle {
+                    width: 2,
+                    height: 2,
+                },
+                stride: 8,
+                offset: pixel_offset as u32,
+            },
+            pixels: [0; 16],
+        };
+        let meta = spa::sys::spa_meta {
+            type_: spa::sys::SPA_META_Cursor,
+            size: std::mem::size_of::<CursorMetaFixture>() as u32,
+            data: (&mut fixture.cursor as *mut spa::sys::spa_meta_cursor).cast(),
+        };
+
+        fixture.bitmap.stride = 7;
+        assert!(pipewire_cursor_bitmap(&meta, &fixture.cursor).is_none());
+        fixture.bitmap.stride = 8;
+        fixture.bitmap.offset = 0;
+        assert!(pipewire_cursor_bitmap(&meta, &fixture.cursor).is_none());
+        fixture.bitmap.offset = pixel_offset as u32;
+        fixture.bitmap.size.width = PIPEWIRE_CURSOR_MAX_BITMAP_SIDE as u32 + 1;
+        assert!(pipewire_cursor_bitmap(&meta, &fixture.cursor).is_none());
+        fixture.bitmap.size.width = 2;
+        fixture.cursor.bitmap_offset = 1;
+        assert!(pipewire_cursor_bitmap(&meta, &fixture.cursor).is_none());
+    }
+
+    #[test]
+    fn pipewire_cursor_metadata_zero_id_hides_a_visible_cursor_once() {
         let mut cursor = spa::sys::spa_meta_cursor {
-            id: 0,
+            id: 7,
             flags: 0,
             position: spa::sys::spa_point { x: 12, y: 18 },
             hotspot: spa::sys::spa_point { x: 0, y: 0 },
@@ -4674,7 +4852,23 @@ mod tests {
             datas: ptr::null_mut(),
         };
 
-        assert_eq!(pipewire_cursor_state(&buffer), None);
+        let mut serial = 0;
+        let mut last_state = None;
+        assert!(
+            pipewire_cursor_sample(&buffer, 100, 80, &mut serial, &mut last_state)
+                .unwrap()
+                .visible
+        );
+
+        // SAFETY: `meta.data` points to the live `cursor` fixture.
+        unsafe {
+            (*meta.data.cast::<spa::sys::spa_meta_cursor>()).id = 0;
+        }
+        let hidden = pipewire_cursor_sample(&buffer, 100, 80, &mut serial, &mut last_state)
+            .expect("cursor hidden update");
+        assert!(!hidden.visible);
+        assert!(hidden.bitmap.is_none());
+        assert!(pipewire_cursor_sample(&buffer, 100, 80, &mut serial, &mut last_state).is_none());
     }
 
     #[test]
@@ -4692,6 +4886,13 @@ mod tests {
         };
         assert!(!pipewire_buffer_has_cursor_meta(&busy_buffer));
 
+        let mut cursor = spa::sys::spa_meta_cursor {
+            id: 0,
+            flags: 0,
+            position: spa::sys::spa_point { x: 0, y: 0 },
+            hotspot: spa::sys::spa_point { x: 0, y: 0 },
+            bitmap_offset: 0,
+        };
         let mut metas = [
             spa::sys::spa_meta {
                 type_: spa::sys::SPA_META_Busy,
@@ -4701,7 +4902,7 @@ mod tests {
             spa::sys::spa_meta {
                 type_: spa::sys::SPA_META_Cursor,
                 size: std::mem::size_of::<spa::sys::spa_meta_cursor>() as u32,
-                data: ptr::null_mut(),
+                data: (&mut cursor as *mut spa::sys::spa_meta_cursor).cast(),
             },
         ];
         let cursor_buffer = spa::sys::spa_buffer {
@@ -4711,6 +4912,20 @@ mod tests {
             datas: ptr::null_mut(),
         };
         assert!(pipewire_buffer_has_cursor_meta(&cursor_buffer));
+
+        // SAFETY: `cursor_buffer.metas` points to the two-element `metas` fixture.
+        unsafe {
+            (*cursor_buffer.metas.add(1)).data = ptr::null_mut();
+        }
+        assert!(!pipewire_buffer_has_cursor_meta(&cursor_buffer));
+        // SAFETY: the fixture and cursor both remain live for this assertion.
+        unsafe {
+            (*cursor_buffer.metas.add(1)).data =
+                (&mut cursor as *mut spa::sys::spa_meta_cursor).cast();
+            (*cursor_buffer.metas.add(1)).size =
+                std::mem::size_of::<spa::sys::spa_meta_cursor>() as u32 - 1;
+        }
+        assert!(!pipewire_buffer_has_cursor_meta(&cursor_buffer));
     }
 
     #[test]
@@ -4764,10 +4979,17 @@ mod tests {
 
     #[test]
     fn required_pipewire_cursor_metadata_recovers_when_meta_appears() {
+        let mut cursor = spa::sys::spa_meta_cursor {
+            id: 0,
+            flags: 0,
+            position: spa::sys::spa_point { x: 0, y: 0 },
+            hotspot: spa::sys::spa_point { x: 0, y: 0 },
+            bitmap_offset: 0,
+        };
         let mut cursor_meta = spa::sys::spa_meta {
             type_: spa::sys::SPA_META_Cursor,
             size: std::mem::size_of::<spa::sys::spa_meta_cursor>() as u32,
-            data: ptr::null_mut(),
+            data: (&mut cursor as *mut spa::sys::spa_meta_cursor).cast(),
         };
         let buffer = spa::sys::spa_buffer {
             n_metas: 1,
@@ -4785,6 +5007,60 @@ mod tests {
         );
         assert!(verified);
         assert!(missing_since.is_none());
+    }
+
+    #[test]
+    fn required_pipewire_cursor_metadata_fails_if_allocation_disappears() {
+        let mut cursor = spa::sys::spa_meta_cursor {
+            id: 0,
+            flags: 0,
+            position: spa::sys::spa_point { x: 0, y: 0 },
+            hotspot: spa::sys::spa_point { x: 0, y: 0 },
+            bitmap_offset: 0,
+        };
+        let mut meta = spa::sys::spa_meta {
+            type_: spa::sys::SPA_META_Cursor,
+            size: std::mem::size_of::<spa::sys::spa_meta_cursor>() as u32,
+            data: (&mut cursor as *mut spa::sys::spa_meta_cursor).cast(),
+        };
+        let buffer = spa::sys::spa_buffer {
+            n_metas: 1,
+            n_datas: 0,
+            metas: &mut meta,
+            datas: ptr::null_mut(),
+        };
+        let now = Instant::now();
+        let mut verified = false;
+        let mut missing_since = None;
+        assert_eq!(
+            pipewire_cursor_metadata_gate(&buffer, true, &mut verified, &mut missing_since, now),
+            PipewireCursorMetadataGate::Ready
+        );
+
+        // SAFETY: `buffer.metas` points to the live one-element metadata fixture.
+        unsafe {
+            (*buffer.metas).data = ptr::null_mut();
+        }
+        assert_eq!(
+            pipewire_cursor_metadata_gate(
+                &buffer,
+                true,
+                &mut verified,
+                &mut missing_since,
+                now + Duration::from_millis(1)
+            ),
+            PipewireCursorMetadataGate::Pending
+        );
+        assert_eq!(
+            pipewire_cursor_metadata_gate(
+                &buffer,
+                true,
+                &mut verified,
+                &mut missing_since,
+                now + PIPEWIRE_CURSOR_METADATA_GRACE + Duration::from_millis(1)
+            ),
+            PipewireCursorMetadataGate::Fatal
+        );
     }
 
     #[test]
@@ -4810,10 +5086,17 @@ mod tests {
             None
         );
 
+        let mut cursor = spa::sys::spa_meta_cursor {
+            id: 0,
+            flags: 0,
+            position: spa::sys::spa_point { x: 0, y: 0 },
+            hotspot: spa::sys::spa_point { x: 0, y: 0 },
+            bitmap_offset: 0,
+        };
         let mut cursor_meta = spa::sys::spa_meta {
             type_: spa::sys::SPA_META_Cursor,
             size: std::mem::size_of::<spa::sys::spa_meta_cursor>() as u32,
-            data: ptr::null_mut(),
+            data: (&mut cursor as *mut spa::sys::spa_meta_cursor).cast(),
         };
         let cursor_buffer = spa::sys::spa_buffer {
             n_metas: 1,
