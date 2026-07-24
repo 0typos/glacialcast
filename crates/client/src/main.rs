@@ -11,19 +11,16 @@ use glacialcast_dash::{
 };
 use glacialcast_protocol::{
     BufferStatus, CaptureSource, ClientMessage, CursorBitmap, CursorMessage, DashObject,
-    DashObjectKind, FrameMessage, H264ParameterSetCache, NewDashObject, NoiseSocket,
-    PROTOCOL_VERSION, ServerMessage, StreamHello, StreamMediaKind, VideoChunkMessage, VideoCodec,
-    VideoPacketization,
+    DashObjectKind, NewDashObject, NoiseSocket, PROTOCOL_VERSION, ServerMessage, StreamHello,
+    StreamMediaKind,
     daemon::{
         daemonize_if_requested, install_signal_handlers, manager_command,
         sanitize_socket_component, serve_control_socket, wait_for_shutdown,
     },
-    decode_key_b64, fast_content_hash, initiator_handshake, now_ms, parse_human_bytes,
-    protect_frame,
+    decode_key_b64, initiator_handshake, now_ms, parse_human_bytes,
 };
 use image::{
-    ColorType, ImageBuffer, ImageEncoder, ImageReader, Rgb, RgbaImage,
-    codecs::{jpeg::JpegEncoder, png::PngEncoder},
+    ColorType, ImageBuffer, ImageEncoder, Rgb, RgbaImage, codecs::png::PngEncoder,
     imageops::FilterType,
 };
 use pipewire as pw;
@@ -32,22 +29,18 @@ use rand::{RngCore, rngs::OsRng};
 use serde::Deserialize;
 use std::{
     collections::VecDeque,
-    io::Cursor,
     net::SocketAddr,
     os::fd::{FromRawFd, OwnedFd, RawFd},
-    path::{Path, PathBuf},
-    process::Stdio,
+    path::PathBuf,
     ptr,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 use tokio::{
-    io::AsyncReadExt,
     net::TcpStream,
-    process::{Child, ChildStdout, Command},
     sync::watch,
     time::{MissedTickBehavior, timeout},
 };
@@ -59,14 +52,7 @@ use zbus::{
     zvariant::{OwnedFd as ZbusOwnedFd, OwnedObjectPath, OwnedValue, Value},
 };
 
-#[cfg(feature = "ffmpeg-vaapi")]
-use glacialcast_protocol::inspect_h264_access_unit;
-#[cfg(feature = "ffmpeg-vaapi")]
-use std::os::fd::AsRawFd;
-
 mod dash_encoder;
-#[cfg(feature = "ffmpeg-vaapi")]
-mod ffmpeg_vaapi;
 
 use dash_encoder::{
     DashDmaBufFrame, DashEncoderMode, DashFrameRelease, DashH264Encoder, DashInputFrame,
@@ -104,12 +90,8 @@ struct Args {
     client_id: Option<String>,
     #[arg(long)]
     display_name: Option<String>,
-    #[arg(long, value_enum, default_value_t = CaptureMode::TestPattern)]
+    #[arg(long, value_enum, default_value_t = CaptureMode::DashWayland)]
     capture: CaptureMode,
-    #[arg(long)]
-    video_command: Option<String>,
-    #[arg(long, default_value = "~/photos/screenshots")]
-    image_dir: PathBuf,
     #[arg(long, value_enum, default_value_t = PortalSourceMode::Monitor)]
     portal_source: PortalSourceMode,
     #[arg(long, value_enum, default_value_t = ScreenCastBackend::Portal)]
@@ -124,14 +106,10 @@ struct Args {
     width: u32,
     #[arg(long, default_value_t = 720)]
     height: u32,
-    #[arg(long, default_value_t = 75)]
-    jpeg_quality: u8,
     #[arg(long, default_value_t = 1600)]
     max_frame_width: u32,
     #[arg(long, default_value_t = 900)]
     max_frame_height: u32,
-    #[arg(long, default_value_t = 0.05)]
-    min_frame_change_percent: f32,
     #[arg(long, value_parser = parse_update_rate, default_value = "1")]
     fps: f64,
     #[arg(long, default_value_t = 30)]
@@ -176,23 +154,10 @@ struct ClientIdentity {
     display_name: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CaptureEncodeSettings {
-    jpeg_quality: u8,
-    max_width: u32,
-    max_height: u32,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CaptureMode {
     DashTest,
     DashWayland,
-    TestPattern,
-    TestVideo,
-    ExternalH264,
-    ImageDir,
-    Wayland,
-    WaylandVideo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -299,14 +264,10 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
     let viewer_key = identity
         .viewer_key_b64
         .as_deref()
-        .map(decode_key_b64)
-        .transpose()
-        .context("viewer key must be URL-safe base64 for 32 bytes")?;
-    let encode_settings = CaptureEncodeSettings {
-        jpeg_quality: args.jpeg_quality,
-        max_width: args.max_frame_width,
-        max_height: args.max_frame_height,
-    };
+        .context("encrypted DASH capture requires --viewer-key or viewer_key_b64 in client.toml")
+        .and_then(|key| {
+            decode_key_b64(key).context("viewer key must be URL-safe base64 for 32 bytes")
+        })?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(install_signal_handlers(shutdown_tx.clone()));
     if serve_control {
@@ -318,93 +279,20 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
         });
     }
 
-    if is_dash_capture_mode(args.capture) {
-        let viewer_key = viewer_key.as_ref().context(
-            "encrypted DASH capture requires --viewer-key or viewer_key_b64 in client.toml",
-        )?;
-        let mut capture: Box<dyn Capture> = match args.capture {
-            CaptureMode::DashTest => Box::new(TestPatternCapture::new(args.width, args.height)),
-            CaptureMode::DashWayland => Box::new(WaylandPipewireCapture::new(&args)),
-            _ => unreachable!("non-DASH modes do not enter the DASH client"),
-        };
-        let mut resend = DashResendBuffer::new(args.resend_bytes);
-        return run_dash_client(
-            &args,
-            &identity,
-            viewer_key,
-            capture.as_mut(),
-            &mut resend,
-            shutdown_rx,
-        )
-        .await;
-    }
-
-    if is_video_capture_mode(args.capture) {
-        if viewer_key.is_some() {
-            warn!(
-                "viewer_key is ignored for video streams; WebRTC uses DTLS/SRTP transport encryption"
-            );
-        }
-        let mut video = build_video_capture(&args)?;
-        let mut resend = VideoResendBuffer::new(args.resend_bytes);
-        let result =
-            run_video_client(&args, &identity, video.as_mut(), &mut resend, shutdown_rx).await;
-        video.stop().await;
-        return result;
-    }
-
     let mut capture: Box<dyn Capture> = match args.capture {
-        CaptureMode::TestPattern => Box::new(TestPatternCapture::new(args.width, args.height)),
-        CaptureMode::DashTest
-        | CaptureMode::DashWayland
-        | CaptureMode::TestVideo
-        | CaptureMode::ExternalH264
-        | CaptureMode::WaylandVideo => {
-            unreachable!("video modes return early")
-        }
-        CaptureMode::ImageDir => Box::new(ImageDirCapture::new(expand_home(&args.image_dir))),
-        CaptureMode::Wayland => Box::new(WaylandPipewireCapture::new(&args)),
+        CaptureMode::DashTest => Box::new(TestPatternCapture::new(args.width, args.height)),
+        CaptureMode::DashWayland => Box::new(WaylandPipewireCapture::new(&args)),
     };
-    let mut resend = ResendBuffer::new(args.resend_bytes);
-
-    loop {
-        let source = match capture.source().await {
-            Ok(source) => source,
-            Err(err) => {
-                if is_fatal_capture_error(&err) {
-                    return Err(err.context("fatal capture setup error"));
-                }
-                warn!(?err, "capture source unavailable; retrying in 1s");
-                let mut retry_shutdown = shutdown_rx.clone();
-                if sleep_or_shutdown(Duration::from_secs(1), &mut retry_shutdown).await {
-                    info!("shutdown requested before capture source became available");
-                    return Ok(());
-                }
-                continue;
-            }
-        };
-        let context = ImageConnectionContext {
-            args: &args,
-            identity: &identity,
-            viewer_key: viewer_key.as_ref(),
-            source: &source,
-            encode_settings,
-        };
-        match run_connection(context, &mut *capture, &mut resend, shutdown_rx.clone()).await {
-            Ok(()) => return Ok(()),
-            Err(err) => {
-                if is_fatal_capture_error(&err) {
-                    return Err(err.context("fatal capture error"));
-                }
-                warn!(?err, "connection dropped; retrying in 1s");
-                let mut retry_shutdown = shutdown_rx.clone();
-                if sleep_or_shutdown(Duration::from_secs(1), &mut retry_shutdown).await {
-                    info!("shutdown requested while retrying connection");
-                    return Ok(());
-                }
-            }
-        }
-    }
+    let mut resend = DashResendBuffer::new(args.resend_bytes);
+    run_dash_client(
+        &args,
+        &identity,
+        &viewer_key,
+        capture.as_mut(),
+        &mut resend,
+        shutdown_rx,
+    )
+    .await
 }
 
 async fn sleep_or_shutdown(duration: Duration, shutdown_rx: &mut watch::Receiver<bool>) -> bool {
@@ -1064,27 +952,6 @@ fn is_fatal_capture_error(err: &anyhow::Error) -> bool {
     })
 }
 
-fn is_video_capture_mode(mode: CaptureMode) -> bool {
-    matches!(
-        mode,
-        CaptureMode::TestVideo | CaptureMode::ExternalH264 | CaptureMode::WaylandVideo
-    )
-}
-
-fn is_dash_capture_mode(mode: CaptureMode) -> bool {
-    matches!(mode, CaptureMode::DashTest | CaptureMode::DashWayland)
-}
-
-fn build_video_capture(args: &Args) -> Result<Box<dyn VideoCapture>> {
-    match args.capture {
-        CaptureMode::TestVideo | CaptureMode::ExternalH264 => {
-            Ok(Box::new(ProcessH264Capture::new(args)?))
-        }
-        CaptureMode::WaylandVideo => Ok(Box::new(WaylandVaapiH264Capture::new(args))),
-        _ => bail!("invalid video capture mode"),
-    }
-}
-
 fn resolve_client_identity(args: &Args) -> Result<ClientIdentity> {
     let config = load_client_config(&args.config)?;
     let client_id = args
@@ -1140,33 +1007,6 @@ fn load_client_config(path: &PathBuf) -> Result<ClientConfig> {
     toml::from_str(&raw).with_context(|| format!("parsing client config {}", path.display()))
 }
 
-fn expand_home(path: &Path) -> PathBuf {
-    let raw = path.as_os_str().to_string_lossy();
-    if raw == "~" {
-        return std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| path.to_path_buf());
-    }
-    if let Some(rest) = raw.strip_prefix("~/") {
-        return std::env::var_os("HOME")
-            .map(|home| PathBuf::from(home).join(rest))
-            .unwrap_or_else(|| path.to_path_buf());
-    }
-    path.to_path_buf()
-}
-
-fn is_supported_image_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| {
-            matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "jpg" | "jpeg" | "png"
-            )
-        })
-        .unwrap_or(false)
-}
-
 fn parse_update_rate(value: &str) -> std::result::Result<f64, String> {
     let fps = value
         .trim()
@@ -1176,676 +1016,6 @@ fn parse_update_rate(value: &str) -> std::result::Result<f64, String> {
         return Err("update rate must be between 0.5 and 15 updates per second".to_string());
     }
     Ok(fps)
-}
-
-struct ImageConnectionContext<'a> {
-    args: &'a Args,
-    identity: &'a ClientIdentity,
-    viewer_key: Option<&'a [u8; 32]>,
-    source: &'a CaptureSource,
-    encode_settings: CaptureEncodeSettings,
-}
-
-async fn run_connection(
-    context: ImageConnectionContext<'_>,
-    capture: &mut dyn Capture,
-    resend: &mut ResendBuffer,
-    mut shutdown_rx: watch::Receiver<bool>,
-) -> Result<()> {
-    let mut stream = TcpStream::connect(context.args.ingest_addr).await?;
-    let transport = initiator_handshake(&mut stream).await?;
-    let mut socket = NoiseSocket::new(stream, transport);
-    let (low, high) = resend.range();
-    socket
-        .write(&ClientMessage::Hello(StreamHello {
-            protocol_version: PROTOCOL_VERSION,
-            client_id: context.identity.client_id.clone(),
-            auth_token: context.identity.auth_token.clone(),
-            display_name: context.identity.display_name.clone(),
-            source: context.source.clone(),
-            media_kind: StreamMediaKind::Image,
-            frame_encrypted: context.viewer_key.is_some(),
-            resend_low: low,
-            resend_high: high,
-        }))
-        .await?;
-
-    let (assigned_stream_id, last_frame_seq) = match socket.read::<ServerMessage>().await? {
-        ServerMessage::HelloAck {
-            accepted: true,
-            stream_id: Some(stream_id),
-            last_frame_seq,
-            ..
-        } => (stream_id, last_frame_seq),
-        ServerMessage::HelloAck { reason, .. } => bail!("server rejected hello: {reason:?}"),
-        other => bail!("server sent unexpected first response: {other:?}"),
-    };
-    resend.drop_other_streams(assigned_stream_id);
-    let mut seq = last_frame_seq.max(resend.range().1.unwrap_or(0));
-    info!(
-        stream_id = %assigned_stream_id,
-        last_frame_seq,
-        next_seq = seq + 1,
-        "server assigned stream"
-    );
-
-    let mut cursor_seq = 0u64;
-    let frame_ms = (1000.0 / context.args.fps).round().max(1.0) as u64;
-    let cursor_ms = 1000 / context.args.cursor_hz.max(1);
-    let mut frame_tick = tokio::time::interval(Duration::from_millis(frame_ms));
-    let mut cursor_tick = tokio::time::interval(Duration::from_millis(cursor_ms));
-    frame_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    cursor_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-    let mut last_sent_fingerprint = None::<FrameFingerprint>;
-    loop {
-        tokio::select! {
-            _ = wait_for_shutdown(&mut shutdown_rx) => {
-                info!("shutdown requested; closing image stream");
-                return Ok(());
-            }
-            _ = frame_tick.tick() => {
-                let captured = capture.capture_jpeg(context.encode_settings).await?;
-                if let Some(previous) = &last_sent_fingerprint {
-                    let delta_percent = captured.fingerprint.delta_percent(previous);
-                    if delta_percent < context.args.min_frame_change_percent {
-                        info!(
-                            delta_percent,
-                            threshold_percent = context.args.min_frame_change_percent,
-                            "skipping visually unchanged frame"
-                        );
-                        continue;
-                    }
-                }
-                seq += 1;
-                let protected = protect_frame(context.viewer_key, &captured.jpeg)?;
-                let frame = FrameMessage {
-                    stream_id: assigned_stream_id,
-                    seq,
-                    captured_at_ms: now_ms(),
-                    width: captured.width,
-                    height: captured.height,
-                    mime: "image/jpeg".to_string(),
-                    key_id: protected.key_id,
-                    nonce: protected.nonce,
-                    content_hash: protected.content_hash,
-                    ciphertext: protected.payload,
-                };
-                socket.write(&ClientMessage::Frame(frame.clone())).await?;
-                info!(
-                    seq,
-                    width = frame.width,
-                    height = frame.height,
-                    bytes = frame.ciphertext.len(),
-                    source_width = context.source.width,
-                    source_height = context.source.height,
-                    "sent encoded frame"
-                );
-                last_sent_fingerprint = Some(captured.fingerprint);
-                resend.push(frame);
-                socket.write(&ClientMessage::BufferStatus(BufferStatus {
-                    stream_id: assigned_stream_id,
-                    lowest_seq: resend.range().0,
-                    highest_seq: resend.range().1,
-                    bytes: resend.bytes,
-                })).await?;
-                read_server_until_ack(&mut socket, resend, &mut shutdown_rx).await?;
-            }
-            _ = cursor_tick.tick() => {
-                cursor_seq += 1;
-                if let Some(cursor) = capture.cursor(cursor_seq, assigned_stream_id).await? {
-                    debug!(
-                        stream_id = %assigned_stream_id,
-                        seq = cursor.seq,
-                        x = cursor.x,
-                        y = cursor.y,
-                        "sending cursor"
-                    );
-                    socket.write(&ClientMessage::Cursor(cursor)).await?;
-                    debug!(stream_id = %assigned_stream_id, seq = cursor_seq, "sent cursor");
-                }
-            }
-        }
-    }
-}
-
-async fn read_server_until_ack(
-    socket: &mut NoiseSocket<TcpStream>,
-    resend: &mut ResendBuffer,
-    shutdown_rx: &mut watch::Receiver<bool>,
-) -> Result<()> {
-    loop {
-        let message = tokio::select! {
-            message = socket.read::<ServerMessage>() => message?,
-            _ = wait_for_shutdown(shutdown_rx) => return Ok(()),
-        };
-        match message {
-            ServerMessage::Ack { through_seq } => {
-                resend.ack(through_seq);
-                return Ok(());
-            }
-            ServerMessage::ResendRequest { from_seq, to_seq } => {
-                for frame in resend.frames(from_seq, to_seq) {
-                    socket.write(&ClientMessage::Frame(frame)).await?;
-                }
-            }
-            ServerMessage::Backpressure { pause_ms, reason } => {
-                warn!(%pause_ms, %reason, "server requested backpressure");
-                tokio::time::sleep(Duration::from_millis(pause_ms)).await;
-            }
-            ServerMessage::KeyframeRequest { reason, .. } => {
-                warn!(%reason, "server requested a keyframe; image stream will send the next full frame");
-            }
-            ServerMessage::Pong { .. } | ServerMessage::HelloAck { .. } => {}
-        }
-    }
-}
-
-async fn run_video_client(
-    args: &Args,
-    identity: &ClientIdentity,
-    capture: &mut dyn VideoCapture,
-    resend: &mut VideoResendBuffer,
-    shutdown_rx: watch::Receiver<bool>,
-) -> Result<()> {
-    loop {
-        let source = match capture.source().await {
-            Ok(source) => source,
-            Err(err) => {
-                if is_fatal_video_source_error(&err) {
-                    return Err(err.context("fatal video source setup error"));
-                }
-                warn!(?err, "video source unavailable; retrying in 1s");
-                let mut retry_shutdown = shutdown_rx.clone();
-                if sleep_or_shutdown(Duration::from_secs(1), &mut retry_shutdown).await {
-                    info!("shutdown requested before video source became available");
-                    return Ok(());
-                }
-                continue;
-            }
-        };
-        match run_video_connection(
-            args,
-            identity,
-            &source,
-            capture,
-            resend,
-            shutdown_rx.clone(),
-        )
-        .await
-        {
-            Ok(()) => return Ok(()),
-            Err(err) => {
-                if is_fatal_video_source_error(&err) {
-                    return Err(err.context("fatal video source error"));
-                }
-                warn!(?err, "video connection dropped; retrying in 1s");
-                let mut retry_shutdown = shutdown_rx.clone();
-                if sleep_or_shutdown(Duration::from_secs(1), &mut retry_shutdown).await {
-                    info!("shutdown requested while retrying video connection");
-                    return Ok(());
-                }
-            }
-        }
-    }
-}
-
-fn is_fatal_video_source_error(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        let message = cause.to_string();
-        message.contains("external H.264 source command failed")
-            || message.contains("external H.264 source exited before producing video")
-            || message.contains("wayland-video VAAPI backend is not implemented yet")
-            || message.contains("wayland-video was built without the ffmpeg-vaapi feature")
-            || message.contains("h264_vaapi")
-            || message.contains("FFmpeg DRM")
-            || message.contains("FFmpeg VAAPI")
-            || message.contains("VAAPI frame")
-            || message
-                .contains("does not include SPA_META_Cursor while --require-cursor-metadata is set")
-            || message.contains("requested portal cursor mode Metadata is not available")
-    })
-}
-
-#[cfg_attr(not(feature = "ffmpeg-vaapi"), allow(dead_code))]
-fn is_vaapi_path_error(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        let message = cause.to_string();
-        message.contains("configuring FFmpeg VAAPI filter graph")
-            || message.contains("creating FFmpeg DRM hardware device context")
-            || message.contains("FFmpeg DRM")
-            || message.contains("FFmpeg VAAPI")
-            || message.contains("VAAPI frame")
-            || message.contains("DMA-BUF")
-            || message.contains("h264_vaapi")
-            || message.contains("hwmap")
-            || message.contains("requested VAProfile is not supported")
-            || message.contains("scale_vaapi")
-    })
-}
-
-async fn run_video_connection(
-    args: &Args,
-    identity: &ClientIdentity,
-    source: &CaptureSource,
-    capture: &mut dyn VideoCapture,
-    resend: &mut VideoResendBuffer,
-    mut shutdown_rx: watch::Receiver<bool>,
-) -> Result<()> {
-    let mut stream = TcpStream::connect(args.ingest_addr).await?;
-    let transport = initiator_handshake(&mut stream).await?;
-    let mut socket = NoiseSocket::new(stream, transport);
-    let (low, high) = resend.range();
-    socket
-        .write(&ClientMessage::Hello(StreamHello {
-            protocol_version: PROTOCOL_VERSION,
-            client_id: identity.client_id.clone(),
-            auth_token: identity.auth_token.clone(),
-            display_name: identity.display_name.clone(),
-            source: source.clone(),
-            media_kind: StreamMediaKind::Video,
-            frame_encrypted: false,
-            resend_low: low,
-            resend_high: high,
-        }))
-        .await?;
-
-    let (assigned_stream_id, last_frame_seq) = match socket.read::<ServerMessage>().await? {
-        ServerMessage::HelloAck {
-            accepted: true,
-            stream_id: Some(stream_id),
-            last_frame_seq,
-            ..
-        } => (stream_id, last_frame_seq),
-        ServerMessage::HelloAck { reason, .. } => bail!("server rejected hello: {reason:?}"),
-        other => bail!("server sent unexpected first response: {other:?}"),
-    };
-    resend.drop_other_streams(assigned_stream_id);
-    let mut seq = last_frame_seq.max(resend.range().1.unwrap_or(0));
-    info!(
-        stream_id = %assigned_stream_id,
-        last_frame_seq,
-        next_seq = seq + 1,
-        "server assigned video stream"
-    );
-    capture.request_keyframe()?;
-
-    let cursor_ms = 1000 / args.cursor_hz.max(1);
-    let mut cursor_tick = tokio::time::interval(Duration::from_millis(cursor_ms));
-    cursor_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut cursor_seq = 0u64;
-
-    loop {
-        tokio::select! {
-            _ = wait_for_shutdown(&mut shutdown_rx) => {
-                info!("shutdown requested; closing video stream");
-                return Ok(());
-            }
-            chunk = capture.next_chunk() => {
-                let chunk = chunk?;
-                seq += 1;
-                let message = VideoChunkMessage {
-                    stream_id: assigned_stream_id,
-                    seq,
-                    captured_at_ms: chunk.captured_at_ms,
-                    pts_ms: chunk.pts_ms,
-                    duration_ms: chunk.duration_ms,
-                    width: chunk.width,
-                    height: chunk.height,
-                    source_width: chunk.source_width,
-                    source_height: chunk.source_height,
-                    codec: VideoCodec::H264,
-                    packetization: VideoPacketization::AnnexB,
-                    keyframe: chunk.keyframe,
-                    mime: "video/h264".to_string(),
-                    key_id: String::new(),
-                    nonce: [0; 12],
-                    content_hash: fast_content_hash(&chunk.payload),
-                    payload: chunk.payload,
-                };
-                socket.write(&ClientMessage::VideoChunk(message.clone())).await?;
-                info!(
-                    seq,
-                    width = message.width,
-                    height = message.height,
-                    keyframe = message.keyframe,
-                    bytes = message.payload.len(),
-                    "sent encoded video chunk"
-                );
-                resend.push(message);
-                socket.write(&ClientMessage::BufferStatus(BufferStatus {
-                    stream_id: assigned_stream_id,
-                    lowest_seq: resend.range().0,
-                    highest_seq: resend.range().1,
-                    bytes: resend.bytes,
-                })).await?;
-                read_server_until_video_ack(
-                    &mut socket,
-                    capture,
-                    resend,
-                    &mut shutdown_rx,
-                )
-                .await?;
-            }
-            _ = cursor_tick.tick() => {
-                cursor_seq += 1;
-                if let Some(cursor) = capture.cursor(cursor_seq, assigned_stream_id).await? {
-                    debug!(
-                        stream_id = %assigned_stream_id,
-                        seq = cursor.seq,
-                        x = cursor.x,
-                        y = cursor.y,
-                        "sending video cursor"
-                    );
-                    socket.write(&ClientMessage::Cursor(cursor)).await?;
-                    debug!(stream_id = %assigned_stream_id, seq = cursor_seq, "sent video cursor");
-                }
-            }
-        }
-    }
-}
-
-async fn read_server_until_video_ack(
-    socket: &mut NoiseSocket<TcpStream>,
-    capture: &mut dyn VideoCapture,
-    resend: &mut VideoResendBuffer,
-    shutdown_rx: &mut watch::Receiver<bool>,
-) -> Result<()> {
-    loop {
-        let message = tokio::select! {
-            message = socket.read::<ServerMessage>() => message?,
-            _ = wait_for_shutdown(shutdown_rx) => return Ok(()),
-        };
-        match message {
-            ServerMessage::Ack { through_seq } => {
-                resend.ack(through_seq);
-                return Ok(());
-            }
-            ServerMessage::ResendRequest { from_seq, to_seq } => {
-                for chunk in resend.chunks(from_seq, to_seq) {
-                    socket.write(&ClientMessage::VideoChunk(chunk)).await?;
-                }
-            }
-            ServerMessage::Backpressure { pause_ms, reason } => {
-                warn!(%pause_ms, %reason, "server requested backpressure");
-                tokio::time::sleep(Duration::from_millis(pause_ms)).await;
-            }
-            ServerMessage::KeyframeRequest { reason, .. } => {
-                warn!(%reason, "server requested a video keyframe");
-                capture.request_keyframe()?;
-            }
-            ServerMessage::Pong { .. } | ServerMessage::HelloAck { .. } => {}
-        }
-    }
-}
-
-struct CapturedVideoChunk {
-    payload: Vec<u8>,
-    keyframe: bool,
-    captured_at_ms: i64,
-    pts_ms: i64,
-    duration_ms: u64,
-    width: u32,
-    height: u32,
-    source_width: u32,
-    source_height: u32,
-}
-
-#[async_trait]
-trait VideoCapture: Send {
-    async fn source(&mut self) -> Result<CaptureSource>;
-    async fn next_chunk(&mut self) -> Result<CapturedVideoChunk>;
-    async fn cursor(&mut self, seq: u64, stream_id: Uuid) -> Result<Option<CursorMessage>>;
-    fn request_keyframe(&mut self) -> Result<()> {
-        Ok(())
-    }
-    async fn stop(&mut self);
-}
-
-struct ProcessH264Capture {
-    width: u32,
-    height: u32,
-    fps: f64,
-    command: FfmpegCommand,
-    process: Option<Child>,
-    stdout: Option<ChildStdout>,
-    parser: H264AnnexBParser,
-    parameter_sets: H264ParameterSetCache,
-    started_at_ms: i64,
-}
-
-enum FfmpegCommand {
-    TestPattern,
-    Shell(String),
-}
-
-impl ProcessH264Capture {
-    fn new(args: &Args) -> Result<Self> {
-        let command = match args.capture {
-            CaptureMode::TestVideo => FfmpegCommand::TestPattern,
-            CaptureMode::ExternalH264 => FfmpegCommand::Shell(
-                args.video_command
-                    .clone()
-                    .context("--video-command is required with --capture external-h264")?,
-            ),
-            _ => bail!("invalid video capture mode"),
-        };
-        Ok(Self {
-            width: args.width.max(1),
-            height: args.height.max(1),
-            fps: args.fps,
-            command,
-            process: None,
-            stdout: None,
-            parser: H264AnnexBParser::default(),
-            parameter_sets: H264ParameterSetCache::default(),
-            started_at_ms: now_ms(),
-        })
-    }
-
-    async fn ensure_started(&mut self) -> Result<()> {
-        if self.process.is_some() {
-            return Ok(());
-        }
-        let mut command = self.build_command();
-        let mut child = command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .stdin(Stdio::null())
-            .spawn()
-            .context("starting H.264 source process")?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("H.264 source stdout was not piped")?;
-        self.started_at_ms = now_ms();
-        self.stdout = Some(stdout);
-        self.process = Some(child);
-        Ok(())
-    }
-
-    fn build_command(&self) -> Command {
-        match &self.command {
-            FfmpegCommand::TestPattern => {
-                let key_interval = self.fps.ceil().max(1.0) as u32;
-                let mut command = Command::new("ffmpeg");
-                command
-                    .arg("-hide_banner")
-                    .arg("-loglevel")
-                    .arg("error")
-                    .arg("-re")
-                    .arg("-f")
-                    .arg("lavfi")
-                    .arg("-i")
-                    .arg(format!(
-                        "testsrc2=size={}x{}:rate={}",
-                        self.width,
-                        self.height,
-                        ffmpeg_rate_arg(self.fps)
-                    ))
-                    .arg("-an")
-                    .arg("-c:v")
-                    .arg("libx264")
-                    .arg("-preset")
-                    .arg("ultrafast")
-                    .arg("-tune")
-                    .arg("zerolatency")
-                    .arg("-profile:v")
-                    .arg("baseline")
-                    .arg("-pix_fmt")
-                    .arg("yuv420p")
-                    .arg("-x264-params")
-                    .arg(format!(
-                        "keyint={key_interval}:min-keyint={key_interval}:scenecut=0:repeat-headers=1:aud=1"
-                    ))
-                    .arg("-bf")
-                    .arg("0")
-                    .arg("-f")
-                    .arg("h264")
-                    .arg("pipe:1");
-                command
-            }
-            FfmpegCommand::Shell(raw) => {
-                let mut command = Command::new("sh");
-                command.arg("-lc").arg(raw);
-                command
-            }
-        }
-    }
-}
-
-#[async_trait]
-impl VideoCapture for ProcessH264Capture {
-    async fn source(&mut self) -> Result<CaptureSource> {
-        self.ensure_started().await?;
-        Ok(CaptureSource {
-            backend: match self.command {
-                FfmpegCommand::TestPattern => "ffmpeg-h264-test-pattern",
-                FfmpegCommand::Shell(_) => "external-h264-annexb",
-            }
-            .to_string(),
-            description: "Annex-B H.264 video stream for WebRTC relay".to_string(),
-            width: self.width,
-            height: self.height,
-        })
-    }
-
-    async fn next_chunk(&mut self) -> Result<CapturedVideoChunk> {
-        self.ensure_started().await?;
-        loop {
-            if let Some(access_unit) = self.parser.pop_access_unit() {
-                let captured_at_ms = now_ms();
-                let keyframe = h264_access_unit_has_idr(&access_unit);
-                let payload = self
-                    .parameter_sets
-                    .normalize_access_unit(access_unit, keyframe);
-                return Ok(CapturedVideoChunk {
-                    keyframe,
-                    payload,
-                    captured_at_ms,
-                    pts_ms: captured_at_ms - self.started_at_ms,
-                    duration_ms: (1000.0 / self.fps).round().max(1.0) as u64,
-                    width: self.width,
-                    height: self.height,
-                    source_width: self.width,
-                    source_height: self.height,
-                });
-            }
-            let stdout = self
-                .stdout
-                .as_mut()
-                .context("ffmpeg stdout was not captured")?;
-            let mut buf = [0u8; 8192];
-            let read = stdout.read(&mut buf).await?;
-            if read == 0 {
-                let status = if let Some(child) = self.process.as_mut() {
-                    child.wait().await.ok()
-                } else {
-                    None
-                };
-                self.stop().await;
-                if matches!(self.command, FfmpegCommand::Shell(_)) {
-                    if let Some(status) = status {
-                        bail!("external H.264 source command failed: {status}");
-                    }
-                    bail!("external H.264 source exited before producing video");
-                }
-                bail!("ffmpeg H.264 source ended");
-            }
-            self.parser.push(&buf[..read]);
-        }
-    }
-
-    async fn cursor(&mut self, seq: u64, stream_id: Uuid) -> Result<Option<CursorMessage>> {
-        if !matches!(self.command, FfmpegCommand::TestPattern) {
-            return Ok(None);
-        }
-        let t = seq as f32 / 30.0;
-        Ok(Some(CursorMessage {
-            stream_id,
-            seq,
-            captured_at_ms: now_ms(),
-            x: ((t.sin() + 1.0) * 0.5) * self.width as f32,
-            y: ((t.cos() + 1.0) * 0.5) * self.height as f32,
-            source_width: self.width,
-            source_height: self.height,
-            bitmap: None,
-        }))
-    }
-
-    async fn stop(&mut self) {
-        if let Some(mut child) = self.process.take() {
-            let _ = child.kill().await;
-        }
-        self.stdout = None;
-        self.parser.clear();
-        self.parameter_sets = H264ParameterSetCache::default();
-    }
-}
-
-impl Drop for ProcessH264Capture {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.process.take() {
-            let _ = child.start_kill();
-        }
-    }
-}
-
-#[cfg_attr(not(feature = "ffmpeg-vaapi"), allow(dead_code))]
-struct WaylandVaapiH264Capture {
-    fps: f64,
-    cursor_hz: u64,
-    width: u32,
-    height: u32,
-    portal_source: PortalSourceMode,
-    screencast_backend: ScreenCastBackend,
-    monitor_name: Option<String>,
-    portal_cursor: PortalCursorMode,
-    require_cursor_metadata: bool,
-    source: Option<CaptureSource>,
-    latest: Option<watch::Receiver<Option<PipewireVideoFrame>>>,
-    cursor_latest: Option<watch::Receiver<Option<PipewireCursorSample>>>,
-    pipewire_error: Option<Arc<Mutex<Option<String>>>>,
-    last_encoded_serial: u64,
-    last_cursor_serial: u64,
-    pending_chunks: VecDeque<CapturedVideoChunk>,
-    parameter_sets: H264ParameterSetCache,
-    awaiting_random_access: bool,
-    encoder_started_at: Instant,
-    started_at_ms: i64,
-    backend: WaylandVideoBackend,
-    #[cfg(feature = "ffmpeg-vaapi")]
-    encoder: Option<ffmpeg_vaapi::VaapiH264Encoder>,
-    #[cfg(feature = "ffmpeg-vaapi")]
-    upload_encoder: Option<ffmpeg_vaapi::VaapiUploadH264Encoder>,
-    #[cfg(feature = "ffmpeg-vaapi")]
-    software_encoder: Option<ffmpeg_vaapi::SoftwareH264Encoder>,
-    portal_node_id: Option<u32>,
-    portal_width: Option<u32>,
-    portal_height: Option<u32>,
-    screencast_session: Option<ScreenCastSession>,
-    pipewire_remote: Option<PipewireRemote>,
-    pipewire_thread: Option<PipewireThreadStop>,
 }
 
 struct PipewireThreadStop {
@@ -1873,776 +1043,6 @@ impl Drop for PipewireThreadStop {
     }
 }
 
-#[cfg_attr(not(feature = "ffmpeg-vaapi"), allow(dead_code))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WaylandVideoBackend {
-    VaapiDmabuf,
-    CpuVaapiUpload,
-    CpuSoftware,
-}
-
-#[cfg_attr(not(feature = "ffmpeg-vaapi"), allow(dead_code))]
-impl WaylandVaapiH264Capture {
-    fn new(args: &Args) -> Self {
-        Self {
-            fps: args.fps,
-            cursor_hz: args.cursor_hz,
-            width: args.width.max(1),
-            height: args.height.max(1),
-            portal_source: args.portal_source,
-            screencast_backend: args.screencast_backend,
-            monitor_name: args.monitor_name.clone(),
-            portal_cursor: args.portal_cursor,
-            require_cursor_metadata: args.require_cursor_metadata,
-            source: None,
-            latest: None,
-            cursor_latest: None,
-            pipewire_error: None,
-            last_encoded_serial: 0,
-            last_cursor_serial: 0,
-            pending_chunks: VecDeque::new(),
-            parameter_sets: H264ParameterSetCache::default(),
-            awaiting_random_access: true,
-            encoder_started_at: Instant::now(),
-            started_at_ms: now_ms(),
-            backend: WaylandVideoBackend::VaapiDmabuf,
-            #[cfg(feature = "ffmpeg-vaapi")]
-            encoder: None,
-            #[cfg(feature = "ffmpeg-vaapi")]
-            upload_encoder: None,
-            #[cfg(feature = "ffmpeg-vaapi")]
-            software_encoder: None,
-            portal_node_id: None,
-            portal_width: None,
-            portal_height: None,
-            screencast_session: None,
-            pipewire_remote: None,
-            pipewire_thread: None,
-        }
-    }
-
-    #[cfg(feature = "ffmpeg-vaapi")]
-    async fn ensure_started(&mut self) -> Result<()> {
-        if self.source.is_some() {
-            return Ok(());
-        }
-        self.ensure_h264_backend_available()?;
-        if self.pipewire_remote.is_none() {
-            let capture = open_screencast_capture(
-                self.screencast_backend,
-                self.portal_source,
-                self.monitor_name.as_deref(),
-                self.portal_cursor,
-            )
-            .await?;
-            self.portal_node_id = Some(capture.node_id);
-            self.portal_width = Some(capture.width);
-            self.portal_height = Some(capture.height);
-            self.pipewire_remote = Some(capture.remote);
-            self.screencast_session = Some(capture.session);
-        }
-        let node_id = self
-            .portal_node_id
-            .context("portal stream was missing node id")?;
-        let portal_width = self
-            .portal_width
-            .context("portal stream was missing width")?;
-        let portal_height = self
-            .portal_height
-            .context("portal stream was missing height")?;
-        let pipewire_remote = self
-            .pipewire_remote
-            .as_ref()
-            .context("screencast stream was missing PipeWire connection")?
-            .try_clone()?;
-        let (tx, rx) = watch::channel(None);
-        let (cursor_tx, cursor_rx) = watch::channel(None);
-        let pipewire_error = Arc::new(Mutex::new(None));
-        let thread_stop = Arc::new(AtomicUsize::new(0));
-        let pipewire_thread = match self.backend {
-            WaylandVideoBackend::VaapiDmabuf => start_pipewire_video_thread(
-                PipewireThreadConfig {
-                    node_id,
-                    width: portal_width,
-                    height: portal_height,
-                    remote: pipewire_remote,
-                    fps: self.fps,
-                    cursor_hz: self.cursor_hz,
-                    require_cursor_metadata: self.require_cursor_metadata,
-                    pipewire_error: pipewire_error.clone(),
-                    mainloop_ptr_out: thread_stop.clone(),
-                },
-                tx,
-                cursor_tx,
-            )?,
-            WaylandVideoBackend::CpuVaapiUpload | WaylandVideoBackend::CpuSoftware => {
-                let (raw_tx, mut raw_rx) = watch::channel(None);
-                let pipewire_thread = start_pipewire_thread(
-                    PipewireThreadConfig {
-                        node_id,
-                        width: portal_width,
-                        height: portal_height,
-                        remote: pipewire_remote,
-                        fps: self.fps,
-                        cursor_hz: self.cursor_hz,
-                        require_cursor_metadata: self.require_cursor_metadata,
-                        pipewire_error: pipewire_error.clone(),
-                        mainloop_ptr_out: thread_stop.clone(),
-                    },
-                    raw_tx,
-                    cursor_tx,
-                )?;
-                tokio::spawn(async move {
-                    while raw_rx.changed().await.is_ok() {
-                        let frame = raw_rx.borrow().clone().map(PipewireVideoFrame::Cpu);
-                        let _ = tx.send(frame);
-                    }
-                });
-                pipewire_thread
-            }
-        };
-
-        info!(
-            node_id,
-            source_width = portal_width,
-            source_height = portal_height,
-            encoded_width = self.width,
-            encoded_height = self.height,
-            backend = ?self.backend,
-            "Wayland/PipeWire video capture started"
-        );
-
-        self.started_at_ms = now_ms();
-        self.encoder_started_at = Instant::now();
-        self.awaiting_random_access = true;
-        let (backend, description) = match self.backend {
-            WaylandVideoBackend::VaapiDmabuf => (
-                "xdg-desktop-portal+pipewire-rs+ffmpeg-vaapi",
-                format!(
-                    "PipeWire node {} via XDG Desktop Portal encoded in-process with FFmpeg VAAPI",
-                    node_id
-                ),
-            ),
-            WaylandVideoBackend::CpuVaapiUpload => (
-                "xdg-desktop-portal+pipewire-rs+ffmpeg-vaapi-upload",
-                format!(
-                    "PipeWire node {} via XDG Desktop Portal using CPU-readable frames uploaded to FFmpeg VAAPI H.264",
-                    node_id
-                ),
-            ),
-            WaylandVideoBackend::CpuSoftware => (
-                "xdg-desktop-portal+pipewire-rs+ffmpeg-software",
-                format!(
-                    "PipeWire node {} via XDG Desktop Portal encoded in-process with FFmpeg software H.264",
-                    node_id
-                ),
-            ),
-        };
-        self.source = Some(CaptureSource {
-            backend: backend.to_string(),
-            description,
-            width: portal_width,
-            height: portal_height,
-        });
-        self.latest = Some(rx);
-        self.cursor_latest = Some(cursor_rx);
-        self.pipewire_error = Some(pipewire_error);
-        self.pipewire_thread = Some(pipewire_thread);
-        Ok(())
-    }
-
-    #[cfg(feature = "ffmpeg-vaapi")]
-    fn ensure_h264_backend_available(&mut self) -> Result<()> {
-        match self.backend {
-            WaylandVideoBackend::VaapiDmabuf => match ffmpeg_vaapi::ensure_h264_vaapi_available() {
-                Ok(()) => Ok(()),
-                Err(err) if ffmpeg_vaapi::software_h264_encoder_available() => {
-                    warn!(
-                        err = %err,
-                        "h264_vaapi is unavailable; falling back to CPU-readable PipeWire plus software H.264"
-                    );
-                    self.backend = WaylandVideoBackend::CpuSoftware;
-                    Ok(())
-                }
-                Err(err) => Err(err).context(
-                    "h264_vaapi is unavailable and no FFmpeg software H.264 encoder was found",
-                ),
-            },
-            WaylandVideoBackend::CpuVaapiUpload => ffmpeg_vaapi::ensure_h264_vaapi_available(),
-            WaylandVideoBackend::CpuSoftware => ffmpeg_vaapi::ensure_software_h264_available(),
-        }
-    }
-
-    #[cfg(feature = "ffmpeg-vaapi")]
-    fn restart_after_vaapi_dmabuf_error(&mut self, reason: &anyhow::Error) -> bool {
-        if self.backend == WaylandVideoBackend::CpuSoftware || !is_vaapi_path_error(reason) {
-            return false;
-        }
-        let next_backend = if ffmpeg_vaapi::ensure_h264_vaapi_available().is_ok() {
-            WaylandVideoBackend::CpuVaapiUpload
-        } else if ffmpeg_vaapi::software_h264_encoder_available() {
-            WaylandVideoBackend::CpuSoftware
-        } else {
-            warn!(
-                err = %reason,
-                "VAAPI DMA-BUF path failed and no fallback H.264 encoder is available"
-            );
-            return false;
-        };
-        match next_backend {
-            WaylandVideoBackend::CpuVaapiUpload => warn!(
-                err = %reason,
-                "VAAPI DMA-BUF path failed; falling back to CPU-readable PipeWire plus VAAPI H.264 upload"
-            ),
-            WaylandVideoBackend::CpuSoftware => warn!(
-                err = %reason,
-                "VAAPI DMA-BUF path failed; falling back to CPU-readable PipeWire plus software H.264"
-            ),
-            WaylandVideoBackend::VaapiDmabuf => {}
-        }
-        self.backend = next_backend;
-        if let Some(mut thread) = self.pipewire_thread.take() {
-            thread.stop();
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        self.source = None;
-        self.latest = None;
-        self.cursor_latest = None;
-        self.pipewire_error = None;
-        self.last_encoded_serial = 0;
-        self.last_cursor_serial = 0;
-        self.pending_chunks.clear();
-        self.parameter_sets = H264ParameterSetCache::default();
-        self.awaiting_random_access = true;
-        self.encoder_started_at = Instant::now();
-        self.encoder = None;
-        self.upload_encoder = None;
-        self.software_encoder = None;
-        true
-    }
-
-    #[cfg(feature = "ffmpeg-vaapi")]
-    fn fallback_after_random_access_timeout(&mut self) -> Result<bool> {
-        let elapsed_ms = self.encoder_started_at.elapsed().as_millis();
-        match self.backend {
-            WaylandVideoBackend::VaapiDmabuf => {
-                let reason = anyhow::anyhow!(
-                    "FFmpeg VAAPI DMA-BUF encoder produced no decodable SPS/PPS/IDR access point within {elapsed_ms}ms"
-                );
-                let next_backend = if ffmpeg_vaapi::ensure_h264_vaapi_available().is_ok() {
-                    WaylandVideoBackend::CpuVaapiUpload
-                } else if ffmpeg_vaapi::software_h264_encoder_available() {
-                    WaylandVideoBackend::CpuSoftware
-                } else {
-                    return Err(reason).context("no fallback H.264 encoder is available");
-                };
-                warn!(
-                    err = %reason,
-                    backend = ?next_backend,
-                    "hardware H.264 output failed startup conformance; switching backend"
-                );
-                self.backend = next_backend;
-                if let Some(mut thread) = self.pipewire_thread.take() {
-                    thread.stop();
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                self.source = None;
-                self.latest = None;
-                self.cursor_latest = None;
-                self.pipewire_error = None;
-                self.last_encoded_serial = 0;
-                self.last_cursor_serial = 0;
-            }
-            WaylandVideoBackend::CpuVaapiUpload => {
-                if !ffmpeg_vaapi::software_h264_encoder_available() {
-                    bail!(
-                        "FFmpeg VAAPI upload encoder produced no decodable SPS/PPS/IDR access point within {elapsed_ms}ms and no software H.264 encoder is available"
-                    );
-                }
-                warn!(
-                    elapsed_ms,
-                    "VAAPI upload output failed startup conformance; falling back to software H.264"
-                );
-                self.backend = WaylandVideoBackend::CpuSoftware;
-                self.refresh_wayland_video_source_description();
-            }
-            WaylandVideoBackend::CpuSoftware => {
-                bail!(
-                    "software H.264 encoder produced no decodable SPS/PPS/IDR access point within {elapsed_ms}ms"
-                );
-            }
-        }
-        self.pending_chunks.clear();
-        self.parameter_sets = H264ParameterSetCache::default();
-        self.awaiting_random_access = true;
-        self.encoder_started_at = Instant::now();
-        self.encoder = None;
-        self.upload_encoder = None;
-        self.software_encoder = None;
-        Ok(true)
-    }
-
-    #[cfg(not(feature = "ffmpeg-vaapi"))]
-    async fn ensure_started(&mut self) -> Result<()> {
-        bail!(
-            "wayland-video was built without the ffmpeg-vaapi feature; rebuild with `cargo build --release -p glacialcast-client --features ffmpeg-vaapi`"
-        )
-    }
-
-    #[cfg(feature = "ffmpeg-vaapi")]
-    async fn encode_next_frame(&mut self) -> Result<()> {
-        self.ensure_started().await?;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(err) = self
-                .pipewire_error
-                .as_ref()
-                .and_then(|slot| slot.lock().expect("PipeWire error mutex poisoned").clone())
-            {
-                bail!("PipeWire stream failed: {err}");
-            }
-
-            let frame = {
-                let latest = self
-                    .latest
-                    .as_mut()
-                    .context("wayland-video capture was not started")?;
-                latest.borrow().clone()
-            };
-            if let Some(frame) = frame
-                && frame.serial() != self.last_encoded_serial
-            {
-                self.last_encoded_serial = frame.serial();
-                let packets = match frame {
-                    PipewireVideoFrame::DmaBuf(frame) => {
-                        let encoder = self.encoder.get_or_insert_with(|| {
-                            ffmpeg_vaapi::VaapiH264Encoder::new(
-                                self.width,
-                                self.height,
-                                self.fps,
-                                self.started_at_ms,
-                            )
-                        });
-                        match encoder.encode_dmabuf(ffmpeg_vaapi::DmaBufInputFrame {
-                            fd: frame.fd.as_raw_fd(),
-                            size: frame.size,
-                            offset: frame.offset,
-                            stride: frame.stride,
-                            drm_format: frame.drm_format,
-                            modifier: frame.modifier,
-                            width: frame.width,
-                            height: frame.height,
-                            captured_at_ms: frame.captured_at_ms,
-                        }) {
-                            Ok(packets) => packets,
-                            Err(err) if self.restart_after_vaapi_dmabuf_error(&err) => {
-                                return Ok(());
-                            }
-                            Err(err) => return Err(err),
-                        }
-                    }
-                    PipewireVideoFrame::Cpu(frame) => self.encode_cpu_frame(frame)?,
-                };
-                for packet in packets {
-                    let payload = self
-                        .parameter_sets
-                        .normalize_access_unit(packet.payload, packet.keyframe);
-                    let access_unit = inspect_h264_access_unit(&payload);
-                    let keyframe = access_unit.has_idr;
-                    if packet.keyframe != keyframe {
-                        warn!(
-                            packet_keyframe = packet.keyframe,
-                            nal_keyframe = keyframe,
-                            nal_types = ?access_unit.nal_types,
-                            "correcting FFmpeg H.264 keyframe metadata from Annex-B NAL contents"
-                        );
-                    }
-                    if self.awaiting_random_access {
-                        if access_unit.is_decodable_random_access_point() {
-                            self.awaiting_random_access = false;
-                            info!(
-                                elapsed_ms = self.encoder_started_at.elapsed().as_millis(),
-                                backend = ?self.backend,
-                                "H.264 encoder produced a decodable random-access point"
-                            );
-                        } else {
-                            debug!(
-                                nal_types = ?access_unit.nal_types,
-                                backend = ?self.backend,
-                                "dropping H.264 access unit while waiting for SPS/PPS/IDR"
-                            );
-                            if self.encoder_started_at.elapsed() >= Duration::from_secs(2) {
-                                self.fallback_after_random_access_timeout()?;
-                                return Ok(());
-                            }
-                            continue;
-                        }
-                    }
-                    self.pending_chunks.push_back(CapturedVideoChunk {
-                        payload,
-                        keyframe,
-                        captured_at_ms: packet.captured_at_ms,
-                        pts_ms: packet.pts_ms,
-                        duration_ms: packet.duration_ms,
-                        width: packet.width,
-                        height: packet.height,
-                        source_width: packet.source_width,
-                        source_height: packet.source_height,
-                    });
-                }
-                return Ok(());
-            }
-
-            if Instant::now() >= deadline {
-                bail!("timed out waiting for a PipeWire video frame from portal stream");
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let latest = self
-                .latest
-                .as_mut()
-                .context("wayland-video capture was not started")?;
-            let _ = timeout(remaining, latest.changed()).await;
-        }
-    }
-
-    #[cfg(feature = "ffmpeg-vaapi")]
-    fn encode_cpu_frame(
-        &mut self,
-        frame: RawFrame,
-    ) -> Result<Vec<ffmpeg_vaapi::EncodedH264Packet>> {
-        let image = raw_frame_to_rgb_image(&frame)?;
-        let image = resize_rgb_image_to_fit(image, self.width, self.height);
-        let encoded_width = image.width();
-        let encoded_height = image.height();
-        let data = image.into_raw();
-        let captured_at_ms = now_ms();
-        if self.backend != WaylandVideoBackend::CpuSoftware
-            && ffmpeg_vaapi::ensure_h264_vaapi_available().is_ok()
-        {
-            let input = ffmpeg_vaapi::RgbInputFrame {
-                data: data.clone(),
-                width: encoded_width,
-                height: encoded_height,
-                captured_at_ms,
-            };
-            match self.encode_rgb_with_vaapi_upload(input) {
-                Ok(packets) => return Ok(packets),
-                Err(err) if ffmpeg_vaapi::software_h264_encoder_available() => {
-                    warn!(
-                        err = %err,
-                        "CPU-readable VAAPI upload failed; falling back to software H.264"
-                    );
-                    self.backend = WaylandVideoBackend::CpuSoftware;
-                    self.upload_encoder = None;
-                    self.refresh_wayland_video_source_description();
-                    info!(
-                        backend = ?self.backend,
-                        "Wayland/PipeWire video capture continuing with fallback backend"
-                    );
-                }
-                Err(err) => return Err(err),
-            }
-        }
-        self.encode_rgb_with_software(ffmpeg_vaapi::RgbInputFrame {
-            data,
-            width: encoded_width,
-            height: encoded_height,
-            captured_at_ms,
-        })
-    }
-
-    #[cfg(feature = "ffmpeg-vaapi")]
-    fn encode_rgb_with_vaapi_upload(
-        &mut self,
-        input: ffmpeg_vaapi::RgbInputFrame,
-    ) -> Result<Vec<ffmpeg_vaapi::EncodedH264Packet>> {
-        let encoder = match self.upload_encoder.as_mut() {
-            Some(encoder) => encoder,
-            None => {
-                self.upload_encoder = Some(ffmpeg_vaapi::VaapiUploadH264Encoder::new(
-                    input.width,
-                    input.height,
-                    self.fps,
-                    self.started_at_ms,
-                )?);
-                self.upload_encoder
-                    .as_mut()
-                    .expect("VAAPI upload encoder was just initialized")
-            }
-        };
-        encoder.encode_rgb(input)
-    }
-
-    #[cfg(feature = "ffmpeg-vaapi")]
-    fn encode_rgb_with_software(
-        &mut self,
-        input: ffmpeg_vaapi::RgbInputFrame,
-    ) -> Result<Vec<ffmpeg_vaapi::EncodedH264Packet>> {
-        let encoded_width = input.width;
-        let encoded_height = input.height;
-        let encoder = match self.software_encoder.as_mut() {
-            Some(encoder) => encoder,
-            None => {
-                self.software_encoder = Some(ffmpeg_vaapi::SoftwareH264Encoder::new(
-                    encoded_width,
-                    encoded_height,
-                    self.fps,
-                    self.started_at_ms,
-                )?);
-                self.software_encoder
-                    .as_mut()
-                    .expect("software encoder was just initialized")
-            }
-        };
-        encoder.encode_rgb(input)
-    }
-
-    #[cfg(feature = "ffmpeg-vaapi")]
-    fn refresh_wayland_video_source_description(&mut self) {
-        let Some(source) = self.source.as_mut() else {
-            return;
-        };
-        let Some(node_id) = self.portal_node_id else {
-            return;
-        };
-        match self.backend {
-            WaylandVideoBackend::VaapiDmabuf => {
-                source.backend = "xdg-desktop-portal+pipewire-rs+ffmpeg-vaapi".to_string();
-                source.description = format!(
-                    "PipeWire node {} via XDG Desktop Portal encoded in-process with FFmpeg VAAPI",
-                    node_id
-                );
-            }
-            WaylandVideoBackend::CpuVaapiUpload => {
-                source.backend = "xdg-desktop-portal+pipewire-rs+ffmpeg-vaapi-upload".to_string();
-                source.description = format!(
-                    "PipeWire node {} via XDG Desktop Portal using CPU-readable frames uploaded to FFmpeg VAAPI H.264",
-                    node_id
-                );
-            }
-            WaylandVideoBackend::CpuSoftware => {
-                source.backend = "xdg-desktop-portal+pipewire-rs+ffmpeg-software".to_string();
-                source.description = format!(
-                    "PipeWire node {} via XDG Desktop Portal encoded in-process with FFmpeg software H.264",
-                    node_id
-                );
-            }
-        }
-    }
-
-    #[cfg(not(feature = "ffmpeg-vaapi"))]
-    async fn encode_next_frame(&mut self) -> Result<()> {
-        let _ = self;
-        bail!("wayland-video was built without the ffmpeg-vaapi feature")
-    }
-}
-
-#[async_trait]
-impl VideoCapture for WaylandVaapiH264Capture {
-    async fn source(&mut self) -> Result<CaptureSource> {
-        self.ensure_started().await?;
-        self.source
-            .clone()
-            .context("wayland-video source was not initialized")
-    }
-
-    async fn next_chunk(&mut self) -> Result<CapturedVideoChunk> {
-        self.ensure_started().await?;
-        while self.pending_chunks.is_empty() {
-            self.encode_next_frame().await?;
-        }
-        self.pending_chunks
-            .pop_front()
-            .context("encoded packet queue unexpectedly empty")
-    }
-
-    async fn cursor(&mut self, seq: u64, stream_id: Uuid) -> Result<Option<CursorMessage>> {
-        Ok(self
-            .next_cursor_sample()
-            .map(|sample| sample.to_message(seq, stream_id)))
-    }
-
-    fn request_keyframe(&mut self) -> Result<()> {
-        self.awaiting_random_access = true;
-        self.encoder_started_at = Instant::now();
-        #[cfg(feature = "ffmpeg-vaapi")]
-        {
-            if let Some(encoder) = self.encoder.as_mut() {
-                encoder.request_keyframe();
-            }
-            if let Some(encoder) = self.upload_encoder.as_mut() {
-                encoder.request_keyframe();
-            }
-            if let Some(encoder) = self.software_encoder.as_mut() {
-                encoder.request_keyframe();
-            }
-        }
-        Ok(())
-    }
-
-    async fn stop(&mut self) {
-        if let Some(mut thread) = self.pipewire_thread.take() {
-            thread.stop();
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        #[cfg(feature = "ffmpeg-vaapi")]
-        {
-            self.encoder = None;
-            self.upload_encoder = None;
-            self.software_encoder = None;
-        }
-        self.latest = None;
-        self.cursor_latest = None;
-        self.pipewire_error = None;
-        self.screencast_session = None;
-        self.pipewire_remote = None;
-        self.source = None;
-        self.parameter_sets = H264ParameterSetCache::default();
-        self.pending_chunks.clear();
-        self.awaiting_random_access = true;
-        self.encoder_started_at = Instant::now();
-    }
-}
-
-#[cfg_attr(not(feature = "ffmpeg-vaapi"), allow(dead_code))]
-impl WaylandVaapiH264Capture {
-    fn next_cursor_sample(&mut self) -> Option<PipewireCursorSample> {
-        let sample = self.cursor_latest.as_mut()?.borrow().clone()?;
-        if sample.serial == self.last_cursor_serial {
-            return None;
-        }
-        self.last_cursor_serial = sample.serial;
-        Some(sample)
-    }
-}
-
-fn ffmpeg_rate_arg(fps: f64) -> String {
-    if (fps.fract()).abs() < f64::EPSILON {
-        return format!("{}", fps as u32);
-    }
-    let denominator = 1000u32;
-    let numerator = (fps.clamp(0.5, 15.0) * f64::from(denominator)).round() as u32;
-    let divisor = gcd(numerator, denominator).max(1);
-    format!("{}/{}", numerator / divisor, denominator / divisor)
-}
-
-#[derive(Default)]
-struct H264AnnexBParser {
-    buffer: Vec<u8>,
-}
-
-impl H264AnnexBParser {
-    fn push(&mut self, bytes: &[u8]) {
-        self.buffer.extend_from_slice(bytes);
-    }
-
-    fn clear(&mut self) {
-        self.buffer.clear();
-    }
-
-    fn pop_access_unit(&mut self) -> Option<Vec<u8>> {
-        let starts = h264_start_codes(&self.buffer);
-        if starts.len() < 2 {
-            return None;
-        }
-        let first_start = starts[0];
-        if first_start > 0 {
-            self.buffer.drain(..first_start);
-            return self.pop_access_unit();
-        }
-
-        let boundary = if h264_nal_type_at(&self.buffer, starts[0]) == Some(9) {
-            self.aud_boundary(&starts)?
-        } else {
-            self.vcl_boundary(&starts)?
-        };
-        let access_unit = self.buffer[..boundary].to_vec();
-        self.buffer.drain(..boundary);
-        Some(access_unit)
-    }
-
-    fn aud_boundary(&self, starts: &[usize]) -> Option<usize> {
-        let mut auds = starts
-            .iter()
-            .copied()
-            .filter(|start| h264_nal_type_at(&self.buffer, *start) == Some(9));
-        let first_aud = auds.next()?;
-        if first_aud > 0 {
-            return Some(first_aud);
-        }
-        auds.next()
-    }
-
-    fn vcl_boundary(&self, starts: &[usize]) -> Option<usize> {
-        let first_vcl_index = starts
-            .iter()
-            .position(|start| h264_nal_type_at(&self.buffer, *start).is_some_and(h264_is_vcl))?;
-
-        for index in first_vcl_index + 1..starts.len() {
-            let nal_type = h264_nal_type_at(&self.buffer, starts[index])?;
-            if h264_is_vcl(nal_type) {
-                return Some(starts[index]);
-            }
-            if h264_can_begin_next_access_unit(nal_type)
-                && starts[index + 1..]
-                    .iter()
-                    .any(|start| h264_nal_type_at(&self.buffer, *start).is_some_and(h264_is_vcl))
-            {
-                return Some(starts[index]);
-            }
-        }
-
-        None
-    }
-}
-
-fn h264_is_vcl(nal_type: u8) -> bool {
-    matches!(nal_type, 1..=5)
-}
-
-fn h264_can_begin_next_access_unit(nal_type: u8) -> bool {
-    matches!(nal_type, 6..=9)
-}
-
-fn h264_access_unit_has_idr(access_unit: &[u8]) -> bool {
-    h264_start_codes(access_unit)
-        .into_iter()
-        .any(|start| h264_nal_type_at(access_unit, start) == Some(5))
-}
-
-fn h264_start_codes(bytes: &[u8]) -> Vec<usize> {
-    let mut starts = Vec::new();
-    let mut i = 0usize;
-    while i + 3 < bytes.len() {
-        if bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] == 1 {
-            starts.push(i);
-            i += 3;
-        } else if i + 4 < bytes.len()
-            && bytes[i] == 0
-            && bytes[i + 1] == 0
-            && bytes[i + 2] == 0
-            && bytes[i + 3] == 1
-        {
-            starts.push(i);
-            i += 4;
-        } else {
-            i += 1;
-        }
-    }
-    starts
-}
-
-fn h264_nal_type_at(bytes: &[u8], start: usize) -> Option<u8> {
-    let offset = if bytes.get(start..start + 4) == Some(&[0, 0, 0, 1]) {
-        start + 4
-    } else if bytes.get(start..start + 3) == Some(&[0, 0, 1]) {
-        start + 3
-    } else {
-        return None;
-    };
-    bytes.get(offset).map(|byte| byte & 0x1f)
-}
-
 #[async_trait]
 trait Capture: Send {
     async fn source(&mut self) -> Result<CaptureSource>;
@@ -2660,60 +1060,7 @@ trait Capture: Send {
             self.capture_rgb(max_width, max_height).await?,
         ))
     }
-    async fn capture_jpeg(&mut self, settings: CaptureEncodeSettings) -> Result<EncodedFrame>;
     async fn cursor(&mut self, seq: u64, stream_id: Uuid) -> Result<Option<CursorMessage>>;
-}
-
-#[derive(Clone)]
-struct EncodedFrame {
-    jpeg: Vec<u8>,
-    width: u32,
-    height: u32,
-    fingerprint: FrameFingerprint,
-}
-
-#[derive(Clone)]
-struct FrameFingerprint {
-    samples: Vec<[u8; 3]>,
-}
-
-impl FrameFingerprint {
-    fn from_image(image: &ImageBuffer<Rgb<u8>, Vec<u8>>) -> Self {
-        const SAMPLE_WIDTH: u32 = 32;
-        const SAMPLE_HEIGHT: u32 = 18;
-
-        let mut samples = Vec::with_capacity((SAMPLE_WIDTH * SAMPLE_HEIGHT) as usize);
-        let width = image.width().max(1);
-        let height = image.height().max(1);
-        for sy in 0..SAMPLE_HEIGHT {
-            let y = ((sy * height) / SAMPLE_HEIGHT).min(height - 1);
-            for sx in 0..SAMPLE_WIDTH {
-                let x = ((sx * width) / SAMPLE_WIDTH).min(width - 1);
-                samples.push(image.get_pixel(x, y).0);
-            }
-        }
-        Self { samples }
-    }
-
-    fn delta_percent(&self, previous: &Self) -> f32 {
-        if self.samples.len() != previous.samples.len() || self.samples.is_empty() {
-            return 100.0;
-        }
-        let total_delta = self
-            .samples
-            .iter()
-            .zip(previous.samples.iter())
-            .map(|(current, previous)| {
-                current
-                    .iter()
-                    .zip(previous.iter())
-                    .map(|(current, previous)| current.abs_diff(*previous) as u64)
-                    .sum::<u64>()
-            })
-            .sum::<u64>();
-        let max_delta = self.samples.len() as f32 * 3.0 * 255.0;
-        (total_delta as f32 / max_delta) * 100.0
-    }
 }
 
 struct TestPatternCapture {
@@ -2755,10 +1102,6 @@ impl Capture for TestPatternCapture {
         })
     }
 
-    async fn capture_jpeg(&mut self, settings: CaptureEncodeSettings) -> Result<EncodedFrame> {
-        encode_rgb_image_as_jpeg(self.next_rgb(), settings)
-    }
-
     async fn capture_rgb(
         &mut self,
         max_width: u32,
@@ -2781,142 +1124,6 @@ impl Capture for TestPatternCapture {
             y: ((t.cos() + 1.0) * 0.5) * self.height as f32,
             source_width: self.width,
             source_height: self.height,
-            bitmap: None,
-        }))
-    }
-}
-
-struct ImageDirCapture {
-    dir: PathBuf,
-    source_width: u32,
-    source_height: u32,
-    cached: Option<CachedImageFrame>,
-}
-
-struct CachedImageFrame {
-    path: PathBuf,
-    modified: SystemTime,
-    settings: CaptureEncodeSettings,
-    encoded: EncodedFrame,
-}
-
-impl ImageDirCapture {
-    fn new(dir: PathBuf) -> Self {
-        Self {
-            dir,
-            source_width: 1,
-            source_height: 1,
-            cached: None,
-        }
-    }
-
-    fn latest_image_path(&self) -> Result<(SystemTime, PathBuf)> {
-        let mut latest = None::<(SystemTime, PathBuf)>;
-        for entry in std::fs::read_dir(&self.dir)
-            .with_context(|| format!("reading image directory {}", self.dir.display()))?
-        {
-            let entry =
-                entry.with_context(|| format!("reading entry in {}", self.dir.display()))?;
-            let path = entry.path();
-            if !path.is_file() || !is_supported_image_path(&path) {
-                continue;
-            }
-            let modified = entry
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            if latest
-                .as_ref()
-                .is_none_or(|(latest_modified, _)| modified > *latest_modified)
-            {
-                latest = Some((modified, path));
-            }
-        }
-        latest.with_context(|| format!("no PNG or JPEG images found in {}", self.dir.display()))
-    }
-
-    fn load_latest_rgb(&mut self) -> Result<ImageBuffer<Rgb<u8>, Vec<u8>>> {
-        let (_, path) = self.latest_image_path()?;
-        let image = ImageReader::open(&path)
-            .with_context(|| format!("opening {}", path.display()))?
-            .with_guessed_format()
-            .with_context(|| format!("detecting image format for {}", path.display()))?
-            .decode()
-            .with_context(|| format!("decoding {}", path.display()))?
-            .to_rgb8();
-        self.source_width = image.width().max(1);
-        self.source_height = image.height().max(1);
-        Ok(image)
-    }
-
-    fn encode_latest(&mut self, settings: CaptureEncodeSettings) -> Result<EncodedFrame> {
-        let (modified, path) = self.latest_image_path()?;
-        if let Some(cached) = &self.cached
-            && cached.path == path
-            && cached.modified == modified
-            && cached.settings == settings
-        {
-            return Ok(cached.encoded.clone());
-        }
-
-        let image = ImageReader::open(&path)
-            .with_context(|| format!("opening {}", path.display()))?
-            .with_guessed_format()
-            .with_context(|| format!("detecting image format for {}", path.display()))?
-            .decode()
-            .with_context(|| format!("decoding {}", path.display()))?
-            .to_rgb8();
-        self.source_width = image.width().max(1);
-        self.source_height = image.height().max(1);
-        let encoded = encode_rgb_image_as_jpeg(image, settings)?;
-        self.cached = Some(CachedImageFrame {
-            path,
-            modified,
-            settings,
-            encoded: encoded.clone(),
-        });
-        Ok(encoded)
-    }
-}
-
-#[async_trait]
-impl Capture for ImageDirCapture {
-    async fn source(&mut self) -> Result<CaptureSource> {
-        let image = self.load_latest_rgb()?;
-        Ok(CaptureSource {
-            backend: "image-dir".to_string(),
-            description: format!("Newest PNG/JPEG from {}", self.dir.display()),
-            width: image.width(),
-            height: image.height(),
-        })
-    }
-
-    async fn capture_jpeg(&mut self, settings: CaptureEncodeSettings) -> Result<EncodedFrame> {
-        self.encode_latest(settings)
-    }
-
-    async fn capture_rgb(
-        &mut self,
-        max_width: u32,
-        max_height: u32,
-    ) -> Result<ImageBuffer<Rgb<u8>, Vec<u8>>> {
-        Ok(resize_rgb_image_to_fit(
-            self.load_latest_rgb()?,
-            max_width,
-            max_height,
-        ))
-    }
-
-    async fn cursor(&mut self, seq: u64, stream_id: Uuid) -> Result<Option<CursorMessage>> {
-        let t = seq as f32 / 24.0;
-        Ok(Some(CursorMessage {
-            stream_id,
-            seq,
-            captured_at_ms: now_ms(),
-            x: ((t.sin() + 1.0) * 0.5) * self.source_width as f32,
-            y: ((t.cos() + 1.0) * 0.5) * self.source_height as f32,
-            source_width: self.source_width,
-            source_height: self.source_height,
             bitmap: None,
         }))
     }
@@ -2974,17 +1181,6 @@ impl WaylandPipewireCapture {
 impl Capture for WaylandPipewireCapture {
     async fn source(&mut self) -> Result<CaptureSource> {
         Ok(self.ensure_started().await?.source.clone())
-    }
-
-    async fn capture_jpeg(&mut self, settings: CaptureEncodeSettings) -> Result<EncodedFrame> {
-        let capture = self.ensure_started().await?;
-        match capture.next_jpeg(settings).await {
-            Ok(jpeg) => Ok(jpeg),
-            Err(err) => {
-                self.inner = None;
-                Err(err)
-            }
-        }
     }
 
     async fn capture_rgb(
@@ -3133,11 +1329,6 @@ impl NativePipewireCapture {
         }
         self.last_cursor_serial = sample.serial;
         Some(sample)
-    }
-
-    async fn next_jpeg(&mut self, settings: CaptureEncodeSettings) -> Result<EncodedFrame> {
-        let frame = self.next_frame().await?;
-        encode_raw_frame_as_jpeg(&frame, settings)
     }
 
     async fn next_rgb(
@@ -3380,7 +1571,6 @@ fn maybe_emit_pipewire_cursor(
     true
 }
 
-#[cfg_attr(not(feature = "ffmpeg-vaapi"), allow(dead_code))]
 fn maybe_emit_pipewire_video_cursor(
     user_data: &mut PipewireVideoUserData,
     buffer: *const spa::sys::spa_buffer,
@@ -3692,14 +1882,12 @@ fn pipewire_meta_type_name(type_: u32) -> &'static str {
     }
 }
 
-#[cfg_attr(not(feature = "ffmpeg-vaapi"), allow(dead_code))]
 #[derive(Clone)]
 enum PipewireVideoFrame {
     Cpu(RawFrame),
     DmaBuf(DmaBufFrame),
 }
 
-#[cfg_attr(not(feature = "ffmpeg-vaapi"), allow(dead_code))]
 impl PipewireVideoFrame {
     fn serial(&self) -> u64 {
         match self {
@@ -3709,11 +1897,9 @@ impl PipewireVideoFrame {
     }
 }
 
-#[cfg_attr(not(feature = "ffmpeg-vaapi"), allow(dead_code))]
 #[derive(Clone)]
 struct DmaBufFrame {
     serial: u64,
-    captured_at_ms: i64,
     width: u32,
     height: u32,
     fd: Arc<OwnedFd>,
@@ -4187,7 +2373,6 @@ fn start_pipewire_thread(
     Ok(stop)
 }
 
-#[cfg_attr(not(feature = "ffmpeg-vaapi"), allow(dead_code))]
 fn start_pipewire_video_thread(
     config: PipewireThreadConfig,
     latest: watch::Sender<Option<PipewireVideoFrame>>,
@@ -4574,7 +2759,6 @@ fn run_pipewire_loop(
     Ok(())
 }
 
-#[cfg_attr(not(feature = "ffmpeg-vaapi"), allow(dead_code))]
 fn run_pipewire_video_loop(
     config: PipewireThreadConfig,
     latest: watch::Sender<Option<PipewireVideoFrame>>,
@@ -4784,8 +2968,6 @@ fn run_pipewire_video_loop(
                 None => return,
             };
             user_data.serial = user_data.serial.wrapping_add(1);
-            let captured_at_ms = now_ms();
-
             if data_type == spa::buffer::DataType::DmaBuf {
                 let Some(owned_fd) = dup_fd(fd) else {
                     warn!(fd, "failed to duplicate PipeWire DMA-BUF fd");
@@ -4814,7 +2996,6 @@ fn run_pipewire_video_loop(
                 });
                 let frame = DmaBufFrame {
                     serial: user_data.serial,
-                    captured_at_ms,
                     width: video_size.width,
                     height: video_size.height,
                     fd: Arc::new(owned_fd),
@@ -4997,7 +3178,6 @@ fn build_pipewire_format_pods_from_node_formats(
     Ok(out)
 }
 
-#[cfg_attr(not(feature = "ffmpeg-vaapi"), allow(dead_code))]
 fn build_pipewire_video_format_pods_from_node_formats(
     advertised_pods: &[Vec<u8>],
 ) -> Result<Vec<Vec<u8>>> {
@@ -5430,7 +3610,6 @@ fn mmap_fd_slice(fd: RawFd, offset: usize, size: usize, sync_dmabuf: bool) -> Op
     Some(out)
 }
 
-#[cfg_attr(not(feature = "ffmpeg-vaapi"), allow(dead_code))]
 fn dup_fd(fd: RawFd) -> Option<OwnedFd> {
     if fd < 0 {
         return None;
@@ -5800,7 +3979,6 @@ struct PipewireUserData {
     cursor_serial: u64,
 }
 
-#[cfg_attr(not(feature = "ffmpeg-vaapi"), allow(dead_code))]
 struct PipewireVideoUserData {
     format: spa::param::video::VideoInfoRaw,
     latest: watch::Sender<Option<PipewireVideoFrame>>,
@@ -5834,7 +4012,6 @@ fn record_pipewire_error(user_data: &PipewireUserData, message: String) {
     }
 }
 
-#[cfg_attr(not(feature = "ffmpeg-vaapi"), allow(dead_code))]
 fn record_pipewire_video_error(user_data: &PipewireVideoUserData, message: String) {
     let mut slot = user_data
         .error
@@ -5844,14 +4021,6 @@ fn record_pipewire_video_error(user_data: &PipewireVideoUserData, message: Strin
     unsafe {
         pw::sys::pw_main_loop_quit(user_data.mainloop_ptr as *mut _);
     }
-}
-
-fn encode_raw_frame_as_jpeg(
-    frame: &RawFrame,
-    settings: CaptureEncodeSettings,
-) -> Result<EncodedFrame> {
-    let image = raw_frame_to_rgb_image(frame)?;
-    encode_rgb_image_as_jpeg(image, settings)
 }
 
 fn raw_frame_to_rgb_image(frame: &RawFrame) -> Result<ImageBuffer<Rgb<u8>, Vec<u8>>> {
@@ -5864,23 +4033,6 @@ fn raw_frame_to_rgb_image(frame: &RawFrame) -> Result<ImageBuffer<Rgb<u8>, Vec<u
         }
     }
     Ok(image)
-}
-
-fn encode_rgb_image_as_jpeg(
-    image: ImageBuffer<Rgb<u8>, Vec<u8>>,
-    settings: CaptureEncodeSettings,
-) -> Result<EncodedFrame> {
-    let image = resize_rgb_image_to_fit(image, settings.max_width, settings.max_height);
-    let fingerprint = FrameFingerprint::from_image(&image);
-    let mut out = Cursor::new(Vec::new());
-    JpegEncoder::new_with_quality(&mut out, settings.jpeg_quality.clamp(1, 100))
-        .encode_image(&image)?;
-    Ok(EncodedFrame {
-        jpeg: out.into_inner(),
-        width: image.width(),
-        height: image.height(),
-        fingerprint,
-    })
 }
 
 fn resize_rgb_image_to_fit(
@@ -5942,12 +4094,10 @@ fn raw_frame_format_for_video_format(
     }
 }
 
-#[cfg_attr(not(feature = "ffmpeg-vaapi"), allow(dead_code))]
 const fn drm_fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
     (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
 }
 
-#[cfg_attr(not(feature = "ffmpeg-vaapi"), allow(dead_code))]
 fn drm_fourcc_for_video_format(format: spa::param::video::VideoFormat) -> Option<u32> {
     match format {
         spa::param::video::VideoFormat::BGRx => Some(drm_fourcc(b'X', b'R', b'2', b'4')),
@@ -5965,7 +4115,6 @@ fn drm_fourcc_for_video_format(format: spa::param::video::VideoFormat) -> Option
     }
 }
 
-#[cfg_attr(not(feature = "ffmpeg-vaapi"), allow(dead_code))]
 fn drm_fourcc_name(format: u32) -> String {
     let bytes = format.to_le_bytes();
     bytes
@@ -6052,134 +4201,6 @@ fn clamp_u8(value: i32) -> u8 {
     value.clamp(0, 255) as u8
 }
 
-struct ResendBuffer {
-    max_bytes: u64,
-    bytes: u64,
-    frames: VecDeque<FrameMessage>,
-}
-
-impl ResendBuffer {
-    fn new(max_bytes: u64) -> Self {
-        Self {
-            max_bytes,
-            bytes: 0,
-            frames: VecDeque::new(),
-        }
-    }
-
-    fn push(&mut self, frame: FrameMessage) {
-        self.bytes += frame.ciphertext.len() as u64;
-        self.frames.push_back(frame);
-        while self.bytes > self.max_bytes {
-            if let Some(old) = self.frames.pop_front() {
-                self.bytes = self.bytes.saturating_sub(old.ciphertext.len() as u64);
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn ack(&mut self, through_seq: u64) {
-        while self
-            .frames
-            .front()
-            .is_some_and(|frame| frame.seq <= through_seq)
-        {
-            if let Some(old) = self.frames.pop_front() {
-                self.bytes = self.bytes.saturating_sub(old.ciphertext.len() as u64);
-            }
-        }
-    }
-
-    fn drop_other_streams(&mut self, stream_id: Uuid) {
-        self.frames.retain(|frame| frame.stream_id == stream_id);
-        self.bytes = self
-            .frames
-            .iter()
-            .map(|frame| frame.ciphertext.len() as u64)
-            .sum();
-    }
-
-    fn frames(&self, from_seq: u64, to_seq: u64) -> Vec<FrameMessage> {
-        self.frames
-            .iter()
-            .filter(|frame| frame.seq >= from_seq && frame.seq <= to_seq)
-            .cloned()
-            .collect()
-    }
-
-    fn range(&self) -> (Option<u64>, Option<u64>) {
-        (
-            self.frames.front().map(|frame| frame.seq),
-            self.frames.back().map(|frame| frame.seq),
-        )
-    }
-}
-
-struct VideoResendBuffer {
-    max_bytes: u64,
-    bytes: u64,
-    chunks: VecDeque<VideoChunkMessage>,
-}
-
-impl VideoResendBuffer {
-    fn new(max_bytes: u64) -> Self {
-        Self {
-            max_bytes,
-            bytes: 0,
-            chunks: VecDeque::new(),
-        }
-    }
-
-    fn push(&mut self, chunk: VideoChunkMessage) {
-        self.bytes += chunk.payload.len() as u64;
-        self.chunks.push_back(chunk);
-        while self.bytes > self.max_bytes {
-            if let Some(old) = self.chunks.pop_front() {
-                self.bytes = self.bytes.saturating_sub(old.payload.len() as u64);
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn ack(&mut self, through_seq: u64) {
-        while self
-            .chunks
-            .front()
-            .is_some_and(|chunk| chunk.seq <= through_seq)
-        {
-            if let Some(old) = self.chunks.pop_front() {
-                self.bytes = self.bytes.saturating_sub(old.payload.len() as u64);
-            }
-        }
-    }
-
-    fn drop_other_streams(&mut self, stream_id: Uuid) {
-        self.chunks.retain(|chunk| chunk.stream_id == stream_id);
-        self.bytes = self
-            .chunks
-            .iter()
-            .map(|chunk| chunk.payload.len() as u64)
-            .sum();
-    }
-
-    fn chunks(&self, from_seq: u64, to_seq: u64) -> Vec<VideoChunkMessage> {
-        self.chunks
-            .iter()
-            .filter(|chunk| chunk.seq >= from_seq && chunk.seq <= to_seq)
-            .cloned()
-            .collect()
-    }
-
-    fn range(&self) -> (Option<u64>, Option<u64>) {
-        (
-            self.chunks.front().map(|chunk| chunk.seq),
-            self.chunks.back().map(|chunk| chunk.seq),
-        )
-    }
-}
-
 struct DashResendBuffer {
     max_bytes: u64,
     bytes: u64,
@@ -6252,34 +4273,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn encoded_rgb_frame_decodes_with_expected_dimensions() {
-        let mut image = ImageBuffer::<Rgb<u8>, Vec<u8>>::new(16, 12);
-        for (x, y, pixel) in image.enumerate_pixels_mut() {
-            *pixel = Rgb([(x * 11) as u8, (y * 17) as u8, ((x + y) * 7) as u8]);
-        }
-
-        let encoded = encode_rgb_image_as_jpeg(
-            image,
-            CaptureEncodeSettings {
-                jpeg_quality: 75,
-                max_width: 16,
-                max_height: 12,
-            },
-        )
-        .unwrap();
-        let decoded = ImageReader::new(Cursor::new(&encoded.jpeg))
-            .with_guessed_format()
-            .unwrap()
-            .decode()
-            .unwrap();
-
-        assert_eq!(encoded.width, 16);
-        assert_eq!(encoded.height, 12);
-        assert_eq!(decoded.width(), 16);
-        assert_eq!(decoded.height(), 12);
-    }
-
-    #[test]
     fn unavailable_required_portal_cursor_metadata_is_fatal() {
         let err = anyhow::anyhow!(
             "requested portal cursor mode Metadata is not available; portal advertised cursor mode mask 3"
@@ -6293,7 +4286,6 @@ mod tests {
             "PipeWire buffer does not include SPA_META_Cursor while --require-cursor-metadata is set"
         );
         assert!(is_fatal_capture_error(&err));
-        assert!(is_fatal_video_source_error(&err));
     }
 
     #[test]
@@ -6500,12 +4492,7 @@ mod tests {
         assert_eq!(bitmap.hotspot_x, 3);
         assert_eq!(bitmap.hotspot_y, 4);
         let png = BASE64_STANDARD.decode(bitmap.png_b64).unwrap();
-        let decoded = ImageReader::new(Cursor::new(png))
-            .with_guessed_format()
-            .unwrap()
-            .decode()
-            .unwrap()
-            .to_rgba8();
+        let decoded = image::load_from_memory(&png).unwrap().to_rgba8();
         assert_eq!(decoded.as_raw(), &rgba_pixels);
     }
 
@@ -6798,100 +4785,5 @@ mod tests {
             },
             other => panic!("unexpected data type value: {other:?}"),
         }
-    }
-
-    #[test]
-    fn h264_annex_b_parser_splits_on_aud_access_units() {
-        let mut parser = H264AnnexBParser::default();
-        parser.push(&[
-            0, 0, 0, 1, 9, 0x10, // AUD
-            0, 0, 1, 7, 1, 2, 3, // SPS
-            0, 0, 1, 8, 4, 5, // PPS
-            0, 0, 1, 5, 6, 7, 8, // IDR
-            0, 0, 0, 1, 9, 0x10, // next AUD
-            0, 0, 1, 1, 9, 10, 11, // non-IDR
-        ]);
-
-        let first = parser.pop_access_unit().expect("first access unit");
-        assert!(first.starts_with(&[0, 0, 0, 1, 9]));
-        assert!(h264_access_unit_has_idr(&first));
-        assert!(parser.pop_access_unit().is_none());
-    }
-
-    #[test]
-    fn h264_annex_b_parser_waits_for_next_aud_across_multislice_reads() {
-        let mut parser = H264AnnexBParser::default();
-        parser.push(&[
-            0, 0, 0, 1, 9, 0x10, // AUD
-            0, 0, 1, 7, 1, 2, 3, // SPS
-            0, 0, 1, 8, 4, 5, // PPS
-            0, 0, 1, 5, 6, 7, // first IDR slice
-            0, 0, 1, 5, 8, 9, // second IDR slice
-        ]);
-        assert!(parser.pop_access_unit().is_none());
-
-        parser.push(&[
-            0, 0, 0, 1, 9, 0x10, // next AUD
-            0, 0, 1, 1, 10, 11, // next frame
-        ]);
-        let first = parser.pop_access_unit().expect("complete multislice frame");
-        assert_eq!(
-            glacialcast_protocol::h264_access_unit_nal_types(&first),
-            vec![9, 7, 8, 5, 5]
-        );
-    }
-
-    #[test]
-    fn h264_annex_b_parser_splits_without_aud_access_units() {
-        let mut parser = H264AnnexBParser::default();
-        parser.push(&[
-            0, 0, 0, 1, 7, 1, 2, 3, // SPS
-            0, 0, 1, 8, 4, 5, // PPS
-            0, 0, 1, 5, 6, 7, 8, // IDR
-            0, 0, 1, 1, 9, 10, 11, // non-IDR
-            0, 0, 1, 7, 12, 13, // next SPS
-            0, 0, 1, 8, 14, 15, // next PPS
-            0, 0, 1, 5, 16, 17, 18, // next IDR
-        ]);
-
-        let first = parser.pop_access_unit().expect("first access unit");
-        assert!(first.starts_with(&[0, 0, 0, 1, 7]));
-        assert!(h264_access_unit_has_idr(&first));
-
-        let second = parser.pop_access_unit().expect("second access unit");
-        assert!(second.starts_with(&[0, 0, 1, 1]));
-        assert!(!h264_access_unit_has_idr(&second));
-        assert!(parser.pop_access_unit().is_none());
-    }
-
-    #[cfg(feature = "ffmpeg-vaapi")]
-    #[test]
-    fn software_h264_starts_and_restarts_with_idr_access_units() {
-        let frame = |captured_at_ms| ffmpeg_vaapi::RgbInputFrame {
-            data: (0..64 * 64)
-                .flat_map(|pixel| {
-                    let x = (pixel % 64) as u8;
-                    let y = (pixel / 64) as u8;
-                    [x.wrapping_mul(3), y.wrapping_mul(5), x.wrapping_add(y)]
-                })
-                .collect(),
-            width: 64,
-            height: 64,
-            captured_at_ms,
-        };
-        let mut encoder = ffmpeg_vaapi::SoftwareH264Encoder::new(64, 64, 5.0, now_ms()).unwrap();
-
-        let initial = encoder.encode_rgb(frame(now_ms())).unwrap();
-        assert!(initial.iter().any(|packet| {
-            inspect_h264_access_unit(&packet.payload).is_decodable_random_access_point()
-        }));
-
-        encoder.request_keyframe();
-        let forced = encoder.encode_rgb(frame(now_ms() + 200)).unwrap();
-        assert!(
-            forced
-                .iter()
-                .any(|packet| inspect_h264_access_unit(&packet.payload).has_idr)
-        );
     }
 }

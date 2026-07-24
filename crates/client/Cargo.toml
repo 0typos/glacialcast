@@ -11,7 +11,6 @@ base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 cros-codecs.workspace = true
-ffmpeg-sys-next = { workspace = true, optional = true }
 futures-util.workspace = true
 glacialcast-dash = { path = "../dash" }
 glacialcast-protocol = { path = "../protocol" }
@@ -28,7 +27,3 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 zbus.workspace = true
 zvariant.workspace = true
-
-[features]
-default = []
-ffmpeg-vaapi = ["dep:ffmpeg-sys-next"]
