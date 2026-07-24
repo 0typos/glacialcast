@@ -24,7 +24,8 @@ const MAX_PORTABLE_DASH_HEADER_LEN: usize = 64 * 1024;
 const MAX_NOISE_PLAINTEXT_LEN: usize = 60 * 1024;
 const NOISE_SEGMENT_MAGIC: &[u8; 4] = b"GCN1";
 const NOISE_SEGMENT_HEADER_LEN: usize = 12;
-pub const NOISE_PATTERN: &str = "Noise_NN_25519_ChaChaPoly_BLAKE2s";
+pub const NOISE_PATTERN: &str = "Noise_NK_25519_ChaChaPoly_BLAKE2s";
+pub const NOISE_KEY_LEN: usize = 32;
 
 #[derive(Debug, Error)]
 pub enum ProtocolError {
@@ -44,6 +45,8 @@ pub enum ProtocolError {
     Crypto,
     #[error("viewer key must decode to 32 bytes, got {0}")]
     InvalidKeyLength(usize),
+    #[error("Noise key must contain 32 bytes, got {0}")]
+    InvalidNoiseKeyLength(usize),
     #[error("unsupported DASH object format version {0}")]
     UnsupportedDashVersion(u16),
     #[error("DASH object payload length does not match its header")]
@@ -818,23 +821,85 @@ pub fn noise_params() -> Result<NoiseParams> {
         .map_err(|err| ProtocolError::Noise(format!("{err:?}")))
 }
 
-pub fn build_noise_initiator() -> Result<HandshakeState> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NoiseKeypair {
+    pub private: [u8; NOISE_KEY_LEN],
+    pub public: [u8; NOISE_KEY_LEN],
+}
+
+impl NoiseKeypair {
+    pub fn validate(&self) -> Result<()> {
+        let mut initiator = build_noise_initiator(&self.public)?;
+        let mut responder = build_noise_responder(&self.private)?;
+        let mut message = [0u8; 128];
+        let mut payload = [0u8; 128];
+        let len = initiator
+            .write_message(&[], &mut message)
+            .map_err(|err| ProtocolError::Noise(format!("{err:?}")))?;
+        responder
+            .read_message(&message[..len], &mut payload)
+            .map_err(|err| ProtocolError::Noise(format!("{err:?}")))?;
+        let len = responder
+            .write_message(&[], &mut message)
+            .map_err(|err| ProtocolError::Noise(format!("{err:?}")))?;
+        initiator
+            .read_message(&message[..len], &mut payload)
+            .map_err(|err| ProtocolError::Noise(format!("{err:?}")))?;
+        Ok(())
+    }
+}
+
+pub fn generate_noise_keypair() -> Result<NoiseKeypair> {
+    let keypair = Builder::new(noise_params()?)
+        .generate_keypair()
+        .map_err(|err| ProtocolError::Noise(format!("{err:?}")))?;
+    let keypair = NoiseKeypair {
+        private: keypair
+            .private
+            .try_into()
+            .map_err(|key: Vec<u8>| ProtocolError::InvalidNoiseKeyLength(key.len()))?,
+        public: keypair
+            .public
+            .try_into()
+            .map_err(|key: Vec<u8>| ProtocolError::InvalidNoiseKeyLength(key.len()))?,
+    };
+    keypair.validate()?;
+    Ok(keypair)
+}
+
+pub fn encode_noise_public_key(key: &[u8; NOISE_KEY_LEN]) -> String {
+    URL_SAFE_NO_PAD.encode(key)
+}
+
+pub fn decode_noise_public_key(encoded: &str) -> Result<[u8; NOISE_KEY_LEN]> {
+    let key = URL_SAFE_NO_PAD.decode(encoded.trim())?;
+    let length = key.len();
+    key.try_into()
+        .map_err(|_| ProtocolError::InvalidNoiseKeyLength(length))
+}
+
+pub fn build_noise_initiator(remote_public_key: &[u8; NOISE_KEY_LEN]) -> Result<HandshakeState> {
     Builder::new(noise_params()?)
+        .remote_public_key(remote_public_key)
         .build_initiator()
         .map_err(|err| ProtocolError::Noise(format!("{err:?}")))
 }
 
-pub fn build_noise_responder() -> Result<HandshakeState> {
+pub fn build_noise_responder(local_private_key: &[u8; NOISE_KEY_LEN]) -> Result<HandshakeState> {
     Builder::new(noise_params()?)
+        .local_private_key(local_private_key)
         .build_responder()
         .map_err(|err| ProtocolError::Noise(format!("{err:?}")))
 }
 
-pub async fn initiator_handshake<S>(stream: &mut S) -> Result<TransportState>
+pub async fn initiator_handshake<S>(
+    stream: &mut S,
+    remote_public_key: &[u8; NOISE_KEY_LEN],
+) -> Result<TransportState>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut noise = build_noise_initiator()?;
+    let mut noise = build_noise_initiator(remote_public_key)?;
     let mut buf = vec![0u8; 65535];
     let len = noise
         .write_message(&[], &mut buf)
@@ -850,11 +915,14 @@ where
         .map_err(|err| ProtocolError::Noise(format!("{err:?}")))
 }
 
-pub async fn responder_handshake<S>(stream: &mut S) -> Result<TransportState>
+pub async fn responder_handshake<S>(
+    stream: &mut S,
+    local_private_key: &[u8; NOISE_KEY_LEN],
+) -> Result<TransportState>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut noise = build_noise_responder()?;
+    let mut noise = build_noise_responder(local_private_key)?;
     let mut buf = vec![0u8; 65535];
     let msg = read_clear_frame(stream).await?;
     noise
@@ -1036,6 +1104,23 @@ mod tests {
     }
 
     #[test]
+    fn noise_server_public_key_round_trips_and_pins_the_private_key() {
+        let keypair = generate_noise_keypair().unwrap();
+        let encoded = encode_noise_public_key(&keypair.public);
+        assert_eq!(decode_noise_public_key(&encoded).unwrap(), keypair.public);
+
+        let other = generate_noise_keypair().unwrap();
+        assert!(
+            NoiseKeypair {
+                private: keypair.private,
+                public: other.public,
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
     fn h264_parameter_set_cache_prepends_missing_keyframe_headers() {
         let mut cache = H264ParameterSetCache::default();
         let first_keyframe = vec![
@@ -1203,8 +1288,11 @@ mod tests {
     #[tokio::test]
     async fn noise_socket_round_trips_large_message_in_segments() {
         let (mut client_stream, mut server_stream) = tokio::io::duplex(1024);
+        let keypair = generate_noise_keypair().unwrap();
         let client = tokio::spawn(async move {
-            let transport = initiator_handshake(&mut client_stream).await.unwrap();
+            let transport = initiator_handshake(&mut client_stream, &keypair.public)
+                .await
+                .unwrap();
             let mut socket = NoiseSocket::new(client_stream, transport);
             let payload = vec![42u8; 200_000];
             socket
@@ -1224,7 +1312,9 @@ mod tests {
                 .unwrap();
         });
         let server = tokio::spawn(async move {
-            let transport = responder_handshake(&mut server_stream).await.unwrap();
+            let transport = responder_handshake(&mut server_stream, &keypair.private)
+                .await
+                .unwrap();
             let mut socket = NoiseSocket::new(server_stream, transport);
             match socket.read::<ClientMessage>().await.unwrap() {
                 ClientMessage::Frame(frame) => {
@@ -1243,8 +1333,11 @@ mod tests {
     async fn noise_socket_round_trips_frame_status_ack_then_cursors() {
         let (mut client_stream, mut server_stream) = tokio::io::duplex(1024);
         let stream_id = Uuid::new_v4();
+        let keypair = generate_noise_keypair().unwrap();
         let client = tokio::spawn(async move {
-            let transport = initiator_handshake(&mut client_stream).await.unwrap();
+            let transport = initiator_handshake(&mut client_stream, &keypair.public)
+                .await
+                .unwrap();
             let mut socket = NoiseSocket::new(client_stream, transport);
             socket
                 .write(&ClientMessage::Frame(FrameMessage {
@@ -1291,7 +1384,9 @@ mod tests {
             }
         });
         let server = tokio::spawn(async move {
-            let transport = responder_handshake(&mut server_stream).await.unwrap();
+            let transport = responder_handshake(&mut server_stream, &keypair.private)
+                .await
+                .unwrap();
             let mut socket = NoiseSocket::new(server_stream, transport);
             match socket.read::<ClientMessage>().await.unwrap() {
                 ClientMessage::Frame(frame) => {

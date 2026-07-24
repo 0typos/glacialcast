@@ -17,7 +17,7 @@ use glacialcast_protocol::{
         daemonize_if_requested, install_signal_handlers, manager_command,
         sanitize_socket_component, serve_control_socket, wait_for_shutdown,
     },
-    decode_key_b64, initiator_handshake, now_ms, parse_human_bytes,
+    decode_key_b64, decode_noise_public_key, initiator_handshake, now_ms, parse_human_bytes,
 };
 use image::{
     ColorType, ImageBuffer, ImageEncoder, Rgb, RgbaImage, codecs::png::PngEncoder,
@@ -82,6 +82,8 @@ struct Args {
     ingest_addr: SocketAddr,
     #[arg(long)]
     ingest_token: Option<String>,
+    #[arg(long, env = "GLACIALCAST_INGEST_SERVER_KEY")]
+    ingest_server_key: Option<String>,
     #[arg(long)]
     viewer_key: Option<String>,
     #[arg(long, conflicts_with = "viewer_key")]
@@ -143,6 +145,7 @@ struct Args {
 struct ClientConfig {
     client_id: Option<String>,
     ingest_token: Option<String>,
+    ingest_server_key: Option<String>,
     viewer_key_b64: Option<String>,
     display_name: Option<String>,
 }
@@ -150,6 +153,7 @@ struct ClientConfig {
 struct ClientIdentity {
     client_id: String,
     auth_token: Option<String>,
+    ingest_server_key: Option<[u8; 32]>,
     viewer_key_b64: Option<String>,
     display_name: String,
 }
@@ -268,6 +272,9 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
         .and_then(|key| {
             decode_key_b64(key).context("viewer key must be URL-safe base64 for 32 bytes")
         })?;
+    identity.ingest_server_key.as_ref().context(
+        "ingest server key is required; pass --ingest-server-key or set ingest_server_key in client.toml",
+    )?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(install_signal_handlers(shutdown_tx.clone()));
     if serve_control {
@@ -377,8 +384,11 @@ async fn run_dash_connection(
     if args.segment_frames == 0 {
         bail!("--segment-frames must be at least 1");
     }
+    let ingest_server_key = identity.ingest_server_key.as_ref().context(
+        "ingest server key is required; pass --ingest-server-key or set ingest_server_key in client.toml",
+    )?;
     let mut stream = TcpStream::connect(args.ingest_addr).await?;
-    let transport = initiator_handshake(&mut stream).await?;
+    let transport = initiator_handshake(&mut stream, ingest_server_key).await?;
     let mut socket = NoiseSocket::new(stream, transport);
     let (low, high) = resend.range();
     socket
@@ -966,6 +976,13 @@ fn resolve_client_identity(args: &Args) -> Result<ClientIdentity> {
         .or(config.ingest_token)
         .map(|token| token.trim().to_string())
         .filter(|token| !token.is_empty());
+    let ingest_server_key = args
+        .ingest_server_key
+        .clone()
+        .or(config.ingest_server_key)
+        .map(|key| decode_noise_public_key(&key))
+        .transpose()
+        .context("ingest_server_key must be URL-safe base64 for a 32-byte Noise public key")?;
     let viewer_key_b64 = if args.no_viewer_key {
         None
     } else {
@@ -985,6 +1002,7 @@ fn resolve_client_identity(args: &Args) -> Result<ClientIdentity> {
     Ok(ClientIdentity {
         client_id,
         auth_token,
+        ingest_server_key,
         viewer_key_b64,
         display_name,
     })

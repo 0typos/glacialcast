@@ -20,20 +20,23 @@ use axum::{
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use glacialcast_protocol::{
-    ClientMessage, ControlEvent, DashObjectHeader, FrameManifest, ServerMessage, StreamHello,
-    StreamMediaKind, VideoChunkManifest,
+    ClientMessage, ControlEvent, DashObjectHeader, FrameManifest, NOISE_KEY_LEN, NoiseKeypair,
+    ServerMessage, StreamHello, StreamMediaKind, VideoChunkManifest,
     daemon::{
         daemonize_if_requested, install_signal_handlers, manager_command, serve_control_socket,
         wait_for_shutdown,
     },
-    encode_ws_event, frame_is_encrypted, now_ms, parse_human_bytes, responder_handshake,
+    encode_noise_public_key, encode_ws_event, frame_is_encrypted, generate_noise_keypair, now_ms,
+    parse_human_bytes, responder_handshake,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
+    io::{Read, Write},
     net::SocketAddr,
-    path::PathBuf,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::{Path as FsPath, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -63,6 +66,10 @@ struct Args {
     ingest_addr: SocketAddr,
     #[arg(long, env = "GLACIALCAST_DATA_DIR", default_value = "data")]
     data_dir: PathBuf,
+    #[arg(long, env = "GLACIALCAST_INGEST_KEY_FILE")]
+    ingest_key_file: Option<PathBuf>,
+    #[arg(long)]
+    print_ingest_server_key: bool,
     #[arg(
         long,
         env = "GLACIALCAST_RETENTION_BYTES_PER_STREAM",
@@ -92,6 +99,7 @@ struct AppState {
     dash_events: broadcast::Sender<DashObjectHeader>,
     auth: AuthConfig,
     active_ingests: Arc<AsyncMutex<HashMap<Uuid, Uuid>>>,
+    ingest_private_key: [u8; NOISE_KEY_LEN],
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -130,6 +138,74 @@ struct AuthConfig {
 
 struct AuthenticatedClient {
     identity: String,
+}
+
+const INGEST_KEY_MAGIC: &[u8; 5] = b"GCNK1";
+
+fn load_or_create_ingest_key(path: &FsPath) -> Result<NoiseKeypair> {
+    match read_ingest_key(path) {
+        Ok(keypair) => return Ok(keypair),
+        Err(err) if path.exists() => return Err(err),
+        Err(_) => {}
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating ingest key directory {}", parent.display()))?;
+    }
+    let keypair = generate_noise_keypair().context("generating Noise server identity")?;
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            return read_ingest_key(path);
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("creating ingest key {}", path.display()));
+        }
+    };
+    file.write_all(INGEST_KEY_MAGIC)?;
+    file.write_all(&keypair.private)?;
+    file.write_all(&keypair.public)?;
+    file.sync_all()?;
+    Ok(keypair)
+}
+
+fn read_ingest_key(path: &FsPath) -> Result<NoiseKeypair> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("opening ingest key {}", path.display()))?;
+    let metadata = file.metadata()?;
+    if metadata.permissions().mode() & 0o077 != 0 {
+        anyhow::bail!(
+            "ingest key {} must not be accessible by group or other users",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    if bytes.len() != INGEST_KEY_MAGIC.len() + NOISE_KEY_LEN * 2
+        || !bytes.starts_with(INGEST_KEY_MAGIC)
+    {
+        anyhow::bail!("ingest key {} has an invalid format", path.display());
+    }
+    let private = bytes[INGEST_KEY_MAGIC.len()..INGEST_KEY_MAGIC.len() + NOISE_KEY_LEN]
+        .try_into()
+        .expect("validated private key slice length");
+    let public = bytes[INGEST_KEY_MAGIC.len() + NOISE_KEY_LEN..]
+        .try_into()
+        .expect("validated public key slice length");
+    let keypair = NoiseKeypair { private, public };
+    keypair
+        .validate()
+        .with_context(|| format!("validating ingest key {}", path.display()))?;
+    Ok(keypair)
 }
 
 impl AuthConfig {
@@ -241,6 +317,16 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
     tokio::fs::create_dir_all(&args.data_dir)
         .await
         .with_context(|| format!("creating data dir {}", args.data_dir.display()))?;
+    let ingest_key_path = args
+        .ingest_key_file
+        .clone()
+        .unwrap_or_else(|| args.data_dir.join("ingest-noise.key"));
+    let ingest_key = load_or_create_ingest_key(&ingest_key_path)?;
+    let ingest_server_key = encode_noise_public_key(&ingest_key.public);
+    if args.print_ingest_server_key {
+        println!("{ingest_server_key}");
+        return Ok(());
+    }
 
     let store = Store::open(args.data_dir.clone(), args.retention_bytes_per_stream)?;
     let dash_store = DashStore::open(
@@ -257,6 +343,7 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
         dash_events,
         auth: AuthConfig::from_config(config.ingest)?,
         active_ingests: Arc::new(AsyncMutex::new(HashMap::new())),
+        ingest_private_key: ingest_key.private,
     };
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     tokio::spawn(install_signal_handlers(shutdown_tx.clone()));
@@ -314,7 +401,12 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
         .nest_service("/assets", ServeDir::new("crates/server/static"))
         .with_state(state);
 
-    info!(control = %args.control_addr, ingest = %args.ingest_addr, "glacialcast server listening");
+    info!(
+        control = %args.control_addr,
+        ingest = %args.ingest_addr,
+        ingest_server_key,
+        "glacialcast server listening"
+    );
     let listener = TcpListener::bind(args.control_addr).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -611,7 +703,7 @@ async fn run_ingest(
 }
 
 async fn handle_ingest(mut stream: TcpStream, state: AppState) -> Result<()> {
-    let transport = responder_handshake(&mut stream).await?;
+    let transport = responder_handshake(&mut stream, &state.ingest_private_key).await?;
     let mut socket = glacialcast_protocol::NoiseSocket::new(stream, transport);
     let hello = match socket.read::<ClientMessage>().await? {
         ClientMessage::Hello(hello) => hello,
@@ -985,6 +1077,32 @@ mod tests {
     fn invalid_token_is_rejected_even_when_optional() {
         let auth = AuthConfig::from_config(token_config(false)).unwrap();
         assert!(auth.authenticate(Some("wrong"), "desk").is_err());
+    }
+
+    #[test]
+    fn ingest_noise_identity_is_private_and_persistent() {
+        let dir = std::env::temp_dir().join(format!("glacialcast-noise-key-{}", Uuid::new_v4()));
+        let path = dir.join("identity.key");
+        let created = load_or_create_ingest_key(&path).unwrap();
+        let loaded = load_or_create_ingest_key(&path).unwrap();
+        assert_eq!(created, loaded);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn ingest_noise_identity_rejects_public_permissions() {
+        let dir = std::env::temp_dir().join(format!("glacialcast-noise-key-{}", Uuid::new_v4()));
+        let path = dir.join("identity.key");
+        load_or_create_ingest_key(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_ingest_key(&path).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
     }
 }
 

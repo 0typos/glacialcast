@@ -63,8 +63,11 @@ XDG portal / PipeWire
 ```
 
 The server is trusted for availability and authorization, but not with captured
-content. TLS protects deployment credentials and server identity. Content
-encryption remains necessary because TLS terminates at the server.
+content. The ingest channel uses a pinned Noise NK server identity to encrypt
+the ingest token and stream objects in transit. HTTPS remains required for
+Internet deployment because the browser and management interfaces are separate
+from that channel. Content encryption remains necessary because transport
+encryption terminates at the server.
 
 ## Media Profile
 
@@ -132,6 +135,13 @@ dimensions before allocating payload storage.
 Ingest control envelopes use Postcard's documented stable wire format behind
 the GlacialCast protocol-version gate. Media payloads remain opaque byte
 strings and are not re-encoded by the relay.
+
+The server persists one Noise static keypair in its data directory with private
+file mode `0600`. Clients pin the URL-safe base64 public key. A client never
+sends its ingest token until the Noise NK handshake has authenticated the
+server, preventing credential disclosure to an accidental or malicious relay
+endpoint. Replacing the server identity is an explicit client configuration
+change.
 
 Cursor batches use a compact, versioned binary payload. Position-only events
 do not repeat bitmap pixels; a bitmap is included only when its identity or
@@ -221,10 +231,9 @@ live append, reconnect from a retained random-access point, history seeking, and
 cursor synchronization. The compositor gate records portal source selection,
 PipeWire buffer types, video damage metadata, and cursor metadata availability.
 
-## Replacement Strategy
+## Completed Replacement
 
-The 0.1 paths remain available only while the new vertical slice is being
-verified. Removal order is:
+The 0.2 vertical slice replaced the 0.1 transport in this order:
 
 1. Introduce the format and cryptographic primitives.
 2. Add opaque relay and storage.
