@@ -7,11 +7,11 @@ version.workspace = true
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true
-bincode.workspace = true
 bytes.workspace = true
 aes-gcm.workspace = true
 glacialcast-dash = { path = "../dash" }
 libc.workspace = true
+postcard.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true

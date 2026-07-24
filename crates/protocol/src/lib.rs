@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 pub mod daemon;
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const MAX_FRAME_LEN: usize = 32 * 1024 * 1024;
 pub const PORTABLE_DASH_MAGIC: &[u8; 4] = b"GCO1";
 const MAX_PORTABLE_DASH_HEADER_LEN: usize = 64 * 1024;
@@ -37,7 +37,7 @@ pub enum ProtocolError {
     #[error("io error: {0}")]
     Io(#[from] io::Error),
     #[error("serialization error: {0}")]
-    Bincode(#[from] Box<bincode::ErrorKind>),
+    Postcard(#[from] postcard::Error),
     #[error("base64 decode error: {0}")]
     Base64(#[from] base64::DecodeError),
     #[error("crypto error")]
@@ -883,7 +883,7 @@ where
     }
 
     pub async fn write<T: Serialize>(&mut self, message: &T) -> Result<()> {
-        let plain = bincode::serialize(message)?;
+        let plain = postcard::to_stdvec(message)?;
         if plain.len() > MAX_FRAME_LEN {
             return Err(ProtocolError::FrameTooLarge(plain.len()));
         }
@@ -938,7 +938,11 @@ where
             }
             plain_message.extend_from_slice(chunk);
             if plain_message.len() == total_len {
-                return bincode::deserialize(&plain_message).map_err(Into::into);
+                let (message, remainder) = postcard::take_from_bytes(&plain_message)?;
+                if !remainder.is_empty() {
+                    return Err(ProtocolError::MalformedFrame);
+                }
+                return Ok(message);
             }
         }
     }

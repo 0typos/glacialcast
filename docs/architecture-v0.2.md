@@ -129,6 +129,10 @@ opaque to the relay.
 The protocol has explicit size limits and rejects unknown versions and invalid
 dimensions before allocating payload storage.
 
+Ingest control envelopes use Postcard's documented stable wire format behind
+the GlacialCast protocol-version gate. Media payloads remain opaque byte
+strings and are not re-encoded by the relay.
+
 Cursor batches use a compact, versioned binary payload. Position-only events
 do not repeat bitmap pixels; a bitmap is included only when its identity or
 content changes. Batches flush often enough to keep live cursor latency below
