@@ -173,6 +173,7 @@ restart the relay, confirm readiness, and run:
 scripts/verify-internet-security.sh
 scripts/verify-ingest-recovery.sh
 scripts/verify-dash-e2e.sh
+cargo deny check
 ```
 
 ## Fail-closed behavior

@@ -127,6 +127,7 @@ history is pruned with relay retention.
 cargo fmt --all -- --check
 cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo deny check
 cargo doc --workspace --no-deps
 node scripts/test-viewer-core.mjs
 scripts/verify-dash-e2e.sh

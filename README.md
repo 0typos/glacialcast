@@ -269,6 +269,7 @@ For niri portal routing helpers and an upstream diagnostic template, see
 cargo fmt --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+cargo deny check
 node scripts/test-viewer-core.mjs
 scripts/verify-ingest-recovery.sh
 scripts/verify-internet-security.sh
