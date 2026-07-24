@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data: blob:; media-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'self'">
+  <title>GlacialCast DASH Viewer</title>
+  <link rel="stylesheet" href="/assets/dash-viewer.css">
+</head>
+<body>
+  <header>
+    <div>
+      <h1>GlacialCast</h1>
+      <div id="stream-label" class="muted">Encrypted DASH stream</div>
+    </div>
+    <a href="/">All streams</a>
+  </header>
+
+  <main>
+    <section id="unlock-panel" class="panel">
+      <h2>Unlock stream</h2>
+      <p>The viewer key stays in this page and is never sent to the relay.</p>
+      <form id="unlock-form">
+        <label for="viewer-key">Viewer key</label>
+        <div class="key-row">
+          <input id="viewer-key" type="password" autocomplete="off" spellcheck="false" required>
+          <button type="submit">Start</button>
+        </div>
+      </form>
+    </section>
+
+    <section id="player-panel" class="player-panel" hidden>
+      <div id="stage" class="stage">
+        <video id="video" muted autoplay playsinline></video>
+        <canvas id="cursor-layer" aria-hidden="true"></canvas>
+        <div id="stage-message" class="stage-message">Preparing encrypted media…</div>
+      </div>
+      <div class="controls">
+        <button id="live-button" type="button">Live</button>
+        <input id="timeline" type="range" min="0" max="0" value="0" step="0.01" aria-label="Replay position">
+        <span id="time-label">0:00</span>
+      </div>
+    </section>
+
+    <section class="status-panel" aria-live="polite">
+      <span id="status">Waiting for viewer key.</span>
+      <span id="metrics"></span>
+    </section>
+  </main>
+
+  <script src="/assets/dash-viewer.js"></script>
+</body>
+</html>

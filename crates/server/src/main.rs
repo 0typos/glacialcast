@@ -489,6 +489,7 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
 
     let app = Router::new()
         .route("/", get(index))
+        .route("/dash/{stream_id}", get(dash_viewer))
         .route("/favicon.ico", get(favicon))
         .route("/api/streams", get(list_streams))
         .route("/api/streams/{stream_id}", delete(delete_stream))
@@ -536,6 +537,20 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
 
 async fn index() -> Html<&'static str> {
     Html(include_str!("../static/index.html"))
+}
+
+async fn dash_viewer(Path(_stream_id): Path<Uuid>) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(
+            "content-security-policy",
+            "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data: blob:; media-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'self'",
+        )
+        .header("x-content-type-options", "nosniff")
+        .header("referrer-policy", "no-referrer")
+        .body(Body::from(include_str!("../static/dash-viewer.html")))
+        .expect("static DASH viewer response headers are valid")
 }
 
 async fn favicon() -> StatusCode {

@@ -834,7 +834,13 @@
           <div class="meta">${streamMeta(stream)}</div>
           <div class="meta">${stream.last_frame_seq ? `seq ${stream.last_frame_seq}` : 'no frames'} · ${formatBytes(stream.retained_bytes)}</div>
         `;
-        button.onclick = () => assignStreamToSlot(state.activeSlot, stream.stream_id);
+        button.onclick = () => {
+          if (stream.media_kind === 'Dash') {
+            location.href = `/dash/${stream.stream_id}`;
+          } else {
+            assignStreamToSlot(state.activeSlot, stream.stream_id);
+          }
+        };
         button.ondragstart = event => {
           event.dataTransfer.effectAllowed = 'copy';
           event.dataTransfer.setData('text/plain', stream.stream_id);
@@ -855,9 +861,11 @@
     }
 
     function streamMeta(stream) {
-      const kind = stream.media_kind === 'Video' ? 'video' : 'images';
+      const kind = stream.media_kind === 'Dash'
+        ? 'encrypted DASH'
+        : stream.media_kind === 'Video' ? 'video' : 'images';
       const key = streamRequiresKey(stream) ? 'keyed' : 'clear';
-      const backend = stream.source?.backend || 'inactive';
+      const backend = escapeHtml(stream.source?.backend || 'inactive');
       const width = stream.source?.width || 0;
       const height = stream.source?.height || 0;
       const seen = stream.last_seen_at_ms ? ` · ${new Date(stream.last_seen_at_ms).toLocaleTimeString()}` : '';
