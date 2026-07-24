@@ -1649,11 +1649,15 @@ struct DequeuedPipewireBuffer<'a> {
 
 impl<'a> DequeuedPipewireBuffer<'a> {
     fn dequeue(stream: &'a pw::stream::Stream) -> Option<Self> {
+        // SAFETY: this wrapper queues every non-null buffer exactly once in
+        // `Drop`, unless ownership is explicitly transferred by `defer_queue`.
         let buffer = unsafe { stream.dequeue_raw_buffer() };
         (!buffer.is_null()).then_some(Self { stream, buffer })
     }
 
     fn spa_buffer_ptr(&self) -> *mut spa::sys::spa_buffer {
+        // SAFETY: `self.buffer` is a non-null dequeued PipeWire buffer that
+        // remains owned by this guard; PipeWire owns its nested SPA buffer.
         unsafe {
             self.buffer
                 .as_ref()
@@ -1667,6 +1671,8 @@ impl<'a> DequeuedPipewireBuffer<'a> {
         if buffer.is_null() {
             return &mut [];
         }
+        // SAFETY: the SPA buffer remains exclusively dequeued through
+        // `&mut self`; PipeWire supplies `n_datas` elements at `datas`.
         unsafe {
             if (*buffer).n_datas == 0 || (*buffer).datas.is_null() {
                 &mut []
@@ -1688,6 +1694,8 @@ impl<'a> DequeuedPipewireBuffer<'a> {
 
 impl Drop for DequeuedPipewireBuffer<'_> {
     fn drop(&mut self) {
+        // SAFETY: `buffer` came from this stream and has not been queued or
+        // transferred, because `defer_queue` forgets the guard.
         unsafe {
             self.stream.queue_raw_buffer(self.buffer);
         }
@@ -1858,6 +1866,9 @@ fn pipewire_cursor_update(buffer: *const spa::sys::spa_buffer) -> PipewireCursor
     if buffer.is_null() {
         return PipewireCursorUpdate::Unchanged;
     }
+    // SAFETY: PipeWire owns `buffer` for the duration of the process callback.
+    // Null pointers, counts, metadata sizes, and cursor data are checked before
+    // each dereference or slice construction.
     unsafe {
         if (*buffer).n_metas == 0 || (*buffer).metas.is_null() {
             return PipewireCursorUpdate::Unchanged;
@@ -1900,6 +1911,9 @@ fn pipewire_cursor_bitmap(
         return None;
     }
 
+    // SAFETY: `meta.data` is callback-owned PipeWire storage of `meta_size`
+    // bytes. The bitmap header and every strided pixel row are checked to lie
+    // within that allocation before a reference or slice is formed.
     unsafe {
         let meta_base = meta.data.cast::<u8>();
         let bitmap = &*(meta_base
@@ -1995,6 +2009,8 @@ fn pipewire_buffer_has_cursor_meta(buffer: *const spa::sys::spa_buffer) -> bool 
     if buffer.is_null() {
         return false;
     }
+    // SAFETY: PipeWire owns `buffer` for the active callback; the metadata
+    // pointer is checked before constructing its `n_metas`-element slice.
     unsafe {
         if (*buffer).n_metas == 0 || (*buffer).metas.is_null() {
             return false;
@@ -2012,6 +2028,8 @@ fn pipewire_buffer_meta_summary(buffer: *const spa::sys::spa_buffer) -> String {
     if buffer.is_null() {
         return "null buffer".to_string();
     }
+    // SAFETY: PipeWire owns `buffer` for the active callback; the metadata
+    // pointer is checked before constructing its `n_metas`-element slice.
     unsafe {
         if (*buffer).n_metas == 0 || (*buffer).metas.is_null() {
             return format!(
@@ -2985,11 +3003,16 @@ fn run_pipewire_video_loop(
     let stream = pw::stream::StreamBox::new(&core, "glacialcast-screen-video", stream_properties)?;
     let (buffer_release_tx, buffer_release_rx) = pw::channel::channel::<usize>();
     let stream_ptr = stream.as_raw_ptr() as usize;
-    let _buffer_release = buffer_release_rx.attach(mainloop.loop_(), move |buffer| unsafe {
-        pw::sys::pw_stream_queue_buffer(
-            stream_ptr as *mut pw::sys::pw_stream,
-            buffer as *mut pw::sys::pw_buffer,
-        );
+    let _buffer_release = buffer_release_rx.attach(mainloop.loop_(), move |buffer| {
+        // SAFETY: the channel is attached to the owning PipeWire main loop;
+        // `stream` outlives this receiver and each value is a buffer explicitly
+        // deferred from that same stream.
+        unsafe {
+            pw::sys::pw_stream_queue_buffer(
+                stream_ptr as *mut pw::sys::pw_stream,
+                buffer as *mut pw::sys::pw_buffer,
+            );
+        }
     });
     let buffer_release_for_process = buffer_release_tx.clone();
 
@@ -3794,16 +3817,22 @@ fn dup_fd(fd: RawFd) -> Option<OwnedFd> {
     if fd < 0 {
         return None;
     }
+    // SAFETY: `dup(2)` accepts an integer descriptor and returns an error for
+    // an invalid one; no pointer or Rust borrow crosses the FFI boundary.
     let duplicated = unsafe { libc::dup(fd) };
     if duplicated < 0 {
         return None;
     }
+    // SAFETY: a non-negative result from `dup` is a new descriptor owned by
+    // the caller and may be transferred into exactly one `OwnedFd`.
     Some(unsafe { OwnedFd::from_raw_fd(duplicated) })
 }
 
 fn sync_dmabuf_read(fd: RawFd, end: bool) {
     let flags = DMA_BUF_SYNC_READ | if end { DMA_BUF_SYNC_END } else { 0 };
     let sync = DmaBufSync { flags };
+    // SAFETY: `sync` has the kernel ABI layout and remains alive for the ioctl;
+    // an invalid or non-DMA-BUF descriptor is reported as a syscall error.
     let _ = unsafe { libc::ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) };
 }
 
@@ -3874,6 +3903,8 @@ fn discover_portal_target_object(
         .done(move |id, seq| {
             if id == pw::core::PW_ID_CORE && seq == pending {
                 done_for_listener.store(true, Ordering::SeqCst);
+                // SAFETY: the listener and captured pointer are scoped within
+                // `discover_portal_target_object`, before `mainloop` is dropped.
                 unsafe {
                     pw::sys::pw_main_loop_quit(mainloop_ptr as *mut _);
                 }
@@ -4015,6 +4046,8 @@ fn enumerate_node_enum_formats(
         .done(move |id, seq| {
             if id == pw::core::PW_ID_CORE && seq == pending {
                 done_for_listener.store(true, Ordering::SeqCst);
+                // SAFETY: the listener and captured pointer are scoped within
+                // this enumeration, before `mainloop` is dropped.
                 unsafe {
                     pw::sys::pw_main_loop_quit(mainloop_ptr as *mut _);
                 }
@@ -4183,6 +4216,8 @@ fn record_pipewire_error(user_data: &PipewireUserData, message: String) {
         .lock()
         .expect("PipeWire error mutex poisoned");
     *slot = Some(message);
+    // SAFETY: user data and its main-loop pointer are created and destroyed on
+    // the same capture thread, and callbacks cannot outlive that main loop.
     unsafe {
         pw::sys::pw_main_loop_quit(user_data.mainloop_ptr as *mut _);
     }
@@ -4194,6 +4229,8 @@ fn record_pipewire_video_error(user_data: &PipewireVideoUserData, message: Strin
         .lock()
         .expect("PipeWire error mutex poisoned");
     *slot = Some(message);
+    // SAFETY: user data and its main-loop pointer are created and destroyed on
+    // the same capture thread, and callbacks cannot outlive that main loop.
     unsafe {
         pw::sys::pw_main_loop_quit(user_data.mainloop_ptr as *mut _);
     }

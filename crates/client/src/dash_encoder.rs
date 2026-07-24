@@ -702,9 +702,12 @@ fn vaapi_has_entrypoint(display: &Display, profile: i32, accepted: &[VAEntrypoin
 
 fn dmabuf_object_size(frame: &DashDmaBufFrame) -> Option<u32> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `stat` is writable storage for one `libc::stat`, and the
+    // `OwnedFd` in `frame` remains open for this call.
     let result = unsafe { libc::fstat(frame.fd.as_raw_fd(), stat.as_mut_ptr()) };
     let fallback = frame.offset.checked_add(frame.size)?;
     let size = if result == 0 {
+        // SAFETY: a successful `fstat` initialized the output structure.
         let size = unsafe { stat.assume_init() }.st_size;
         usize::try_from(size)
             .ok()

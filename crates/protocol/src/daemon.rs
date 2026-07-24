@@ -66,6 +66,8 @@ pub fn daemonize_if_requested(
         .stderr(Stdio::null());
 
     #[cfg(unix)]
+    // SAFETY: the post-fork closure performs only the async-signal-safe
+    // `setsid(2)` syscall and reads `errno` when that syscall fails.
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() == -1 {
@@ -202,6 +204,8 @@ async fn handle_control_connection(
         }
         "signal TERM" | "signal SIGTERM" => {
             #[cfg(unix)]
+            // SAFETY: the target is this live process ID and SIGTERM is a
+            // valid signal number; no pointer or borrowed memory crosses FFI.
             unsafe {
                 libc::kill(std::process::id() as libc::pid_t, libc::SIGTERM);
             }

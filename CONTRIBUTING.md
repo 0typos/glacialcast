@@ -68,7 +68,10 @@ Documentation is part of the compatibility and security surface.
   purpose. Document units, size limits, ownership, ordering, error behavior,
   and security-sensitive invariants where they are not obvious from the type.
 - Explain why a non-obvious algorithm or unsafe boundary is correct near the
-  implementation. Do not use comments that merely restate the code.
+  implementation. Every unsafe block requires a directly preceding `SAFETY:`
+  argument that states the pointer, lifetime, aliasing, initialization, or FFI
+  invariant that makes it sound. Do not use comments that merely restate the
+  code.
 - Add a compiling rustdoc example when a public API has a non-obvious usage
   contract. Examples are tested by `cargo test --doc`.
 - User-visible flags and configuration keys must have CLI help or adjacent
@@ -133,8 +136,8 @@ The normal commit gate is:
 scripts/verify-quality.sh standard
 ```
 
-It enforces formatting, all Rust tests, warning-free Clippy, strict rustdoc,
-dependency policy, shell syntax, and viewer-core tests.
+It enforces formatting, all Rust tests, warning-free Clippy, documented unsafe
+blocks, strict rustdoc, dependency policy, shell syntax, and viewer-core tests.
 
 Before merging or releasing behavior changes, run:
 

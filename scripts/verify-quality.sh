@@ -18,7 +18,9 @@ run() {
 standard_checks() {
   run cargo fmt --all -- --check
   run cargo test --workspace --all-features
-  run cargo clippy --workspace --all-targets --all-features -- -D warnings
+  run cargo clippy --workspace --all-targets --all-features -- \
+    -D warnings \
+    -D clippy::undocumented_unsafe_blocks
   run env "RUSTDOCFLAGS=-D warnings -D missing-docs" cargo doc --workspace --no-deps
   run cargo deny -L error check
   run bash -n scripts/*.sh

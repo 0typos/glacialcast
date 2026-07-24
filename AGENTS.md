@@ -57,6 +57,8 @@ These instructions apply to the entire repository.
 - Library crates must deny missing rustdoc for public APIs. Document purpose,
   units, bounds, ordering, errors, and security invariants rather than merely
   restating identifiers.
+- Every unsafe block must have a directly preceding `SAFETY:` comment that
+  explains the concrete invariant making the operation sound.
 - Update the architecture, Internet deployment, or testing/demo guide in the
   same change when their contract is affected.
 
