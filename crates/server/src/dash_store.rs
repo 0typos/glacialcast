@@ -1299,4 +1299,43 @@ mod tests {
         assert_eq!(store.list(stream_id).unwrap().len(), 10);
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    #[ignore = "release-mode persistence performance gate"]
+    fn relay_persistence_performance_supports_target_object_rate() {
+        let (root, store) = test_store(256 * 1024 * 1024);
+        let stream_id = Uuid::from_u128(55);
+        let epoch_id = Uuid::from_u128(56);
+        let keys = EpochKeys::derive(&[10; 32], stream_id, epoch_id).unwrap();
+        let iterations = 1_000u64;
+        let started = std::time::Instant::now();
+        for sequence in 1..=iterations {
+            store
+                .store(object(
+                    &keys,
+                    stream_id,
+                    epoch_id,
+                    ObjectSpec {
+                        kind: DashObjectKind::Cursor,
+                        sequence,
+                        segment_number: (sequence - 1) / 5 + 1,
+                        chunk_index: 0,
+                        random_access: true,
+                        payload: vec![sequence as u8; 512],
+                    },
+                ))
+                .unwrap();
+        }
+        let elapsed = started.elapsed();
+        let objects_per_second = iterations as f64 / elapsed.as_secs_f64();
+        println!(
+            "relay_persistence_objects_per_second={objects_per_second:.2} elapsed_seconds={:.3}",
+            elapsed.as_secs_f64()
+        );
+        assert!(
+            objects_per_second >= 10.0,
+            "relay persistence {objects_per_second:.2} objects/s is below the 10 objects/s floor"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
