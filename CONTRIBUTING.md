@@ -76,7 +76,7 @@ Documentation is part of the compatibility and security surface.
   contract. Examples are tested by `cargo test --doc`.
 - User-visible flags and configuration keys must have CLI help or adjacent
   example-configuration comments.
-- Update `docs/architecture-v0.2.md` when wire formats, trust boundaries,
+- Update `docs/architecture.md` when wire formats, trust boundaries,
   retention, encryption, or supported media behavior changes.
 - Update `docs/internet-deployment.md` when an operational default, public
   listener, credential, proxy, backup, or monitoring behavior changes.

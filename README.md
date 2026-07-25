@@ -5,7 +5,7 @@ with bounded history. It captures a selected monitor or window through the XDG
 Desktop Portal and PipeWire, sends H.264 video at about one frame per second,
 and renders cursor updates as an independent higher-rate overlay.
 
-The 0.2 MVP provides:
+The current pre-1.0 implementation provides:
 
 - native portal and PipeWire capture without GStreamer;
 - direct VA-API H.264 encoding on supported Intel/AMD devices;
@@ -23,8 +23,8 @@ viewer supports a fail-closed Internet profile with HTTPS proxying, signed
 viewer sessions, publisher-scoped authorization, admin controls, CSRF and
 origin enforcement, request/connection limits, and operational probes.
 
-GlacialCast 0.2 is video-only and view-only. Audio and remote input are outside
-the MVP.
+GlacialCast is video-only and view-only. Audio and remote input are outside the
+current product contract.
 
 ## Dependencies
 
@@ -339,7 +339,7 @@ For a staged checklist, interactive local demo, browser setup, real Wayland and
 VA-API gates, offline-file demonstration, deployed-host smoke test, and
 troubleshooting, see the [testing and demo guide](docs/testing-demo-guide.md).
 
-The architecture is described in `docs/architecture-v0.2.md`; version and
+The architecture is described in `docs/architecture.md`; version and
 format evolution follows `docs/compatibility.md`.
 The latest robustness, code-quality, and performance assessment is in
 `docs/robustness-performance-review.md`.

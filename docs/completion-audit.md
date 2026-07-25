@@ -1,13 +1,13 @@
-# GlacialCast 0.4 Completion Audit
+# GlacialCast 0.5 Completion Audit
 
 Last updated: 2026-07-24.
 
 ## Decision
 
-The 0.4 implementation is complete for the supported encrypted DASH path,
+The 0.5 implementation is complete for the supported encrypted DASH path,
 managed viewer access, checksummed offline transfer, and documented Internet
 deployment and release profiles. The deterministic full quality gate passes at
-version 0.4.0. Prior Firefox and Chromium browser gates validate the live and
+version 0.5.0. Firefox and Chromium browser gates validate the live and
 portable viewers; the release policy requires rerunning that matrix for each
 candidate artifact.
 
@@ -22,7 +22,7 @@ session.
 | Requirement | Evidence | Status |
 | --- | --- | --- |
 | Wayland capture | Native XDG Desktop Portal/PipeWire capture supports monitor/window selection; niri's Mutter-compatible API is an alternative backend. Capture and buffer negotiation have focused unit coverage. | Implemented; host gate pending |
-| Very low video cadence | `--fps` accepts 0.5 through 15 and defaults to 1. PipeWire damage metadata or a CPU-frame fingerprint suppresses unchanged samples, while a bounded idle heartbeat preserves timeline progress. Static, typing, scroll, and motion profiles have separate traffic ceilings. | Verified |
+| Very low video cadence | `--fps` accepts 0.5 through 15 and defaults to 1. PipeWire damage accumulates across throttled callbacks and a CPU-frame fingerprint remains authoritative when available; both suppress unchanged samples without dropping intervening changes. A bounded idle heartbeat preserves timeline progress. Static, typing, scroll, and motion profiles have separate traffic ceilings. | Verified |
 | Low live latency | `scripts/verify-dash-e2e.sh` rejects periodic capture-to-durable-relay acknowledgement above 250 ms. The final maximum was 46 ms. The browser gate rejects live announcement-to-MSE-append above 250 ms; the final live results were 13 ms in Firefox and 2 ms in Chromium. | Verified under local synthetic conditions |
 | Independent cursor | Video and cursor timers are separate. Cursor batches flush every 200 ms and carry their own media timestamps. Live and offline Firefox/Chromium gates require the overlay to paint, move independently, hide, and reappear. | Verified synthetically |
 | Real cursor metadata | `dash-wayland` requests and parses `SPA_META_Cursor`, including position, visibility, bitmap, and hotspot. `--require-cursor-metadata` fails closed when the compositor omits it. | Implemented; compositor gate pending |
@@ -30,10 +30,10 @@ session.
 | Server-blind E2EE | Media samples use CENC AES-CTR; cursor records use AES-256-GCM; every object is HMAC authenticated. Viewer keys are not sent to or logged by the relay. | Verified |
 | Authenticated ingest | Protocol version 5 uses Noise NK with a persistent `0600` relay identity. Clients pin the public key before sending tokens or objects. | Verified |
 | Internet transport boundary | Internet mode requires an exact path-free HTTPS public origin, keeps application HTTP on loopback, and provides a validated Caddy reverse-proxy profile. HSTS and restrictive response headers are emitted by the application. | Verified |
-| Viewer authorization | High-entropy access tokens create signed `__Host-`, `Secure`, `HttpOnly`, `SameSite=Strict` sessions. Administrators can create publisher-scoped viewer identities in the dashboard; the token is shown once, only its hash is stored, and revocation immediately invalidates both bearer and browser-session authority. The relay access token remains distinct from the E2EE viewer key. | Verified |
+| Viewer authorization | High-entropy access tokens create signed `__Host-`, `Secure`, `HttpOnly`, `SameSite=Strict` sessions. Administrators can create bounded publisher-scoped viewer identities in the dashboard; the token is shown once, redacted from debug output, and only its hash is stored. Oversized enrollment state is rejected before publication, and revocation immediately invalidates both bearer and browser-session authority. The relay access token remains distinct from the E2EE viewer key. | Verified |
 | Browser request integrity | State changes require exact-origin validation and session-bound CSRF authority. WebSocket upgrades require the configured origin. Bearer access is supported for non-browser mirroring without relying on ambient cookies. | Verified |
 | Abuse containment | HTTP work, authenticated requests, login attempts, WebSockets, ingest attempts, and active publisher connections are bounded globally and by principal or source address. HTTP, Noise handshake, and ingest-idle deadlines are enforced. | Verified |
-| Bounded history | The relay evicts complete media/cursor groups by both age and bytes, including cursor-only groups; it retains required epoch metadata and a persistent ingest sequence high-water mark, uses arrival time rather than UUID ordering, and reapplies policy at restart. Per-stream append journals remove catalog snapshot rewrites from the ingest hot path and recover incomplete final records safely. | Verified |
+| Bounded history | The relay evicts complete media/cursor groups by both age and bytes, including cursor-only and inactive streams; a periodic durable sweep enforces age without new ingest. It retains required epoch metadata and a persistent ingest sequence high-water mark, uses arrival time rather than UUID ordering, and reapplies policy at restart. Per-stream append journals remove catalog snapshot rewrites from the ingest hot path, recover incomplete final records safely, and adopt only an exact authenticated payload stranded at the next sequence by a crash. | Verified |
 | Firefox primary target | Clear Key EME, MSE append, painted 320×180 video, live updates, and cursor decryption passed in Playwright Firefox. | Verified |
 | Chromium target | The same live checks passed in Playwright Chromium. | Verified |
 | Portable file stream | Relay objects mirror atomically to versioned `.gco` files. A compact v2 root references bounded, immutable index chunks recording exact public headers, lengths, and SHA-256 checksums; the reader remains compatible with v1. Follow mode indexes history once and requests only later sequences. Verification reports missing and unexpected objects for resumable, out-of-order delivery and rejects corruption, oversize input, symlinks, or metadata mismatch. Checksums detect transfer errors but are not signatures. The self-contained server watches the input read-only. | Verified |

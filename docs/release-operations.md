@@ -45,8 +45,8 @@ a workflow artifact.
 On a receiving host, keep the archive and checksum together:
 
 ```sh
-sha256sum --check glacialcast-v0.4.0-x86_64-unknown-linux-gnu.tar.gz.sha256
-tar -xzf glacialcast-v0.4.0-x86_64-unknown-linux-gnu.tar.gz
+sha256sum --check glacialcast-v0.5.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf glacialcast-v0.5.0-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 The checksum detects accidental corruption but is not an identity proof.

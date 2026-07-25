@@ -1,4 +1,4 @@
-# GlacialCast 0.2 Architecture
+# GlacialCast Architecture
 
 ## Product Contract
 
@@ -8,8 +8,8 @@ low frame rate, publishes cursor updates independently at a higher rate, keeps
 a bounded replay window, and can copy the same stream files to an offline
 machine for playback.
 
-The first 0.2 release is deliberately video-only and view-only. Remote input and
-audio are outside the MVP.
+The current pre-1.0 product is deliberately video-only and view-only. Remote
+input and audio are outside the product contract.
 
 ## MVP Requirements
 
@@ -279,7 +279,7 @@ without shipping them.
 
 When VA-API H.264 encoding is unavailable, automatic mode falls back to the
 focused OpenH264 software encoder. An operator can require either backend
-explicitly. NVIDIA hardware encoding is not required for 0.2.
+explicitly. NVIDIA hardware encoding is not currently required.
 
 On Intel and AMD render nodes that expose both constrained-baseline H.264
 encoding and the VA-API video-processing entrypoint, the Wayland path imports

@@ -26,11 +26,15 @@ not DRM or access control.
 
 ## Correctness and Robustness Findings
 
-The hardening pass addressed the highest-risk defects found in the review:
+The hardening pass and its 0.5 follow-up addressed the highest-risk defects
+found in the review:
 
 - PipeWire cursor hide transitions are preserved, malformed cursor allocations
   and bitmaps are rejected, coordinates are bounded, and the latest movement is
   no longer permanently lost to callback-level rate limiting.
+- PipeWire video damage is accumulated across throttled callbacks, with a
+  CPU-pixel fingerprint as the authoritative fallback, so an intervening change
+  cannot be mistaken for an unchanged frame.
 - Cursor bitmaps remain raw shared RGBA in the capture path instead of taking a
   PNG/base64 encode/decode round trip. The wire format and browser parser now
   enforce the same size, timeline, coordinate, visibility, hotspot, and
@@ -44,10 +48,16 @@ The hardening pass addressed the highest-risk defects found in the review:
   tested truncation and trailing data.
 - Relay storage confines catalog entries to exact per-stream object paths,
   rejects symlinks, corruption, size mismatches, media chunk gaps/overlap, and
-  no-clobber publication conflicts. Cursor-only groups now obey retention.
+  no-clobber publication conflicts. Cursor-only and inactive streams obey
+  durable age/byte retention, and crash-stranded payloads are adopted only when
+  the next authenticated retry is byte-identical.
 - Offline catalogs accept only bounded regular files, enforce unique
   stream/sequence identities, update atomically in memory, and reject malformed
-  media chunk sets.
+  media chunk sets. Follow mode indexes history once, requests only later
+  sequences, and rewrites one bounded content-addressed index chunk per bucket.
+- The viewer rebases retained and live capture epochs into one timeline and
+  maintains the necessary Clear Key sessions, source-buffer types, and cursor
+  bitmap namespaces across publisher restarts.
 - The authenticated recovery gate proves invalid-token rejection, persistent
   Noise identity, stable stream assignment, contiguous sequence recovery, new
   epoch creation, and durable high-water state across a forced relay crash and a
@@ -58,22 +68,23 @@ MediaMTX, WebRTC, or third-party DASH-player dependency in the runtime.
 
 ## Test and Coverage State
 
-The normal Rust suite increased from 60 to 130 defined tests, of which 129 run
+The normal Rust suite increased from 60 to 162 defined tests, of which 161 run
 in the ordinary debug profile and one performance test runs explicitly in
 release mode:
 
 | Area | Tests |
 | --- | ---: |
-| Client and Wayland/cursor capture | 42 |
+| Client and Wayland/cursor capture | 50 |
 | DASH, fMP4, CENC, and cursor format | 16 |
-| Offline mirror/viewer | 10 |
-| Protocol and daemon control | 24 |
-| Relay, authorization, and storage | 38 |
-| Whole Rust workspace | 130 |
+| Offline mirror/viewer | 17 |
+| Protocol and daemon control | 25 |
+| Relay, authorization, and storage | 54 |
+| Whole Rust workspace | 162 |
 
 Three checked rustdoc examples cover epoch-key derivation, authenticated object
-construction, and byte-size parsing. The current coverage run measured 57.89%
-line coverage. The browser core has another 14 JavaScript tests. Multi-process
+construction, and byte-size parsing. The last recorded coverage run measured
+57.89% line coverage before the 0.5 follow-up. The browser core has another 16
+JavaScript tests. Multi-process
 gates cover live ingest, portable mirroring, offline serving, authentication,
 crash/restart, and optional Firefox/Chromium playback. The lower client and
 server-main coverage is concentrated in process orchestration,
@@ -138,9 +149,9 @@ separate 256 KiB/minute ceiling.
 - The custom constrained fMP4/CENC and viewer code intentionally avoids large
   dependencies, but that makes browser interoperability tests and format
   fuzzing permanent maintenance requirements. Nightly targets now cover
-  portable objects, cursor envelopes, Noise segments, epoch descriptors, and
-  catalog-journal records; golden vectors detect accidental key and portable
-  format drift.
+  portable objects, cursor envelopes, Noise segments, epoch descriptors,
+  catalog-journal records, and transfer-index JSON; golden vectors detect
+  accidental key and portable format drift.
 - E2EE does not hide timing, dimensions, object sizes, activity, or availability
   from the relay. Internet deployment should document this traffic-analysis
   boundary explicitly; `internet-deployment.md` now does.
