@@ -122,7 +122,10 @@ Sign in as an administrator and use **Viewer access** on the relay dashboard to
 create one scoped identity for each person or device. The generated access
 token is shown exactly once. The relay persists only its SHA-256 hash in
 `access-enrollments.json`, with mode `0600`; revoking the identity immediately
-invalidates both its token and existing browser sessions.
+invalidates both its token and existing browser sessions. Enrollment state is
+bounded to 4,096 viewers, 256 publisher scopes per viewer, and a 1 MiB durable
+file. Mutations that would exceed a bound fail before replacing the last valid
+file. Debug formatting redacts configured and newly generated access tokens.
 
 The dashboard-generated secret is a **relay access token**: it permits retrieval
 of the named publishers' opaque objects. It is not the **E2EE viewer key**, which

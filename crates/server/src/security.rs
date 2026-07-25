@@ -39,6 +39,8 @@ const MAX_PRINCIPAL_NAME_LEN: usize = 64;
 const MAX_PUBLISHER_NAME_LEN: usize = 128;
 const MANAGED_ACCESS_VERSION: u16 = 1;
 const MAX_MANAGED_ACCESS_FILE_LEN: u64 = 1024 * 1024;
+const MAX_MANAGED_VIEWERS: usize = 4096;
+const MAX_MANAGED_PUBLISHERS_PER_VIEWER: usize = 256;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -49,7 +51,7 @@ pub enum AccessRole {
     Admin,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfiguredAccessToken {
     pub name: String,
@@ -60,6 +62,19 @@ pub struct ConfiguredAccessToken {
     pub role: AccessRole,
     #[serde(default)]
     pub publishers: Vec<String>,
+}
+
+impl fmt::Debug for ConfiguredAccessToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfiguredAccessToken")
+            .field("name", &self.name)
+            .field("token", &"[REDACTED]")
+            .field("previous_tokens", &self.previous_tokens.len())
+            .field("role", &self.role)
+            .field("publishers", &self.publishers)
+            .finish()
+    }
 }
 
 fn default_access_role() -> AccessRole {
@@ -112,10 +127,20 @@ pub struct ManagedViewerSummary {
     pub created_at_ms: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct ManagedViewerEnrollment {
     pub viewer: ManagedViewerSummary,
     pub access_token: String,
+}
+
+impl fmt::Debug for ManagedViewerEnrollment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedViewerEnrollment")
+            .field("viewer", &self.viewer)
+            .field("access_token", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -374,6 +399,11 @@ impl AccessControl {
                 "managed viewer {name} already exists"
             )));
         }
+        if managed.viewers.len() >= MAX_MANAGED_VIEWERS {
+            return Err(ManagedViewerMutationError::Invalid(format!(
+                "managed viewer limit of {MAX_MANAGED_VIEWERS} has been reached"
+            )));
+        }
         let mut next = managed.viewers.clone();
         next.insert(name.to_string(), viewer);
         managed
@@ -439,7 +469,20 @@ impl ManagedAccessState {
             );
         }
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        file.read_to_end(&mut bytes)?;
+        Read::take(&mut file, MAX_MANAGED_ACCESS_FILE_LEN.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_MANAGED_ACCESS_FILE_LEN {
+            bail!(
+                "managed access file {} exceeds its size limit",
+                path.display()
+            );
+        }
+        if bytes.len() as u64 != metadata.len() {
+            bail!(
+                "managed access file {} changed while it was being read",
+                path.display()
+            );
+        }
         let stored: ManagedAccessFile = serde_json::from_slice(&bytes)
             .with_context(|| format!("parsing managed access file {}", path.display()))?;
         if stored.version != MANAGED_ACCESS_VERSION {
@@ -447,6 +490,13 @@ impl ManagedAccessState {
                 "managed access file {} has unsupported version {}",
                 path.display(),
                 stored.version
+            );
+        }
+        if stored.viewers.len() > MAX_MANAGED_VIEWERS {
+            bail!(
+                "managed access file {} exceeds the viewer limit of {}",
+                path.display(),
+                MAX_MANAGED_VIEWERS
             );
         }
         let mut viewers = BTreeMap::new();
@@ -509,6 +559,12 @@ impl ManagedAccessState {
         };
         let bytes =
             serde_json::to_vec_pretty(&stored).context("serializing managed access file")?;
+        if bytes.len() as u64 > MAX_MANAGED_ACCESS_FILE_LEN {
+            bail!(
+                "managed access state exceeds its {} byte size limit",
+                MAX_MANAGED_ACCESS_FILE_LEN
+            );
+        }
         let temporary = parent.join(format!(
             ".{}-{}.tmp",
             self.path
@@ -543,6 +599,12 @@ impl ManagedAccessState {
 }
 
 fn validated_publishers(publishers: Vec<String>) -> Result<Vec<String>> {
+    if publishers.len() > MAX_MANAGED_PUBLISHERS_PER_VIEWER {
+        bail!(
+            "managed viewer exceeds the publisher limit of {}",
+            MAX_MANAGED_PUBLISHERS_PER_VIEWER
+        );
+    }
     let mut normalized = HashSet::new();
     for publisher in publishers {
         let publisher = publisher.trim();
@@ -1049,6 +1111,18 @@ mod tests {
 
     #[test]
     fn access_configuration_rejects_weak_or_ambiguous_credentials() {
+        let configured = ConfiguredAccessToken {
+            name: "redacted".to_string(),
+            token: "current-secret".to_string(),
+            previous_tokens: vec!["previous-secret".to_string()],
+            role: AccessRole::Viewer,
+            publishers: vec!["workstation".to_string()],
+        };
+        let debug = format!("{configured:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("current-secret"));
+        assert!(!debug.contains("previous-secret"));
+
         let mut missing_scope = access_config();
         missing_scope.tokens[0].publishers.clear();
         assert!(AccessControl::from_config(missing_scope, false).is_err());
@@ -1081,6 +1155,9 @@ mod tests {
             .unwrap();
         assert_eq!(enrollment.viewer.publishers, ["workstation"]);
         assert!(enrollment.access_token.starts_with("gca_"));
+        let debug = format!("{enrollment:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(&enrollment.access_token));
         assert_eq!(
             access
                 .authenticate_token(&enrollment.access_token)
@@ -1151,12 +1228,73 @@ mod tests {
             access.enroll_viewer("new viewer", vec!["*".to_string()]),
             Err(ManagedViewerMutationError::Invalid(_))
         ));
+        assert!(matches!(
+            access.enroll_viewer(
+                "wide-viewer",
+                vec!["workstation".to_string(); MAX_MANAGED_PUBLISHERS_PER_VIEWER + 1],
+            ),
+            Err(ManagedViewerMutationError::Invalid(_))
+        ));
+
+        let summary = ManagedViewerSummary {
+            name: "limit-template".to_string(),
+            publishers: vec!["workstation".to_string()],
+            created_at_ms: glacialcast_protocol::now_ms(),
+        };
+        let token_hash = [7; 32];
+        let template = ManagedViewer {
+            principal: managed_principal(&summary, token_hash).unwrap(),
+            summary,
+            token_hash,
+        };
+        {
+            let mut managed = access.managed.as_ref().unwrap().lock().unwrap();
+            for index in 0..MAX_MANAGED_VIEWERS {
+                managed
+                    .viewers
+                    .insert(format!("limit-{index:04}"), template.clone());
+            }
+        }
+        assert!(matches!(
+            access.enroll_viewer("over-limit", vec!["*".to_string()]),
+            Err(ManagedViewerMutationError::Invalid(message))
+                if message.contains("viewer limit")
+        ));
+        assert!(!managed_path.exists());
 
         let link = root.join("managed-link.json");
         std::os::unix::fs::symlink(&managed_path, &link).unwrap();
         assert!(
             AccessControl::from_config_with_managed_file(access_config(), false, link).is_err()
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_access_refuses_oversized_state_before_publication() {
+        let root =
+            std::env::temp_dir().join(format!("glacialcast-managed-size-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("access-enrollments.json");
+        let summary = ManagedViewerSummary {
+            name: "oversized".to_string(),
+            publishers: vec!["x".repeat(MAX_PUBLISHER_NAME_LEN); 9000],
+            created_at_ms: glacialcast_protocol::now_ms(),
+        };
+        let token_hash = [9; 32];
+        let viewer = ManagedViewer {
+            principal: managed_principal(&summary, token_hash).unwrap(),
+            summary,
+            token_hash,
+        };
+        let state = ManagedAccessState {
+            path: path.clone(),
+            viewers: BTreeMap::new(),
+        };
+        let viewers = BTreeMap::from([("oversized".to_string(), viewer)]);
+        let error = state.persist(&viewers).unwrap_err();
+        assert!(error.to_string().contains("size limit"));
+        assert!(!path.exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -257,10 +257,12 @@ local viewer and MPEG-DASH endpoints in one binary. The offline host therefore
 needs only that binary, the object files, and an installed Firefox or Chromium
 browser; it does not need Internet access or third-party JavaScript. The
 offline catalog accepts only bounded regular `.gco` files, rejects duplicate
-stream/sequence identities, and ignores symlinks and incomplete transfer files.
-The service binds to loopback by default and requires an explicit
-`--allow-non-loopback` override before exposing the key-entry viewer to a
-trusted network.
+stream/sequence identities, and ignores incomplete transfer files. Manifest,
+chunk, and object reads open the final path with `O_NOFOLLOW`, validate the
+opened descriptor as a bounded regular file, and reject changes in length
+during the read. The service binds to loopback by default and requires an
+explicit `--allow-non-loopback` override before exposing the key-entry viewer
+to a trusted network.
 
 ## Runtime Dependency Boundary
 

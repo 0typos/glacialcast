@@ -12,7 +12,7 @@ if ! [[ "${seconds}" =~ ^[0-9]+$ ]] || (( seconds < 1 )); then
 fi
 if ! cargo "+${toolchain}" fuzz --help >/dev/null 2>&1; then
   echo "cargo-fuzz and Rust ${toolchain} are required" >&2
-  echo "install with: rustup toolchain install ${toolchain} && cargo install cargo-fuzz --locked" >&2
+  echo "install with: rustup toolchain install ${toolchain} && cargo install cargo-fuzz --version 0.13.2 --locked" >&2
   exit 2
 fi
 
@@ -24,7 +24,8 @@ for target in \
   cursor_envelope \
   noise_segment \
   epoch_descriptor \
-  catalog_journal; do
+  catalog_journal \
+  transfer_index; do
   target_corpus="${fuzz_tmp_dir}/${target}"
   target_log="${fuzz_tmp_dir}/${target}.log"
   mkdir -p "${target_corpus}"

@@ -58,10 +58,11 @@ route, authorization rule, or configuration default is incompatible.
 derived keys and exact portable bytes for deterministic test inputs. The
 workspace test decodes and authenticates it on every normal test run.
 
-The five fuzz targets cover portable objects, cursor envelopes, Noise segment
-headers, epoch descriptors, and relay catalog-journal records. Transfer-index
-compatibility is additionally fixed by unit vectors that exercise legacy v1,
-chunked v2, checksum failure, duplicate metadata, and size limits:
+The six fuzz targets cover portable objects, cursor envelopes, Noise segment
+headers, epoch descriptors, relay catalog-journal records, and both generations
+of transfer-index JSON. Transfer-index compatibility is additionally fixed by
+unit vectors that exercise legacy v1, chunked v2, checksum failure, duplicate
+metadata, symlink rejection, and size limits:
 
 ```sh
 GLACIALCAST_FUZZ_SECONDS=30 scripts/verify-fuzz.sh

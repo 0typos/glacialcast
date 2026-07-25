@@ -48,5 +48,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "transfer_index"
+path = "fuzz_targets/transfer_index.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

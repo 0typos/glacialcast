@@ -23,14 +23,22 @@ use axum::{
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use glacialcast_dash::{EpochDescriptor, MpdConfig, SegmentTimelineEntry, build_mpd};
-use glacialcast_protocol::{DashObject, DashObjectHeader, DashObjectKind, MAX_FRAME_LEN};
+#[cfg(test)]
+use glacialcast_protocol::transfer::{LEGACY_TRANSFER_MANIFEST_VERSION, LegacyTransferManifest};
+use glacialcast_protocol::{
+    DashObject, DashObjectHeader, DashObjectKind, MAX_FRAME_LEN,
+    transfer::{
+        TRANSFER_CHUNK_VERSION, TRANSFER_MANIFEST_VERSION, TransferChunk, TransferChunkDescriptor,
+        TransferManifest, TransferObject, TransferRoot, parse_transfer_chunk, parse_transfer_root,
+    },
+};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     fs::{File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     net::SocketAddr,
     os::unix::fs::OpenOptionsExt,
     path::{Path as FsPath, PathBuf},
@@ -47,9 +55,6 @@ const VIEWER_CORE_JS: &str = include_str!("../../server/static/dash-viewer-core.
 const VIEWER_JS: &str = include_str!("../../server/static/dash-viewer.js");
 const MAX_PORTABLE_FILE_LEN: u64 = MAX_FRAME_LEN as u64 + 128 * 1024;
 const TRANSFER_MANIFEST_FILE: &str = "glacialcast-transfer.json";
-const TRANSFER_MANIFEST_VERSION: u16 = 2;
-const LEGACY_TRANSFER_MANIFEST_VERSION: u16 = 1;
-const TRANSFER_CHUNK_VERSION: u16 = 1;
 const TRANSFER_CHUNK_OBJECTS: u64 = 1024;
 const MAX_TRANSFER_MANIFEST_LEN: u64 = 16 * 1024 * 1024;
 const MAX_TRANSFER_CHUNK_LEN: u64 = 16 * 1024 * 1024;
@@ -99,52 +104,6 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TransferManifest {
-    version: u16,
-    stream_id: Uuid,
-    generated_at_ms: i64,
-    chunks: Vec<TransferChunkDescriptor>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyTransferManifest {
-    version: u16,
-    stream_id: Uuid,
-    generated_at_ms: i64,
-    objects: Vec<TransferObject>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TransferObject {
-    filename: String,
-    length: u64,
-    sha256: String,
-    header: DashObjectHeader,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TransferChunkDescriptor {
-    filename: String,
-    length: u64,
-    sha256: String,
-    first_sequence: u64,
-    last_sequence: u64,
-    object_count: usize,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TransferChunk {
-    version: u16,
-    stream_id: Uuid,
-    objects: Vec<TransferObject>,
 }
 
 #[derive(Default)]
@@ -495,7 +454,7 @@ impl TransferIndex {
                     sha256: digest,
                     first_sequence,
                     last_sequence,
-                    object_count: chunk.objects.len(),
+                    object_count: chunk.objects.len() as u64,
                 },
             );
         }
@@ -546,7 +505,7 @@ fn write_immutable_transfer_chunk(directory: &FsPath, path: &FsPath, bytes: &[u8
                 );
             }
             let existing =
-                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+                read_bounded_regular_file(path, MAX_TRANSFER_CHUNK_LEN, "transfer chunk")?;
             if existing != bytes {
                 bail!("existing transfer chunk conflicts with its content hash");
             }
@@ -617,19 +576,11 @@ fn verify_transfer(root: &FsPath) -> Result<TransferVerification> {
         bail!("portable transfer is not a directory: {}", root.display());
     }
     let manifest_path = root.join(TRANSFER_MANIFEST_FILE);
-    let metadata = std::fs::symlink_metadata(&manifest_path)
-        .with_context(|| format!("reading transfer manifest {}", manifest_path.display()))?;
-    if !metadata.file_type().is_file() {
-        bail!(
-            "transfer manifest is not a regular file: {}",
-            manifest_path.display()
-        );
-    }
-    if metadata.len() > MAX_TRANSFER_MANIFEST_LEN {
-        bail!("transfer manifest exceeds its size limit");
-    }
-    let manifest_bytes = std::fs::read(&manifest_path)
-        .with_context(|| format!("reading transfer manifest {}", manifest_path.display()))?;
+    let manifest_bytes = read_bounded_regular_file(
+        &manifest_path,
+        MAX_TRANSFER_MANIFEST_LEN,
+        "transfer manifest",
+    )?;
     let (manifest_stream_id, manifest_objects) = decode_transfer_manifest(root, &manifest_bytes)?;
 
     let mut expected_names = HashSet::new();
@@ -667,7 +618,7 @@ fn verify_transfer(root: &FsPath) -> Result<TransferVerification> {
         if metadata.len() != declared.length || metadata.len() > MAX_PORTABLE_FILE_LEN {
             bail!("declared object length mismatch: {}", path.display());
         }
-        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let bytes = read_bounded_regular_file(&path, MAX_PORTABLE_FILE_LEN, "portable object")?;
         if sha256_hex(&bytes) != declared.sha256 {
             bail!("declared object checksum mismatch: {}", path.display());
         }
@@ -715,29 +666,9 @@ fn decode_transfer_manifest(
     root: &FsPath,
     manifest_bytes: &[u8],
 ) -> Result<(Uuid, Vec<TransferObject>)> {
-    #[derive(Deserialize)]
-    struct ManifestVersion {
-        version: u16,
-    }
-
-    let version: ManifestVersion =
-        serde_json::from_slice(manifest_bytes).context("decoding transfer manifest version")?;
-    match version.version {
-        LEGACY_TRANSFER_MANIFEST_VERSION => {
-            let manifest: LegacyTransferManifest = serde_json::from_slice(manifest_bytes)
-                .context("decoding legacy transfer manifest")?;
-            if manifest.version != LEGACY_TRANSFER_MANIFEST_VERSION || manifest.generated_at_ms <= 0
-            {
-                bail!("legacy transfer manifest has invalid metadata");
-            }
-            Ok((manifest.stream_id, manifest.objects))
-        }
-        TRANSFER_MANIFEST_VERSION => {
-            let manifest: TransferManifest =
-                serde_json::from_slice(manifest_bytes).context("decoding transfer manifest")?;
-            if manifest.version != TRANSFER_MANIFEST_VERSION || manifest.generated_at_ms <= 0 {
-                bail!("transfer manifest has invalid metadata");
-            }
+    match parse_transfer_root(manifest_bytes)? {
+        TransferRoot::Legacy(manifest) => Ok((manifest.stream_id, manifest.objects)),
+        TransferRoot::Chunked(manifest) => {
             let mut objects = Vec::new();
             let mut chunk_names = HashSet::new();
             let mut previous_sequence = None;
@@ -747,7 +678,7 @@ fn decode_transfer_manifest(
                     || declared.length == 0
                     || declared.length > MAX_TRANSFER_CHUNK_LEN
                     || declared.object_count == 0
-                    || declared.object_count > TRANSFER_CHUNK_OBJECTS as usize
+                    || declared.object_count > TRANSFER_CHUNK_OBJECTS
                     || declared.first_sequence > declared.last_sequence
                     || previous_sequence.is_some_and(|sequence| sequence >= declared.first_sequence)
                 {
@@ -757,16 +688,14 @@ fn decode_transfer_manifest(
                     );
                 }
                 let path = root.join(&declared.filename);
-                let metadata = std::fs::symlink_metadata(&path)
-                    .with_context(|| format!("inspecting transfer chunk {}", path.display()))?;
-                if !metadata.file_type().is_file() || metadata.len() != declared.length {
+                let bytes =
+                    read_bounded_regular_file(&path, MAX_TRANSFER_CHUNK_LEN, "transfer chunk")?;
+                if bytes.len() as u64 != declared.length {
                     bail!(
                         "transfer manifest chunk is not a regular file of the declared length: {}",
                         path.display()
                     );
                 }
-                let bytes = std::fs::read(&path)
-                    .with_context(|| format!("reading transfer chunk {}", path.display()))?;
                 let digest = sha256_hex(&bytes);
                 if digest != declared.sha256 {
                     bail!(
@@ -774,11 +703,10 @@ fn decode_transfer_manifest(
                         path.display()
                     );
                 }
-                let chunk: TransferChunk = serde_json::from_slice(&bytes)
+                let chunk = parse_transfer_chunk(&bytes)
                     .with_context(|| format!("decoding transfer chunk {}", path.display()))?;
-                if chunk.version != TRANSFER_CHUNK_VERSION
-                    || chunk.stream_id != manifest.stream_id
-                    || chunk.objects.len() != declared.object_count
+                if chunk.stream_id != manifest.stream_id
+                    || chunk.objects.len() as u64 != declared.object_count
                     || chunk.objects.first().map(|object| object.header.sequence)
                         != Some(declared.first_sequence)
                     || chunk.objects.last().map(|object| object.header.sequence)
@@ -810,7 +738,6 @@ fn decode_transfer_manifest(
             }
             Ok((manifest.stream_id, objects))
         }
-        version => bail!("unsupported transfer manifest version {version}"),
     }
 }
 
@@ -900,18 +827,35 @@ fn read_portable_object(path: &FsPath) -> Result<DashObject> {
 }
 
 fn read_portable_file(path: &FsPath) -> Result<(DashObject, Vec<u8>)> {
-    let metadata = std::fs::symlink_metadata(path)
-        .with_context(|| format!("reading metadata for {}", path.display()))?;
-    if !metadata.file_type().is_file() {
-        bail!("portable object is not a regular file: {}", path.display());
-    }
-    if metadata.len() > MAX_PORTABLE_FILE_LEN {
-        bail!("portable object {} exceeds its size limit", path.display());
-    }
-    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let bytes = read_bounded_regular_file(path, MAX_PORTABLE_FILE_LEN, "portable object")?;
     let object = DashObject::from_portable_bytes(&bytes)
         .with_context(|| format!("decoding portable object {}", path.display()))?;
     Ok((object, bytes))
+}
+
+fn read_bounded_regular_file(path: &FsPath, max_len: u64, kind: &str) -> Result<Vec<u8>> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("opening {kind} {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspecting open {kind} {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("{kind} is not a regular file: {}", path.display());
+    }
+    if metadata.len() > max_len {
+        bail!("{kind} {} exceeds its size limit", path.display());
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    Read::take(&mut file, max_len.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {kind} {}", path.display()))?;
+    if bytes.len() as u64 != metadata.len() {
+        bail!("{kind} {} changed while it was being read", path.display());
+    }
+    Ok(bytes)
 }
 
 fn validate_offline_listener(listen: SocketAddr, allow_non_loopback: bool) -> Result<()> {
@@ -1767,6 +1711,51 @@ mod tests {
         std::fs::write(&first_path, bytes).unwrap();
         let error = verify_transfer(directory.path()).unwrap_err();
         assert!(error.to_string().contains("checksum mismatch"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transfer_verification_never_follows_manifest_chunk_or_object_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let stream_id = Uuid::new_v4();
+        let epoch_id = Uuid::new_v4();
+        let object = test_object(
+            stream_id,
+            epoch_id,
+            DashObjectKind::Cursor,
+            1,
+            1,
+            0,
+            vec![1],
+        );
+        let object_path = portable_object_path(directory.path(), 1);
+        write_portable_object(directory.path(), &object_path, &object).unwrap();
+        write_transfer_manifest(directory.path(), stream_id).unwrap();
+
+        let manifest_path = directory.path().join(TRANSFER_MANIFEST_FILE);
+        let manifest: TransferManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let real_manifest = directory.path().join("manifest.backing");
+        std::fs::rename(&manifest_path, &real_manifest).unwrap();
+        symlink(&real_manifest, &manifest_path).unwrap();
+        assert!(verify_transfer(directory.path()).is_err());
+        std::fs::remove_file(&manifest_path).unwrap();
+        std::fs::rename(&real_manifest, &manifest_path).unwrap();
+
+        let chunk_path = directory.path().join(&manifest.chunks[0].filename);
+        let real_chunk = directory.path().join("chunk.backing");
+        std::fs::rename(&chunk_path, &real_chunk).unwrap();
+        symlink(&real_chunk, &chunk_path).unwrap();
+        assert!(verify_transfer(directory.path()).is_err());
+        std::fs::remove_file(&chunk_path).unwrap();
+        std::fs::rename(&real_chunk, &chunk_path).unwrap();
+
+        let real_object = directory.path().join("object.backing");
+        std::fs::rename(&object_path, &real_object).unwrap();
+        symlink(&real_object, &object_path).unwrap();
+        assert!(verify_transfer(directory.path()).is_err());
     }
 
     #[cfg(unix)]

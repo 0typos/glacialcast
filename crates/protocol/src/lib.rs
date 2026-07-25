@@ -28,6 +28,7 @@ use uuid::Uuid;
 
 /// Helpers shared by the client and server daemon-control implementations.
 pub mod daemon;
+pub mod transfer;
 
 /// Publisher/relay message schema version.
 pub const PROTOCOL_VERSION: u16 = 5;

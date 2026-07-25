@@ -1069,6 +1069,7 @@ dependencies = [
  "futures-util",
  "glacialcast-dash",
  "glacialcast-protocol",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

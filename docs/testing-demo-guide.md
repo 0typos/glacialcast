@@ -90,9 +90,10 @@ GLACIALCAST_FUZZ_SECONDS=30 scripts/verify-fuzz.sh
 ```
 
 The script fuzzes portable objects, cursor envelopes, Noise segment headers,
-epoch descriptors, and relay catalog-journal records. It mutates a temporary
-copy of the reviewed seed corpus, so a normal run does not dirty the worktree.
-Any crashing input is retained in `fuzz/artifacts/`.
+epoch descriptors, relay catalog-journal records, and v1/v2 transfer-index
+JSON. It mutates a temporary copy of the reviewed seed corpus, so a normal run
+does not dirty the worktree. Any crashing input is retained in
+`fuzz/artifacts/`.
 
 ## 3. Run the headless end-to-end gates
 
