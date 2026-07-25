@@ -72,16 +72,20 @@ Release packaging has its own deterministic gate:
 scripts/verify-packaging.sh
 ```
 
-It builds the versioned Linux archive, verifies its checksum, packaged binary
-versions, SPDX SBOM, required operator files, and systemd unit. The full quality
-profile runs this gate automatically.
+It builds the versioned Linux archive twice in independent Cargo target
+directories, compares the resulting digests, and verifies its checksum, exact
+packaged binary versions, source revision, SPDX Cargo and native-runtime
+inventory, required operator files, and systemd unit. A development build from
+a dirty tree is marked `-dirty` in the SBOM; release automation instead sets
+`GLACIALCAST_REQUIRE_CLEAN=1`. The full quality profile runs this gate
+automatically.
 
 Parser changes should also run the bounded fuzz suite. It needs the pinned
 nightly and `cargo-fuzz` once:
 
 ```sh
 rustup toolchain install nightly-2026-07-03
-cargo install cargo-fuzz --locked
+cargo install cargo-fuzz --version 0.13.2 --locked
 GLACIALCAST_FUZZ_SECONDS=30 scripts/verify-fuzz.sh
 ```
 
@@ -149,7 +153,7 @@ required:
 
 ```sh
 pw_root="${XDG_CACHE_HOME:-$HOME/.cache}/glacialcast-playwright"
-npm install --prefix "$pw_root" playwright
+npm install --prefix "$pw_root" playwright@1.59.1
 "$pw_root/node_modules/.bin/playwright" install firefox chromium
 export GLACIALCAST_PLAYWRIGHT_MODULE="$pw_root/node_modules/playwright"
 ```

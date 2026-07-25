@@ -28,9 +28,9 @@ the MVP.
 
 ## Dependencies
 
-The default build needs a Rust toolchain, PipeWire, libva, GBM, and Clang
-development files. OpenH264 is loaded dynamically at runtime for software
-encoding.
+The default build uses the exact Rust release pinned in
+`rust-toolchain.toml` and needs PipeWire, libva, GBM, and Clang development
+files. OpenH264 is loaded dynamically at runtime for software encoding.
 
 On Fedora:
 
@@ -254,7 +254,9 @@ scripts/verify-packaging.sh
 ```
 
 The ignored `dist/` output contains all three binaries, deployment examples,
-operator documentation, an SPDX 2.3 SBOM, and a SHA-256 checksum. Optional
+operator documentation, an SPDX 2.3 SBOM, and a SHA-256 checksum. The gate
+compares archives built in two independent target directories, requires exact
+binary versions, and records dirty-worktree provenance honestly. Optional
 Minisign signing, installation, backup, upgrade, and rollback procedures are in
 the [release operations runbook](docs/release-operations.md).
 

@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install native build dependencies
         run: |
           sudo apt-get update
@@ -33,10 +33,6 @@ jobs:
             libpipewire-0.3-dev \
             libspa-0.2-dev \
             libva-dev
-      - name: Select stable Rust
-        run: |
-          rustup update stable
-          rustup default stable
       - name: Run reliability soak
         env:
           GLACIALCAST_SOAK_SECONDS: "1800"
@@ -52,7 +48,7 @@ jobs:
       matrix:
         test-pattern: [motion, static]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install native build dependencies
         run: |
           sudo apt-get update
@@ -64,13 +60,9 @@ jobs:
             libpipewire-0.3-dev \
             libspa-0.2-dev \
             libva-dev
-      - name: Select stable Rust
-        run: |
-          rustup update stable
-          rustup default stable
       - name: Install browser test runtime
         run: |
-          npm install --prefix /tmp/glacialcast-playwright playwright
+          npm install --prefix /tmp/glacialcast-playwright playwright@1.59.1
           /tmp/glacialcast-playwright/node_modules/.bin/playwright install --with-deps firefox chromium
       - name: Run live and offline browser matrix
         env:
@@ -86,7 +78,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install native build dependencies
         run: |
           sudo apt-get update
@@ -99,15 +91,15 @@ jobs:
             libva-dev
       - name: Install fuzz toolchain
         run: |
-          rustup toolchain install nightly-2026-07-03
-          cargo install cargo-fuzz --locked
+          rustup toolchain install nightly-2026-07-03 --profile minimal
+          cargo install cargo-fuzz --version 0.13.2 --locked
       - name: Run parser fuzz targets
         env:
           GLACIALCAST_FUZZ_SECONDS: "60"
         run: scripts/verify-fuzz.sh
       - name: Preserve fuzz failures
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: parser-fuzz-failures
           path: fuzz/artifacts/

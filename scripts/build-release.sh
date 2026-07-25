@@ -11,8 +11,16 @@ version="$(
 )"
 target="$(rustc -vV | sed -n 's/^host: //p')"
 revision="$(git rev-parse HEAD 2>/dev/null || printf 'uncommitted')"
+if [[ -n "$(git status --porcelain=v1 --untracked-files=normal 2>/dev/null)" ]]; then
+  if [[ "${GLACIALCAST_REQUIRE_CLEAN:-0}" == "1" ]]; then
+    echo "release build requires a clean worktree" >&2
+    exit 1
+  fi
+  revision="${revision}-dirty"
+fi
 source_epoch="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct 2>/dev/null || date +%s)}"
 dist_dir="${GLACIALCAST_DIST_DIR:-${repo_root}/dist}"
+target_dir="${CARGO_TARGET_DIR:-${repo_root}/target}"
 bundle_name="glacialcast-v${version}-${target}"
 archive="${dist_dir}/${bundle_name}.tar.gz"
 build_root="$(mktemp -d /tmp/glacialcast-release.XXXXXX)"
@@ -23,16 +31,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cargo build --workspace --release --locked
+CARGO_TARGET_DIR="${target_dir}" cargo build --workspace --release --locked
 mkdir -p \
   "${bundle_root}/bin" \
   "${bundle_root}/deploy" \
   "${bundle_root}/docs" \
   "${dist_dir}"
 cp -a \
-  target/release/glacialcast-client \
-  target/release/glacialcast-offline \
-  target/release/glacialcast-server \
+  "${target_dir}/release/glacialcast-client" \
+  "${target_dir}/release/glacialcast-offline" \
+  "${target_dir}/release/glacialcast-server" \
   "${bundle_root}/bin/"
 cp -a deploy/. "${bundle_root}/deploy/"
 cp -a \

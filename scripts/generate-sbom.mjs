@@ -37,6 +37,22 @@ const packageIds = new Map(
     `SPDXRef-Package-${index}-${pkg.name.replace(/[^A-Za-z0-9.-]/g, '-')}`,
   ]),
 );
+const nativePackages = [
+  ['SPDXRef-Native-PipeWire', 'PipeWire'],
+  ['SPDXRef-Native-libgbm', 'libgbm'],
+  ['SPDXRef-Native-libva', 'libva'],
+  ['SPDXRef-Native-OpenH264', 'OpenH264'],
+].map(([SPDXID, name]) => ({
+  SPDXID,
+  name,
+  downloadLocation: 'NOASSERTION',
+  filesAnalyzed: false,
+  licenseConcluded: 'NOASSERTION',
+  licenseDeclared: 'NOASSERTION',
+  copyrightText: 'NOASSERTION',
+  primaryPackagePurpose: 'LIBRARY',
+  comment: 'System-provided runtime dependency; exact version is deployment-specific.',
+}));
 
 const packages = metadata.packages.map(pkg => ({
   SPDXID: packageIds.get(pkg.id),
@@ -53,7 +69,7 @@ const packages = metadata.packages.map(pkg => ({
     referenceType: 'purl',
     referenceLocator: `pkg:cargo/${encodeURIComponent(pkg.name)}@${pkg.version}`,
   }],
-}));
+})).concat(nativePackages);
 
 const relationships = [];
 for (const id of metadata.workspace_members) {
@@ -71,6 +87,15 @@ for (const node of metadata.resolve?.nodes || []) {
       relatedSpdxElement: packageIds.get(dependency),
     });
   }
+}
+const client = metadata.packages.find(pkg => pkg.name === 'glacialcast-client');
+if (!client) throw new Error('workspace does not contain glacialcast-client');
+for (const dependency of nativePackages) {
+  relationships.push({
+    spdxElementId: packageIds.get(client.id),
+    relationshipType: 'DEPENDS_ON',
+    relatedSpdxElement: dependency.SPDXID,
+  });
 }
 
 const document = {

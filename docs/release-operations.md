@@ -26,10 +26,18 @@ scripts/verify-packaging.sh
 ls -l dist/
 ```
 
-`verify-packaging.sh` rebuilds in release mode, validates the checksum, executes
-all three packaged binaries with `--version`, checks the SPDX document and
-systemd unit, and confirms required documentation. The manual **Release
-archive** GitHub workflow performs the same operation and uploads the files as
+`verify-packaging.sh` builds twice with independent Cargo target and output
+directories, compares the archives, validates the checksum, requires the exact
+workspace version from all three packaged binaries, checks revision provenance,
+the SPDX Cargo/native-runtime inventory and systemd unit, and confirms required
+documentation. Local dirty-tree artifacts are labeled with a `-dirty` revision
+in the SBOM instead of claiming clean provenance. Set
+`GLACIALCAST_REQUIRE_CLEAN=1` to reject them.
+
+The compiler is fixed by `rust-toolchain.toml`; CI helper tools and GitHub
+Actions are pinned as well. The manual **Release archive** GitHub workflow runs
+the full deterministic and Firefox/Chromium live/offline acceptance gates for
+the selected commit before a separate clean packaging job uploads the files as
 a workflow artifact.
 
 ## Checksums and optional signatures
@@ -114,7 +122,9 @@ silently.
 
 ## Offline receiver operations
 
-Transfer completed `.gco` files and `glacialcast-transfer.json`, then run:
+Transfer completed `.gco` files and immutable
+`glacialcast-transfer-chunk-*.json` indexes, then transfer
+`glacialcast-transfer.json` last and run:
 
 ```sh
 glacialcast-offline verify --input /media/glacialcast-transfer
