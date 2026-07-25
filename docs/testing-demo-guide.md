@@ -358,6 +358,26 @@ scripts/verify-wayland-cursor-metadata.sh
 Replace `DP-3` with the output name reported by niri. GNOME, KDE, and wlroots
 users should begin with the default portal path.
 
+The object-level gate proves that capture, cursor metadata, encryption, and
+relay delivery are active. It cannot determine whether a GPU buffer was
+interpreted with the correct pixel layout. Add a real browser screenshot to
+the same run:
+
+```sh
+GLACIALCAST_VERIFY_SCREENCAST_BACKEND=mutter \
+GLACIALCAST_VERIFY_MONITOR_NAME=DP-3 \
+GLACIALCAST_VERIFY_SCREENSHOT=/tmp/glacialcast-wayland.png \
+GLACIALCAST_VERIFY_BROWSER=firefox \
+GLACIALCAST_PLAYWRIGHT_MODULE="$pw_root/node_modules/playwright" \
+scripts/verify-wayland-cursor-metadata.sh
+```
+
+Inspect `/tmp/glacialcast-wayland.png` before recording platform support.
+Repeat with `GLACIALCAST_VERIFY_BROWSER=chromium` for a release candidate. This
+visual gate is deliberately explicit: a decoded frame with repeated tiles,
+horizontal strips, or scrambled blocks is a capture failure even when the
+script reports that media objects arrived.
+
 ## 7. Test VA-API and DMA-BUF
 
 Run:
@@ -555,6 +575,29 @@ cursor gate:
 cargo build --workspace --release
 scripts/verify-wayland-cursor-metadata.sh
 ```
+
+### The Wayland picture is tiled, striped, or capture reports GBM readback failure
+
+Do not continue using a build that publishes scrambled pixels. Current builds
+only map explicitly linear, mappable DMA-BUFs directly and otherwise require
+the graphics driver's GBM readback path.
+
+On NVIDIA, first verify that the loaded kernel module and installed userspace
+driver agree:
+
+```sh
+nvidia-smi
+modinfo -F version nvidia
+sed -n '1p' /proc/driver/nvidia/version
+ls -l /dev/dri/renderD*
+```
+
+If `nvidia-smi` cannot initialize, the two reported versions differ, or the
+render node disappeared after a driver update, reboot before testing again.
+Then rebuild and run the screenshot-enabled Wayland gate above. If the correct
+render node is not `/dev/dri/renderD128`, pass it to the client with
+`--vaapi-device` and to the verifier with
+`GLACIALCAST_VERIFY_VAAPI_DEVICE`.
 
 ### The browser gate cannot launch
 

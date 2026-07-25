@@ -286,7 +286,11 @@ encoding and the VA-API video-processing entrypoint, the Wayland path imports
 the compositor's RGB DMA-BUF and converts/scales it into an owned NV12 GBM
 surface before encoding. The client does not return the PipeWire buffer to its
 pool until that GPU operation has synchronized. If either capability is absent,
-the portal stream requests CPU-readable buffers instead.
+the portal stream requests CPU-readable buffers. A compositor may nevertheless
+return a non-linear or non-mappable DMA-BUF; the client then imports and maps it
+through the render driver's GBM implementation before software encoding. Raw
+`mmap` is limited to explicitly linear, mappable DMA-BUFs so tiled GPU memory
+cannot be mistaken for a linear image.
 
 ## Compatibility Matrix
 

@@ -9,6 +9,9 @@ ingest_addr="${GLACIALCAST_VERIFY_INGEST_ADDR:-127.0.0.1:18998}"
 backend="${GLACIALCAST_VERIFY_SCREENCAST_BACKEND:-portal}"
 monitor_name="${GLACIALCAST_VERIFY_MONITOR_NAME:-}"
 timeout_seconds="${GLACIALCAST_VERIFY_TIMEOUT_SECONDS:-60}"
+screenshot="${GLACIALCAST_VERIFY_SCREENSHOT:-}"
+browser="${GLACIALCAST_VERIFY_BROWSER:-firefox}"
+gpu_device="${GLACIALCAST_VERIFY_VAAPI_DEVICE:-/dev/dri/renderD128}"
 origin="http://${control_addr}"
 work_dir="$(mktemp -d /tmp/glacialcast-wayland-cursor.XXXXXX)"
 server_log="${work_dir}/server.log"
@@ -64,6 +67,7 @@ client_args=(
   --display-name "Wayland Cursor Verify"
   --capture dash-wayland
   --dash-encoder openh264
+  --vaapi-device "${gpu_device}"
   --portal-source monitor
   --screencast-backend "${backend}"
   --portal-cursor metadata
@@ -118,5 +122,23 @@ NODE
   sed -n '1,260p' "${client_log}" >&2
   exit 1
 }
+
+if [[ -n "${screenshot}" ]]; then
+  stream_id="$(
+    node - "${origin}" <<'NODE'
+const origin = process.argv[2];
+const streams = await fetch(`${origin}/api/streams`).then(response => response.json());
+const stream = streams.find(candidate => candidate.display_name === 'Wayland Cursor Verify');
+if (!stream) process.exit(1);
+process.stdout.write(stream.stream_id);
+NODE
+  )"
+  node scripts/capture-dash-frame.mjs \
+    "${origin}" \
+    "${stream_id}" \
+    "${viewer_key}" \
+    "${screenshot}" \
+    "${browser}"
+fi
 
 echo "PASS: Wayland capture emitted encrypted media and independent PipeWire cursor objects"

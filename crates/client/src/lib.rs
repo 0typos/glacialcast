@@ -39,7 +39,7 @@ use serde::Deserialize;
 use std::{
     collections::VecDeque,
     io::Read,
-    os::fd::{FromRawFd, OwnedFd, RawFd},
+    os::fd::{BorrowedFd, FromRawFd, OwnedFd, RawFd},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::PathBuf,
     ptr,
@@ -1629,6 +1629,7 @@ struct WaylandPipewireCapture {
     portal_cursor: PortalCursorMode,
     require_cursor_metadata: bool,
     prefer_dmabuf: bool,
+    gpu_device: PathBuf,
     inner: Option<NativePipewireCapture>,
 }
 
@@ -1644,6 +1645,7 @@ impl WaylandPipewireCapture {
             require_cursor_metadata: args.require_cursor_metadata,
             prefer_dmabuf: args.capture == CaptureMode::DashWayland
                 && should_capture_dmabuf(args.dash_encoder, &args.vaapi_device),
+            gpu_device: args.vaapi_device.clone(),
             inner: None,
         }
     }
@@ -1660,6 +1662,7 @@ impl WaylandPipewireCapture {
                     portal_cursor: self.portal_cursor,
                     require_cursor_metadata: self.require_cursor_metadata,
                     prefer_dmabuf: self.prefer_dmabuf,
+                    gpu_device: &self.gpu_device,
                 })
                 .await?,
             );
@@ -1738,6 +1741,7 @@ struct NativePipewireCaptureConfig<'a> {
     portal_cursor: PortalCursorMode,
     require_cursor_metadata: bool,
     prefer_dmabuf: bool,
+    gpu_device: &'a std::path::Path,
 }
 
 impl NativePipewireCapture {
@@ -1751,6 +1755,7 @@ impl NativePipewireCapture {
             portal_cursor,
             require_cursor_metadata,
             prefer_dmabuf,
+            gpu_device,
         } = config;
         let capture = open_screencast_capture(
             screencast_backend,
@@ -1770,6 +1775,7 @@ impl NativePipewireCapture {
             fps,
             cursor_hz,
             require_cursor_metadata,
+            gpu_device: gpu_device.to_path_buf(),
             pipewire_error: pipewire_error.clone(),
             mainloop_ptr_out: thread_stop.clone(),
         };
@@ -2945,6 +2951,7 @@ struct PipewireThreadConfig {
     fps: f64,
     cursor_hz: u64,
     require_cursor_metadata: bool,
+    gpu_device: PathBuf,
     pipewire_error: Arc<Mutex<Option<String>>>,
     mainloop_ptr_out: Arc<Mutex<Option<usize>>>,
 }
@@ -3018,6 +3025,7 @@ fn run_pipewire_loop(
         fps,
         cursor_hz,
         require_cursor_metadata,
+        gpu_device,
         pipewire_error,
         mainloop_ptr_out,
     } = config;
@@ -3049,6 +3057,7 @@ fn run_pipewire_loop(
         cursor_meta_verified: false,
         pending_video_damage: AccumulatedFrameDamage::default(),
         mainloop_ptr,
+        gpu_readback: GpuReadback::new(gpu_device),
         unmapped_buffer_logged: false,
         cursor_meta_logged: false,
         serial: 0,
@@ -3201,47 +3210,12 @@ fn run_pipewire_loop(
             let data_flags = data.flags();
             let fd = data.fd();
             let map_offset = data.as_raw().mapoffset as usize;
-            if data_type == spa::buffer::DataType::DmaBuf
-                && user_data.format.modifier() != DRM_FORMAT_MOD_LINEAR
-                && user_data.format.modifier() != DRM_FORMAT_MOD_INVALID as u64
-            {
-                let message = format!(
-                    "PipeWire returned a DMA-BUF with non-linear modifier {} after CPU-readable PipeWire buffers were requested; this requires a real DMA-BUF media backend",
-                    user_data.format.modifier()
-                );
-                warn!(
-                    ?data_type,
-                    ?data_flags,
-                    fd,
-                    map_offset,
-                    offset,
-                    size,
-                    chunk_size,
-                    stride,
-                    %message,
-                    "PipeWire did not provide CPU-readable capture data"
-                );
-                record_pipewire_error(user_data, message);
-                return;
-            }
-            if data_type == spa::buffer::DataType::DmaBuf
-                && !data_is_mappable(data)
-                && !user_data.unmapped_buffer_logged
-            {
-                user_data.unmapped_buffer_logged = true;
-                warn!(
-                    ?data_type,
-                    ?data_flags,
-                    fd,
-                    map_offset,
-                    offset,
-                    size,
-                    chunk_size,
-                    stride,
-                    modifier = user_data.format.modifier(),
-                    "PipeWire DMA-BUF is missing the mappable flag; attempting CPU mmap before falling back"
-                );
-            }
+            let modifier = user_data.format.modifier();
+            let needs_gpu_readback = dmabuf_requires_gpu_readback(
+                data_type == spa::buffer::DataType::DmaBuf,
+                data_is_mappable(data),
+                modifier,
+            );
             let now = Instant::now();
             if let Some(last_frame_copied_at) = user_data.last_frame_copied_at
                 && now.duration_since(last_frame_copied_at) < user_data.min_frame_interval
@@ -3250,19 +3224,70 @@ fn run_pipewire_loop(
             }
             user_data.last_frame_copied_at = Some(now);
 
-            let frame_data = match data.data() {
-                Some(bytes) => {
-                    if offset.saturating_add(size) > bytes.len() {
+            let (frame_data, frame_stride) = if needs_gpu_readback {
+                let Some(fd_offset) = map_offset.checked_add(offset) else {
+                    return;
+                };
+                match user_data.gpu_readback.copy_dmabuf(
+                    fd,
+                    fd_offset,
+                    video_size.width,
+                    video_size.height,
+                    stride,
+                    user_data.format.format(),
+                    modifier,
+                ) {
+                    Ok(readback) => {
+                        if !user_data.unmapped_buffer_logged {
+                            user_data.unmapped_buffer_logged = true;
+                            info!(
+                                ?data_type,
+                                ?data_flags,
+                                fd,
+                                map_offset,
+                                offset,
+                                source_stride = stride,
+                                mapped_stride = readback.1,
+                                modifier,
+                                "copied PipeWire DMA-BUF through driver-backed GBM readback"
+                            );
+                        }
+                        readback
+                    }
+                    Err(err) => {
+                        let message = format!(
+                            "PipeWire DMA-BUF requires GPU readback, but GBM could not produce linear pixels for node {node_id}: {err:#}"
+                        );
+                        warn!(
+                            ?data_type,
+                            ?data_flags,
+                            fd,
+                            map_offset,
+                            offset,
+                            size,
+                            chunk_size,
+                            stride,
+                            modifier,
+                            %message
+                        );
+                        record_pipewire_error(user_data, message);
                         return;
                     }
-                    bytes[offset..offset + size].to_vec()
                 }
-                None => {
+            } else {
+                let frame_data = match data.data() {
+                    Some(bytes) => {
+                        if offset.saturating_add(size) > bytes.len() {
+                            return;
+                        }
+                        bytes[offset..offset + size].to_vec()
+                    }
+                    None => {
                     let Some(fd_offset) = map_offset.checked_add(offset) else {
                         return;
                     };
                     let Some(mapped) =
-                        mmap_fd_slice(fd, fd_offset, size, data_type == spa::buffer::DataType::DmaBuf)
+                        mmap_fd_slice(fd, fd_offset, size, false)
                     else {
                         let message = format!(
                             "PipeWire delivered an fd buffer that could not be read from CPU memory for node {node_id}"
@@ -3279,9 +3304,7 @@ fn run_pipewire_loop(
                             modifier = user_data.format.modifier(),
                             %message
                         );
-                        if data_type == spa::buffer::DataType::DmaBuf {
-                            record_pipewire_error(user_data, message);
-                        }
+                        record_pipewire_error(user_data, message);
                         return;
                     };
                     if !user_data.unmapped_buffer_logged {
@@ -3299,7 +3322,9 @@ fn run_pipewire_loop(
                         );
                     }
                     mapped
-                }
+                    }
+                };
+                (frame_data, stride)
             };
             user_data.serial = user_data.serial.wrapping_add(1);
             let frame = RawFrame {
@@ -3307,7 +3332,7 @@ fn run_pipewire_loop(
                 damage: user_data.pending_video_damage.take(),
                 width: video_size.width,
                 height: video_size.height,
-                stride,
+                stride: frame_stride,
                 format,
                 data: frame_data,
             };
@@ -3379,6 +3404,7 @@ fn run_pipewire_video_loop(
         fps,
         cursor_hz,
         require_cursor_metadata,
+        gpu_device: _,
         pipewire_error,
         mainloop_ptr_out,
     } = config;
@@ -3752,13 +3778,13 @@ fn build_pipewire_format_pods_from_node_formats(
             continue;
         }
         let modifier = if format_param_has_video_modifier(pod) {
-            match preferred_cpu_readable_modifier(pod) {
+            match preferred_safe_readback_modifier(pod) {
                 Some(modifier) => Some(modifier),
                 None => {
                     skipped_modifier_count += 1;
                     warn!(
                         format = ?format,
-                        "skipping PipeWire format because its advertised modifiers are not CPU-readable"
+                        "skipping PipeWire format because its advertised modifiers have no safe readback path"
                     );
                     continue;
                 }
@@ -4075,10 +4101,20 @@ fn format_param_has_video_modifier(param: &spa::pod::Pod) -> bool {
         .is_some()
 }
 
-fn preferred_cpu_readable_modifier(param: &spa::pod::Pod) -> Option<u64> {
+fn preferred_safe_readback_modifier(param: &spa::pod::Pod) -> Option<u64> {
     let modifiers = video_modifier_values(param);
+    preferred_safe_readback_modifier_from_values(&modifiers)
+}
+
+fn preferred_safe_readback_modifier_from_values(modifiers: &[u64]) -> Option<u64> {
     if modifiers.contains(&DRM_FORMAT_MOD_LINEAR) {
         Some(DRM_FORMAT_MOD_LINEAR)
+    } else if let Some(modifier) = modifiers
+        .iter()
+        .copied()
+        .find(|modifier| *modifier != DRM_FORMAT_MOD_INVALID as u64)
+    {
+        Some(modifier)
     } else if modifiers.contains(&(DRM_FORMAT_MOD_INVALID as u64)) {
         Some(DRM_FORMAT_MOD_INVALID as u64)
     } else {
@@ -4199,6 +4235,154 @@ fn build_buffers_param_pod(
         ],
     };
     serialize_pod_object(obj)
+}
+
+fn dmabuf_requires_gpu_readback(is_dmabuf: bool, mappable: bool, modifier: u64) -> bool {
+    is_dmabuf && (!mappable || modifier != DRM_FORMAT_MOD_LINEAR)
+}
+
+struct GpuReadback {
+    device_path: PathBuf,
+    device: Option<gbm::Device<std::fs::File>>,
+}
+
+impl GpuReadback {
+    fn new(device_path: PathBuf) -> Self {
+        Self {
+            device_path,
+            device: None,
+        }
+    }
+
+    fn device(&mut self) -> Result<&gbm::Device<std::fs::File>> {
+        if self.device.is_none() {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.device_path)
+                .with_context(|| {
+                    format!("opening GBM readback device {}", self.device_path.display())
+                })?;
+            let device = gbm::Device::new(file).with_context(|| {
+                format!(
+                    "creating GBM readback device {}",
+                    self.device_path.display()
+                )
+            })?;
+            info!(
+                device = %self.device_path.display(),
+                backend = device.backend_name(),
+                "initialized GBM DMA-BUF readback"
+            );
+            self.device = Some(device);
+        }
+        Ok(self.device.as_ref().expect("GBM device initialized"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_dmabuf(
+        &mut self,
+        fd: RawFd,
+        offset: usize,
+        width: u32,
+        height: u32,
+        stride: usize,
+        video_format: spa::param::video::VideoFormat,
+        modifier: u64,
+    ) -> Result<(Vec<u8>, usize)> {
+        self.copy_dmabuf_with_gbm(
+            fd,
+            offset,
+            width,
+            height,
+            stride,
+            video_format,
+            modifier,
+        )
+        .with_context(|| {
+            format!(
+                "driver-backed GBM readback failed for modifier {modifier:#018x}; refusing raw DMA-BUF mapping because it can publish tiled or corrupt pixels"
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_dmabuf_with_gbm(
+        &mut self,
+        fd: RawFd,
+        offset: usize,
+        width: u32,
+        height: u32,
+        stride: usize,
+        video_format: spa::param::video::VideoFormat,
+        modifier: u64,
+    ) -> Result<(Vec<u8>, usize)> {
+        if fd < 0 {
+            bail!("PipeWire supplied an invalid DMA-BUF descriptor");
+        }
+        let drm_fourcc = drm_fourcc_for_video_format(video_format)
+            .with_context(|| format!("no DRM fourcc mapping for {video_format:?}"))?;
+        let gbm_format = gbm::Format::try_from(drm_fourcc).map_err(|_| {
+            anyhow::anyhow!(
+                "GBM does not recognize DRM format {} ({drm_fourcc:#010x})",
+                drm_fourcc_name(drm_fourcc)
+            )
+        })?;
+        let stride = u32::try_from(stride).context("DMA-BUF stride exceeds GBM limits")?;
+        // SAFETY: PipeWire owns this descriptor and keeps it valid while the
+        // process callback and imported buffer object are alive.
+        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
+        let device = self.device()?;
+        let buffer = if modifier == DRM_FORMAT_MOD_INVALID as u64 {
+            if offset != 0 {
+                bail!("implicit-modifier DMA-BUF has unsupported non-zero plane offset {offset}");
+            }
+            device
+                .import_buffer_object_from_dma_buf::<()>(
+                    borrowed_fd,
+                    width,
+                    height,
+                    stride,
+                    gbm_format,
+                    gbm::BufferObjectFlags::empty(),
+                )
+                .context("importing implicit-modifier DMA-BUF into GBM")?
+        } else {
+            let offset = i32::try_from(offset).context("DMA-BUF offset exceeds GBM limits")?;
+            let stride = i32::try_from(stride).context("DMA-BUF stride exceeds GBM limits")?;
+            device
+                .import_buffer_object_from_dma_buf_with_modifiers::<()>(
+                    1,
+                    [Some(borrowed_fd), None, None, None],
+                    width,
+                    height,
+                    gbm_format,
+                    gbm::BufferObjectFlags::empty(),
+                    [stride, 0, 0, 0],
+                    [offset, 0, 0, 0],
+                    gbm::Modifier::from(modifier),
+                )
+                .context("importing explicit-modifier DMA-BUF into GBM")?
+        };
+        let deadline = Instant::now() + Duration::from_millis(100);
+        loop {
+            let mapped = buffer
+                .map(device, 0, 0, width, height, |mapped| {
+                    (mapped.buffer().to_vec(), mapped.stride() as usize)
+                })
+                .map_err(|_| anyhow::anyhow!("GBM buffer belongs to a different device"))?;
+            match mapped {
+                Ok(readback) => return Ok(readback),
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(err) => return Err(err).context("mapping imported DMA-BUF through GBM"),
+            }
+        }
+    }
 }
 
 #[repr(C)]
@@ -4642,6 +4826,7 @@ struct PipewireUserData {
     cursor_meta_verified: bool,
     pending_video_damage: AccumulatedFrameDamage,
     mainloop_ptr: usize,
+    gpu_readback: GpuReadback,
     unmapped_buffer_logged: bool,
     cursor_meta_logged: bool,
     serial: u64,
@@ -4978,6 +5163,51 @@ mod tests {
         resend.push(resend_object(stream_id, 3, 10));
         assert_eq!(resend.range(), (Some(3), Some(3)));
         assert_eq!(resend.bytes, 10);
+    }
+
+    #[test]
+    fn dmabuf_readback_only_bypasses_gpu_for_linear_mappable_memory() {
+        assert!(!dmabuf_requires_gpu_readback(
+            true,
+            true,
+            DRM_FORMAT_MOD_LINEAR
+        ));
+        assert!(dmabuf_requires_gpu_readback(
+            true,
+            false,
+            DRM_FORMAT_MOD_LINEAR
+        ));
+        assert!(dmabuf_requires_gpu_readback(
+            true,
+            true,
+            DRM_FORMAT_MOD_INVALID as u64
+        ));
+        assert!(dmabuf_requires_gpu_readback(true, true, 0x10));
+        assert!(!dmabuf_requires_gpu_readback(
+            false,
+            false,
+            DRM_FORMAT_MOD_INVALID as u64
+        ));
+    }
+
+    #[test]
+    fn explicit_modifier_is_preferred_to_implicit_when_linear_is_unavailable() {
+        const EXPLICIT_MODIFIER: u64 = 0x0300_0000_0060_6010;
+        assert_eq!(
+            preferred_safe_readback_modifier_from_values(&[
+                DRM_FORMAT_MOD_INVALID as u64,
+                EXPLICIT_MODIFIER,
+            ]),
+            Some(EXPLICIT_MODIFIER)
+        );
+        assert_eq!(
+            preferred_safe_readback_modifier_from_values(&[
+                EXPLICIT_MODIFIER,
+                DRM_FORMAT_MOD_INVALID as u64,
+                DRM_FORMAT_MOD_LINEAR,
+            ]),
+            Some(DRM_FORMAT_MOD_LINEAR)
+        );
     }
 
     #[test]
@@ -5999,7 +6229,7 @@ mod tests {
 
         assert!(format_param_has_video_modifier(pod));
         assert_eq!(
-            preferred_cpu_readable_modifier(pod),
+            preferred_safe_readback_modifier(pod),
             Some(DRM_FORMAT_MOD_INVALID as u64)
         );
     }
@@ -6024,7 +6254,7 @@ mod tests {
         let implicit_dmabuf_offer = spa::pod::Pod::from_bytes(&offers[1]).unwrap();
         assert!(format_param_has_video_modifier(implicit_dmabuf_offer));
         assert_eq!(
-            preferred_cpu_readable_modifier(implicit_dmabuf_offer),
+            preferred_safe_readback_modifier(implicit_dmabuf_offer),
             Some(DRM_FORMAT_MOD_INVALID as u64)
         );
     }

@@ -32,7 +32,7 @@ an “implemented” row to “validated” based on compilation or synthetic ca
 | GNOME / Mutter | XDG Desktop Portal | Implemented; host evidence required | Pending target-host validation |
 | KDE Plasma / KWin | XDG Desktop Portal | Implemented; host evidence required | Pending target-host validation |
 | wlroots compositors | xdg-desktop-portal-wlr | Implemented; host evidence required | Pending target-host validation |
-| niri | Mutter-compatible ScreenCast path or configured portal | Validated on niri 26.04 with PipeWire 1.6.8 through the direct path | Pending hardware gate and human Firefox playback check |
+| niri | Mutter-compatible ScreenCast path or configured portal | Cursor metadata and object transport validated on niri 26.04 with PipeWire 1.6.8 through the direct path | Pending pixel-correct Firefox/Chromium screenshot and hardware gate |
 
 ## Encoder matrix
 

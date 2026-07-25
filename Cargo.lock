@@ -1023,6 +1023,7 @@ dependencies = [
  "clap",
  "cros-codecs",
  "futures-util",
+ "gbm",
  "glacialcast-dash",
  "glacialcast-protocol",
  "image",

@@ -197,12 +197,17 @@ For repeatable bandwidth tests, `--test-pattern` accepts `static`, `typing`,
 
 `--dash-encoder auto` first tries constrained-baseline VA-API on
 `/dev/dri/renderD128`, then OpenH264. Use another render node with
-`--vaapi-device`, or require a backend with `--dash-encoder vaapi` or
-`--dash-encoder openh264`.
+`--vaapi-device`; that option also selects the GBM device used to read
+non-linear compositor DMA-BUFs. Require a backend with `--dash-encoder vaapi`
+or `--dash-encoder openh264`.
 
 When VA-API video processing is available, compositor DMA-BUFs are imported and
 converted directly to owned NV12 surfaces. Otherwise capture negotiates
-CPU-readable buffers for VA-API upload or OpenH264.
+CPU-readable buffers for VA-API upload or OpenH264. Some compositors still
+supply tiled or otherwise non-mappable DMA-BUFs. Those are copied through the
+render driver's GBM implementation. GlacialCast refuses to map such buffers as
+linear memory when driver-backed readback is unavailable, because doing so
+would publish a corrupted picture.
 
 ## Offline transfer
 
