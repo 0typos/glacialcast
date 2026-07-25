@@ -7,6 +7,21 @@ encrypted DASH rather than the removed legacy video path.
 Generated from the Glacialcast cursor metadata verifier on 2026-05-04
 23:54:24-04:00.
 
+## Resolution
+
+A later comparison with niri 26.04 and WebRTC found a Glacialcast-side
+negotiation bug. Glacialcast requested a fixed cursor metadata allocation for
+only a 64×64 bitmap. Niri 26.04 reserves capacity for a 384×384 bitmap, so the
+fixed requests could not be reconciled and PipeWire allocated buffers without
+`SPA_META_Cursor`.
+
+The client now advertises the interoperable cursor metadata size range: 1×1
+minimum, 64×64 default, and 384×384 maximum. The observations and original
+conclusion below describe the pre-fix behavior and should not be treated as the
+current diagnosis. After the fix, the direct niri verifier passed on niri
+26.04 with PipeWire 1.6.8 and emitted both encrypted media and independent
+cursor objects.
+
 ## Summary
 
 Glacialcast can request and consume `SPA_META_Cursor` from PipeWire buffers, but
@@ -161,10 +176,10 @@ PipeWire stream failed: PipeWire video buffer does not include SPA_META_Cursor w
 
 ## Current Conclusion
 
-This looks like a compositor/PipeWire emission problem rather than a Glacialcast
-transport or viewer problem. niri accepts metadata mode and successfully starts
-the screencast, but does not allocate or populate `SPA_META_Cursor` on the
-PipeWire buffers.
+At the time of this report, this looked like a compositor/PipeWire emission
+problem rather than a Glacialcast transport or viewer problem. The later
+resolution above identified Glacialcast's fixed-size metadata request as the
+compatibility failure.
 
 The missing behavior is observable without the Glacialcast server or browser:
 the client exits solely because the PipeWire buffer metadata list lacks

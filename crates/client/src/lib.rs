@@ -81,7 +81,11 @@ const SPA_DATA_FLAG_MAPPABLE: u32 = 1 << 3;
 const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x4008_6200;
 const DMA_BUF_SYNC_READ: u64 = 1 << 0;
 const DMA_BUF_SYNC_END: u64 = 1 << 2;
+const PIPEWIRE_CURSOR_MIN_BITMAP_SIDE: usize = 1;
 const PIPEWIRE_CURSOR_DEFAULT_BITMAP_SIDE: usize = 64;
+// WebRTC and niri accept cursor metadata through 384×384. Advertising a range
+// lets producers that reserve the full capacity negotiate with this consumer.
+const PIPEWIRE_CURSOR_NEGOTIATED_MAX_BITMAP_SIDE: usize = 384;
 const PIPEWIRE_CURSOR_MAX_BITMAP_SIDE: usize = 512;
 const CURSOR_BITMAP_REFRESH_TICKS: u64 = MEDIA_TIMESCALE as u64 * 60;
 const PIPEWIRE_CURSOR_METADATA_GRACE: Duration = Duration::from_secs(5);
@@ -4039,9 +4043,14 @@ fn build_pipewire_cursor_meta_param_pod() -> Result<Vec<u8>> {
             ),
             spa::pod::Property::new(
                 spa::sys::SPA_PARAM_META_size,
-                spa::pod::Value::Int(pipewire_cursor_meta_size(
-                    PIPEWIRE_CURSOR_DEFAULT_BITMAP_SIDE,
-                )),
+                spa::pod::Value::Choice(spa::pod::ChoiceValue::Int(spa::utils::Choice(
+                    spa::utils::ChoiceFlags::empty(),
+                    spa::utils::ChoiceEnum::Range {
+                        default: pipewire_cursor_meta_size(PIPEWIRE_CURSOR_DEFAULT_BITMAP_SIDE),
+                        min: pipewire_cursor_meta_size(PIPEWIRE_CURSOR_MIN_BITMAP_SIDE),
+                        max: pipewire_cursor_meta_size(PIPEWIRE_CURSOR_NEGOTIATED_MAX_BITMAP_SIDE),
+                    },
+                ))),
             ),
         ],
     };
@@ -5313,7 +5322,7 @@ mod tests {
     }
 
     #[test]
-    fn pipewire_cursor_meta_request_has_size_property() {
+    fn pipewire_cursor_meta_request_negotiates_ecosystem_bitmap_range() {
         let bytes = build_pipewire_cursor_meta_param_pod().unwrap();
         let pod = spa::pod::Pod::from_bytes(&bytes).unwrap();
         let object = <&spa::pod::PodObject>::try_from(pod).unwrap();
@@ -5324,12 +5333,27 @@ mod tests {
             meta_type.value().get_id().unwrap(),
             spa::utils::Id(spa::sys::SPA_META_Cursor)
         );
-        assert!(
-            object
-                .find_prop(spa::utils::Id(spa::sys::SPA_PARAM_META_size))
-                .is_some()
+        let size = object
+            .find_prop(spa::utils::Id(spa::sys::SPA_PARAM_META_size))
+            .expect("cursor meta request size property");
+        let mut size_bytes = size.value().as_bytes().to_vec();
+        size_bytes.resize(size_bytes.len().next_multiple_of(8), 0);
+        let (_, value) =
+            spa::pod::deserialize::PodDeserializer::deserialize_from::<spa::pod::Value>(
+                &size_bytes,
+            )
+            .unwrap();
+        let spa::pod::Value::Choice(spa::pod::ChoiceValue::Int(choice)) = value else {
+            panic!("cursor meta size must be an integer choice range");
+        };
+        assert_eq!(
+            choice.1,
+            spa::utils::ChoiceEnum::Range {
+                default: pipewire_cursor_meta_size(PIPEWIRE_CURSOR_DEFAULT_BITMAP_SIDE),
+                min: pipewire_cursor_meta_size(PIPEWIRE_CURSOR_MIN_BITMAP_SIDE),
+                max: pipewire_cursor_meta_size(PIPEWIRE_CURSOR_NEGOTIATED_MAX_BITMAP_SIDE),
+            }
         );
-        assert!(pipewire_cursor_meta_size(PIPEWIRE_CURSOR_DEFAULT_BITMAP_SIDE) > 0);
     }
 
     #[test]

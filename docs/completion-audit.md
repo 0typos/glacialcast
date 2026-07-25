@@ -11,21 +11,21 @@ version 0.5.0. Firefox and Chromium browser gates validate the live and
 portable viewers; the release policy requires rerunning that matrix for each
 candidate artifact.
 
-Real Wayland cursor metadata and VA-API/DMA-BUF acceptance remain
-host-dependent gates. They could not be run from the final audit shell because
-it had no `WAYLAND_DISPLAY` and no `/dev/dri` render node. The repository
-contains strict scripts for running both gates in a suitable compositor
-session.
+Real Wayland cursor metadata passed through niri 26.04's direct
+Mutter-compatible path with PipeWire 1.6.8. The gate emitted both encrypted
+media and independent cursor objects. VA-API/DMA-BUF acceptance and the other
+compositor families remain host-dependent gates. The repository contains
+strict scripts for running them in a suitable compositor session.
 
 ## Requirement Evidence
 
 | Requirement | Evidence | Status |
 | --- | --- | --- |
-| Wayland capture | Native XDG Desktop Portal/PipeWire capture supports monitor/window selection; niri's Mutter-compatible API is an alternative backend. Capture and buffer negotiation have focused unit coverage. | Implemented; host gate pending |
+| Wayland capture | Native XDG Desktop Portal/PipeWire capture supports monitor/window selection; niri's Mutter-compatible API is an alternative backend. Capture and buffer negotiation have focused unit coverage, and the direct niri gate passed on niri 26.04 with PipeWire 1.6.8. | Verified on niri direct path; other compositor gates pending |
 | Very low video cadence | `--fps` accepts 0.5 through 15 and defaults to 1. PipeWire damage accumulates across throttled callbacks and a CPU-frame fingerprint remains authoritative when available; both suppress unchanged samples without dropping intervening changes. A bounded idle heartbeat preserves timeline progress. Static, typing, scroll, and motion profiles have separate traffic ceilings. | Verified |
 | Low live latency | `scripts/verify-dash-e2e.sh` rejects periodic capture-to-durable-relay acknowledgement above 250 ms. The 0.5 acceptance maximum was 10 ms. The browser gate rejects live announcement-to-MSE-append above 250 ms; the 0.5 live results were 18 ms in Firefox and 9 ms in Chromium. | Verified under local synthetic conditions |
-| Independent cursor | Video and cursor timers are separate. Cursor batches flush every 200 ms and carry their own media timestamps. Live and offline Firefox/Chromium gates require the overlay to paint, move independently, hide, and reappear. | Verified synthetically |
-| Real cursor metadata | `dash-wayland` requests and parses `SPA_META_Cursor`, including position, visibility, bitmap, and hotspot. `--require-cursor-metadata` fails closed when the compositor omits it. | Implemented; compositor gate pending |
+| Independent cursor | Video and cursor timers are separate. Cursor batches flush every 200 ms and carry their own media timestamps. Live and offline Firefox/Chromium gates require the overlay to paint, move independently, hide, and reappear. The direct niri gate emitted independent cursor objects. | Verified synthetically and on niri 26.04 |
+| Real cursor metadata | `dash-wayland` requests and parses `SPA_META_Cursor`, including position, visibility, bitmap, and hotspot. It negotiates the 1×1 through 384×384 allocation range used by current WebRTC and niri producers. `--require-cursor-metadata` fails closed when the compositor omits it. | Verified on niri 26.04 with PipeWire 1.6.8; other compositor gates pending |
 | MPEG-DASH/fMP4 | The client emits an initialization segment plus immediate encrypted `moof`/`mdat` fragments and a dynamic MPD. Segment boundaries require an IDR. | Verified |
 | Server-blind E2EE | Media samples use CENC AES-CTR; cursor records use AES-256-GCM; every object is HMAC authenticated. Viewer keys are not sent to or logged by the relay. | Verified |
 | Authenticated ingest | Protocol version 5 uses Noise NK with a persistent `0600` relay identity. Clients pin the public key before sending tokens or objects. | Verified |

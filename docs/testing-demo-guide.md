@@ -546,6 +546,16 @@ recommended portal backend or niri's direct Mutter-compatible path. Removing
 the flag or choosing embedded cursor mode is useful for diagnosis, but does not
 satisfy the independent-cursor requirement.
 
+Niri 26.04 reserves cursor bitmap metadata through 384×384. Current
+Glacialcast builds negotiate that full range. If a previously built binary
+reports only `SPA_META_Busy`, rebuild the release binary before rerunning the
+cursor gate:
+
+```sh
+cargo build --workspace --release
+scripts/verify-wayland-cursor-metadata.sh
+```
+
 ### The browser gate cannot launch
 
 Confirm `GLACIALCAST_PLAYWRIGHT_MODULE` points to the installed Playwright
