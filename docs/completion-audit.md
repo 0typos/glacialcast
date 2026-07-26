@@ -84,6 +84,7 @@ Run these inside the target graphical session:
 
 ```sh
 scripts/verify-wayland-cursor-metadata.sh
+scripts/verify-wayland-picture.sh
 scripts/verify-wayland-video-hardware.sh
 ```
 
@@ -103,8 +104,11 @@ scripts/verify-wayland-video-hardware.sh
 ```
 
 The cursor gate requires both encrypted media and a cursor object from the real
-PipeWire stream. The hardware gate requires the VA-API backend; optional strict
-mode also requires a compositor DMA-BUF to reach VA-API import.
+PipeWire stream. The picture gate additionally requires a browser-decoded frame
+to match a `grim` screenshot of the captured output, which is the only check
+that rejects a scrambled readback. The hardware gate requires the VA-API
+backend; optional strict mode also requires a compositor DMA-BUF to reach
+VA-API import.
 
 ## Internet Deployment Boundary
 

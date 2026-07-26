@@ -13,7 +13,7 @@ root.
 | 2 | Synthetic end to end | OpenH264 | Encrypted ingest, DASH, live cursor objects, retained history, and portable files |
 | 3 | Browser matrix | Playwright Firefox and Chromium | Actual MSE/EME decoding, painted video, live append, and independent cursor behavior |
 | 4 | Internet profile | Docker and Playwright | Login and secure cookies through a real Caddy HTTPS reverse proxy |
-| 5 | Wayland host gates | A graphical Wayland session | Portal/PipeWire capture, real cursor metadata, and optional VA-API/DMA-BUF |
+| 5 | Wayland host gates | A graphical Wayland session | Portal/PipeWire capture, real cursor metadata, a published picture that matches the screen, and optional VA-API/DMA-BUF |
 
 The streaming gates in Levels 2 through 4 use a deterministic synthetic source,
 so they distinguish a GlacialCast problem from a compositor or GPU integration
@@ -59,7 +59,8 @@ Success means:
 
 - all Rust unit tests and checked rustdoc examples pass, while the release-only
   persistence performance test is ignored by the normal profile;
-- the viewer core and operations-dashboard helper tests report `PASS`;
+- the viewer core, operations-dashboard helper, and picture-comparator tests
+  report `PASS`;
 - Clippy produces no warnings; and
 - `cargo-deny` reports `advisories ok, bans ok, licenses ok, sources ok`.
 
@@ -374,23 +375,35 @@ users should begin with the default portal path.
 
 The object-level gate proves that capture, cursor metadata, encryption, and
 relay delivery are active. It cannot determine whether a GPU buffer was
-interpreted with the correct pixel layout. Add a real browser screenshot to
-the same run:
+interpreted with the correct pixel layout: a frame of repeated tiles,
+horizontal strips, or scrambled blocks still produces valid encrypted objects.
+The picture gate answers that question mechanically by comparing what a browser
+decodes against the compositor's own screenshot of the captured output:
 
 ```sh
-GLACIALCAST_VERIFY_SCREENCAST_BACKEND=mutter \
-GLACIALCAST_VERIFY_MONITOR_NAME=DP-3 \
+GLACIALCAST_PLAYWRIGHT_MODULE="$pw_root/node_modules/playwright" \
+scripts/verify-wayland-picture.sh
+
+GLACIALCAST_VERIFY_BROWSER=chromium \
+GLACIALCAST_PLAYWRIGHT_MODULE="$pw_root/node_modules/playwright" \
+scripts/verify-wayland-picture.sh
+```
+
+It needs `grim`, and skips rather than guesses when the portal chooser decided
+which output is published; pass `GLACIALCAST_VERIFY_MONITOR_NAME` in that case.
+A correct capture scores about 0.99 and an unrelated screen scores near zero,
+so the 0.85 default leaves room for compression and a slightly changed desktop.
+Run both browsers for a release candidate.
+
+To keep a frame for a human to inspect as well, add a screenshot to the cursor
+gate run:
+
+```sh
 GLACIALCAST_VERIFY_SCREENSHOT=/tmp/glacialcast-wayland.png \
 GLACIALCAST_VERIFY_BROWSER=firefox \
 GLACIALCAST_PLAYWRIGHT_MODULE="$pw_root/node_modules/playwright" \
 scripts/verify-wayland-cursor-metadata.sh
 ```
-
-Inspect `/tmp/glacialcast-wayland.png` before recording platform support.
-Repeat with `GLACIALCAST_VERIFY_BROWSER=chromium` for a release candidate. This
-visual gate is deliberately explicit: a decoded frame with repeated tiles,
-horizontal strips, or scrambled blocks is a capture failure even when the
-script reports that media objects arrived.
 
 ## 7. Test VA-API and DMA-BUF
 
@@ -588,11 +601,22 @@ cursor gate:
 ```sh
 cargo build --workspace --release
 scripts/verify-wayland-cursor-metadata.sh
+scripts/verify-wayland-picture.sh
 ```
 
-That gate selects the capture backend automatically, so it runs unattended
-under niri and prompts for the portal chooser elsewhere. Force one with
+Both gates select the capture backend automatically, so they run unattended
+under niri and prompt for the portal chooser elsewhere. Force one with
 `GLACIALCAST_VERIFY_SCREENCAST_BACKEND=portal` or `=mutter`.
+
+The picture gate is the one that rejects a scrambled readback. It publishes
+the real screen, decodes a frame in a browser with the viewer key, screenshots
+the same output with `grim`, and requires the two to correlate at least
+`GLACIALCAST_VERIFY_PICTURE_CORRELATION` (0.85 by default; a correct capture
+scores about 0.99 and an unrelated screen scores near zero). It needs `grim`
+and repeats once, because a desktop that changes between the two captures
+lowers the score on its own. Set `GLACIALCAST_VERIFY_BROWSER=chromium` to
+repeat it in the other engine, and `GLACIALCAST_VERIFY_MONITOR_NAME` when the
+portal chooser decides which output is published.
 
 ### The Wayland picture is tiled, striped, or capture reports GBM readback failure
 

@@ -12,9 +12,12 @@ scripts/record-platform-support.sh \
   --run-gates
 ```
 
-The resulting report and its two logs record the commit, compositor, session,
-PipeWire, libva, cursor-metadata gate, and hardware-video gate. Do not convert
-an “implemented” row to “validated” based on compilation or synthetic capture.
+The resulting report and its logs record the commit, compositor, session,
+PipeWire, libva, cursor-metadata gate, published-picture gate, and
+hardware-video gate. Do not convert an “implemented” row to “validated” based
+on compilation or synthetic capture: only the picture gate compares what a
+browser decodes against the compositor's own screenshot of the same output, and
+scrambled pixels still produce valid encrypted objects.
 
 ## Browser and transport matrix
 

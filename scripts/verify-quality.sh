@@ -27,6 +27,7 @@ standard_checks() {
   run bash -n scripts/*.sh packaging/*.sh
   run node scripts/test-viewer-core.mjs
   run node scripts/test-index-ui.mjs
+  run node scripts/test-compare-frame.mjs
 }
 
 full_checks() {

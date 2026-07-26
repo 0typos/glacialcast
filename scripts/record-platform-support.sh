@@ -53,16 +53,27 @@ if [[ -z "${output}" ]]; then
 fi
 
 cursor_status="not-run"
+picture_status="not-run"
 video_status="not-run"
 cursor_log=""
+picture_log=""
 video_log=""
 if [[ "${run_gates}" == "1" ]]; then
   cursor_log="${output}.cursor.log"
+  picture_log="${output}.picture.log"
   video_log="${output}.video.log"
   if scripts/verify-wayland-cursor-metadata.sh >"${cursor_log}" 2>&1; then
     cursor_status="pass"
   else
     cursor_status="fail"
+  fi
+  if scripts/verify-wayland-picture.sh >"${picture_log}" 2>&1; then
+    picture_status="pass"
+    if grep -q '^SKIP:' "${picture_log}"; then
+      picture_status="skip"
+    fi
+  else
+    picture_status="fail"
   fi
   if scripts/verify-wayland-video-hardware.sh >"${video_log}" 2>&1; then
     video_status="pass"
@@ -100,13 +111,17 @@ libva_version="$(vainfo --version 2>/dev/null | head -1 || true)"
   echo "| Gate | Result | Log |"
   echo "| --- | --- | --- |"
   echo "| Independent cursor metadata | ${cursor_status} | ${cursor_log:-n/a} |"
+  echo "| Published picture matches the screen | ${picture_status} | ${picture_log:-n/a} |"
   echo "| VA-API / DMA-BUF video | ${video_status} | ${video_log:-n/a} |"
   echo
-  echo "A release support claim requires both logs, the compositor/portal version,"
+  echo "A release support claim requires these logs, the compositor/portal version,"
   echo "GPU model, and a human playback check in Firefox."
 } >"${output}"
 
 echo "Platform evidence written to ${output}"
-if [[ "${run_gates}" == "1" && ("${cursor_status}" != "pass" || "${video_status}" != "pass") ]]; then
+if [[ "${run_gates}" == "1" ]] \
+  && [[ "${cursor_status}" != "pass" \
+    || "${picture_status}" == "fail" \
+    || "${video_status}" != "pass" ]]; then
   exit 1
 fi

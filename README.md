@@ -349,6 +349,12 @@ niri msg -j version
 systemctl --user status xdg-desktop-portal.service xdg-desktop-portal-gnome.service
 ```
 
+`scripts/verify-wayland-picture.sh` is the acceptance check for the published
+image itself: it publishes the real screen, decodes a frame in Firefox or
+Chromium with the viewer key, and requires it to match a `grim` screenshot of
+the same output. Object-level gates cannot catch a tiled or wrongly swizzled
+readback, because scrambled pixels still produce valid encrypted objects.
+
 For niri portal routing helpers and an upstream diagnostic template, see
 `scripts/setup-niri-gnome-portal.sh`, `scripts/setup-niri-wlr-portal.sh`,
 `scripts/setup-user-wlr-portal.sh`, and
