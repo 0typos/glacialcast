@@ -63,11 +63,13 @@ use zbus::{
 };
 
 mod dash_encoder;
+mod egl_readback;
 
 use dash_encoder::{
     DashDmaBufFrame, DashEncoderMode, DashFrameRelease, DashH264Encoder, DashInputFrame,
     should_capture_dmabuf,
 };
+use egl_readback::{DmaBufPlane, EglReadback, ReadbackLayout};
 
 const PORTAL_SOURCE_MONITOR: u32 = 1;
 const PORTAL_SOURCE_WINDOW: u32 = 2;
@@ -3224,7 +3226,7 @@ fn run_pipewire_loop(
             }
             user_data.last_frame_copied_at = Some(now);
 
-            let (frame_data, frame_stride) = if needs_gpu_readback {
+            let (frame_data, frame_stride, frame_format) = if needs_gpu_readback {
                 let Some(fd_offset) = map_offset.checked_add(offset) else {
                     return;
                 };
@@ -3247,16 +3249,18 @@ fn run_pipewire_loop(
                                 map_offset,
                                 offset,
                                 source_stride = stride,
-                                mapped_stride = readback.1,
+                                mapped_stride = readback.stride,
+                                readback_format = ?readback.format,
+                                readback_path = readback.path,
                                 modifier,
-                                "copied PipeWire DMA-BUF through driver-backed GBM readback"
+                                "copied PipeWire DMA-BUF through driver-backed GPU readback"
                             );
                         }
-                        readback
+                        (readback.data, readback.stride, readback.format)
                     }
                     Err(err) => {
                         let message = format!(
-                            "PipeWire DMA-BUF requires GPU readback, but GBM could not produce linear pixels for node {node_id}: {err:#}"
+                            "PipeWire DMA-BUF requires GPU readback, but no driver path produced linear pixels for node {node_id}: {err:#}"
                         );
                         warn!(
                             ?data_type,
@@ -3324,7 +3328,7 @@ fn run_pipewire_loop(
                     mapped
                     }
                 };
-                (frame_data, stride)
+                (frame_data, stride, format)
             };
             user_data.serial = user_data.serial.wrapping_add(1);
             let frame = RawFrame {
@@ -3333,7 +3337,7 @@ fn run_pipewire_loop(
                 width: video_size.width,
                 height: video_size.height,
                 stride: frame_stride,
-                format,
+                format: frame_format,
                 data: frame_data,
             };
             let _ = user_data.latest.send(Some(frame));
@@ -3792,24 +3796,29 @@ fn build_pipewire_format_pods_from_node_formats(
         } else {
             None
         };
-        if modifier == Some(DRM_FORMAT_MOD_INVALID as u64) {
-            out.push(build_exact_cpu_pipewire_format_pod(
-                format,
-                size.width,
-                size.height,
-                fps,
-                None,
-            )?);
-            cpu_count += 1;
-        }
+        // A modifier-less offer asks for shared memory, the only buffer this
+        // CPU readback path can read without driver help. Offer it first for
+        // every advertised format: when it is emitted only alongside an
+        // implicit modifier, a compositor advertising nothing but opaque vendor
+        // modifiers is left with no CPU-readable option to accept at all.
         out.push(build_exact_cpu_pipewire_format_pod(
             format,
             size.width,
             size.height,
             fps,
-            modifier,
+            None,
         )?);
         cpu_count += 1;
+        if modifier.is_some() {
+            out.push(build_exact_cpu_pipewire_format_pod(
+                format,
+                size.width,
+                size.height,
+                fps,
+                modifier,
+            )?);
+            cpu_count += 1;
+        }
     }
     if !out.is_empty() {
         info!(
@@ -4241,16 +4250,45 @@ fn dmabuf_requires_gpu_readback(is_dmabuf: bool, mappable: bool, modifier: u64) 
     is_dmabuf && (!mappable || modifier != DRM_FORMAT_MOD_LINEAR)
 }
 
+/// Linear pixels recovered from one compositor DMA-BUF.
+struct DmaBufReadback {
+    /// Untiled pixel rows.
+    data: Vec<u8>,
+    /// Distance in bytes between consecutive rows of `data`.
+    stride: usize,
+    /// Byte order of `data`, which need not match the negotiated PipeWire
+    /// format because the GPU path reads whatever the driver renders best.
+    format: RawFrameFormat,
+    /// Which driver path produced the pixels, for one-time operator logging.
+    path: &'static str,
+}
+
+/// Reads compositor DMA-BUFs back into linear CPU pixels.
+///
+/// Two driver paths are tried in order. `gbm_bo_map` is cheap and correct on
+/// Mesa, which detiles during the transfer. Drivers that refuse to map a
+/// foreign buffer object — the proprietary NVIDIA stack returns `EAGAIN`
+/// indefinitely — are served by importing the descriptor as an `EGLImage` and
+/// reading a framebuffer instead. Whichever path fails first is latched off so
+/// a permanently unsupported path is not retried once per frame.
 struct GpuReadback {
+    // Declared before `device` so the EGL context is torn down while the GBM
+    // device it was created from is still alive.
+    egl: Option<EglReadback>,
     device_path: PathBuf,
     device: Option<gbm::Device<std::fs::File>>,
+    gbm_unusable: bool,
+    egl_unusable: bool,
 }
 
 impl GpuReadback {
     fn new(device_path: PathBuf) -> Self {
         Self {
+            egl: None,
             device_path,
             device: None,
+            gbm_unusable: false,
+            egl_unusable: false,
         }
     }
 
@@ -4279,6 +4317,30 @@ impl GpuReadback {
         Ok(self.device.as_ref().expect("GBM device initialized"))
     }
 
+    /// Returns the EGL importer, creating it on first use.
+    ///
+    /// The context is created on, and stays bound to, the PipeWire loop thread
+    /// that owns this value.
+    fn egl(&mut self) -> Result<&mut EglReadback> {
+        if self.egl.is_none() {
+            let device_ptr = {
+                use gbm::AsRaw;
+                self.device()?.as_raw_mut().cast::<std::ffi::c_void>()
+            };
+            // SAFETY: `self.device` owns the GBM device the pointer refers to,
+            // it is declared after `self.egl` so it outlives the EGL context,
+            // and neither field is replaced while the context exists.
+            let readback = unsafe { EglReadback::new(device_ptr) }?;
+            info!(
+                device = %self.device_path.display(),
+                driver = readback.describe(),
+                "initialized EGL DMA-BUF readback"
+            );
+            self.egl = Some(readback);
+        }
+        Ok(self.egl.as_mut().expect("EGL readback initialized"))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn copy_dmabuf(
         &mut self,
@@ -4289,20 +4351,96 @@ impl GpuReadback {
         stride: usize,
         video_format: spa::param::video::VideoFormat,
         modifier: u64,
-    ) -> Result<(Vec<u8>, usize)> {
-        self.copy_dmabuf_with_gbm(
+    ) -> Result<DmaBufReadback> {
+        let gbm_error = if self.gbm_unusable {
+            None
+        } else {
+            match self.copy_dmabuf_with_gbm(
+                fd,
+                offset,
+                width,
+                height,
+                stride,
+                video_format,
+                modifier,
+            ) {
+                Ok((data, stride)) => {
+                    let format =
+                        raw_frame_format_for_video_format(video_format).with_context(|| {
+                            format!("unsupported PipeWire video format {video_format:?}")
+                        })?;
+                    return Ok(DmaBufReadback {
+                        data,
+                        stride,
+                        format,
+                        path: "gbm",
+                    });
+                }
+                Err(err) => {
+                    self.gbm_unusable = true;
+                    warn!(
+                        modifier,
+                        error = %format!("{err:#}"),
+                        "GBM cannot map this compositor DMA-BUF; falling back to EGL readback"
+                    );
+                    Some(err)
+                }
+            }
+        };
+        if self.egl_unusable {
+            bail!(
+                "no driver-backed readback path remains for modifier {modifier:#018x}; refusing raw DMA-BUF mapping because it can publish tiled or corrupt pixels"
+            );
+        }
+        match self.copy_dmabuf_with_egl(fd, offset, width, height, stride, video_format, modifier) {
+            Ok(readback) => Ok(readback),
+            Err(egl_error) => {
+                self.egl_unusable = true;
+                let egl_error = egl_error.context(format!(
+                    "EGL readback failed for modifier {modifier:#018x}; refusing raw DMA-BUF mapping because it can publish tiled or corrupt pixels"
+                ));
+                Err(match gbm_error {
+                    Some(gbm_error) => {
+                        egl_error.context(format!("GBM readback also failed: {gbm_error:#}"))
+                    }
+                    None => egl_error,
+                })
+            }
+        }
+    }
+
+    /// Imports the descriptor as an `EGLImage` and reads linear pixels back.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_dmabuf_with_egl(
+        &mut self,
+        fd: RawFd,
+        offset: usize,
+        width: u32,
+        height: u32,
+        stride: usize,
+        video_format: spa::param::video::VideoFormat,
+        modifier: u64,
+    ) -> Result<DmaBufReadback> {
+        let fourcc = drm_fourcc_for_video_format(video_format)
+            .with_context(|| format!("no DRM fourcc mapping for {video_format:?}"))?;
+        let plane = DmaBufPlane {
             fd,
-            offset,
+            offset: u32::try_from(offset).context("DMA-BUF offset exceeds EGL limits")?,
+            stride: u32::try_from(stride).context("DMA-BUF stride exceeds EGL limits")?,
             width,
             height,
-            stride,
-            video_format,
+            fourcc,
             modifier,
-        )
-        .with_context(|| {
-            format!(
-                "driver-backed GBM readback failed for modifier {modifier:#018x}; refusing raw DMA-BUF mapping because it can publish tiled or corrupt pixels"
-            )
+        };
+        let readback = self.egl()?.read_dmabuf(&plane)?;
+        Ok(DmaBufReadback {
+            data: readback.data,
+            stride: readback.stride,
+            format: match readback.layout {
+                ReadbackLayout::Rgba => RawFrameFormat::Rgbx,
+                ReadbackLayout::Bgra => RawFrameFormat::Bgrx,
+            },
+            path: "egl",
         })
     }
 
@@ -6256,6 +6394,34 @@ mod tests {
         assert_eq!(
             preferred_safe_readback_modifier(implicit_dmabuf_offer),
             Some(DRM_FORMAT_MOD_INVALID as u64)
+        );
+    }
+
+    #[test]
+    fn cpu_pipewire_formats_offer_shared_memory_for_vendor_only_modifiers() {
+        // niri on NVIDIA advertises block-linear modifiers and no linear or
+        // implicit alternative. Withholding the modifier-less offer here left
+        // PipeWire with only a tiled DMA-BUF that GBM readback cannot map.
+        const EXPLICIT_MODIFIER: u64 = 0x0300_0000_0060_6010;
+        let advertised = build_exact_cpu_pipewire_format_pod(
+            spa::param::video::VideoFormat::BGRx,
+            100,
+            80,
+            20.0,
+            Some(EXPLICIT_MODIFIER),
+        )
+        .unwrap();
+
+        let offers = build_pipewire_format_pods_from_node_formats(&[advertised], 15.0).unwrap();
+        assert_eq!(offers.len(), 2);
+
+        let shm_offer = spa::pod::Pod::from_bytes(&offers[0]).unwrap();
+        assert!(!format_param_has_video_modifier(shm_offer));
+
+        let dmabuf_offer = spa::pod::Pod::from_bytes(&offers[1]).unwrap();
+        assert_eq!(
+            preferred_safe_readback_modifier(dmabuf_offer),
+            Some(EXPLICIT_MODIFIER)
         );
     }
 

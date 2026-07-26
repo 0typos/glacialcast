@@ -41,6 +41,8 @@ const nativePackages = [
   ['SPDXRef-Native-PipeWire', 'PipeWire'],
   ['SPDXRef-Native-libgbm', 'libgbm'],
   ['SPDXRef-Native-libva', 'libva'],
+  ['SPDXRef-Native-libEGL', 'libEGL'],
+  ['SPDXRef-Native-libGLESv2', 'libGLESv2'],
   ['SPDXRef-Native-OpenH264', 'OpenH264'],
 ].map(([SPDXID, name]) => ({
   SPDXID,

@@ -16,6 +16,7 @@ glacialcast-dash = { path = "../dash", version = "0.5.0" }
 glacialcast-protocol = { path = "../protocol", version = "0.5.0" }
 image.workspace = true
 libc.workspace = true
+libloading.workspace = true
 openh264.workspace = true
 pipewire.workspace = true
 rand.workspace = true

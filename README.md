@@ -205,9 +205,12 @@ When VA-API video processing is available, compositor DMA-BUFs are imported and
 converted directly to owned NV12 surfaces. Otherwise capture negotiates
 CPU-readable buffers for VA-API upload or OpenH264. Some compositors still
 supply tiled or otherwise non-mappable DMA-BUFs. Those are copied through the
-render driver's GBM implementation. GlacialCast refuses to map such buffers as
-linear memory when driver-backed readback is unavailable, because doing so
-would publish a corrupted picture.
+render driver: first `gbm_bo_map`, and when the driver refuses to map a foreign
+buffer object, an `EGLImage` import that reads the frame back through OpenGL
+ES. The proprietary NVIDIA stack only supports the second path, so `libEGL` and
+`libGLESv2` are loaded at runtime when they are needed. GlacialCast refuses to
+map such buffers as linear memory when neither driver-backed readback path is
+available, because doing so would publish a corrupted picture.
 
 ## Offline transfer
 

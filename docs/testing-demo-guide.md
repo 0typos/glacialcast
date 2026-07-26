@@ -579,8 +579,11 @@ scripts/verify-wayland-cursor-metadata.sh
 ### The Wayland picture is tiled, striped, or capture reports GBM readback failure
 
 Do not continue using a build that publishes scrambled pixels. Current builds
-only map explicitly linear, mappable DMA-BUFs directly and otherwise require
-the graphics driver's GBM readback path.
+only map explicitly linear, mappable DMA-BUFs directly and otherwise require a
+driver-backed readback path: `gbm_bo_map` first, then an `EGLImage` import read
+back through OpenGL ES. A host missing `libEGL.so.1` or `libGLESv2.so.2` has
+only the GBM path, which the NVIDIA driver does not implement for foreign
+buffer objects; install the vendor's EGL and OpenGL ES runtime in that case.
 
 On NVIDIA, first verify that the loaded kernel module and installed userspace
 driver agree:
