@@ -53,6 +53,7 @@ const VIEWER_HTML: &str = include_str!("../../server/static/dash-viewer.html");
 const VIEWER_CSS: &str = include_str!("../../server/static/dash-viewer.css");
 const VIEWER_CORE_JS: &str = include_str!("../../server/static/dash-viewer-core.js");
 const VIEWER_JS: &str = include_str!("../../server/static/dash-viewer.js");
+const VIEWER_PAGE_JS: &str = include_str!("../../server/static/dash-viewer-page.js");
 const MAX_PORTABLE_FILE_LEN: u64 = MAX_FRAME_LEN as u64 + 128 * 1024;
 const TRANSFER_MANIFEST_FILE: &str = "glacialcast-transfer.json";
 const TRANSFER_CHUNK_OBJECTS: u64 = 1024;
@@ -921,6 +922,7 @@ async fn serve(input: PathBuf, listen: SocketAddr, allow_non_loopback: bool) -> 
         .route("/assets/dash-viewer.css", get(viewer_css))
         .route("/assets/dash-viewer-core.js", get(viewer_core_js))
         .route("/assets/dash-viewer.js", get(viewer_js))
+        .route("/assets/dash-viewer-page.js", get(viewer_page_js))
         .route("/api/dash/streams/{stream_id}/objects", get(list_objects))
         .route(
             "/api/dash/streams/{stream_id}/objects/{sequence}",
@@ -1114,6 +1116,10 @@ async fn viewer_css() -> Response {
 
 async fn viewer_js() -> Response {
     static_response("text/javascript; charset=utf-8", VIEWER_JS)
+}
+
+async fn viewer_page_js() -> Response {
+    static_response("text/javascript; charset=utf-8", VIEWER_PAGE_JS)
 }
 
 async fn viewer_core_js() -> Response {
@@ -2034,6 +2040,12 @@ mod tests {
             .unwrap();
         let html = std::str::from_utf8(&body).unwrap();
         assert!(html.find("dash-viewer-core.js").unwrap() < html.find("dash-viewer.js").unwrap());
+        assert!(
+            html.find("dash-viewer.js").unwrap() < html.find("dash-viewer-page.js").unwrap(),
+            "the page script must load after the player it mounts"
+        );
+        let page = viewer_page_js().await;
+        assert_eq!(page.status(), StatusCode::OK);
 
         let core = viewer_core_js().await;
         assert_eq!(

@@ -712,6 +712,7 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
         .route("/assets/dash-viewer.css", get(dash_viewer_css))
         .route("/assets/dash-viewer-core.js", get(dash_viewer_core_js))
         .route("/assets/dash-viewer.js", get(dash_viewer_js))
+        .route("/assets/dash-viewer-page.js", get(dash_viewer_page_js))
         .with_state(state)
         .layer(DefaultBodyLimit::max(4096))
         .layer(TraceLayer::new_for_http())
@@ -935,6 +936,13 @@ async fn dash_viewer_js() -> Response {
     static_response(
         "text/javascript; charset=utf-8",
         include_str!("../static/dash-viewer.js"),
+    )
+}
+
+async fn dash_viewer_page_js() -> Response {
+    static_response(
+        "text/javascript; charset=utf-8",
+        include_str!("../static/dash-viewer-page.js"),
     )
 }
 
