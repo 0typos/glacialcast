@@ -6,7 +6,7 @@ cd "${repo_root}"
 
 control_addr="${GLACIALCAST_VERIFY_CONTROL_ADDR:-127.0.0.1:18995}"
 ingest_addr="${GLACIALCAST_VERIFY_INGEST_ADDR:-127.0.0.1:18996}"
-backend="${GLACIALCAST_VERIFY_SCREENCAST_BACKEND:-portal}"
+backend="${GLACIALCAST_VERIFY_SCREENCAST_BACKEND:-auto}"
 monitor_name="${GLACIALCAST_VERIFY_MONITOR_NAME:-}"
 vaapi_device="${GLACIALCAST_VERIFY_VAAPI_DEVICE:-/dev/dri/renderD128}"
 require_dmabuf="${GLACIALCAST_VERIFY_REQUIRE_DMABUF:-0}"
@@ -34,7 +34,7 @@ if [[ ! -e "${vaapi_device}" ]]; then
   echo "VA-API render node does not exist: ${vaapi_device}" >&2
   exit 1
 fi
-if [[ "${backend}" == "portal" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+if [[ "${backend}" != "mutter" && -z "${WAYLAND_DISPLAY:-}" ]]; then
   echo "WAYLAND_DISPLAY is not set; run this gate inside the target Wayland session" >&2
   exit 1
 fi
@@ -84,7 +84,7 @@ fi
 target/debug/glacialcast-client "${client_args[@]}" >"${client_log}" 2>&1 &
 client_pid="$!"
 
-echo "Select the target source in the portal."
+echo "If a desktop chooser appears, select the target source."
 node - "${origin}" "${timeout_seconds}" "${client_pid}" <<'NODE' || {
 const [origin, timeoutSeconds, clientPid] = process.argv.slice(2);
 const deadline = Date.now() + Number(timeoutSeconds) * 1000;

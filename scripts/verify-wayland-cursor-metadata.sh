@@ -6,7 +6,7 @@ cd "${repo_root}"
 
 control_addr="${GLACIALCAST_VERIFY_CONTROL_ADDR:-127.0.0.1:18997}"
 ingest_addr="${GLACIALCAST_VERIFY_INGEST_ADDR:-127.0.0.1:18998}"
-backend="${GLACIALCAST_VERIFY_SCREENCAST_BACKEND:-portal}"
+backend="${GLACIALCAST_VERIFY_SCREENCAST_BACKEND:-auto}"
 monitor_name="${GLACIALCAST_VERIFY_MONITOR_NAME:-}"
 timeout_seconds="${GLACIALCAST_VERIFY_TIMEOUT_SECONDS:-60}"
 screenshot="${GLACIALCAST_VERIFY_SCREENSHOT:-}"
@@ -31,7 +31,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [[ "${backend}" == "portal" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+if [[ "${backend}" != "mutter" && -z "${WAYLAND_DISPLAY:-}" ]]; then
   echo "WAYLAND_DISPLAY is not set; run this gate inside the target Wayland session" >&2
   exit 1
 fi
@@ -83,7 +83,7 @@ fi
 target/debug/glacialcast-client "${client_args[@]}" >"${client_log}" 2>&1 &
 client_pid="$!"
 
-echo "Select the target source in the portal, then move the pointer over it."
+echo "If a desktop chooser appears, select the target source, then move the pointer over it."
 node - "${origin}" "${timeout_seconds}" "${client_pid}" <<'NODE' || {
 const [origin, timeoutSeconds, clientPid] = process.argv.slice(2);
 const deadline = Date.now() + Number(timeoutSeconds) * 1000;

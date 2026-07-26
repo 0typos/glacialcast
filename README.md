@@ -193,8 +193,15 @@ provide the pinned public key without placing it on the command line.
 
 ## Capture and encoding
 
-`--portal-source` accepts `monitor`, `window`, or `any`. The portal backend is
-the default. Niri's Mutter-compatible ScreenCast API can be selected directly:
+`--portal-source` accepts `monitor`, `window`, or `any`.
+
+`--screencast-backend auto` is the default. Under niri it uses that
+compositor's own Mutter-compatible ScreenCast interface, which lets a detached
+publisher pick a monitor with no desktop dialog; the monitor is the primary
+output unless `--monitor-name` names another. GNOME, KDE, and sway keep the XDG
+portal, whose permission prompt is the sanctioned consent step there. Force
+either interface with `--screencast-backend portal` or
+`--screencast-backend mutter`:
 
 ```sh
 ./target/release/glacialcast-client \
@@ -204,8 +211,8 @@ the default. Niri's Mutter-compatible ScreenCast API can be selected directly:
   --monitor-name DP-3
 ```
 
-The portal grants a session to a specific process, so a publisher must be
-started from the desktop session and answered once per start.
+The portal grants a session to a specific process, so a portal-backed publisher
+must be started from the desktop session and answered once per start.
 `deploy/glacialcast-publisher.service` is a user unit that starts the publisher
 with the graphical session.
 

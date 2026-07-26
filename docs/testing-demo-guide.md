@@ -328,8 +328,11 @@ target/release/glacialcast-client \
   --cursor-hz 30
 ```
 
-Choose a monitor in the portal dialog and move the pointer over that monitor.
-The browser should show the real screen at the sparse video cadence while the
+Under niri this starts recording the primary output immediately, because
+automatic backend selection uses that compositor's own ScreenCast interface;
+name another output with `--monitor-name`. On GNOME, KDE, and sway, choose a
+monitor in the portal dialog. Then move the pointer over the captured monitor:
+the browser should show the real screen at the sparse video cadence while the
 independent cursor remains responsive.
 
 The publisher detaches after printing its viewer key, so this terminal returns
@@ -586,6 +589,10 @@ cursor gate:
 cargo build --workspace --release
 scripts/verify-wayland-cursor-metadata.sh
 ```
+
+That gate selects the capture backend automatically, so it runs unattended
+under niri and prompts for the portal chooser elsewhere. Force one with
+`GLACIALCAST_VERIFY_SCREENCAST_BACKEND=portal` or `=mutter`.
 
 ### The Wayland picture is tiled, striped, or capture reports GBM readback failure
 

@@ -148,7 +148,7 @@ struct Args {
     test_pattern: TestPatternMode,
     #[arg(long, value_enum, default_value_t = PortalSourceMode::Monitor)]
     portal_source: PortalSourceMode,
-    #[arg(long, value_enum, default_value_t = ScreenCastBackend::Portal)]
+    #[arg(long, value_enum, default_value_t = ScreenCastBackend::Auto)]
     screencast_backend: ScreenCastBackend,
     #[arg(long)]
     monitor_name: Option<String>,
@@ -255,6 +255,7 @@ impl PortalSourceMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ScreenCastBackend {
+    Auto,
     Portal,
     Mutter,
 }
@@ -2009,16 +2010,19 @@ impl NativePipewireCapture {
             node_id = capture.node_id,
             width = capture.width,
             height = capture.height,
-            backend = ?screencast_backend,
+            requested_backend = ?screencast_backend,
+            backend = ?capture.backend,
             dmabuf = prefer_dmabuf,
             "Wayland/PipeWire native capture started"
         );
 
         Ok(Self {
             source: CaptureSource {
-                backend: match screencast_backend {
-                    ScreenCastBackend::Portal => "xdg-desktop-portal+pipewire-rs",
+                backend: match capture.backend {
                     ScreenCastBackend::Mutter => "mutter-screencast+pipewire-rs",
+                    ScreenCastBackend::Auto | ScreenCastBackend::Portal => {
+                        "xdg-desktop-portal+pipewire-rs"
+                    }
                 }
                 .to_string(),
                 description: capture.description,
@@ -2786,6 +2790,9 @@ struct ScreenCastCapture {
     width: u32,
     height: u32,
     description: String,
+    /// The interface that actually opened the session, which differs from the
+    /// requested value when the operator asked for automatic selection.
+    backend: ScreenCastBackend,
     remote: PipewireRemote,
     session: ScreenCastSession,
 }
@@ -2822,12 +2829,142 @@ async fn open_screencast_capture(
     monitor_name: Option<&str>,
     cursor_preference: PortalCursorMode,
 ) -> Result<ScreenCastCapture> {
+    let backend = match backend {
+        ScreenCastBackend::Auto => resolve_screencast_backend(source_mode).await,
+        selected => selected,
+    };
     match backend {
-        ScreenCastBackend::Portal => open_screencast_portal(source_mode, cursor_preference).await,
+        ScreenCastBackend::Portal | ScreenCastBackend::Auto => {
+            open_screencast_portal(source_mode, cursor_preference).await
+        }
         ScreenCastBackend::Mutter => {
             open_mutter_screencast(source_mode, monitor_name, cursor_preference).await
         }
     }
+}
+
+/// Chooses the ScreenCast interface that fits the running compositor.
+///
+/// niri implements the Mutter ScreenCast API as its own native interface, and
+/// using it directly lets a detached publisher select a monitor without a
+/// desktop dialog. Every other desktop keeps the XDG portal, whose permission
+/// prompt is the sanctioned consent step there: GNOME exposes the same Mutter
+/// API, but reaching past its portal would bypass that prompt.
+async fn resolve_screencast_backend(source_mode: PortalSourceMode) -> ScreenCastBackend {
+    if source_mode != PortalSourceMode::Monitor || !session_desktop_is_niri() {
+        return ScreenCastBackend::Portal;
+    }
+    match mutter_screencast_version().await {
+        Ok(version) => {
+            info!(
+                version,
+                "niri session detected; using its Mutter-compatible ScreenCast interface"
+            );
+            ScreenCastBackend::Mutter
+        }
+        Err(err) => {
+            warn!(
+                ?err,
+                "niri session detected but its ScreenCast interface is unavailable; using the XDG portal"
+            );
+            ScreenCastBackend::Portal
+        }
+    }
+}
+
+/// Reports whether the session identifies itself as niri.
+fn session_desktop_is_niri() -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP")
+        .unwrap_or_default()
+        .split(':')
+        .any(|entry| entry.eq_ignore_ascii_case("niri"))
+}
+
+/// Identifies one physical output as `(connector, vendor, product, serial)`.
+type MutterMonitorSpec = (String, String, String, String);
+/// One advertised output mode; only the identifier and extent are used here.
+type MutterMode = (
+    String,
+    i32,
+    i32,
+    f64,
+    f64,
+    Vec<f64>,
+    std::collections::HashMap<String, OwnedValue>,
+);
+/// A physical output with its modes and properties.
+type MutterMonitor = (
+    MutterMonitorSpec,
+    Vec<MutterMode>,
+    std::collections::HashMap<String, OwnedValue>,
+);
+/// A laid-out region of the desktop, which may drive several outputs.
+type MutterLogicalMonitor = (
+    i32,
+    i32,
+    f64,
+    u32,
+    bool,
+    Vec<MutterMonitorSpec>,
+    std::collections::HashMap<String, OwnedValue>,
+);
+/// The reply of `org.gnome.Mutter.DisplayConfig.GetCurrentState`.
+type MutterCurrentState = (
+    u32,
+    Vec<MutterMonitor>,
+    Vec<MutterLogicalMonitor>,
+    std::collections::HashMap<String, OwnedValue>,
+);
+
+/// Picks the output to record when the operator named none.
+///
+/// The primary logical monitor wins, then the first laid-out logical monitor,
+/// then the first physical output. Selecting explicitly with `--monitor-name`
+/// is still the only way to guarantee a particular output across replugs.
+async fn default_mutter_connector(connection: &Connection) -> Result<String> {
+    let proxy = Proxy::new(
+        connection,
+        "org.gnome.Mutter.DisplayConfig",
+        "/org/gnome/Mutter/DisplayConfig",
+        "org.gnome.Mutter.DisplayConfig",
+    )
+    .await
+    .context("connecting to the compositor display configuration")?;
+    let (_, monitors, logical_monitors, _): MutterCurrentState = proxy
+        .call("GetCurrentState", &())
+        .await
+        .context("reading the compositor display configuration")?;
+    let from_logical = logical_monitors
+        .iter()
+        .find(|logical| logical.4)
+        .or_else(|| logical_monitors.first())
+        .and_then(|logical| logical.5.first())
+        .map(|spec| spec.0.clone());
+    let connector = from_logical
+        .or_else(|| monitors.first().map(|monitor| monitor.0.0.clone()))
+        .context("the compositor reported no connected monitor to record")?;
+    info!(
+        connector,
+        monitor_count = monitors.len(),
+        "selected a monitor to record; pass --monitor-name to choose another"
+    );
+    Ok(connector)
+}
+
+/// Returns the advertised Mutter ScreenCast interface version.
+async fn mutter_screencast_version() -> Result<i32> {
+    let connection = Connection::session().await?;
+    let proxy = Proxy::new(
+        &connection,
+        "org.gnome.Mutter.ScreenCast",
+        "/org/gnome/Mutter/ScreenCast",
+        "org.gnome.Mutter.ScreenCast",
+    )
+    .await?;
+    proxy
+        .get_property::<i32>("Version")
+        .await
+        .context("reading Mutter ScreenCast version")
 }
 
 async fn open_mutter_screencast(
@@ -2838,12 +2975,18 @@ async fn open_mutter_screencast(
     if source_mode != PortalSourceMode::Monitor {
         bail!("--screencast-backend mutter currently requires --portal-source monitor");
     }
-    let connector = monitor_name
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .context("--screencast-backend mutter requires --monitor-name <connector>")?;
     let connection = Connection::session().await?;
     info!("connected to D-Bus session bus for Mutter ScreenCast");
+    let requested = monitor_name.map(str::trim).filter(|name| !name.is_empty());
+    let discovered = match requested {
+        Some(_) => None,
+        None => Some(default_mutter_connector(&connection).await?),
+    };
+    let connector = requested.unwrap_or_else(|| {
+        discovered
+            .as_deref()
+            .expect("a connector is discovered when none was requested")
+    });
     let root_proxy = Proxy::new(
         &connection,
         "org.gnome.Mutter.ScreenCast",
@@ -2912,6 +3055,7 @@ async fn open_mutter_screencast(
         description: format!(
             "PipeWire node {node_id} via Mutter ScreenCast connector {connector} ({prop_summary})"
         ),
+        backend: ScreenCastBackend::Mutter,
         remote: PipewireRemote::Default,
         session: ScreenCastSession::Mutter {
             _connection: connection,
@@ -3065,6 +3209,7 @@ async fn open_screencast_portal(
         width,
         height,
         description,
+        backend: ScreenCastBackend::Portal,
         remote,
         session: ScreenCastSession::Portal {
             _connection: connection,
