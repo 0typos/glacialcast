@@ -265,6 +265,70 @@
     return found;
   }
 
+  // Cursor timestamps are carried on the 90 kHz media timescale.
+  const CURSOR_TICKS_PER_MS = 90;
+  // How far behind the newest sample the live overlay deliberately runs. One
+  // publisher flush interval of slack means there is normally a queue of
+  // samples to play out, so the overlay animates instead of snapping.
+  const DEFAULT_CURSOR_LAG_MS = 120;
+  // Beyond this the overlay is not smoothing, it is simply stale, so it jumps
+  // rather than crawling through a backlog.
+  const DEFAULT_CURSOR_DRIFT_MS = 600;
+
+  /**
+   * Paces live cursor playback against a wall clock.
+   *
+   * Cursor samples arrive batched: the publisher collects a flush interval of
+   * them and sends them together. Rendering only the newest sample of each
+   * batch throws away every intermediate position and reduces a 60 Hz cursor to
+   * the batch rate, so the overlay instead runs a small fixed distance behind
+   * the newest sample and plays the queue out in real time.
+   *
+   * The clock deliberately does not follow the video element. Video is
+   * published around 1 fps with variable-duration samples, so its currentTime
+   * stalls between fragments; the cursor timeline must keep advancing anyway.
+   */
+  function createCursorClock(options = {}) {
+    const lagTicks = Math.max(0, Math.round(
+      (options.targetLagMs ?? DEFAULT_CURSOR_LAG_MS) * CURSOR_TICKS_PER_MS,
+    ));
+    const driftTicks = Math.max(lagTicks, Math.round(
+      (options.maxDriftMs ?? DEFAULT_CURSOR_DRIFT_MS) * CURSOR_TICKS_PER_MS,
+    ));
+    let anchorMedia = null;
+    let anchorWall = 0;
+
+    function anchor(media, nowMs) {
+      anchorMedia = media;
+      anchorWall = nowMs;
+      return media;
+    }
+
+    return {
+      /** Drops the anchor so the next sample re-synchronises, after a seek. */
+      reset() {
+        anchorMedia = null;
+      },
+      /**
+       * Returns the cursor timestamp to display now, given the newest sample
+       * available and a monotonic millisecond clock.
+       */
+      sample(newestTimestamp, nowMs) {
+        if (!Number.isFinite(newestTimestamp)) return null;
+        if (anchorMedia === null) return anchor(newestTimestamp - lagTicks, nowMs);
+        const target = anchorMedia + (nowMs - anchorWall) * CURSOR_TICKS_PER_MS;
+        // Ran past the queue: hold at the newest sample and restart the clock
+        // there, so a later burst does not replay stale positions.
+        if (target >= newestTimestamp) return anchor(newestTimestamp, nowMs);
+        // Fell too far behind, usually a stalled tab or a delivery burst.
+        if (newestTimestamp - target > driftTicks) {
+          return anchor(newestTimestamp - lagTicks, nowMs);
+        }
+        return target;
+      },
+    };
+  }
+
   function retainCursorHistory(events, cutoffTimestamp) {
     if (events.length === 0 || events[0].timestamp >= cutoffTimestamp) return events;
     let low = 0;
@@ -367,8 +431,10 @@
     MAX_CURSOR_BITMAP_SIDE,
     MAX_CURSOR_PAYLOAD,
     MAX_CURSOR_PLAINTEXT,
+    CURSOR_TICKS_PER_MS,
     buildEpochTimeline,
     containedVideoRectangle,
+    createCursorClock,
     findCursorEvent,
     mergeSortedCursorEvents,
     parseCursorBatch,

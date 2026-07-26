@@ -394,4 +394,49 @@ test('contained video geometry handles letterboxing and pillarboxing', () => {
   assert.throws(() => core.containedVideoRectangle(0, 100, 100, 100), /positive/);
 });
 
+test('live cursor clock plays batches out instead of snapping to the newest', () => {
+  const ticks = core.CURSOR_TICKS_PER_MS;
+  const clock = core.createCursorClock({ targetLagMs: 100, maxDriftMs: 500 });
+  // A batch of 100 ms of samples lands at once; the newest is 10_000 ticks in.
+  const newest = 10_000 * ticks;
+  const first = clock.sample(newest, 1_000);
+  assert.equal(first, newest - 100 * ticks, 'starts one lag behind the newest');
+
+  // Wall clock advances 40 ms with no new samples: the overlay must advance
+  // through the queue rather than sit on one position.
+  const later = clock.sample(newest, 1_040);
+  assert.equal(later, first + 40 * ticks);
+  assert.ok(later < newest, 'still trailing the newest sample');
+});
+
+test('live cursor clock holds at the newest sample and does not run ahead', () => {
+  const ticks = core.CURSOR_TICKS_PER_MS;
+  const clock = core.createCursorClock({ targetLagMs: 100, maxDriftMs: 500 });
+  const newest = 5_000 * ticks;
+  clock.sample(newest, 0);
+  // Far past the queue with nothing new delivered.
+  assert.equal(clock.sample(newest, 10_000), newest);
+  // Having caught up, it resumes from there rather than replaying the gap.
+  const resumed = clock.sample(newest + 30 * ticks, 10_020);
+  assert.equal(resumed, newest + 20 * ticks);
+});
+
+test('live cursor clock jumps forward instead of crawling through a backlog', () => {
+  const ticks = core.CURSOR_TICKS_PER_MS;
+  const clock = core.createCursorClock({ targetLagMs: 100, maxDriftMs: 500 });
+  clock.sample(1_000 * ticks, 0);
+  // A backgrounded tab wakes up to samples far beyond the drift bound.
+  const caught = clock.sample(9_000 * ticks, 50);
+  assert.equal(caught, (9_000 - 100) * ticks, 'resynchronises to one lag behind');
+});
+
+test('live cursor clock resynchronises after a reset', () => {
+  const ticks = core.CURSOR_TICKS_PER_MS;
+  const clock = core.createCursorClock({ targetLagMs: 100, maxDriftMs: 500 });
+  clock.sample(1_000 * ticks, 0);
+  clock.reset();
+  assert.equal(clock.sample(4_000 * ticks, 5), (4_000 - 100) * ticks);
+  assert.equal(clock.sample(Number.NaN, 6), null);
+});
+
 console.log(`PASS viewer core: ${tests} tests`);

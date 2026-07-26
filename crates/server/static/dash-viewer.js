@@ -49,6 +49,7 @@ const state = {
   live: true,
   appendedMedia: 0,
   decryptedCursorBatches: 0,
+  cursorClock: ViewerCore.createCursorClock(),
   lastRenderedCursor: undefined,
   lastRenderedBitmap: undefined,
   lastRenderLayout: '',
@@ -63,11 +64,13 @@ els.unlockForm.addEventListener('submit', event => {
 
 els.liveButton.addEventListener('click', () => {
   state.live = true;
+  state.cursorClock.reset();
   seekToLiveEdge();
 });
 
 els.timeline.addEventListener('input', () => {
   state.live = false;
+  state.cursorClock.reset();
   els.video.currentTime = Number(els.timeline.value);
 });
 
@@ -801,11 +804,21 @@ function renderCursor() {
 
 function currentCursorEvent() {
   if (!state.cursorEvents.length || !state.descriptor) return null;
-  return ViewerCore.findCursorEvent(
-    state.cursorEvents,
-    els.video.currentTime * TIMESCALE,
-    state.live,
-  );
+  if (!state.live) {
+    // Scrubbing history: the video clock is authoritative, because the cursor
+    // has to line up with the frame the viewer is looking at.
+    return ViewerCore.findCursorEvent(
+      state.cursorEvents,
+      els.video.currentTime * TIMESCALE,
+      false,
+    );
+  }
+  // Live: pace the batched samples against a wall clock instead of snapping to
+  // the newest one, which would collapse each batch to a single position.
+  const newest = state.cursorEvents[state.cursorEvents.length - 1].timestamp;
+  const timestamp = state.cursorClock.sample(newest, performance.now());
+  if (timestamp === null) return null;
+  return ViewerCore.findCursorEvent(state.cursorEvents, timestamp, false);
 }
 
 function containedVideoRectangle(width, height, videoWidth, videoHeight) {
