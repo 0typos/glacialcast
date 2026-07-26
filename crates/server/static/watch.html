@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'">
+  <title>GlacialCast Multi-stream Viewer</title>
+  <link rel="stylesheet" href="/assets/watch.css">
+</head>
+<body>
+  <header>
+    <div>
+      <h1>GlacialCast</h1>
+      <div id="headline" class="muted">Watch up to four encrypted streams</div>
+    </div>
+    <div class="header-actions">
+      <div class="layouts" role="group" aria-label="Layout">
+        <button type="button" data-layout="1" aria-pressed="true">1</button>
+        <button type="button" data-layout="2" aria-pressed="false">2</button>
+        <button type="button" data-layout="4" aria-pressed="false">4</button>
+      </div>
+      <a href="/">All streams</a>
+    </div>
+  </header>
+
+  <main>
+    <aside id="sidebar" aria-labelledby="sidebar-title">
+      <h2 id="sidebar-title">Your streams</h2>
+
+      <form id="unlock-keyring" class="panel">
+        <p class="help">
+          Your viewer keys are stored in this browser, encrypted with a passphrase.
+          They are never sent to the relay.
+        </p>
+        <label for="passphrase">Keyring passphrase</label>
+        <input id="passphrase" type="password" autocomplete="current-password" required>
+        <button type="submit">Open keyring</button>
+        <p id="keyring-error" class="error" role="alert" hidden></p>
+      </form>
+
+      <div id="keyring-panel" hidden>
+        <ul id="stream-list" class="stream-list"></ul>
+        <p id="empty-hint" class="help" hidden>
+          No stored keys yet. Add one below.
+        </p>
+
+        <form id="add-key" class="panel">
+          <h3>Add a stream key</h3>
+          <label for="add-stream">Stream</label>
+          <select id="add-stream" required></select>
+          <label for="add-key-value">Viewer key</label>
+          <input id="add-key-value" type="password" autocomplete="off" spellcheck="false" required>
+          <button type="submit">Remember key</button>
+          <p id="add-error" class="error" role="alert" hidden></p>
+        </form>
+
+        <button id="forget-all" type="button" class="danger">Forget all keys</button>
+      </div>
+    </aside>
+
+    <section id="grid" class="grid layout-1" aria-label="Stream tiles"></section>
+  </main>
+
+  <template id="tile-template">
+    <article class="tile" tabindex="0">
+      <div class="tile-header">
+        <span class="tile-title">Empty</span>
+        <span class="tile-actions">
+          <button type="button" data-action="fullscreen" title="Full screen">⛶</button>
+          <button type="button" data-action="remove" title="Remove">✕</button>
+        </span>
+      </div>
+      <div class="tile-body" data-role="player">
+        <div data-role="stage" class="stage">
+          <video data-role="video" muted autoplay playsinline></video>
+          <canvas data-role="cursor-layer" aria-hidden="true"></canvas>
+          <div data-role="stage-message" class="stage-message">Drop a stream here</div>
+        </div>
+      </div>
+      <div class="tile-status">
+        <span data-role="status"></span>
+        <span data-role="metrics"></span>
+      </div>
+    </article>
+  </template>
+
+  <script src="/assets/dash-viewer-core.js"></script>
+  <script src="/assets/dash-viewer.js"></script>
+  <script src="/assets/keyring.js"></script>
+  <script src="/assets/watch.js"></script>
+</body>
+</html>

@@ -113,6 +113,8 @@ They verify:
 - invalid publisher-token rejection and recovery across a forced crash;
 - viewer/admin roles, publisher scopes, CSRF, exact origins, throttling,
   security headers, private configuration, and fail-closed listeners;
+- several concurrent tiles in the multi-stream viewer, each decoding its own
+  stream from the encrypted keyring;
 - a moving 1280×720, 1 FPS, default-cursor application-traffic ceiling; and
 - conservative crypto, packaging, and durable-storage throughput floors.
 

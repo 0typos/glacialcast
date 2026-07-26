@@ -303,6 +303,22 @@ Whichever path fails first is latched off so an unsupported path is not retried
 once per frame. Raw `mmap` is limited to explicitly linear, mappable DMA-BUFs so
 tiled GPU memory cannot be mistaken for a linear image.
 
+### Watching several streams
+
+The player is a factory rather than a page singleton, so one document can host
+several independent instances: each owns its live WebSocket, MediaSource, key
+session, and cursor overlay, and each is destroyed when its tile is emptied.
+The relay's per-principal WebSocket limit accounts for a four-tile view plus
+the operations dashboard's control socket.
+
+Persisting viewer keys for the side panel is a deliberate exposure change. Keys
+are wrapped with AES-GCM under a PBKDF2-SHA-256 key derived from an operator
+passphrase and stored in `localStorage`; the passphrase is never stored and
+unwrapped keys exist only in memory for the session. Every entry is decrypted
+at unlock so a wrong passphrase fails loudly instead of presenting an empty
+keyring that would then be overwritten. The relay still never receives a viewer
+key.
+
 ### Publishing several screens
 
 A publisher asked for more than one output opens one relay connection per

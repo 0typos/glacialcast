@@ -175,6 +175,25 @@ Open `http://127.0.0.1:8899`, select the stream, and enter the viewer key. The
 browser receives encrypted DASH objects from the relay and performs content
 authentication and decryption locally.
 
+## Watching several streams at once
+
+`/watch` shows up to four streams together. Pick a 1, 2, or 4 tile layout, drag
+a stream from the side panel into a tile — or press its **Watch** button, which
+does the same thing from a keyboard — and full-screen any tile on its own.
+Dropping a stream onto an occupied tile swaps the two, and shrinking the layout
+destroys the players it drops rather than leaving them decoding out of sight.
+
+The side panel lists the streams this browser holds a key for, which means the
+keys have to persist. They are kept in `localStorage` wrapped with AES-GCM under
+a key derived from a passphrase by PBKDF2-SHA-256, so the passphrase is asked
+for once per session and never stored. This is a real change in exposure over
+pasting a key per visit: a stolen browser profile yields ciphertext and a salt
+rather than nothing at all, and anyone who learns the passphrase and has that
+profile gets every stream in it. A wrong passphrase is reported rather than
+silently opening an empty keyring. **Forget all keys** clears the store.
+
+Viewer keys still never leave the page and are never sent to the relay.
+
 For a noninteractive transport test, publish the built-in pattern:
 
 ```sh

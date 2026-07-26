@@ -212,3 +212,18 @@ button.danger { color: var(--danger); background: transparent; }
   #enrollment-form { grid-template-columns: 1fr; }
   .actions { justify-content: start; }
 }
+
+.summary-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+/* Matches the adjacent refresh button so the two read as one control group. */
+.button-link {
+  display: inline-block;
+  padding: 0.45rem 0.9rem;
+  border: 1px solid currentcolor;
+  border-radius: 6px;
+  text-decoration: none;
+}

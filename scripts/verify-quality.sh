@@ -28,11 +28,13 @@ standard_checks() {
   run node scripts/test-viewer-core.mjs
   run node scripts/test-index-ui.mjs
   run node scripts/test-compare-frame.mjs
+  run node scripts/test-keyring.mjs
 }
 
 full_checks() {
   standard_checks
   run scripts/verify-dash-e2e.sh
+  run scripts/verify-multi-stream.sh
   run scripts/verify-ingest-recovery.sh
   run scripts/verify-internet-security.sh
   run scripts/verify-bandwidth.sh

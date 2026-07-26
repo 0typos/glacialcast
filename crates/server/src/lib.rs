@@ -203,7 +203,7 @@ impl Default for LimitsConfig {
         Self {
             max_http_in_flight: 128,
             max_websockets: 64,
-            max_websockets_per_principal: 4,
+            max_websockets_per_principal: 9,
             max_ingest_connections: 16,
             max_ingest_connections_per_ip: 4,
             login_attempts_per_minute: 10,
@@ -669,6 +669,7 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
         .route("/", get(index))
         .route("/login", get(login_page))
         .route("/dash/{stream_id}", get(dash_viewer))
+        .route("/watch", get(watch_viewer))
         .route("/favicon.ico", get(favicon))
         .route("/api/auth/login", post(login))
         .route("/api/auth/logout", post(logout))
@@ -713,6 +714,9 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
         .route("/assets/dash-viewer-core.js", get(dash_viewer_core_js))
         .route("/assets/dash-viewer.js", get(dash_viewer_js))
         .route("/assets/dash-viewer-page.js", get(dash_viewer_page_js))
+        .route("/assets/keyring.js", get(keyring_js))
+        .route("/assets/watch.js", get(watch_js))
+        .route("/assets/watch.css", get(watch_css))
         .with_state(state)
         .layer(DefaultBodyLimit::max(4096))
         .layer(TraceLayer::new_for_http())
@@ -885,6 +889,22 @@ async fn dash_viewer(
     )
 }
 
+/// Serves the multi-stream viewer.
+///
+/// The page itself carries no stream data: it lists what the relay authorizes
+/// this principal to see and unlocks each tile from the browser-held keyring,
+/// so no per-stream authorization decision is needed here beyond being signed
+/// in.
+async fn watch_viewer(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if request_identity(&state, &headers).is_err() {
+        return Redirect::to("/login").into_response();
+    }
+    static_response(
+        "text/html; charset=utf-8",
+        include_str!("../static/watch.html"),
+    )
+}
+
 async fn favicon() -> StatusCode {
     StatusCode::NO_CONTENT
 }
@@ -936,6 +956,27 @@ async fn dash_viewer_js() -> Response {
     static_response(
         "text/javascript; charset=utf-8",
         include_str!("../static/dash-viewer.js"),
+    )
+}
+
+async fn watch_js() -> Response {
+    static_response(
+        "text/javascript; charset=utf-8",
+        include_str!("../static/watch.js"),
+    )
+}
+
+async fn keyring_js() -> Response {
+    static_response(
+        "text/javascript; charset=utf-8",
+        include_str!("../static/keyring.js"),
+    )
+}
+
+async fn watch_css() -> Response {
+    static_response(
+        "text/css; charset=utf-8",
+        include_str!("../static/watch.css"),
     )
 }
 
