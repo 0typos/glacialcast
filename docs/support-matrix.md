@@ -32,7 +32,7 @@ an “implemented” row to “validated” based on compilation or synthetic ca
 | GNOME / Mutter | XDG Desktop Portal | Implemented; host evidence required | Pending target-host validation |
 | KDE Plasma / KWin | XDG Desktop Portal | Implemented; host evidence required | Pending target-host validation |
 | wlroots compositors | xdg-desktop-portal-wlr | Implemented; host evidence required | Pending target-host validation |
-| niri | Mutter-compatible ScreenCast path or configured portal | Cursor metadata and object transport validated on niri 26.04 with PipeWire 1.6.8 through the direct path | Pending pixel-correct Firefox/Chromium screenshot and hardware gate |
+| niri | Automatic selection uses niri's own Mutter-compatible ScreenCast interface; the configured portal remains available | Cursor metadata and object transport validated on niri 26.04 with PipeWire 1.6.8 | Validated for software encoding on NVIDIA: Firefox and Chromium decoded a frame that correlates 0.985 with the compositor's own screenshot of the captured output. VA-API hardware encoding remains pending representative hardware |
 
 ## Encoder matrix
 
@@ -40,6 +40,7 @@ an “implemented” row to “validated” based on compilation or synthetic ca
 | --- | --- | --- |
 | Intel VA-API | DMA-BUF import/VPP when exposed, CPU upload fallback | Pending representative hardware validation |
 | AMD VA-API | DMA-BUF import/VPP when exposed, CPU upload fallback | Pending representative hardware validation |
+| NVIDIA proprietary driver | No VA-API H.264 entry point, so software encoding after EGL DMA-BUF readback | Validated on a GeForce RTX 5070 under niri 26.04; `scripts/verify-wayland-video-hardware.sh` correctly fails closed because the driver exposes no VA-API encode entry point |
 | Other / unsupported VA-API | Dynamically loaded OpenH264 software encoder | Validated by deterministic integration gates |
 
 ## Release policy

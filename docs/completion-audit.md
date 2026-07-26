@@ -1,6 +1,6 @@
 # GlacialCast 0.5 Completion Audit
 
-Last updated: 2026-07-24.
+Last updated: 2026-07-26.
 
 ## Decision
 
@@ -11,21 +11,23 @@ version 0.5.0. Firefox and Chromium browser gates validate the live and
 portable viewers; the release policy requires rerunning that matrix for each
 candidate artifact.
 
-Real Wayland cursor metadata passed through niri 26.04's direct
-Mutter-compatible path with PipeWire 1.6.8. The gate emitted both encrypted
-media and independent cursor objects, but that object-level result is not
-pixel-correctness evidence. A later Firefox screenshot exposed unsafe
-NVIDIA DMA-BUF readback; GlacialCast now fails closed unless the buffer is
-explicitly linear and mappable or GBM supplies a driver-backed linear copy.
-NVIDIA visual acceptance, VA-API/DMA-BUF acceptance, and the other compositor
-families remain host-dependent gates. The repository contains strict scripts
+Real Wayland capture is now validated end to end on niri 26.04 with PipeWire
+1.6.8 and an NVIDIA GeForce RTX 5070. The compositor offers only block-linear
+DMA-BUFs there and refuses to allocate shared memory once a modifier is
+negotiated, while the proprietary driver never maps a foreign buffer object
+through GBM. Importing the descriptor as an `EGLImage` and reading the
+framebuffer back resolves the tiling, and both Firefox and Chromium decoded a
+frame that correlates 0.985 with the compositor's own screenshot of the same
+output. GlacialCast still fails closed when neither driver-backed readback path
+is available. VA-API acceptance and the GNOME, KDE, and wlroots compositor
+families remain host-dependent gates; the repository contains strict scripts
 for running them in a suitable compositor session.
 
 ## Requirement Evidence
 
 | Requirement | Evidence | Status |
 | --- | --- | --- |
-| Wayland capture | Native XDG Desktop Portal/PipeWire capture supports monitor/window selection; niri's Mutter-compatible API is an alternative backend. Capture and buffer negotiation have focused unit coverage, and the direct niri object/cursor gate passed on niri 26.04 with PipeWire 1.6.8. A browser screenshot gate now covers the separate pixel-layout acceptance step. | Cursor/transport verified on niri direct path; NVIDIA picture and other compositor gates pending |
+| Wayland capture | Native XDG Desktop Portal/PipeWire capture supports monitor/window selection; automatic backend selection uses niri's Mutter-compatible API under niri and the portal elsewhere. Capture and buffer negotiation have focused unit coverage; the niri object/cursor gate and the browser screenshot gate both passed on niri 26.04 with PipeWire 1.6.8, and the decoded picture matched the compositor's own screenshot. | Verified on niri with NVIDIA software encoding; GNOME, KDE, and wlroots gates pending |
 | Very low video cadence | `--fps` accepts 0.5 through 15 and defaults to 1. PipeWire damage accumulates across throttled callbacks and a CPU-frame fingerprint remains authoritative when available; both suppress unchanged samples without dropping intervening changes. A bounded idle heartbeat preserves timeline progress. Static, typing, scroll, and motion profiles have separate traffic ceilings. | Verified |
 | Low live latency | `scripts/verify-dash-e2e.sh` rejects periodic capture-to-durable-relay acknowledgement above 250 ms. The 0.5 acceptance maximum was 10 ms. The browser gate rejects live announcement-to-MSE-append above 250 ms; the 0.5 live results were 18 ms in Firefox and 9 ms in Chromium. | Verified under local synthetic conditions |
 | Independent cursor | Video and cursor timers are separate. Cursor batches flush every 200 ms and carry their own media timestamps. Live and offline Firefox/Chromium gates require the overlay to paint, move independently, hide, and reappear. The direct niri gate emitted independent cursor objects. | Verified synthetically and on niri 26.04 |
@@ -44,7 +46,7 @@ for running them in a suitable compositor session.
 | Offline browser playback | Copied objects decoded and painted in both Firefox and Chromium across six capture epochs. The 0.5 append results were 18 ms and 6 ms respectively after offline file announcements. | Verified |
 | Authenticated HTTPS playback | A real Caddy TLS proxy, login flow, secure session cookie, scoped stream API, live WebSocket, CENC playback, and cursor paint/move/hide/restore passed in Firefox and Chromium. The 0.5 live append results were 9 ms and 4 ms respectively. | Verified |
 | Intel/AMD hardware path | The direct VA-API encoder and PipeWire DMA-BUF import/VPP conversion are implemented; buffer leases remain held until conversion synchronizes. | Unit/build verified; hardware gate pending |
-| Software fallback | Auto mode falls back to dynamically loaded OpenH264; no FFmpeg/GStreamer runtime is present. The complete synthetic gate uses this path. Non-linear compositor DMA-BUFs require driver-backed GBM readback before software encoding and fail closed if that readback is unavailable. | Verified synthetically; target-GPU picture validation pending |
+| Software fallback | Auto mode falls back to dynamically loaded OpenH264; no FFmpeg/GStreamer runtime is present. The complete synthetic gate uses this path. Non-linear compositor DMA-BUFs require driver-backed readback before software encoding — `gbm_bo_map` first, then an EGL import read back through OpenGL ES — and fail closed when neither is available. | Verified synthetically and on NVIDIA under niri |
 | Operator diagnostics | The administrator dashboard reports rolling media/cursor ingress, connection and HTTP health, retention limits, per-stream activity/sequence state, and managed-viewer count without exposing credentials or content keys. | Verified |
 | Release artifacts | A deterministic Linux archive includes exact-version binaries, deployment examples, operator documentation, an SPDX 2.3 SBOM, and SHA-256 checksum. The gate rebuilds in two independent target directories, compares digests, validates source/dirty-tree provenance and contents, and checks the systemd unit. The compiler, CI tools, and Actions are pinned. Release automation requires the full deterministic and Firefox/Chromium gates before packaging. Optional Minisign signing and backup/upgrade/rollback procedures are documented. | Verified |
 | Focused dependencies | The runtime has no MediaMTX, FFmpeg, GStreamer, WebRTC, dash.js, or bincode dependency. Protocol envelopes use Postcard and opaque media is not re-encoded by the relay. | Verified |
