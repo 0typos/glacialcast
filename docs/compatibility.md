@@ -54,7 +54,7 @@ route, authorization rule, or configuration default is incompatible.
 
 ## Golden vectors and fuzzing
 
-[`test-vectors/protocol-v5.json`](../test-vectors/protocol-v5.json) fixes the
+[`test-vectors/protocol-v6.json`](../test-vectors/protocol-v6.json) fixes the
 derived keys and exact portable bytes for deterministic test inputs. The
 workspace test decodes and authenticates it on every normal test run.
 

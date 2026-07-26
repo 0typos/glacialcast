@@ -7,6 +7,8 @@
 //! verification, and changing a principal's credentials or scope changes its
 //! session version.
 
+use crate::IDENTITY_LABEL_SEPARATOR;
+
 use anyhow::{Context, Result, bail};
 use axum::http::{HeaderMap, header};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -97,8 +99,23 @@ pub struct Principal {
 }
 
 impl Principal {
+    /// Reports whether this principal may view a stream published under
+    /// `publisher`.
+    ///
+    /// A publisher capturing several outputs registers each as
+    /// `<principal>:<label>`, so a scope naming the principal authorizes all of
+    /// its outputs. Matching stops at the first separator rather than using a
+    /// prefix test, so a scope of `desk` never authorizes `desk-other`.
     pub fn can_view_publisher(&self, publisher: &str) -> bool {
-        self.role == AccessRole::Admin || self.all_publishers || self.publishers.contains(publisher)
+        if self.role == AccessRole::Admin || self.all_publishers {
+            return true;
+        }
+        if self.publishers.contains(publisher) {
+            return true;
+        }
+        publisher
+            .split_once(IDENTITY_LABEL_SEPARATOR)
+            .is_some_and(|(principal, _)| self.publishers.contains(principal))
     }
 
     pub fn is_admin(&self) -> bool {
@@ -1089,6 +1106,15 @@ mod tests {
         let viewer = access.authenticate_token(TOKEN).unwrap();
         assert!(viewer.can_view_publisher("workstation"));
         assert!(!viewer.can_view_publisher("other"));
+        // A publisher casting several screens registers one stream per output
+        // as `<principal>:<label>`, and the principal's scope covers them all.
+        assert!(viewer.can_view_publisher("workstation:DP-1"));
+        assert!(viewer.can_view_publisher("workstation:HDMI-A-1"));
+        // Matching stops at the separator: a neighbouring principal whose name
+        // merely starts with the scope must stay out of reach.
+        assert!(!viewer.can_view_publisher("workstation-other"));
+        assert!(!viewer.can_view_publisher("workstation-other:DP-1"));
+        assert!(!viewer.can_view_publisher("other:workstation"));
         assert!(!viewer.is_admin());
         assert_eq!(
             access

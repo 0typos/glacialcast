@@ -211,6 +211,26 @@ either interface with `--screencast-backend portal` or
   --monitor-name DP-3
 ```
 
+Cast several screens at once with a repeated `--monitor-name`, or all of them
+with `--all-monitors`:
+
+```sh
+./target/release/glacialcast-client --config client.toml --list-monitors
+./target/release/glacialcast-client --config client.toml --all-monitors
+```
+
+Each screen becomes its own stream, published over its own relay connection and
+named `<display name> (<connector>)`, so viewers can watch one screen or
+several. They all share the one viewer key. Selecting several screens needs the
+compositor's ScreenCast interface, so it is available under niri; the portal
+chooses its own sources in its dialog.
+
+Publishing more than one screen labels each stream's durable relay identity as
+`<publisher>:<connector>`. A publisher that casts a single screen keeps the
+bare identity, so an existing single-screen deployment recovers exactly the
+stream it had before. Viewer access scopes still name the publisher and cover
+all of its screens.
+
 The portal grants a session to a specific process, so a portal-backed publisher
 must be started from the desktop session and answered once per start.
 `deploy/glacialcast-publisher.service` is a user unit that starts the publisher

@@ -31,7 +31,7 @@ pub mod daemon;
 pub mod transfer;
 
 /// Publisher/relay message schema version.
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 /// Absolute maximum serialized message size accepted by [`NoiseSocket`].
 pub const MAX_FRAME_LEN: usize = 32 * 1024 * 1024;
 const MAX_WIRE_PACKET_LEN: usize = 65_535;
@@ -115,6 +115,14 @@ pub struct StreamHello {
     pub display_name: String,
     /// Public capture-source metadata.
     pub source: CaptureSource,
+    /// Distinguishes several streams published by one authenticated client.
+    ///
+    /// A publisher capturing more than one output opens one connection per
+    /// output and labels each with its connector name. The relay appends the
+    /// label to the authenticated principal to form the durable stream
+    /// identity, so the outputs do not collide on a single stream record.
+    /// `None` keeps the historical single-stream identity.
+    pub source_label: Option<String>,
     /// Lowest object sequence still available for retransmission.
     pub resend_low: Option<u64>,
     /// Highest object sequence still available for retransmission.
@@ -1037,7 +1045,7 @@ mod tests {
     #[test]
     fn protocol_golden_vector_is_stable_and_decodable() {
         let vector: serde_json::Value =
-            serde_json::from_str(include_str!("../../../test-vectors/protocol-v5.json")).unwrap();
+            serde_json::from_str(include_str!("../../../test-vectors/protocol-v6.json")).unwrap();
         let string = |field: &str| vector[field].as_str().unwrap();
         let viewer_key: [u8; 32] = URL_SAFE_NO_PAD
             .decode(string("viewer_key_b64"))

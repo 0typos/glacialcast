@@ -1890,10 +1890,49 @@ async fn authenticate_hello(state: &AppState, hello: &StreamHello) -> Result<Aut
         anyhow::bail!("resend range is inverted");
     }
 
-    let identity = state
+    let principal = state
         .auth
         .authenticate(hello.auth_token.as_deref(), &hello.client_id)?;
+    let identity = match hello.source_label.as_deref() {
+        Some(label) => format!(
+            "{principal}{IDENTITY_LABEL_SEPARATOR}{}",
+            validate_source_label(label)?
+        ),
+        None => principal,
+    };
     Ok(AuthenticatedClient { identity })
+}
+
+/// Separates the authenticated principal from a publisher-chosen output label.
+///
+/// Viewer scopes are matched against the principal alone, so this character
+/// must never appear inside either half.
+pub(crate) const IDENTITY_LABEL_SEPARATOR: char = ':';
+
+/// The longest accepted per-output label.
+const MAX_SOURCE_LABEL_LEN: usize = 64;
+
+/// Validates a publisher-supplied output label.
+///
+/// The label is concatenated onto an authenticated principal to build the
+/// durable stream identity, so a label containing the separator would let one
+/// publisher impersonate another principal's stream. Only unreserved ASCII is
+/// accepted for the same reason.
+fn validate_source_label(label: &str) -> Result<&str> {
+    if label.is_empty() || label.len() > MAX_SOURCE_LABEL_LEN {
+        anyhow::bail!("source label must contain 1 to {MAX_SOURCE_LABEL_LEN} bytes");
+    }
+    // No '.' and no separator: the label is concatenated onto an
+    // authenticated principal, and keeping it free of both path syntax and the
+    // separator means it can never forge another principal's identity nor be
+    // mistaken for a path component by anything downstream.
+    if !label
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        anyhow::bail!("source label may only contain ASCII letters, digits, '-', and '_'");
+    }
+    Ok(label)
 }
 
 fn hash_token(token: &str) -> [u8; 32] {
@@ -1913,6 +1952,22 @@ mod tests {
                 previous_tokens: Vec::new(),
             }],
         }
+    }
+
+    #[test]
+    fn source_labels_cannot_forge_another_principal() {
+        assert_eq!(validate_source_label("DP-1").unwrap(), "DP-1");
+        assert_eq!(validate_source_label("HDMI-A-1").unwrap(), "HDMI-A-1");
+        // The durable identity is `<principal>:<label>` and viewer scopes match
+        // on the part before the separator, so a label carrying one would let
+        // this publisher register under a principal it never authenticated as.
+        assert!(validate_source_label("a:admin").is_err());
+        assert!(validate_source_label("../secrets").is_err());
+        assert!(validate_source_label("with space").is_err());
+        assert!(validate_source_label("new\nline").is_err());
+        assert!(validate_source_label("").is_err());
+        assert!(validate_source_label(&"x".repeat(65)).is_err());
+        assert!(validate_source_label(&"x".repeat(64)).is_ok());
     }
 
     #[test]

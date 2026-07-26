@@ -21,7 +21,8 @@ The MVP is complete when all of the following are true:
    already-connected viewer within 250 milliseconds under local test
    conditions.
 3. Cursor position, visibility, hotspot, and bitmap changes are carried
-   independently of video at up to 30 updates per second.
+   independently of video at up to 60 updates per second, bounded in practice
+   by the rate the compositor delivers cursor metadata.
 4. The client produces an MPEG-DASH presentation made from fragmented MP4 H.264
    media. Every segment begins at a decodable random-access point.
 5. Media samples use MPEG Common Encryption (`cenc`). The relay never receives
@@ -110,8 +111,10 @@ predicted sample and emitted on the bounded idle heartbeat. If content changes
 while such a sample is pending, the client publishes the completed idle span
 before immediately publishing the changed frame. This keeps retained history
 continuous without resending static pixels every video tick. Independent live
-cursor rendering always uses the newest cursor event and does not wait for the
-media clock.
+cursor rendering does not wait for the media clock. Samples arrive batched, so
+the viewer paces them against a wall clock a fixed distance behind the newest
+sample rather than rendering only the newest of each batch, which would reduce
+the cursor to the publisher's flush rate.
 
 The relay may assemble four published fragments into one retained `.m4s`
 object without delaying live notification. Segment timeline duration spans
@@ -299,6 +302,26 @@ the EGL context is created on, and stays bound to, the PipeWire loop thread.
 Whichever path fails first is latched off so an unsupported path is not retried
 once per frame. Raw `mmap` is limited to explicitly linear, mappable DMA-BUFs so
 tiled GPU memory cannot be mistaken for a linear image.
+
+### Publishing several screens
+
+A publisher asked for more than one output opens one relay connection per
+output, each on its own thread with its own encoder: the VA-API encoder holds
+thread-affine handles, and separate threads also keep one slow encode from
+delaying another screen's cadence. A fatal error on any output shuts the whole
+publisher down rather than leaving a daemon serving only some of the screens
+the operator asked for.
+
+The relay keys durable streams on the authenticated publisher identity, so
+several outputs under one ingest token would otherwise collide on a single
+stream record. `StreamHello` therefore carries an optional `source_label`, and
+the relay forms the identity as `<principal>:<label>`. The label is restricted
+to ASCII letters, digits, `-`, and `_`: it is concatenated onto an
+authenticated principal, so a label containing the separator would let a
+publisher register under a principal it never authenticated as. Viewer scopes
+match the principal up to the first separator, which authorizes every screen a
+publisher casts without authorizing a different publisher whose name merely
+shares a prefix.
 
 ## Compatibility Matrix
 

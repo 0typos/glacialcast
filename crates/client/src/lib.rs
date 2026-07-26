@@ -151,7 +151,11 @@ struct Args {
     #[arg(long, value_enum, default_value_t = ScreenCastBackend::Auto)]
     screencast_backend: ScreenCastBackend,
     #[arg(long)]
-    monitor_name: Option<String>,
+    monitor_name: Vec<String>,
+    #[arg(long, conflicts_with = "monitor_name")]
+    all_monitors: bool,
+    #[arg(long)]
+    list_monitors: bool,
     #[arg(long, value_enum, default_value_t = PortalCursorMode::Auto)]
     portal_cursor: PortalCursorMode,
     #[arg(long)]
@@ -209,6 +213,17 @@ struct ClientConfig {
     viewer_key_b64: Option<String>,
     display_name: Option<String>,
     viewer_url: Option<String>,
+}
+
+/// Identifies one published stream to the relay.
+///
+/// A publisher casting several screens shares one client identity across them
+/// and distinguishes each stream by its label.
+#[derive(Clone, Copy)]
+struct StreamIdentity<'a> {
+    client: &'a ClientIdentity,
+    /// Per-output label, or `None` when this process publishes one stream.
+    label: Option<&'a str>,
 }
 
 struct ClientIdentity {
@@ -301,6 +316,14 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
+    if args.list_monitors {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("building monitor listing runtime")?;
+        return runtime.block_on(print_monitor_list(&args));
+    }
+
     if args.daemon_stop || args.daemon_status {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -377,7 +400,8 @@ fn print_sharing_summary(
     println!();
     println!(
         "Share the viewer key over a secure out-of-band channel. It is stable across\n\
-         restarts, and anyone who has it can watch this stream; the relay cannot."
+         restarts, and one key unlocks every screen this publisher casts; the relay\n\
+         cannot decrypt any of them."
     );
 }
 
@@ -417,24 +441,188 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
         });
     }
 
-    let mut capture: Box<dyn Capture> = match args.capture {
-        CaptureMode::DashTest => Box::new(TestPatternCapture::new(
-            args.width,
-            args.height,
-            args.test_pattern,
-        )),
-        CaptureMode::DashWayland => Box::new(WaylandPipewireCapture::new(&args)),
-    };
-    let mut resend = DashResendBuffer::new(args.resend_bytes);
-    run_dash_client(
-        &args,
-        &identity,
-        &viewer_key,
-        capture.as_mut(),
-        &mut resend,
-        shutdown_rx,
-    )
+    let targets = resolve_publish_targets(&args).await?;
+    info!(
+        streams = targets.len(),
+        labels = ?targets.iter().map(|target| target.label.as_deref()).collect::<Vec<_>>(),
+        "publishing capture targets"
+    );
+
+    // Each target runs on its own thread with its own current-thread runtime.
+    // The VA-API encoder holds thread-affine handles and is deliberately not
+    // `Send`, and giving every stream its own encoder thread also keeps one
+    // slow encode from delaying another output's cadence.
+    let args = Arc::new(args);
+    let identity = Arc::new(identity);
+    let mut publishers = Vec::new();
+    for target in targets {
+        let args = Arc::clone(&args);
+        let identity = Arc::clone(&identity);
+        let shutdown_rx = shutdown_rx.clone();
+        let shutdown_tx = shutdown_tx.clone();
+        let name = target
+            .label
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        let handle = std::thread::Builder::new()
+            .name(format!("glacialcast-publish-{name}"))
+            .spawn(move || -> Result<()> {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("building publisher runtime")?;
+                let result = runtime.block_on(async {
+                    let mut capture: Box<dyn Capture> = match args.capture {
+                        CaptureMode::DashTest => Box::new(TestPatternCapture::new(
+                            args.width,
+                            args.height,
+                            args.test_pattern,
+                        )),
+                        CaptureMode::DashWayland => {
+                            Box::new(WaylandPipewireCapture::new(&args, &target))
+                        }
+                    };
+                    let mut resend = DashResendBuffer::new(args.resend_bytes);
+                    run_dash_client(
+                        &args,
+                        StreamIdentity {
+                            client: &identity,
+                            label: target.label.as_deref(),
+                        },
+                        &viewer_key,
+                        capture.as_mut(),
+                        &mut resend,
+                        shutdown_rx,
+                    )
+                    .await
+                });
+                // A fatal error on one output must stop the whole publisher
+                // rather than leave a daemon serving only some of the screens
+                // the operator asked for.
+                if result.is_err() {
+                    let _ = shutdown_tx.send(true);
+                }
+                result.with_context(|| format!("publishing capture target {name}"))
+            })
+            .context("spawning publisher thread")?;
+        publishers.push(handle);
+    }
+
+    let results = tokio::task::spawn_blocking(move || {
+        publishers
+            .into_iter()
+            .map(|handle| match handle.join() {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!("publisher thread panicked")),
+            })
+            .collect::<Vec<_>>()
+    })
     .await
+    .context("joining publisher threads")?;
+
+    let mut first_error = None;
+    for result in results {
+        if let Err(err) = result {
+            warn!(error = %format!("{err:#}"), "capture publisher stopped with an error");
+            if first_error.is_none() {
+                first_error = Some(err);
+            }
+        }
+    }
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// One capture source this process publishes as its own stream.
+struct PublishTarget {
+    /// Per-output label appended to the durable relay identity, or `None` when
+    /// this process publishes a single stream under the bare identity.
+    label: Option<String>,
+    /// The interface that opens this target.
+    backend: ScreenCastBackend,
+    /// Monitor connector for the Mutter interface; the portal chooser decides
+    /// its own source, so this is `None` there.
+    connector: Option<String>,
+}
+
+/// Resolves which sources this process will publish.
+///
+/// A single target keeps the historical unlabelled identity so existing
+/// deployments recover the same relay stream. Publishing several outputs
+/// labels each one, because the relay keys durable streams on that identity and
+/// unlabelled outputs would collide on a single record.
+async fn resolve_publish_targets(args: &Args) -> Result<Vec<PublishTarget>> {
+    if args.capture != CaptureMode::DashWayland {
+        return Ok(vec![PublishTarget {
+            label: None,
+            backend: args.screencast_backend,
+            connector: None,
+        }]);
+    }
+    let backend = match args.screencast_backend {
+        ScreenCastBackend::Auto => resolve_screencast_backend(args.portal_source).await,
+        selected => selected,
+    };
+    if backend != ScreenCastBackend::Mutter {
+        if args.all_monitors || args.monitor_name.len() > 1 {
+            bail!(
+                "selecting several monitors needs the compositor's ScreenCast interface; \
+                 the desktop portal chooses its own sources in its dialog"
+            );
+        }
+        return Ok(vec![PublishTarget {
+            label: None,
+            backend,
+            connector: args.monitor_name.first().cloned(),
+        }]);
+    }
+
+    let connectors = if args.all_monitors {
+        let connection = Connection::session().await?;
+        let all = list_mutter_connectors(&connection).await?;
+        if all.is_empty() {
+            bail!("--all-monitors found no connected monitor to record");
+        }
+        all
+    } else if args.monitor_name.is_empty() {
+        let connection = Connection::session().await?;
+        vec![default_mutter_connector(&connection).await?]
+    } else {
+        args.monitor_name.clone()
+    };
+
+    let labelled = connectors.len() > 1;
+    Ok(connectors
+        .into_iter()
+        .map(|connector| PublishTarget {
+            label: labelled.then(|| sanitize_source_label(&connector)),
+            backend,
+            connector: Some(connector),
+        })
+        .collect())
+}
+
+/// Reduces a connector name to the characters the relay accepts in a label.
+fn sanitize_source_label(connector: &str) -> String {
+    let label: String = connector
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .take(64)
+        .collect();
+    let label = label.trim_matches('-').to_string();
+    if label.is_empty() {
+        "output".to_string()
+    } else {
+        label
+    }
 }
 
 async fn sleep_or_shutdown(duration: Duration, shutdown_rx: &mut watch::Receiver<bool>) -> bool {
@@ -446,7 +634,7 @@ async fn sleep_or_shutdown(duration: Duration, shutdown_rx: &mut watch::Receiver
 
 async fn run_dash_client(
     args: &Args,
-    identity: &ClientIdentity,
+    identity: StreamIdentity<'_>,
     viewer_key: &[u8; 32],
     capture: &mut dyn Capture,
     resend: &mut DashResendBuffer,
@@ -531,7 +719,7 @@ fn is_fatal_dash_error(err: &anyhow::Error) -> bool {
 
 async fn run_dash_connection(
     args: &Args,
-    identity: &ClientIdentity,
+    identity: StreamIdentity<'_>,
     viewer_key: &[u8; 32],
     source: &CaptureSource,
     capture: &mut dyn Capture,
@@ -541,7 +729,7 @@ async fn run_dash_connection(
     if args.segment_frames == 0 {
         bail!("--segment-frames must be at least 1");
     }
-    let ingest_server_key = identity.ingest_server_key.as_ref().context(
+    let ingest_server_key = identity.client.ingest_server_key.as_ref().context(
         "ingest server key is required; pass --ingest-server-key or set ingest_server_key in client.toml",
     )?;
     let mut stream = timeout(
@@ -562,10 +750,16 @@ async fn run_dash_connection(
     socket
         .write(&ClientMessage::Hello(StreamHello {
             protocol_version: PROTOCOL_VERSION,
-            client_id: identity.client_id.clone(),
-            auth_token: identity.auth_token.clone(),
-            display_name: identity.display_name.clone(),
+            client_id: identity.client.client_id.clone(),
+            auth_token: identity.client.auth_token.clone(),
+            // A publisher casting several screens shows one entry per screen
+            // in the viewer, so the label has to reach the name a viewer reads.
+            display_name: match identity.label {
+                Some(label) => format!("{} ({label})", identity.client.display_name),
+                None => identity.client.display_name.clone(),
+            },
             source: source.clone(),
+            source_label: identity.label.map(str::to_string),
             resend_low: low,
             resend_high: high,
         }))
@@ -1869,13 +2063,13 @@ struct WaylandPipewireCapture {
 }
 
 impl WaylandPipewireCapture {
-    fn new(args: &Args) -> Self {
+    fn new(args: &Args, target: &PublishTarget) -> Self {
         Self {
             fps: args.fps,
             cursor_hz: args.cursor_hz,
             portal_source: args.portal_source,
-            screencast_backend: args.screencast_backend,
-            monitor_name: args.monitor_name.clone(),
+            screencast_backend: target.backend,
+            monitor_name: target.connector.clone(),
             portal_cursor: args.portal_cursor,
             require_cursor_metadata: args.require_cursor_metadata,
             prefer_dmabuf: args.capture == CaptureMode::DashWayland
@@ -2958,18 +3152,7 @@ type MutterCurrentState = (
 /// then the first physical output. Selecting explicitly with `--monitor-name`
 /// is still the only way to guarantee a particular output across replugs.
 async fn default_mutter_connector(connection: &Connection) -> Result<String> {
-    let proxy = Proxy::new(
-        connection,
-        "org.gnome.Mutter.DisplayConfig",
-        "/org/gnome/Mutter/DisplayConfig",
-        "org.gnome.Mutter.DisplayConfig",
-    )
-    .await
-    .context("connecting to the compositor display configuration")?;
-    let (_, monitors, logical_monitors, _): MutterCurrentState = proxy
-        .call("GetCurrentState", &())
-        .await
-        .context("reading the compositor display configuration")?;
+    let (monitors, logical_monitors) = read_mutter_display_state(connection).await?;
     let from_logical = logical_monitors
         .iter()
         .find(|logical| logical.4)
@@ -2985,6 +3168,86 @@ async fn default_mutter_connector(connection: &Connection) -> Result<String> {
         "selected a monitor to record; pass --monitor-name to choose another"
     );
     Ok(connector)
+}
+
+/// Reads the compositor's monitor and layout tables.
+async fn read_mutter_display_state(
+    connection: &Connection,
+) -> Result<(Vec<MutterMonitor>, Vec<MutterLogicalMonitor>)> {
+    let proxy = Proxy::new(
+        connection,
+        "org.gnome.Mutter.DisplayConfig",
+        "/org/gnome/Mutter/DisplayConfig",
+        "org.gnome.Mutter.DisplayConfig",
+    )
+    .await
+    .context("connecting to the compositor display configuration")?;
+    let (_, monitors, logical_monitors, _): MutterCurrentState = proxy
+        .call("GetCurrentState", &())
+        .await
+        .context("reading the compositor display configuration")?;
+    Ok((monitors, logical_monitors))
+}
+
+/// Lists every laid-out monitor connector, primary output first.
+async fn list_mutter_connectors(connection: &Connection) -> Result<Vec<String>> {
+    let (monitors, logical_monitors) = read_mutter_display_state(connection).await?;
+    // Only laid-out outputs can be recorded; a connected but disabled monitor
+    // appears in `monitors` without a logical monitor.
+    let mut connectors: Vec<String> = logical_monitors
+        .iter()
+        .flat_map(|logical| logical.5.iter().map(|spec| spec.0.clone()))
+        .collect();
+    if let Some(primary) = logical_monitors
+        .iter()
+        .find(|logical| logical.4)
+        .and_then(|logical| logical.5.first())
+        .map(|spec| spec.0.clone())
+        && let Some(index) = connectors.iter().position(|entry| *entry == primary)
+    {
+        connectors.swap(0, index);
+    }
+    if connectors.is_empty() {
+        connectors.extend(monitors.iter().map(|monitor| monitor.0.0.clone()));
+    }
+    connectors.dedup();
+    Ok(connectors)
+}
+
+/// Prints the recordable monitors for `--list-monitors`.
+async fn print_monitor_list(args: &Args) -> Result<()> {
+    let backend = match args.screencast_backend {
+        ScreenCastBackend::Auto => resolve_screencast_backend(args.portal_source).await,
+        selected => selected,
+    };
+    if backend != ScreenCastBackend::Mutter {
+        println!(
+            "This desktop selects capture sources in its portal dialog, so there is no list \
+             to print. Start the publisher and choose there."
+        );
+        return Ok(());
+    }
+    let connection = Connection::session().await?;
+    let (monitors, logical_monitors) = read_mutter_display_state(&connection).await?;
+    let primary = logical_monitors
+        .iter()
+        .find(|logical| logical.4)
+        .and_then(|logical| logical.5.first())
+        .map(|spec| spec.0.clone());
+    for connector in list_mutter_connectors(&connection).await? {
+        let described = monitors
+            .iter()
+            .find(|monitor| monitor.0.0 == connector)
+            .map(|monitor| format!("{} {}", monitor.0.1, monitor.0.2))
+            .unwrap_or_default();
+        let marker = if primary.as_deref() == Some(connector.as_str()) {
+            " (primary)"
+        } else {
+            ""
+        };
+        println!("{connector}\t{described}{marker}");
+    }
+    Ok(())
 }
 
 /// Returns the advertised Mutter ScreenCast interface version.
@@ -5965,7 +6228,10 @@ mod tests {
             let mut resend = DashResendBuffer::new(1024);
             let publisher = run_dash_client(
                 &args,
-                &identity,
+                StreamIdentity {
+                    client: &identity,
+                    label: None,
+                },
                 &[7u8; 32],
                 &mut capture,
                 &mut resend,
@@ -6244,6 +6510,19 @@ mod tests {
             meter.record(start + CAPTURE_RATE_WINDOW + Duration::from_secs(1), true),
             None
         );
+    }
+
+    #[test]
+    fn source_labels_are_reduced_to_relay_safe_characters() {
+        assert_eq!(sanitize_source_label("DP-3"), "DP-3");
+        assert_eq!(sanitize_source_label("HDMI-A-1"), "HDMI-A-1");
+        // The relay splits the durable identity on the first colon, so a
+        // connector containing one must never survive into a label.
+        assert_eq!(sanitize_source_label("desk:evil"), "desk-evil");
+        assert_eq!(sanitize_source_label("../../etc"), "etc");
+        assert_eq!(sanitize_source_label(""), "output");
+        assert_eq!(sanitize_source_label("---"), "output");
+        assert!(sanitize_source_label(&"x".repeat(200)).len() <= 64);
     }
 
     #[test]
