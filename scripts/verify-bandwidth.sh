@@ -108,7 +108,6 @@ target/debug/glacialcast-client \
   --width 1280 \
   --height 720 \
   --fps 1 \
-  --cursor-hz 30 \
   --video-bitrate 250000 \
   --segment-frames 4 \
   >"${client_log}" 2>&1 &
@@ -185,7 +184,7 @@ const mediaPerMinute = Math.ceil(mediaBytes * scale);
 const cursorPerMinute = Math.ceil(cursorBytes * scale);
 const totalPerMinute = Math.ceil((mediaBytes + cursorBytes + otherBytes) * scale);
 const result = {
-  profile: `${profile}-pattern-1280x720-1fps-30hz-250kbps`,
+  profile: `${profile}-pattern-1280x720-1fps-default-cursor-250kbps`,
   sample_seconds: seconds,
   media_bytes_per_minute: mediaPerMinute,
   cursor_bytes_per_minute: cursorPerMinute,

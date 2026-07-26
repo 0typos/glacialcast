@@ -168,8 +168,10 @@ struct Args {
     fps: f64,
     #[arg(long, value_parser = parse_idle_heartbeat_seconds, default_value_t = 10)]
     idle_heartbeat_seconds: u64,
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 60)]
     cursor_hz: u64,
+    #[arg(long, value_parser = parse_cursor_flush_ms, default_value_t = 100)]
+    cursor_flush_ms: u64,
     #[arg(long, default_value_t = 250_000)]
     video_bitrate: u32,
     #[arg(long, default_value_t = DEFAULT_SEGMENT_FRAMES)]
@@ -728,7 +730,8 @@ async fn run_dash_connection(
     let cursor_interval = Duration::from_secs_f64(1.0 / args.cursor_hz.max(1) as f64);
     let mut cursor_tick = tokio::time::interval(cursor_interval);
     cursor_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut cursor_flush_tick = tokio::time::interval(Duration::from_millis(200));
+    let mut cursor_flush_tick =
+        tokio::time::interval(Duration::from_millis(args.cursor_flush_ms.max(1)));
     cursor_flush_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut media_index = 1u64;
     let heartbeat_ticks = args
@@ -1618,6 +1621,21 @@ fn parse_update_rate(value: &str) -> std::result::Result<f64, String> {
     Ok(fps)
 }
 
+/// Parses the cursor batch flush interval in milliseconds.
+///
+/// The lower bound keeps a publisher from turning every cursor sample into its
+/// own relay object, and the upper bound keeps live cursor latency bounded.
+fn parse_cursor_flush_ms(value: &str) -> std::result::Result<u64, String> {
+    let milliseconds = value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| format!("invalid cursor flush interval {value:?}"))?;
+    if !(20..=1000).contains(&milliseconds) {
+        return Err("cursor flush interval must be between 20 and 1000 milliseconds".to_string());
+    }
+    Ok(milliseconds)
+}
+
 fn parse_idle_heartbeat_seconds(value: &str) -> std::result::Result<u64, String> {
     let seconds = value
         .trim()
@@ -2301,16 +2319,31 @@ fn maybe_emit_pipewire_cursor(
             return false;
         }
     }
-    if let Some(sample) = pipewire_cursor_sample(
+    let sample = pipewire_cursor_sample(
         buffer,
         source_width,
         source_height,
         &mut user_data.cursor_serial,
         &mut user_data.last_cursor_state,
-    ) {
+    );
+    let changed = sample.is_some();
+    if let Some(sample) = sample {
         let _ = user_data.cursor_latest.send(Some(sample));
     }
+    report_capture_rate(&mut user_data.rate_meter, changed, "PipeWire");
     true
+}
+
+/// Emits the periodic capture-rate line for one delivered buffer.
+fn report_capture_rate(meter: &mut CaptureRateMeter, cursor_changed: bool, label: &str) {
+    if let Some((buffer_hz, cursor_hz)) = meter.record(Instant::now(), cursor_changed) {
+        debug!(
+            label,
+            buffer_hz = format!("{buffer_hz:.1}"),
+            cursor_hz = format!("{cursor_hz:.1}"),
+            "compositor capture rate"
+        );
+    }
 }
 
 fn maybe_emit_pipewire_video_cursor(
@@ -2339,15 +2372,18 @@ fn maybe_emit_pipewire_video_cursor(
             return false;
         }
     }
-    if let Some(sample) = pipewire_cursor_sample(
+    let sample = pipewire_cursor_sample(
         buffer,
         source_width,
         source_height,
         &mut user_data.cursor_serial,
         &mut user_data.last_cursor_state,
-    ) {
+    );
+    let changed = sample.is_some();
+    if let Some(sample) = sample {
         let _ = user_data.cursor_latest.send(Some(sample));
     }
+    report_capture_rate(&mut user_data.rate_meter, changed, "PipeWire video");
     true
 }
 
@@ -3421,6 +3457,7 @@ fn run_pipewire_loop(
         gpu_readback: GpuReadback::new(gpu_device),
         unmapped_buffer_logged: false,
         cursor_meta_logged: false,
+        rate_meter: CaptureRateMeter::new(Instant::now()),
         serial: 0,
         cursor_serial: 0,
     };
@@ -3801,6 +3838,7 @@ fn run_pipewire_video_loop(
         mainloop_ptr,
         first_frame_logged: false,
         cursor_meta_logged: false,
+        rate_meter: CaptureRateMeter::new(Instant::now()),
         serial: 0,
         cursor_serial: 0,
     };
@@ -4263,6 +4301,19 @@ fn build_exact_cpu_pipewire_format_pod(
             pw::spa::utils::Fraction { num: 0, denom: 1 },
             pw::spa::utils::Fraction { num: 240, denom: 1 }
         ),
+        // Screen capture negotiates a variable framerate, so this cap rather
+        // than `VideoFramerate` is what bounds delivery. Without it a 144 Hz
+        // panel would hand over 144 buffers per second to feed a timeline that
+        // consumes at most `fps`.
+        pw::spa::pod::property!(
+            pw::spa::param::format::FormatProperties::VideoMaxFramerate,
+            Choice,
+            Range,
+            Fraction,
+            fps,
+            pw::spa::utils::Fraction { num: 1, denom: 1 },
+            fps
+        ),
     );
     if let Some(modifier) = modifier {
         let mut prop = spa::pod::Property::new(
@@ -4342,6 +4393,19 @@ fn build_default_pipewire_format_pod(width: u32, height: u32, fps: f64) -> Resul
             pw::spa::utils::Fraction { num: 0, denom: 1 },
             pw::spa::utils::Fraction { num: 240, denom: 1 }
         ),
+        // Screen capture negotiates a variable framerate, so this cap rather
+        // than `VideoFramerate` is what bounds delivery. Without it a 144 Hz
+        // panel would hand over 144 buffers per second to feed a timeline that
+        // consumes at most `fps`.
+        pw::spa::pod::property!(
+            pw::spa::param::format::FormatProperties::VideoMaxFramerate,
+            Choice,
+            Range,
+            Fraction,
+            fps,
+            pw::spa::utils::Fraction { num: 1, denom: 1 },
+            fps
+        ),
     );
     serialize_pod_object(obj)
 }
@@ -4367,8 +4431,14 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
     a
 }
 
+/// Returns the PipeWire delivery rate that satisfies both timelines.
+///
+/// The cursor overlay is sampled from buffer metadata, so the stream has to be
+/// fed at least as fast as the cursor rate even though video is published far
+/// more slowly. The upper bound keeps a high-refresh panel from spending the
+/// capture thread on buffers no timeline consumes.
 fn pipewire_capture_rate(frame_fps: f64, cursor_hz: u64) -> f64 {
-    frame_fps.max(cursor_hz.max(1) as f64).clamp(0.5, 60.0)
+    frame_fps.max(cursor_hz.max(1) as f64).clamp(0.5, 120.0)
 }
 
 fn serialize_pod_object(obj: spa::pod::Object) -> Result<Vec<u8>> {
@@ -5326,8 +5396,55 @@ struct PipewireUserData {
     gpu_readback: GpuReadback,
     unmapped_buffer_logged: bool,
     cursor_meta_logged: bool,
+    rate_meter: CaptureRateMeter,
     serial: u64,
     cursor_serial: u64,
+}
+
+/// How long the capture rate meter averages before reporting.
+const CAPTURE_RATE_WINDOW: Duration = Duration::from_secs(5);
+
+/// Measures how fast a compositor actually feeds the capture stream.
+///
+/// The cursor overlay can only be as smooth as the rate PipeWire delivers
+/// buffers carrying `SPA_META_Cursor`, and that rate is negotiated with the
+/// compositor rather than chosen by this process. Reporting both the buffer
+/// rate and the rate at which the cursor actually moved separates "the
+/// compositor is slow" from "the cursor simply did not move".
+struct CaptureRateMeter {
+    window_started: Instant,
+    buffers: u32,
+    cursor_samples: u32,
+}
+
+impl CaptureRateMeter {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_started: now,
+            buffers: 0,
+            cursor_samples: 0,
+        }
+    }
+
+    /// Records one delivered buffer and returns the closed window's rates in
+    /// hertz once `CAPTURE_RATE_WINDOW` has elapsed.
+    fn record(&mut self, now: Instant, cursor_changed: bool) -> Option<(f64, f64)> {
+        self.buffers = self.buffers.saturating_add(1);
+        if cursor_changed {
+            self.cursor_samples = self.cursor_samples.saturating_add(1);
+        }
+        let elapsed = now.saturating_duration_since(self.window_started);
+        if elapsed < CAPTURE_RATE_WINDOW {
+            return None;
+        }
+        let seconds = elapsed.as_secs_f64();
+        let rates = (
+            f64::from(self.buffers) / seconds,
+            f64::from(self.cursor_samples) / seconds,
+        );
+        *self = Self::new(now);
+        Some(rates)
+    }
 }
 
 struct PipewireVideoUserData {
@@ -5347,6 +5464,7 @@ struct PipewireVideoUserData {
     mainloop_ptr: usize,
     first_frame_logged: bool,
     cursor_meta_logged: bool,
+    rate_meter: CaptureRateMeter,
     serial: u64,
     cursor_serial: u64,
 }
@@ -6104,7 +6222,37 @@ mod tests {
     fn pipewire_capture_rate_tracks_cursor_rate_above_frame_rate() {
         assert_eq!(pipewire_capture_rate(1.0, 30), 30.0);
         assert_eq!(pipewire_capture_rate(15.0, 10), 15.0);
-        assert_eq!(pipewire_capture_rate(15.0, 120), 60.0);
+        // The default cursor rate must survive intact: niri delivers cursor
+        // metadata at the panel rate, and clamping here would discard half of
+        // it before the publisher ever sees it.
+        assert_eq!(pipewire_capture_rate(1.0, 60), 60.0);
+        assert_eq!(pipewire_capture_rate(15.0, 240), 120.0);
+    }
+
+    #[test]
+    fn capture_rate_meter_reports_once_per_window() {
+        let start = Instant::now();
+        let mut meter = CaptureRateMeter::new(start);
+        assert_eq!(meter.record(start + Duration::from_secs(1), true), None);
+        let (buffer_hz, cursor_hz) = meter
+            .record(start + CAPTURE_RATE_WINDOW, false)
+            .expect("the window closes once it is full");
+        assert!((buffer_hz - 0.4).abs() < 1e-9, "{buffer_hz}");
+        assert!((cursor_hz - 0.2).abs() < 1e-9, "{cursor_hz}");
+        // A closed window restarts empty rather than accumulating forever.
+        assert_eq!(
+            meter.record(start + CAPTURE_RATE_WINDOW + Duration::from_secs(1), true),
+            None
+        );
+    }
+
+    #[test]
+    fn cursor_flush_interval_is_bounded() {
+        assert_eq!(parse_cursor_flush_ms("100"), Ok(100));
+        assert_eq!(parse_cursor_flush_ms(" 20 "), Ok(20));
+        assert!(parse_cursor_flush_ms("19").is_err());
+        assert!(parse_cursor_flush_ms("1001").is_err());
+        assert!(parse_cursor_flush_ms("soon").is_err());
     }
 
     #[test]

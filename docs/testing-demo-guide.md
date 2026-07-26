@@ -113,7 +113,7 @@ They verify:
 - invalid publisher-token rejection and recovery across a forced crash;
 - viewer/admin roles, publisher scopes, CSRF, exact origins, throttling,
   security headers, private configuration, and fail-closed listeners;
-- a moving 1280×720, 1 FPS, 30 Hz cursor application-traffic ceiling; and
+- a moving 1280×720, 1 FPS, default-cursor application-traffic ceiling; and
 - conservative crypto, packaging, and durable-storage throughput floors.
 
 Each script prints a final line beginning with `PASS:`. A failure is meaningful:
@@ -351,7 +351,7 @@ scripts/verify-bandwidth.sh
 
 It measures static, typing-like, scrolling, and full-motion patterns. Static
 and typing profiles have stricter media-byte ceilings; every profile keeps the
-same independent 30 Hz cursor ceiling.
+same independent cursor ceiling at the shipped 60 Hz default.
 
 For an automated pass/fail check:
 

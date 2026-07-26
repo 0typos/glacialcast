@@ -151,7 +151,7 @@ Publish a selected Wayland monitor:
   --require-cursor-metadata \
   --fps 1 \
   --idle-heartbeat-seconds 10 \
-  --cursor-hz 30
+  --cursor-hz 60
 ```
 
 The publisher detaches into the background and returns immediately, after
@@ -185,7 +185,7 @@ For a noninteractive transport test, publish the built-in pattern:
   --height 720 \
   --test-pattern motion \
   --fps 1 \
-  --cursor-hz 30
+  --cursor-hz 60
 ```
 
 Command-line flags override configuration. `GLACIALCAST_INGEST_SERVER_KEY` can
@@ -228,6 +228,15 @@ content is represented by a variable-duration sample at
 `--idle-heartbeat-seconds` instead of resending a frame every tick. A changed
 frame is still published on the next video tick, while cursor objects continue
 at `--cursor-hz`. Set the heartbeat to `1` for a denser compatibility profile.
+
+`--cursor-hz` defaults to 60 and is the rate the publisher forwards cursor
+samples at, independent of `--fps`. It cannot exceed what the compositor
+delivers: a screen-capture stream carries cursor metadata on its buffers, so a
+60 Hz panel yields at most 60 samples per second. Run the publisher with
+`RUST_LOG=glacialcast_client=debug` to see the measured `compositor capture
+rate` line reporting both the delivered buffer rate and the rate at which the
+cursor actually moved. `--cursor-flush-ms` (default 100) bounds how long a
+sample waits to be batched, trading live cursor latency against object count.
 
 For repeatable bandwidth tests, `--test-pattern` accepts `static`, `typing`,
 `scroll`, and `motion`.
@@ -386,7 +395,7 @@ the relay behind a real Caddy HTTPS proxy and verifies authenticated playback
 and cursor behavior in both Firefox and Chromium. The performance gate runs
 conservative release-mode throughput and durable-object floors. The bandwidth
 gate enforces application-byte ceilings for the default moving 1280×720,
-1 FPS video and independent 30 Hz cursor profile; framing overhead remains a
+1 FPS video and independent 60 Hz cursor profile; framing overhead remains a
 deployment measurement. Hardware checks require the corresponding host
 capabilities and are described in `docs/completion-audit.md`. The
 release-validation targets and evidence collection command are in
