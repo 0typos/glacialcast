@@ -78,6 +78,7 @@ RUST_LOG=glacialcast_client=info target/debug/glacialcast-client \
   --ingest-addr "${ingest_addr}" \
   "--ingest-server-key=${ingest_server_key}" \
   "--viewer-key=${viewer_key}" \
+  --foreground \
   --client-id soak-client \
   --display-name "Soak Verify" \
   --capture dash-test \

@@ -116,6 +116,8 @@ struct Args {
     daemon_stop: bool,
     #[arg(long)]
     daemon_status: bool,
+    #[arg(long)]
+    log_file: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -465,6 +467,7 @@ pub fn run() -> Result<()> {
         &daemon_socket,
         "--daemon-socket",
         "--daemon-child",
+        args.log_file.as_deref(),
     )? {
         return Ok(());
     }

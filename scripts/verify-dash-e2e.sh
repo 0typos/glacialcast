@@ -71,6 +71,7 @@ start_client() {
     --ingest-addr "${ingest_addr}" \
     "--ingest-server-key=${ingest_server_key}" \
     "--viewer-key=${viewer_key}" \
+    --foreground \
     --client-id dash-e2e \
     --display-name "DASH E2E" \
     --capture dash-test \

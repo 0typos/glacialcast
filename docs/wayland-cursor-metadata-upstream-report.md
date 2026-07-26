@@ -80,6 +80,7 @@ The verifier launches a temporary server and starts:
 
 ```sh
 target/debug/glacialcast-client \
+  --foreground \
   --config /tmp/glacialcast-missing-client.toml \
   --ingest-addr 127.0.0.1:18900 \
   --client-id cursor-metadata-verify \

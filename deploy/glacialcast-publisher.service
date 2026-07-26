@@ -1,0 +1,48 @@
+[Unit]
+Description=GlacialCast encrypted screen publisher
+Documentation=https://github.com/glacialcast/glacialcast
+# The publisher captures the running graphical session, so it must start with
+# that session and stop with it. Install it as a user unit, not a system unit:
+#   mkdir -p ~/.config/systemd/user
+#   cp glacialcast-publisher.service ~/.config/systemd/user/
+#   systemctl --user enable --now glacialcast-publisher.service
+PartOf=graphical-session.target
+After=graphical-session.target pipewire.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+UMask=0077
+Environment=RUST_LOG=glacialcast_client=info
+# --foreground keeps the process in the foreground because systemd, not the
+# publisher, supervises it here. Without it the unit would exit immediately
+# after detaching. Print the viewer key to share with:
+#   glacialcast-client --config %h/.config/glacialcast/client.toml \
+#     --print-viewer-key
+ExecStart=/usr/local/bin/glacialcast-client \
+    --foreground \
+    --config %h/.config/glacialcast/client.toml \
+    --ingest-addr 127.0.0.1:8900 \
+    --capture dash-wayland \
+    --portal-source monitor \
+    --fps 1 \
+    --idle-heartbeat-seconds 10 \
+    --cursor-hz 30
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+
+NoNewPrivileges=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+LockPersonality=yes
+
+[Install]
+WantedBy=graphical-session.target

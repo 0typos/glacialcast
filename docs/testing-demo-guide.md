@@ -267,6 +267,7 @@ Both should return a success status and a short text response.
 target/release/glacialcast-client \
   --config "$demo_dir/client.toml" \
   --ingest-addr 127.0.0.1:8900 \
+  --foreground \
   --capture dash-test \
   --dash-encoder openh264 \
   --width 1280 \
@@ -289,6 +290,9 @@ Expected behavior:
 - the metrics count both media fragments and cursor events; and
 - after the stream has run for a while, the timeline moves backward through
   retained history and **Live** returns to the live edge.
+
+`--foreground` keeps this terminal attached so `Ctrl+C` still stops the
+publisher; without it the publisher detaches and prints its viewer key.
 
 Repeat the publisher with `--test-pattern static --idle-heartbeat-seconds 4`.
 The cursor should remain smooth, the media-fragment count should rise only on
@@ -327,6 +331,13 @@ target/release/glacialcast-client \
 Choose a monitor in the portal dialog and move the pointer over that monitor.
 The browser should show the real screen at the sparse video cadence while the
 independent cursor remains responsive.
+
+The publisher detaches after printing its viewer key, so this terminal returns
+immediately. Follow its progress in the printed log file, and stop it with:
+
+```sh
+target/release/glacialcast-client --config "$demo_dir/client.toml" --daemon-stop
+```
 
 Run the deterministic application-traffic matrix separately:
 

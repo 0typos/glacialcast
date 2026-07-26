@@ -19,7 +19,7 @@ use tokio::{
 };
 
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::os::unix::{fs::OpenOptionsExt, process::CommandExt};
 
 /// Converts a user-facing value into a conservative Unix-socket path component.
 pub fn sanitize_socket_component(value: &str) -> String {
@@ -41,12 +41,17 @@ pub fn sanitize_socket_component(value: &str) -> String {
 /// Returns `true` in the parent after spawning the daemon child, which tells
 /// the caller to exit successfully. Returns `false` when the current process
 /// should continue normal startup.
+///
+/// When `log_path` is set, the child's standard output and error are appended
+/// to that file, which is created with mode `0600` because process logs can
+/// contain operational detail. Without it, both streams are discarded.
 pub fn daemonize_if_requested(
     daemon: bool,
     daemon_child: bool,
     socket_path: &Path,
     socket_flag: &str,
     child_flag: &str,
+    log_path: Option<&Path>,
 ) -> Result<bool> {
     if !daemon || daemon_child {
         return Ok(false);
@@ -58,12 +63,22 @@ pub fn daemonize_if_requested(
     args.push(OsString::from(socket_flag));
     args.push(socket_path.as_os_str().to_os_string());
 
+    let (stdout, stderr) = match log_path {
+        Some(path) => {
+            let file = open_daemon_log(path)?;
+            let duplicate = file
+                .try_clone()
+                .with_context(|| format!("duplicating daemon log {}", path.display()))?;
+            (Stdio::from(file), Stdio::from(duplicate))
+        }
+        None => (Stdio::null(), Stdio::null()),
+    };
     let mut command = Command::new(current_exe);
     command
         .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(stdout)
+        .stderr(stderr);
 
     #[cfg(unix)]
     // SAFETY: the post-fork closure performs only the async-signal-safe
@@ -84,6 +99,23 @@ pub fn daemonize_if_requested(
         socket_path.display()
     );
     Ok(true)
+}
+
+/// Opens the daemon log for appending, creating it private when absent.
+fn open_daemon_log(path: &Path) -> Result<std::fs::File> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating daemon log directory {}", parent.display()))?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("opening daemon log {}", path.display()))
 }
 
 fn filtered_daemon_args(

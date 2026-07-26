@@ -29,7 +29,8 @@ use glacialcast_protocol::{
         daemonize_if_requested, install_signal_handlers, manager_command,
         sanitize_socket_component, serve_control_socket, wait_for_shutdown,
     },
-    decode_key_b64, decode_noise_public_key, initiator_handshake, now_ms, parse_human_bytes,
+    decode_key_b64, decode_noise_public_key, encode_key_b64, initiator_handshake, now_ms,
+    parse_human_bytes,
 };
 use image::{ImageBuffer, Rgb, imageops::FilterType};
 use pipewire as pw;
@@ -38,7 +39,7 @@ use rand::{RngCore, rngs::OsRng};
 use serde::Deserialize;
 use std::{
     collections::VecDeque,
-    io::{IsTerminal, Read},
+    io::{IsTerminal, Read, Write},
     os::fd::{BorrowedFd, FromRawFd, OwnedFd, RawFd},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::PathBuf,
@@ -132,6 +133,12 @@ struct Args {
     #[arg(long, conflicts_with = "viewer_key")]
     no_viewer_key: bool,
     #[arg(long)]
+    viewer_key_file: Option<PathBuf>,
+    #[arg(long)]
+    print_viewer_key: bool,
+    #[arg(long)]
+    viewer_url: Option<String>,
+    #[arg(long)]
     client_id: Option<String>,
     #[arg(long)]
     display_name: Option<String>,
@@ -176,6 +183,8 @@ struct Args {
     #[arg(long, value_parser = parse_human_bytes, default_value = "128MiB")]
     resend_bytes: u64,
     #[arg(long)]
+    foreground: bool,
+    #[arg(long)]
     daemon: bool,
     #[arg(long, hide = true)]
     daemon_child: bool,
@@ -185,6 +194,8 @@ struct Args {
     daemon_stop: bool,
     #[arg(long)]
     daemon_status: bool,
+    #[arg(long)]
+    log_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -195,6 +206,7 @@ struct ClientConfig {
     ingest_server_key: Option<String>,
     viewer_key_b64: Option<String>,
     display_name: Option<String>,
+    viewer_url: Option<String>,
 }
 
 struct ClientIdentity {
@@ -203,6 +215,11 @@ struct ClientIdentity {
     ingest_server_key: Option<[u8; 32]>,
     viewer_key_b64: Option<String>,
     display_name: String,
+    /// Where a generated viewer key is kept so restarts republish the same
+    /// key, or `None` when the key came from configuration or the command line.
+    viewer_key_file: Option<PathBuf>,
+    /// Operator-supplied viewer page address, printed with the sharing summary.
+    viewer_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -263,13 +280,23 @@ impl PortalCursorMode {
 
 /// Parses the process configuration and runs the capture publisher.
 ///
-/// This is the installed binary's entry point. It returns after a requested
+/// This is the installed binary's entry point. The publisher detaches into the
+/// background unless `--foreground` is given, after printing the viewer key
+/// that the operator shares out of band. It returns after a requested
 /// daemon-management action, clean shutdown, or a fatal configuration,
 /// capture, encoding, or transport error.
 pub fn run() -> Result<()> {
     let args = Args::parse();
     let identity = resolve_client_identity(&args)?;
     let daemon_socket = client_daemon_socket(&args, &identity);
+
+    if args.print_viewer_key {
+        let key = identity.viewer_key_b64.as_deref().context(
+            "no viewer key is configured; remove --no-viewer-key to create a persistent one",
+        )?;
+        println!("{key}");
+        return Ok(());
+    }
 
     if args.daemon_stop || args.daemon_status {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -286,12 +313,21 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
+    let detach = !args.foreground && !args.daemon_child;
+    let log_file = args
+        .log_file
+        .clone()
+        .unwrap_or_else(|| default_log_file(&identity.client_id));
+    if detach {
+        print_sharing_summary(&identity, &daemon_socket, &log_file);
+    }
     if daemonize_if_requested(
-        args.daemon,
+        detach,
         args.daemon_child,
         &daemon_socket,
         "--daemon-socket",
         "--daemon-child",
+        Some(&log_file),
     )? {
         return Ok(());
     }
@@ -311,6 +347,35 @@ pub fn run() -> Result<()> {
         .build()
         .context("building client runtime")?;
     runtime.block_on(run_client(args, identity, daemon_socket))
+}
+
+/// Prints everything an operator needs to invite viewers, before detaching.
+///
+/// The viewer key is written to standard output only, never to the log file or
+/// to the relay, because the relay must not be able to decrypt the stream.
+fn print_sharing_summary(
+    identity: &ClientIdentity,
+    daemon_socket: &std::path::Path,
+    log_file: &std::path::Path,
+) {
+    println!("GlacialCast publisher \"{}\"", identity.display_name);
+    if let Some(viewer_url) = &identity.viewer_url {
+        println!("  viewer page  {viewer_url}");
+    }
+    match identity.viewer_key_b64.as_deref() {
+        Some(key) => println!("  viewer key   {key}"),
+        None => println!("  viewer key   (none configured; publishing will fail)"),
+    }
+    if let Some(path) = &identity.viewer_key_file {
+        println!("  key file     {}", path.display());
+    }
+    println!("  log file     {}", log_file.display());
+    println!("  control      {}", daemon_socket.display());
+    println!();
+    println!(
+        "Share the viewer key over a secure out-of-band channel. It is stable across\n\
+         restarts, and anyone who has it can watch this stream; the relay cannot."
+    );
 }
 
 fn client_daemon_socket(args: &Args, identity: &ClientIdentity) -> PathBuf {
@@ -1346,14 +1411,25 @@ fn resolve_client_identity(args: &Args) -> Result<ClientIdentity> {
         .map(|key| decode_noise_public_key(&key))
         .transpose()
         .context("ingest_server_key must be URL-safe base64 for a 32-byte Noise public key")?;
-    let viewer_key_b64 = if args.no_viewer_key {
+    let configured_viewer_key = args
+        .viewer_key
+        .clone()
+        .or(config.viewer_key_b64)
+        .map(|key| non_empty_trimmed("viewer_key_b64", key))
+        .transpose()?;
+    let viewer_key_file = if args.no_viewer_key || configured_viewer_key.is_some() {
         None
     } else {
-        args.viewer_key
-            .clone()
-            .or(config.viewer_key_b64)
-            .map(|key| non_empty_trimmed("viewer_key_b64", key))
-            .transpose()?
+        Some(
+            args.viewer_key_file
+                .clone()
+                .unwrap_or_else(|| default_viewer_key_file(&client_id)),
+        )
+    };
+    let viewer_key_b64 = match (&configured_viewer_key, &viewer_key_file) {
+        (Some(key), _) => Some(key.clone()),
+        (None, Some(path)) => Some(load_or_create_viewer_key(path)?),
+        (None, None) => None,
     };
     let display_name = args
         .display_name
@@ -1361,6 +1437,12 @@ fn resolve_client_identity(args: &Args) -> Result<ClientIdentity> {
         .or(config.display_name)
         .unwrap_or_else(|| "Glacialcast client".to_string());
     let display_name = non_empty_trimmed("display_name", display_name)?;
+    let viewer_url = args
+        .viewer_url
+        .clone()
+        .or(config.viewer_url)
+        .map(|url| non_empty_trimmed("viewer_url", url))
+        .transpose()?;
 
     Ok(ClientIdentity {
         client_id,
@@ -1368,7 +1450,123 @@ fn resolve_client_identity(args: &Args) -> Result<ClientIdentity> {
         ingest_server_key,
         viewer_key_b64,
         display_name,
+        viewer_key_file,
+        viewer_url,
     })
+}
+
+/// Returns the per-user directory that holds generated client state.
+///
+/// Generated material is kept out of the working directory because the
+/// publisher detaches by default and may be started from anywhere.
+fn client_state_dir() -> PathBuf {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map(|home| home.join(".local").join("state"))
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("glacialcast")
+}
+
+/// Returns the default persisted viewer-key path for `client_id`.
+fn default_viewer_key_file(client_id: &str) -> PathBuf {
+    let component = sanitize_socket_component(client_id);
+    let component = if component.is_empty() {
+        "client".to_string()
+    } else {
+        component
+    };
+    client_state_dir().join(format!("viewer-{component}.key"))
+}
+
+/// Returns the default detached-publisher log path for `client_id`.
+fn default_log_file(client_id: &str) -> PathBuf {
+    let component = sanitize_socket_component(client_id);
+    let component = if component.is_empty() {
+        "client".to_string()
+    } else {
+        component
+    };
+    client_state_dir().join(format!("client-{component}.log"))
+}
+
+/// Reads the persisted viewer key, creating a fresh one when absent.
+///
+/// The key is 32 random bytes rendered as URL-safe base64 without padding.
+/// Persisting it is what makes the published key stable: restarting the
+/// publisher, or reconnecting after a relay outage, republishes under the same
+/// key so viewers do not need a new secret. The file must be a private regular
+/// file with mode 0600 and is created that way.
+///
+/// # Errors
+///
+/// Returns an error when the file exists but is group- or world-accessible, is
+/// not a regular file, or does not contain exactly one 32-byte key.
+fn load_or_create_viewer_key(path: &std::path::Path) -> Result<String> {
+    match read_viewer_key(path) {
+        Ok(key) => return Ok(key),
+        Err(err) if path.exists() => return Err(err),
+        Err(_) => {}
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating viewer key directory {}", parent.display()))?;
+    }
+    let mut key = [0u8; 32];
+    OsRng.fill_bytes(&mut key);
+    let encoded = encode_key_b64(&key);
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            return read_viewer_key(path);
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("creating viewer key {}", path.display()));
+        }
+    };
+    file.write_all(encoded.as_bytes())
+        .and_then(|()| file.write_all(b"\n"))
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("writing viewer key {}", path.display()))?;
+    Ok(encoded)
+}
+
+/// Reads and validates a persisted viewer key.
+fn read_viewer_key(path: &std::path::Path) -> Result<String> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("opening viewer key {}", path.display()))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
+        bail!(
+            "viewer key {} must be a private regular file with mode 0600",
+            path.display()
+        );
+    }
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)
+        .with_context(|| format!("reading viewer key {}", path.display()))?;
+    let key = non_empty_trimmed("viewer key", raw)?;
+    decode_key_b64(&key).with_context(|| {
+        format!(
+            "viewer key {} must be URL-safe base64 for 32 bytes",
+            path.display()
+        )
+    })?;
+    Ok(key)
 }
 
 fn non_empty_trimmed(field: &str, value: String) -> Result<String> {
@@ -5496,6 +5694,8 @@ mod tests {
                 ingest_server_key: None,
                 viewer_key_b64: None,
                 display_name: "Chooser".to_string(),
+                viewer_key_file: None,
+                viewer_url: None,
             };
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let mut capture = NeverOpeningCapture;
@@ -5519,6 +5719,60 @@ mod tests {
                 .expect("shutdown must interrupt an unanswered chooser")
                 .expect("interrupted startup is a clean exit");
         });
+    }
+
+    #[test]
+    fn generated_viewer_key_is_private_and_stable_across_restarts() {
+        let root = std::env::temp_dir().join(format!("glacialcast-viewer-key-{}", Uuid::new_v4()));
+        let path = root.join("viewer.key");
+
+        let created = load_or_create_viewer_key(&path).unwrap();
+        assert_eq!(decode_key_b64(&created).unwrap().len(), 32);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "a generated viewer key must not be readable by other users"
+        );
+        // Restarting the publisher must republish under the same key so the
+        // secret already shared with viewers keeps working.
+        assert_eq!(load_or_create_viewer_key(&path).unwrap(), created);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            load_or_create_viewer_key(&path).is_err(),
+            "a group- or world-readable viewer key must be rejected, not reused"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&path, "not-a-32-byte-key\n").unwrap();
+        assert!(
+            load_or_create_viewer_key(&path).is_err(),
+            "a malformed viewer key must be rejected, not silently replaced"
+        );
+
+        std::fs::write(&path, "").unwrap();
+        assert!(load_or_create_viewer_key(&path).is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn generated_state_paths_sanitize_the_client_identity() {
+        let key = default_viewer_key_file("desk/../../etc");
+        let log = default_log_file("desk/../../etc");
+        assert_eq!(
+            key.file_name().unwrap().to_string_lossy(),
+            "viewer-desk-------etc.key"
+        );
+        assert_eq!(
+            log.file_name().unwrap().to_string_lossy(),
+            "client-desk-------etc.log"
+        );
+        assert_eq!(key.parent(), log.parent());
+        assert_eq!(
+            default_viewer_key_file("///").file_name().unwrap(),
+            "viewer-client.key"
+        );
     }
 
     #[test]

@@ -81,15 +81,22 @@ client_id = "workstation"
 display_name = "Workstation"
 ingest_token = "replace-with-a-random-secret"
 ingest_server_key = "URL-safe-base64-public-key-printed-by-the-server"
-viewer_key_b64 = "URL-safe-base64-32-byte-viewer-key"
+viewer_url = "https://cast.example.com"
 ```
 
-Generate the independent viewer key once and distribute it to viewers out of
-band:
+The viewer key is created on first start and kept at
+`$XDG_STATE_HOME/glacialcast/viewer-<client-id>.key` with mode `0600`, so every
+later run publishes under the same key and viewers keep the secret they already
+have. Print it at any time without starting a capture:
 
 ```sh
-node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
+./target/release/glacialcast-client --config client.toml --print-viewer-key
 ```
+
+Select another location with `--viewer-key-file`, or pin an existing key with
+`--viewer-key` or a `viewer_key_b64` entry in `client.toml`; either takes
+precedence and nothing is then written to disk. `viewer_url` is only printed
+with the startup summary so the invitation is complete.
 
 Neither key belongs in a URL, log, or server configuration. The ingest server
 key is public; the viewer key is secret.
@@ -108,6 +115,7 @@ Start with:
 - `deploy/server.internet.toml.example`
 - `deploy/Caddyfile.example`
 - `deploy/glacialcast-server.service`
+- `deploy/glacialcast-publisher.service`
 - `docs/internet-deployment.md`
 
 Internet mode is enabled by setting an HTTPS `security.public_origin`. It
@@ -146,6 +154,23 @@ Publish a selected Wayland monitor:
   --cursor-hz 30
 ```
 
+The publisher detaches into the background and returns immediately, after
+printing the viewer key, the log path, and its control socket:
+
+```text
+GlacialCast publisher "Workstation"
+  viewer key   O8VyOonGQ4Bf1Cz9JHyuX6BcLXrt3NNsEwZZsPQXIr0
+  key file     /home/you/.local/state/glacialcast/viewer-workstation.key
+  log file     /home/you/.local/state/glacialcast/client-workstation.log
+  control      /tmp/glacialcast-client-workstation.sock
+```
+
+Send that key to viewers over a secure out-of-band channel; it is the only
+secret they need and it does not change when the publisher restarts. Use
+`--foreground` when another supervisor owns the process, `--log-file` to place
+the detached log elsewhere, and `--daemon-status` or `--daemon-stop` to inspect
+or end the running publisher.
+
 Open `http://127.0.0.1:8899`, select the stream, and enter the viewer key. The
 browser receives encrypted DASH objects from the relay and performs content
 authentication and decryption locally.
@@ -178,6 +203,11 @@ the default. Niri's Mutter-compatible ScreenCast API can be selected directly:
   --screencast-backend mutter \
   --monitor-name DP-3
 ```
+
+The portal grants a session to a specific process, so a publisher must be
+started from the desktop session and answered once per start.
+`deploy/glacialcast-publisher.service` is a user unit that starts the publisher
+with the graphical session.
 
 `--portal-cursor auto` prefers PipeWire `SPA_META_Cursor`. Use
 `--require-cursor-metadata` when an independent cursor is mandatory. Embedded
@@ -270,12 +300,14 @@ the [release operations runbook](docs/release-operations.md).
 
 ## Daemon mode
 
-Both network processes support a local Unix control socket:
+Both network processes support a local Unix control socket. The relay stays in
+the foreground unless `--daemon` is given:
 
 ```sh
 ./target/release/glacialcast-server \
   --daemon \
   --daemon-socket /tmp/glacialcast-server.sock \
+  --log-file /var/log/glacialcast-server.log \
   --control-addr 0.0.0.0:8899 \
   --ingest-addr 0.0.0.0:8900 \
   --data-dir data
@@ -289,8 +321,12 @@ Both network processes support a local Unix control socket:
   --daemon-socket /tmp/glacialcast-server.sock
 ```
 
-The client supports the same `--daemon`, `--daemon-status`, `--daemon-stop`,
-and `--daemon-socket` flags.
+The publisher detaches by default and accepts the same `--daemon-status`,
+`--daemon-stop`, `--daemon-socket`, and `--log-file` flags. Its control socket
+defaults to `/tmp/glacialcast-client-<client-id>.sock` and its log to
+`$XDG_STATE_HOME/glacialcast/client-<client-id>.log`, both created with mode
+`0600`. Pass `--foreground` under systemd or any other supervisor; `--daemon`
+remains accepted and is now the default.
 
 ## Wayland cursor diagnostics
 

@@ -162,6 +162,7 @@ RUST_LOG=glacialcast_client=info target/debug/glacialcast-client \
   "--ingest-server-key=${ingest_server_key}" \
   "--viewer-key=${viewer_key}" \
   --ingest-token wrong-recovery-token \
+  --foreground \
   --client-id rejected-client \
   --display-name "Rejected Recovery E2E" \
   --capture dash-test \
@@ -188,6 +189,7 @@ RUST_LOG=glacialcast_client=info target/debug/glacialcast-client \
   "--ingest-server-key=${ingest_server_key}" \
   "--viewer-key=${viewer_key}" \
   --ingest-token correct-recovery-token \
+  --foreground \
   --client-id ignored-when-token-is-present \
   --display-name "Recovery E2E" \
   --capture dash-test \

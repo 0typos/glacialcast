@@ -597,6 +597,24 @@ pub fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+/// Encodes a 32-byte viewer key as unpadded URL-safe base64.
+///
+/// The result is the exact form a viewer pastes into the unlock form and the
+/// only form the key should ever be written or shared in.
+///
+/// # Examples
+///
+/// ```
+/// use glacialcast_protocol::{decode_key_b64, encode_key_b64};
+///
+/// let key = [7u8; 32];
+/// assert_eq!(decode_key_b64(&encode_key_b64(&key))?, key);
+/// # Ok::<(), glacialcast_protocol::ProtocolError>(())
+/// ```
+pub fn encode_key_b64(key: &[u8; 32]) -> String {
+    URL_SAFE_NO_PAD.encode(key)
+}
+
 /// Decodes an unpadded URL-safe base64 viewer key and enforces 32 bytes.
 pub fn decode_key_b64(key: &str) -> Result<[u8; 32]> {
     let decoded = URL_SAFE_NO_PAD.decode(key)?;

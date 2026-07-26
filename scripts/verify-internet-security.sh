@@ -238,6 +238,7 @@ RUST_LOG=glacialcast_client=info target/debug/glacialcast-client \
   "--ingest-server-key=${ingest_server_key}" \
   "--viewer-key=${viewer_key}" \
   --ingest-token "${ingest_token}" \
+  --foreground \
   --client-id ignored-after-authentication \
   --display-name "Internet Security E2E" \
   --capture dash-test \
