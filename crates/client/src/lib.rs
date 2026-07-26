@@ -38,7 +38,7 @@ use rand::{RngCore, rngs::OsRng};
 use serde::Deserialize;
 use std::{
     collections::VecDeque,
-    io::Read,
+    io::{IsTerminal, Read},
     os::fd::{BorrowedFd, FromRawFd, OwnedFd, RawFd},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::PathBuf,
@@ -301,6 +301,9 @@ pub fn run() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "glacialcast_client=info".into()),
         )
+        // A detached publisher writes this stream to a log file, so colour it
+        // only when a human is actually watching a terminal.
+        .with_ansi(std::io::stdout().is_terminal())
         .init();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -383,7 +386,20 @@ async fn run_dash_client(
 ) -> Result<()> {
     let mut retry_delay = Duration::from_secs(1);
     loop {
-        let source = match capture.source().await {
+        // Opening a source can block indefinitely on a desktop chooser that
+        // nobody answers, so shutdown has to win the race. Otherwise SIGTERM
+        // and `--daemon-stop` are ignored for as long as the dialog is open.
+        let opened = {
+            let mut source_shutdown = shutdown_rx.clone();
+            tokio::select! {
+                opened = capture.source() => opened,
+                _ = wait_for_shutdown(&mut source_shutdown) => {
+                    info!("shutdown requested while opening the capture source");
+                    return Ok(());
+                }
+            }
+        };
+        let source = match opened {
             Ok(source) => source,
             Err(err) => {
                 if is_fatal_capture_error(&err) {
@@ -5440,6 +5456,69 @@ mod tests {
         std::os::unix::fs::symlink(root.join("missing.toml"), &dangling).unwrap();
         assert!(load_client_config(&dangling).is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A capture whose source never opens, standing in for a desktop chooser
+    /// that nobody answers.
+    struct NeverOpeningCapture;
+
+    #[async_trait]
+    impl Capture for NeverOpeningCapture {
+        async fn source(&mut self) -> Result<CaptureSource> {
+            std::future::pending::<()>().await;
+            unreachable!("pending future never resolves")
+        }
+
+        async fn capture_rgb(
+            &mut self,
+            _max_width: u32,
+            _max_height: u32,
+        ) -> Result<ImageBuffer<Rgb<u8>, Vec<u8>>> {
+            unreachable!("the source never opens")
+        }
+
+        async fn cursor(&mut self, _seq: u64) -> Result<Option<CursorMessage>> {
+            unreachable!("the source never opens")
+        }
+    }
+
+    #[test]
+    fn shutdown_interrupts_a_capture_source_waiting_on_a_desktop_chooser() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let args = Args::parse_from(["glacialcast-client"]);
+            let identity = ClientIdentity {
+                client_id: "chooser".to_string(),
+                auth_token: None,
+                ingest_server_key: None,
+                viewer_key_b64: None,
+                display_name: "Chooser".to_string(),
+            };
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let mut capture = NeverOpeningCapture;
+            let mut resend = DashResendBuffer::new(1024);
+            let publisher = run_dash_client(
+                &args,
+                &identity,
+                &[7u8; 32],
+                &mut capture,
+                &mut resend,
+                shutdown_rx,
+            );
+            tokio::pin!(publisher);
+            tokio::select! {
+                result = &mut publisher => panic!("publisher returned early: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+            shutdown_tx.send(true).unwrap();
+            timeout(Duration::from_secs(5), publisher)
+                .await
+                .expect("shutdown must interrupt an unanswered chooser")
+                .expect("interrupted startup is a clean exit");
+        });
     }
 
     #[test]

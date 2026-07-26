@@ -38,7 +38,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     fs::{File, OpenOptions},
-    io::{Read, Write},
+    io::{IsTerminal, Read, Write},
     net::SocketAddr,
     os::unix::fs::OpenOptionsExt,
     path::{Path as FsPath, PathBuf},
@@ -142,6 +142,9 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "glacialcast_offline=info".into()),
         )
+        // Transfer runs are commonly piped into a file or a log collector,
+        // which should not receive terminal colour escapes.
+        .with_ansi(std::io::stdout().is_terminal())
         .init();
     match Args::parse().command {
         Command::Mirror {

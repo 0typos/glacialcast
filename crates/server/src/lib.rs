@@ -55,7 +55,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
-    io::{Read, Write},
+    io::{IsTerminal, Read, Write},
     net::SocketAddr,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path as FsPath, PathBuf},
@@ -474,6 +474,9 @@ pub fn run() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "glacialcast_server=info,tower_http=info".into()),
         )
+        // Journald, a redirected file, and a daemon log all read better
+        // without terminal colour escapes.
+        .with_ansi(std::io::stdout().is_terminal())
         .init();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()

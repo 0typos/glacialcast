@@ -265,8 +265,11 @@ if grep -Fq "${viewer_key}" "${server_log}"; then
   echo "viewer key leaked into the relay log" >&2
   exit 1
 fi
+# Tolerate terminal colour escapes between the field name and its value so the
+# assertion does not depend on where the client log was written.
 capture_latencies="$(
-  sed -n 's/.*capture_to_ack_ms=\([0-9][0-9]*\).*/\1/p' "${client_log}"
+  sed -e 's/\x1b\[[0-9;]*m//g' "${client_log}" \
+    | sed -n 's/.*capture_to_ack_ms=\([0-9][0-9]*\).*/\1/p'
 )"
 if [[ -z "${capture_latencies}" ]]; then
   echo "client did not report a periodic capture-to-relay latency sample" >&2
