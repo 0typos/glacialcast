@@ -32,9 +32,9 @@ scrambled pixels still produce valid encrypted objects.
 
 | Compositor family | Portal/capture path | Independent cursor | Release status |
 | --- | --- | --- | --- |
-| GNOME / Mutter | XDG Desktop Portal | Implemented; host evidence required | Pending target-host validation |
-| KDE Plasma / KWin | XDG Desktop Portal | Implemented; host evidence required | Pending target-host validation |
-| wlroots compositors | xdg-desktop-portal-wlr | Implemented; host evidence required | Pending target-host validation |
+| GNOME / Mutter | XDG Desktop Portal, multi-select, persisted grant | Implemented; host evidence required | Pending target-host validation |
+| KDE Plasma / KWin | XDG Desktop Portal, multi-select, persisted grant | Implemented; host evidence required | Pending target-host validation |
+| wlroots compositors | xdg-desktop-portal-wlr, multi-select, persisted grant | Implemented; host evidence required | Pending target-host validation |
 | niri | Automatic selection uses niri's own Mutter-compatible ScreenCast interface; the configured portal remains available | Cursor metadata and object transport validated on niri 26.04 with PipeWire 1.6.8 | Validated for software encoding on NVIDIA: Firefox and Chromium decoded a frame that correlates 0.985 with the compositor's own screenshot of the captured output. VA-API hardware encoding remains pending representative hardware |
 
 ## Encoder matrix
@@ -45,6 +45,13 @@ scrambled pixels still produce valid encrypted objects.
 | AMD VA-API | DMA-BUF import/VPP when exposed, CPU upload fallback | Pending representative hardware validation |
 | NVIDIA proprietary driver | No VA-API H.264 entry point, so software encoding after EGL DMA-BUF readback | Validated on a GeForce RTX 5070 under niri 26.04; `scripts/verify-wayland-video-hardware.sh` correctly fails closed because the driver exposes no VA-API encode entry point |
 | Other / unsupported VA-API | Dynamically loaded OpenH264 software encoder | Validated by deterministic integration gates |
+
+The portal path was exercised on this niri host through
+`xdg-desktop-portal-gnome`: a first start prompted and took 3.5 seconds, and the
+next reused the stored restore token in 15 milliseconds with no dialog. That
+covers the code path but not GNOME, KDE, or sway themselves, whose rows stay
+pending until their own evidence is recorded. Multi-source portal selection has
+no host evidence at all yet — it needs a desktop whose chooser offers it.
 
 ## Release policy
 

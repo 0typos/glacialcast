@@ -328,6 +328,15 @@ delaying another screen's cadence. A fatal error on any output shuts the whole
 publisher down rather than leaving a daemon serving only some of the screens
 the operator asked for.
 
+The two interfaces reach several outputs differently. Under the Mutter
+interface each output is its own session, opened by its own publisher thread.
+The portal instead approves a whole selection in one dialog, so that session is
+opened once before any thread starts and each thread is handed one already-open
+stream; the session is shared and closes when the last capture is dropped. The
+publisher also asks the portal to persist the grant and stores the returned
+token with mode 0600, because a detached publisher cannot answer a dialog after
+a reboot. A stale token falls back to prompting rather than failing.
+
 The relay keys durable streams on the authenticated publisher identity, so
 several outputs under one ingest token would otherwise collide on a single
 stream record. `StreamHello` therefore carries an optional `source_label`, and

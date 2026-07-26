@@ -78,6 +78,8 @@ const PORTAL_CURSOR_HIDDEN: u32 = 1;
 const PORTAL_CURSOR_EMBEDDED: u32 = 2;
 const PORTAL_CURSOR_METADATA: u32 = 4;
 const PORTAL_PERSIST_DO_NOT: u32 = 0;
+/// Ask the portal to remember the grant until the application revokes it.
+const PORTAL_PERSIST_UNTIL_REVOKED: u32 = 2;
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 const DRM_FORMAT_MOD_INVALID: i64 = 0x00ff_ffff_ffff_ffff;
 const SPA_DATA_FLAG_MAPPABLE: u32 = 1 << 3;
@@ -156,6 +158,8 @@ struct Args {
     all_monitors: bool,
     #[arg(long)]
     list_monitors: bool,
+    #[arg(long)]
+    portal_token_file: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = PortalCursorMode::Auto)]
     portal_cursor: PortalCursorMode,
     #[arg(long)]
@@ -441,7 +445,7 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
         });
     }
 
-    let targets = resolve_publish_targets(&args).await?;
+    let targets = resolve_publish_targets(&args, &identity).await?;
     info!(
         streams = targets.len(),
         labels = ?targets.iter().map(|target| target.label.as_deref()).collect::<Vec<_>>(),
@@ -471,6 +475,7 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
                     .enable_all()
                     .build()
                     .context("building publisher runtime")?;
+                let label = target.label.clone();
                 let result = runtime.block_on(async {
                     let mut capture: Box<dyn Capture> = match args.capture {
                         CaptureMode::DashTest => Box::new(TestPatternCapture::new(
@@ -479,7 +484,7 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
                             args.test_pattern,
                         )),
                         CaptureMode::DashWayland => {
-                            Box::new(WaylandPipewireCapture::new(&args, &target))
+                            Box::new(WaylandPipewireCapture::new(&args, target))
                         }
                     };
                     let mut resend = DashResendBuffer::new(args.resend_bytes);
@@ -487,7 +492,7 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
                         &args,
                         StreamIdentity {
                             client: &identity,
-                            label: target.label.as_deref(),
+                            label: label.as_deref(),
                         },
                         &viewer_key,
                         capture.as_mut(),
@@ -545,6 +550,12 @@ struct PublishTarget {
     /// Monitor connector for the Mutter interface; the portal chooser decides
     /// its own source, so this is `None` there.
     connector: Option<String>,
+    /// A session opened before the publisher threads started.
+    ///
+    /// One portal dialog grants every selected output at once, so the portal
+    /// path opens its session up front and hands each thread one already-open
+    /// stream. The Mutter path opens its own session per output instead.
+    opened: Option<ScreenCastCapture>,
 }
 
 /// Resolves which sources this process will publish.
@@ -553,12 +564,16 @@ struct PublishTarget {
 /// deployments recover the same relay stream. Publishing several outputs
 /// labels each one, because the relay keys durable streams on that identity and
 /// unlabelled outputs would collide on a single record.
-async fn resolve_publish_targets(args: &Args) -> Result<Vec<PublishTarget>> {
+async fn resolve_publish_targets(
+    args: &Args,
+    identity: &ClientIdentity,
+) -> Result<Vec<PublishTarget>> {
     if args.capture != CaptureMode::DashWayland {
         return Ok(vec![PublishTarget {
             label: None,
             backend: args.screencast_backend,
             connector: None,
+            opened: None,
         }]);
     }
     let backend = match args.screencast_backend {
@@ -566,17 +581,33 @@ async fn resolve_publish_targets(args: &Args) -> Result<Vec<PublishTarget>> {
         selected => selected,
     };
     if backend != ScreenCastBackend::Mutter {
-        if args.all_monitors || args.monitor_name.len() > 1 {
+        if !args.monitor_name.is_empty() {
             bail!(
-                "selecting several monitors needs the compositor's ScreenCast interface; \
-                 the desktop portal chooses its own sources in its dialog"
+                "--monitor-name needs the compositor's ScreenCast interface; the desktop \
+                 portal chooses its own sources in its dialog"
             );
         }
-        return Ok(vec![PublishTarget {
-            label: None,
-            backend,
-            connector: args.monitor_name.first().cloned(),
-        }]);
+        // One dialog grants the whole selection, so the session is opened here
+        // rather than once per publisher thread.
+        let restore = PortalRestoreToken::load(
+            args.portal_token_file
+                .clone()
+                .unwrap_or_else(|| default_portal_token_file(&identity.client_id)),
+        );
+        let captures =
+            open_screencast_portal_sources(args.portal_source, args.portal_cursor, Some(&restore))
+                .await?;
+        let labelled = captures.len() > 1;
+        return Ok(captures
+            .into_iter()
+            .enumerate()
+            .map(|(index, capture)| PublishTarget {
+                label: labelled.then(|| format!("source-{}", index + 1)),
+                backend,
+                connector: None,
+                opened: Some(capture),
+            })
+            .collect());
     }
 
     let connectors = if args.all_monitors {
@@ -600,8 +631,102 @@ async fn resolve_publish_targets(args: &Args) -> Result<Vec<PublishTarget>> {
             label: labelled.then(|| sanitize_source_label(&connector)),
             backend,
             connector: Some(connector),
+            opened: None,
         })
         .collect())
+}
+
+/// A portal grant this publisher may reuse instead of prompting again.
+///
+/// The portal issues an opaque token when it agrees to remember a selection.
+/// It is stored with mode 0600 next to the viewer key: it is not a content
+/// secret, but anyone holding it can resume this publisher's screen-capture
+/// grant, so it does not belong in a world-readable file.
+struct PortalRestoreToken {
+    path: PathBuf,
+    value: Option<String>,
+}
+
+/// The longest token this client will store or present.
+///
+/// The portal chooses the format, so the only safe assumption is that it is
+/// bounded and printable; a file that fails either check is ignored rather
+/// than replayed.
+const MAX_PORTAL_RESTORE_TOKEN_LEN: usize = 512;
+
+impl PortalRestoreToken {
+    /// Loads any token previously stored for `client_id`.
+    ///
+    /// A missing, unreadable, or malformed file is not an error: the portal
+    /// simply prompts, which is the behaviour without a token at all.
+    fn load(path: PathBuf) -> Self {
+        let value = std::fs::read_to_string(&path).ok().and_then(|raw| {
+            let token = raw.trim().to_string();
+            let acceptable = !token.is_empty()
+                && token.len() <= MAX_PORTAL_RESTORE_TOKEN_LEN
+                && token
+                    .chars()
+                    .all(|ch| !ch.is_control() && !ch.is_whitespace());
+            if acceptable {
+                Some(token)
+            } else {
+                warn!(path = %path.display(), "ignoring a malformed portal restore token");
+                None
+            }
+        });
+        Self { path, value }
+    }
+
+    fn value(&self) -> Option<&str> {
+        self.value.as_deref()
+    }
+
+    /// Replaces the stored token, reporting rather than failing on error.
+    ///
+    /// Losing a token costs one dialog on the next start, which must never be
+    /// escalated into a failure to publish.
+    fn save(&self, token: &str) {
+        if token.len() > MAX_PORTAL_RESTORE_TOKEN_LEN {
+            warn!("portal returned an implausibly long restore token; not storing it");
+            return;
+        }
+        if let Err(err) = self.write(token) {
+            warn!(
+                path = %self.path.display(),
+                error = %format!("{err:#}"),
+                "could not store the portal restore token; the next start will prompt"
+            );
+        }
+    }
+
+    fn write(&self, token: &str) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temporary = self.path.with_extension("tmp");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(token.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &self.path)?;
+        Ok(())
+    }
+}
+
+/// Returns the default portal restore-token path for `client_id`.
+fn default_portal_token_file(client_id: &str) -> PathBuf {
+    let component = sanitize_socket_component(client_id);
+    let component = if component.is_empty() {
+        "client".to_string()
+    } else {
+        component
+    };
+    client_state_dir().join(format!("portal-{component}.token"))
 }
 
 /// Reduces a connector name to the characters the relay accepts in a label.
@@ -2050,6 +2175,9 @@ fn test_pattern_cursor_visible(sequence: u64) -> bool {
 }
 
 struct WaylandPipewireCapture {
+    /// A session already granted before this capture started, used by the
+    /// portal path where one dialog approves every selected output.
+    opened: Option<ScreenCastCapture>,
     fps: f64,
     cursor_hz: u64,
     portal_source: PortalSourceMode,
@@ -2063,13 +2191,14 @@ struct WaylandPipewireCapture {
 }
 
 impl WaylandPipewireCapture {
-    fn new(args: &Args, target: &PublishTarget) -> Self {
+    fn new(args: &Args, target: PublishTarget) -> Self {
         Self {
+            opened: target.opened,
             fps: args.fps,
             cursor_hz: args.cursor_hz,
             portal_source: args.portal_source,
             screencast_backend: target.backend,
-            monitor_name: target.connector.clone(),
+            monitor_name: target.connector,
             portal_cursor: args.portal_cursor,
             require_cursor_metadata: args.require_cursor_metadata,
             prefer_dmabuf: args.capture == CaptureMode::DashWayland
@@ -2081,18 +2210,24 @@ impl WaylandPipewireCapture {
 
     async fn ensure_started(&mut self) -> Result<&mut NativePipewireCapture> {
         if self.inner.is_none() {
+            // A grant opened before the publisher threads started is consumed
+            // once. Reconnecting after that reopens through the normal path,
+            // which is also what re-prompts if the portal grant has lapsed.
             self.inner = Some(
-                NativePipewireCapture::start(NativePipewireCaptureConfig {
-                    fps: self.fps,
-                    cursor_hz: self.cursor_hz,
-                    portal_source: self.portal_source,
-                    screencast_backend: self.screencast_backend,
-                    monitor_name: self.monitor_name.as_deref(),
-                    portal_cursor: self.portal_cursor,
-                    require_cursor_metadata: self.require_cursor_metadata,
-                    prefer_dmabuf: self.prefer_dmabuf,
-                    gpu_device: &self.gpu_device,
-                })
+                NativePipewireCapture::start(
+                    NativePipewireCaptureConfig {
+                        fps: self.fps,
+                        cursor_hz: self.cursor_hz,
+                        portal_source: self.portal_source,
+                        screencast_backend: self.screencast_backend,
+                        monitor_name: self.monitor_name.as_deref(),
+                        portal_cursor: self.portal_cursor,
+                        require_cursor_metadata: self.require_cursor_metadata,
+                        prefer_dmabuf: self.prefer_dmabuf,
+                        gpu_device: &self.gpu_device,
+                    },
+                    self.opened.take(),
+                )
                 .await?,
             );
         }
@@ -2174,7 +2309,10 @@ struct NativePipewireCaptureConfig<'a> {
 }
 
 impl NativePipewireCapture {
-    async fn start(config: NativePipewireCaptureConfig<'_>) -> Result<Self> {
+    async fn start(
+        config: NativePipewireCaptureConfig<'_>,
+        opened: Option<ScreenCastCapture>,
+    ) -> Result<Self> {
         let NativePipewireCaptureConfig {
             fps,
             cursor_hz,
@@ -2186,13 +2324,18 @@ impl NativePipewireCapture {
             prefer_dmabuf,
             gpu_device,
         } = config;
-        let capture = open_screencast_capture(
-            screencast_backend,
-            portal_source,
-            monitor_name,
-            portal_cursor,
-        )
-        .await?;
+        let capture = match opened {
+            Some(capture) => capture,
+            None => {
+                open_screencast_capture(
+                    screencast_backend,
+                    portal_source,
+                    monitor_name,
+                    portal_cursor,
+                )
+                .await?
+            }
+        };
         let (cursor_tx, cursor_rx) = watch::channel(None);
         let pipewire_error = Arc::new(Mutex::new(None));
         let thread_stop = Arc::new(Mutex::new(None));
@@ -3042,15 +3185,22 @@ impl PipewireRemote {
 }
 
 enum ScreenCastSession {
-    Portal {
-        _connection: Connection,
-        _session_handle: OwnedObjectPath,
-        _fd: OwnedFd,
-    },
+    /// A portal grant. One dialog can approve several outputs, so the session
+    /// is shared by every capture taken from it and closes when the last one
+    /// is dropped. The handle is held, never read: dropping it revokes the
+    /// grant and tears down the PipeWire nodes.
+    Portal(#[allow(dead_code)] Arc<PortalSession>),
     Mutter {
         _connection: Connection,
         _session_handle: OwnedObjectPath,
     },
+}
+
+/// A live XDG ScreenCast grant.
+struct PortalSession {
+    _connection: Connection,
+    _session_handle: OwnedObjectPath,
+    _fd: OwnedFd,
 }
 
 async fn open_screencast_capture(
@@ -3367,6 +3517,22 @@ async fn open_screencast_portal(
     source_mode: PortalSourceMode,
     cursor_preference: PortalCursorMode,
 ) -> Result<ScreenCastCapture> {
+    let mut captures = open_screencast_portal_sources(source_mode, cursor_preference, None).await?;
+    Ok(captures.remove(0))
+}
+
+/// Opens one XDG ScreenCast grant and returns a capture per approved output.
+///
+/// The portal dialog approves the whole selection at once, so several outputs
+/// share a single session and a single PipeWire remote. When `restore_token` is
+/// set the portal may skip the dialog entirely; a stale or rejected token
+/// simply falls back to prompting, which is why it is passed as a hint rather
+/// than required to succeed.
+async fn open_screencast_portal_sources(
+    source_mode: PortalSourceMode,
+    cursor_preference: PortalCursorMode,
+    restore_token: Option<&PortalRestoreToken>,
+) -> Result<Vec<ScreenCastCapture>> {
     let connection = Connection::session().await?;
     info!("connected to D-Bus session bus for XDG ScreenCast portal");
     let proxy = Proxy::new(
@@ -3436,9 +3602,24 @@ async fn open_screencast_portal(
         let mut options = std::collections::HashMap::<&str, Value<'_>>::new();
         options.insert("handle_token", Value::from(request_token));
         options.insert("types", Value::from(source_mask));
-        options.insert("multiple", Value::from(false));
+        // Several outputs may be approved in one dialog; every returned stream
+        // is published, so a selection of three screens yields three streams.
+        options.insert("multiple", Value::from(true));
         options.insert("cursor_mode", Value::from(cursor_mode));
-        options.insert("persist_mode", Value::from(PORTAL_PERSIST_DO_NOT));
+        match restore_token.and_then(|token| token.value()) {
+            Some(token) => {
+                options.insert("persist_mode", Value::from(PORTAL_PERSIST_UNTIL_REVOKED));
+                options.insert("restore_token", Value::from(token.to_string()));
+            }
+            None => {
+                let persist = if restore_token.is_some() {
+                    PORTAL_PERSIST_UNTIL_REVOKED
+                } else {
+                    PORTAL_PERSIST_DO_NOT
+                };
+                options.insert("persist_mode", Value::from(persist));
+            }
+        }
         let _handle: OwnedObjectPath = proxy
             .call("SelectSources", &(session_handle.clone(), options))
             .await?;
@@ -3449,7 +3630,11 @@ async fn open_screencast_portal(
         let request_token = portal_token("glacialcast_request");
         let (_request_proxy, signals) =
             prepare_portal_response(&connection, &request_token).await?;
-        info!("starting XDG ScreenCast session; accept the desktop chooser to continue");
+        if restore_token.and_then(PortalRestoreToken::value).is_some() {
+            info!("starting XDG ScreenCast session with a stored grant; no chooser expected");
+        } else {
+            info!("starting XDG ScreenCast session; accept the desktop chooser to continue");
+        }
         let mut options = std::collections::HashMap::<&str, Value<'_>>::new();
         options.insert("handle_token", Value::from(request_token));
         let _handle: OwnedObjectPath = proxy
@@ -3458,23 +3643,29 @@ async fn open_screencast_portal(
         wait_portal_response(signals).await?
     };
 
+    // A grant the portal agreed to remember comes back with a token to present
+    // next time. Storing it is what lets a detached publisher restart without
+    // another dialog.
+    if let Some(store) = restore_token {
+        match results
+            .get("restore_token")
+            .and_then(|value| value.try_clone().ok())
+            .and_then(|value| String::try_from(value).ok())
+        {
+            Some(token) if !token.is_empty() => store.save(&token),
+            _ => info!("portal did not return a restore token; it will prompt again"),
+        }
+    }
+
     let streams_value = results
         .get("streams")
         .context("Start response did not include streams")?
         .try_clone()?;
     let streams: Vec<(u32, std::collections::HashMap<String, OwnedValue>)> =
         streams_value.try_into()?;
-    let (node_id, props) = streams
-        .into_iter()
-        .next()
-        .context("portal returned no PipeWire streams")?;
-    let prop_summary = portal_prop_summary(&props);
-    let (width, height) = props
-        .get("size")
-        .and_then(|value| value.try_clone().ok())
-        .and_then(|value| <(i32, i32)>::try_from(value).ok())
-        .map(|(w, h)| (w.max(1) as u32, h.max(1) as u32))
-        .unwrap_or((1, 1));
+    if streams.is_empty() {
+        bail!("portal returned no PipeWire streams");
+    }
 
     let fd: ZbusOwnedFd = proxy
         .call(
@@ -3491,31 +3682,41 @@ async fn open_screencast_portal(
         PORTAL_CURSOR_METADATA => "cursor metadata requested",
         _ => "cursor hidden by portal",
     };
-    let description = format!(
-        "PipeWire node {node_id} via raw XDG Desktop Portal ({cursor_description}; {prop_summary})"
-    );
-    info!(
-        node_id,
-        width,
-        height,
-        props = %prop_summary,
-        "opened PipeWire remote from portal"
-    );
 
-    let remote = PipewireRemote::PortalFd(fd.try_clone()?);
-    Ok(ScreenCastCapture {
-        node_id,
-        width,
-        height,
-        description,
-        backend: ScreenCastBackend::Portal,
-        remote,
-        session: ScreenCastSession::Portal {
-            _connection: connection,
-            _session_handle: session_handle,
-            _fd: fd,
-        },
-    })
+    let session = Arc::new(PortalSession {
+        _fd: fd.try_clone()?,
+        _connection: connection,
+        _session_handle: session_handle,
+    });
+    let mut captures = Vec::with_capacity(streams.len());
+    for (node_id, props) in streams {
+        let prop_summary = portal_prop_summary(&props);
+        let (width, height) = props
+            .get("size")
+            .and_then(|value| value.try_clone().ok())
+            .and_then(|value| <(i32, i32)>::try_from(value).ok())
+            .map(|(w, h)| (w.max(1) as u32, h.max(1) as u32))
+            .unwrap_or((1, 1));
+        info!(
+            node_id,
+            width,
+            height,
+            props = %prop_summary,
+            "opened PipeWire remote from portal"
+        );
+        captures.push(ScreenCastCapture {
+            node_id,
+            width,
+            height,
+            description: format!(
+                "PipeWire node {node_id} via raw XDG Desktop Portal                  ({cursor_description}; {prop_summary})"
+            ),
+            backend: ScreenCastBackend::Portal,
+            remote: PipewireRemote::PortalFd(fd.try_clone()?),
+            session: ScreenCastSession::Portal(Arc::clone(&session)),
+        });
+    }
+    Ok(captures)
 }
 
 fn select_portal_cursor_mode(
@@ -6509,6 +6710,63 @@ mod tests {
         assert_eq!(
             meter.record(start + CAPTURE_RATE_WINDOW + Duration::from_secs(1), true),
             None
+        );
+    }
+
+    #[test]
+    fn portal_restore_tokens_round_trip_and_reject_junk() {
+        let root = std::env::temp_dir().join(format!("glacialcast-portal-{}", Uuid::new_v4()));
+        let path = root.join("portal.token");
+
+        // Nothing stored yet means "prompt", not an error.
+        assert_eq!(PortalRestoreToken::load(path.clone()).value(), None);
+
+        PortalRestoreToken::load(path.clone()).save("opaque-token-value");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the grant token must not be readable by other users"
+        );
+        assert_eq!(
+            PortalRestoreToken::load(path.clone()).value(),
+            Some("opaque-token-value")
+        );
+
+        // Replacing it is atomic and leaves no temporary behind.
+        PortalRestoreToken::load(path.clone()).save("second-token");
+        assert_eq!(
+            PortalRestoreToken::load(path.clone()).value(),
+            Some("second-token")
+        );
+        assert!(!path.with_extension("tmp").exists());
+
+        // A malformed file falls back to prompting rather than replaying junk.
+        std::fs::write(&path, "  \n").unwrap();
+        assert_eq!(PortalRestoreToken::load(path.clone()).value(), None);
+        std::fs::write(&path, "has space").unwrap();
+        assert_eq!(PortalRestoreToken::load(path.clone()).value(), None);
+        std::fs::write(&path, "x".repeat(MAX_PORTAL_RESTORE_TOKEN_LEN + 1)).unwrap();
+        assert_eq!(PortalRestoreToken::load(path.clone()).value(), None);
+
+        // An implausibly long token from the portal is not stored at all.
+        std::fs::remove_file(&path).unwrap();
+        PortalRestoreToken::load(path.clone()).save(&"y".repeat(MAX_PORTAL_RESTORE_TOKEN_LEN + 1));
+        assert!(!path.exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn portal_token_paths_sanitize_the_client_identity() {
+        assert_eq!(
+            default_portal_token_file("desk/../etc")
+                .file_name()
+                .unwrap(),
+            "portal-desk----etc.token"
+        );
+        assert_eq!(
+            default_portal_token_file("///").file_name().unwrap(),
+            "portal-client.token"
         );
     }
 

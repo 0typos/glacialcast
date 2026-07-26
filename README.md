@@ -250,10 +250,20 @@ bare identity, so an existing single-screen deployment recovers exactly the
 stream it had before. Viewer access scopes still name the publisher and cover
 all of its screens.
 
+On GNOME, KDE, and sway the portal dialog chooses the sources, and it accepts
+several at once — every approved output becomes its own stream, exactly as with
+`--all-monitors`. The publisher asks the portal to remember the grant and stores
+the returned token at
+`$XDG_STATE_HOME/glacialcast/portal-<client-id>.token` with mode `0600`, so a
+restart or reboot resumes the same screens without another dialog. Measured on
+this host, a first start took 3.5 seconds of dialog and the next took 15
+milliseconds with no prompt. Delete that file to be asked again, and use
+`--portal-token-file` to move it. A stale or rejected token falls back to
+prompting rather than failing.
+
 The portal grants a session to a specific process, so a portal-backed publisher
-must be started from the desktop session and answered once per start.
-`deploy/glacialcast-publisher.service` is a user unit that starts the publisher
-with the graphical session.
+must be started from the desktop session. `deploy/glacialcast-publisher.service`
+is a user unit that starts the publisher with the graphical session.
 
 `--portal-cursor auto` prefers PipeWire `SPA_META_Cursor`. Use
 `--require-cursor-metadata` when an independent cursor is mandatory. Embedded
