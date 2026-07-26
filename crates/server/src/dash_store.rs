@@ -627,7 +627,24 @@ impl DashStore {
                     );
                 }
                 validate_media_progression(&catalog, &stored.header)?;
-                let payload = self.read_stored_payload(stream_id, &stored)?;
+                let payload = match self.read_stored_payload(stream_id, &stored) {
+                    Ok(payload) => payload,
+                    // Retention deletes the payload before it rewrites the
+                    // catalog, so a crash in that window leaves an entry with
+                    // no file. The object is simply gone; refusing to start
+                    // would turn a recoverable gap into an unavailable relay.
+                    // Any other error still fails closed.
+                    Err(err) if is_missing_file(&err) => {
+                        tracing::warn!(
+                            %stream_id,
+                            sequence = stored.header.sequence,
+                            path = %stored.relative_path.display(),
+                            "dropping DASH catalog entry whose payload no longer exists"
+                        );
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
                 DashObject {
                     header: stored.header.clone(),
                     payload,
@@ -927,19 +944,34 @@ impl DashStore {
             }
             validate_media_progression(catalog, &transaction.put.header)?;
             if !put_was_removed {
-                let payload = self.read_stored_payload(stream_id, &transaction.put)?;
-                DashObject {
-                    header: transaction.put.header.clone(),
-                    payload,
+                // As in the snapshot path: a journaled object whose payload is
+                // gone was already evicted, and must not keep the relay from
+                // starting. Sequence accounting below still advances so the
+                // gap does not look like a skipped sequence.
+                match self.read_stored_payload(stream_id, &transaction.put) {
+                    Ok(payload) => {
+                        DashObject {
+                            header: transaction.put.header.clone(),
+                            payload,
+                        }
+                        .validate()
+                        .context("validating journaled DASH object")?;
+                        catalog.bytes = catalog
+                            .bytes
+                            .saturating_add(u64::from(transaction.put.header.payload_len));
+                        catalog
+                            .objects
+                            .insert(transaction.put.header.sequence, transaction.put);
+                    }
+                    Err(err) if is_missing_file(&err) => {
+                        tracing::warn!(
+                            %stream_id,
+                            sequence = transaction.put.header.sequence,
+                            "dropping journaled DASH object whose payload no longer exists"
+                        );
+                    }
+                    Err(err) => return Err(err),
                 }
-                .validate()
-                .context("validating journaled DASH object")?;
-                catalog.bytes = catalog
-                    .bytes
-                    .saturating_add(u64::from(transaction.put.header.payload_len));
-                catalog
-                    .objects
-                    .insert(transaction.put.header.sequence, transaction.put);
             }
         }
         catalog.last_sequence = Some(
@@ -1147,6 +1179,18 @@ fn read_bounded_regular_file(path: &Path, expected_len: u64) -> Result<Vec<u8>> 
         anyhow::bail!("file length changed while reading: {}", path.display());
     }
     Ok(bytes)
+}
+
+/// Reports whether `error` was caused by a file that does not exist.
+///
+/// Used to tell a payload that retention already deleted apart from a payload
+/// this process cannot read for any other reason.
+fn is_missing_file(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    })
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
@@ -1956,6 +2000,82 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(store.last_sequence(stream_id).unwrap(), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_drops_catalog_entries_whose_payload_was_already_deleted() {
+        let (root, store) = test_store(1024 * 1024);
+        let stream_id = Uuid::from_u128(91);
+        let epoch_id = Uuid::from_u128(92);
+        let keys = EpochKeys::derive(&[7; 32], stream_id, epoch_id).unwrap();
+        let media = |sequence| {
+            object(
+                &keys,
+                stream_id,
+                epoch_id,
+                ObjectSpec {
+                    kind: DashObjectKind::Media,
+                    sequence,
+                    segment_number: sequence,
+                    chunk_index: 0,
+                    random_access: true,
+                    payload: vec![sequence as u8],
+                },
+            )
+        };
+        store.store(media(1)).unwrap();
+        store.store(media(2)).unwrap();
+        let orphaned = store.stream_dir(stream_id).join(object_relative_path(1));
+        drop(store);
+
+        // Retention removes the payload before it rewrites the catalog, so a
+        // crash in that window leaves an entry pointing at nothing.
+        std::fs::remove_file(&orphaned).unwrap();
+
+        let reopened =
+            DashStore::open(root.clone(), 1024 * 1024, Duration::from_secs(1800)).unwrap();
+        let retained = reopened.list(stream_id).unwrap();
+        assert_eq!(
+            retained
+                .iter()
+                .map(|stored| stored.header.sequence)
+                .collect::<Vec<_>>(),
+            vec![2],
+            "the surviving object must still be served"
+        );
+        assert_eq!(reopened.last_sequence(stream_id).unwrap(), Some(2));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_still_fails_when_a_payload_is_unreadable_for_another_reason() {
+        let (root, store) = test_store(1024 * 1024);
+        let stream_id = Uuid::from_u128(93);
+        let epoch_id = Uuid::from_u128(94);
+        let keys = EpochKeys::derive(&[7; 32], stream_id, epoch_id).unwrap();
+        store
+            .store(object(
+                &keys,
+                stream_id,
+                epoch_id,
+                ObjectSpec {
+                    kind: DashObjectKind::Media,
+                    sequence: 1,
+                    segment_number: 1,
+                    chunk_index: 0,
+                    random_access: true,
+                    payload: vec![1, 2, 3],
+                },
+            ))
+            .unwrap();
+        let path = store.stream_dir(stream_id).join(object_relative_path(1));
+        drop(store);
+
+        // Present but corrupt is not the same as gone, and must not be
+        // silently discarded.
+        std::fs::write(&path, b"truncated").unwrap();
+        assert!(DashStore::open(root.clone(), 1024 * 1024, Duration::from_secs(1800)).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 
