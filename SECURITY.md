@@ -57,11 +57,17 @@ have to rediscover them:
 
 - **The viewer key unlocks everything the publisher casts.** One key covers
   every screen from one publisher, by design. Sharing it shares all of them.
-- **The browser keyring is only as strong as its passphrase.** Viewer keys are
-  wrapped with AES-GCM under a PBKDF2-SHA-256 key in `localStorage`. A stolen
-  browser profile plus a guessed or known passphrase yields every key in it.
-  This exposure is stated in the README; a weak-passphrase attack is not a
-  finding.
+- **A key phrase carries 70 bits, not 256.** A viewing key is seven words from
+  a 1024-word list, stretched into 32 bytes with PBKDF2-HMAC-SHA-256 at 600,000
+  iterations over a per-publisher salt. That the derived key has less entropy
+  than a random 32-byte key is the deliberate trade for a key a person can
+  actually transfer. Reports that the phrase space is smaller than 2^256 are not
+  findings; a flaw in the derivation, the salt handling, or the word decoding
+  very much is.
+- **An unlocked key lives in `sessionStorage` for the tab.** It is plaintext
+  there, readable by any script already running on the page. Script injection
+  into the viewer is in scope; the storage choice itself is not, since such a
+  script could equally read the key from memory.
 - **The relay learns metadata.** Stream existence, display names, object sizes,
   and timing are visible to it. Traffic analysis of a screen stream is not
   something this design defends against.

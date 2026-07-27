@@ -204,6 +204,19 @@ aside {
   color: var(--muted);
 }
 
+/* Once something is unlocked the form has done its job, so it recedes rather
+   than competing with the stream list. It stays available for a second
+   publisher's key. */
+.panel.secondary {
+  background: transparent;
+  opacity: 0.7;
+}
+
+.panel.secondary:focus-within {
+  background: var(--panel);
+  opacity: 1;
+}
+
 .error {
   margin: 0;
   color: var(--danger);

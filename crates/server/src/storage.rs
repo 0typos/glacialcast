@@ -65,6 +65,17 @@ impl Store {
             UPDATE streams SET active = 0;
             "#,
         )?;
+        // Added after the original schema, so an existing catalog needs the
+        // column bolted on. SQLite has no "ADD COLUMN IF NOT EXISTS", and a
+        // duplicate-column error here simply means an already-migrated
+        // database.
+        if let Err(error) = self
+            .conn()?
+            .execute("ALTER TABLE streams ADD COLUMN viewer_key_salt TEXT", [])
+            && !error.to_string().contains("duplicate column name")
+        {
+            return Err(error.into());
+        }
         Ok(())
     }
 
@@ -73,6 +84,7 @@ impl Store {
         client_id: &str,
         display_name: &str,
         source: &CaptureSource,
+        viewer_key_salt: Option<&str>,
     ) -> Result<Uuid> {
         let now = glacialcast_protocol::now_ms();
         if let Some(stream_id) = self.stream_id_for_client(client_id)? {
@@ -85,6 +97,7 @@ impl Store {
                     source_width = ?5,
                     source_height = ?6,
                     last_seen_at_ms = ?7,
+                    viewer_key_salt = ?8,
                     active = 1
                 WHERE stream_id = ?1
                 "#,
@@ -96,6 +109,7 @@ impl Store {
                     source.width,
                     source.height,
                     now,
+                    viewer_key_salt,
                 ],
             )?;
             return Ok(stream_id);
@@ -106,8 +120,9 @@ impl Store {
             r#"
             INSERT INTO streams
                 (stream_id, client_id, display_name, backend, source_description,
-                 source_width, source_height, created_at_ms, last_seen_at_ms, active)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, 1)
+                 source_width, source_height, created_at_ms, last_seen_at_ms, active,
+                 viewer_key_salt)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, 1, ?9)
             "#,
             params![
                 stream_id.to_string(),
@@ -118,6 +133,7 @@ impl Store {
                 source.width,
                 source.height,
                 now,
+                viewer_key_salt,
             ],
         )?;
         Ok(stream_id)
@@ -177,7 +193,7 @@ impl Store {
         let mut statement = conn.prepare(
             r#"
             SELECT stream_id, client_id, display_name, backend, source_description,
-                   source_width, source_height, active, last_seen_at_ms
+                   source_width, source_height, active, last_seen_at_ms, viewer_key_salt
             FROM streams
             ORDER BY active DESC, COALESCE(last_seen_at_ms, created_at_ms) DESC
             "#,
@@ -193,6 +209,7 @@ impl Store {
                 row.get::<_, i64>(6)?,
                 row.get::<_, i64>(7)?,
                 row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<String>>(9)?,
             ))
         })?;
 
@@ -207,13 +224,23 @@ impl Store {
                 height,
                 active,
                 last_seen,
+                viewer_key_salt,
             ) = row?;
+            // The durable identity is `{principal}:{label}`, and only the
+            // principal identifies the publisher a viewer key belongs to.
+            let publisher = client_id
+                .split(crate::IDENTITY_LABEL_SEPARATOR)
+                .next()
+                .unwrap_or(client_id.as_str())
+                .to_string();
             Ok(StreamRecord {
                 client_id,
                 stream: PublicStream {
                     stream_id: Uuid::parse_str(&stream_id)
                         .context("invalid stream_id in stream catalog")?,
                     display_name,
+                    publisher,
+                    viewer_key_salt,
                     source: CaptureSource {
                         backend,
                         description,
@@ -278,10 +305,10 @@ mod tests {
             std::env::temp_dir().join(format!("glacialcast-stream-catalog-{}", Uuid::new_v4()));
         let store = Store::open(root.clone()).unwrap();
         let stream_id = store
-            .ensure_stream_for_client("desk", "Desktop", &source("first"))
+            .ensure_stream_for_client("desk", "Desktop", &source("first"), None)
             .unwrap();
         let reconnected = store
-            .ensure_stream_for_client("desk", "Renamed", &source("second"))
+            .ensure_stream_for_client("desk", "Renamed", &source("second"), None)
             .unwrap();
         assert_eq!(reconnected, stream_id);
         drop(store);
@@ -301,7 +328,7 @@ mod tests {
             std::env::temp_dir().join(format!("glacialcast-stream-authz-{}", Uuid::new_v4()));
         let store = Store::open(root.clone()).unwrap();
         let stream_id = store
-            .ensure_stream_for_client("publisher-one", "Desktop", &source("screen"))
+            .ensure_stream_for_client("publisher-one", "Desktop", &source("screen"), None)
             .unwrap();
         let records = store.list_stream_records().unwrap();
         assert_eq!(records.len(), 1);
@@ -321,7 +348,7 @@ mod tests {
             std::env::temp_dir().join(format!("glacialcast-stream-catalog-{}", Uuid::new_v4()));
         let store = Store::open(root.clone()).unwrap();
         let stream_id = store
-            .ensure_stream_for_client("desk", "Desktop", &source("screen"))
+            .ensure_stream_for_client("desk", "Desktop", &source("screen"), None)
             .unwrap();
         assert!(store.stream_exists(stream_id).unwrap());
         store.mark_stream_inactive(stream_id).unwrap();

@@ -54,6 +54,7 @@ const VIEWER_CSS: &str = include_str!("../../server/static/dash-viewer.css");
 const VIEWER_CORE_JS: &str = include_str!("../../server/static/dash-viewer-core.js");
 const VIEWER_JS: &str = include_str!("../../server/static/dash-viewer.js");
 const VIEWER_PAGE_JS: &str = include_str!("../../server/static/dash-viewer-page.js");
+const VIEWER_KEY_JS: &str = include_str!("../../server/static/viewer-key.js");
 const MAX_PORTABLE_FILE_LEN: u64 = MAX_FRAME_LEN as u64 + 128 * 1024;
 const TRANSFER_MANIFEST_FILE: &str = "glacialcast-transfer.json";
 const TRANSFER_CHUNK_OBJECTS: u64 = 1024;
@@ -923,6 +924,7 @@ async fn serve(input: PathBuf, listen: SocketAddr, allow_non_loopback: bool) -> 
         .route("/assets/dash-viewer-core.js", get(viewer_core_js))
         .route("/assets/dash-viewer.js", get(viewer_js))
         .route("/assets/dash-viewer-page.js", get(viewer_page_js))
+        .route("/assets/viewer-key.js", get(viewer_key_js))
         .route("/api/dash/streams/{stream_id}/objects", get(list_objects))
         .route(
             "/api/dash/streams/{stream_id}/objects/{sequence}",
@@ -1120,6 +1122,10 @@ async fn viewer_js() -> Response {
 
 async fn viewer_page_js() -> Response {
     static_response("text/javascript; charset=utf-8", VIEWER_PAGE_JS)
+}
+
+async fn viewer_key_js() -> Response {
+    static_response("text/javascript; charset=utf-8", VIEWER_KEY_JS)
 }
 
 async fn viewer_core_js() -> Response {

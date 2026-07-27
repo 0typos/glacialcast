@@ -30,7 +30,7 @@ use glacialcast_protocol::{
         sanitize_socket_component, serve_control_socket, wait_for_shutdown,
     },
     decode_key_b64, decode_noise_public_key, encode_key_b64, initiator_handshake, now_ms,
-    parse_human_bytes,
+    parse_human_bytes, viewer_key,
 };
 use image::{ImageBuffer, Rgb, imageops::FilterType};
 use pipewire as pw;
@@ -136,6 +136,11 @@ struct Args {
     no_viewer_key: bool,
     #[arg(long)]
     viewer_key_file: Option<PathBuf>,
+    /// Replaces the stored viewer key with a fresh key phrase.
+    ///
+    /// Every key already shared for this publisher stops working.
+    #[arg(long, conflicts_with_all = ["viewer_key", "no_viewer_key"])]
+    new_viewer_key: bool,
     #[arg(long)]
     print_viewer_key: bool,
     #[arg(long)]
@@ -257,6 +262,12 @@ struct ClientIdentity {
     auth_token: Option<String>,
     ingest_server_key: Option<[u8; 32]>,
     viewer_key_b64: Option<String>,
+    /// The viewer key in the form shared with people, which is a key phrase
+    /// unless the key was supplied directly as base64.
+    viewer_key_shareable: Option<String>,
+    /// Public salt the relay republishes so a viewer can derive the key from
+    /// the phrase. `None` for a raw key, which needs no derivation.
+    viewer_key_salt_b64: Option<String>,
     display_name: String,
     /// Where a generated viewer key is kept so restarts republish the same
     /// key, or `None` when the key came from configuration or the command line.
@@ -335,7 +346,8 @@ pub fn run() -> Result<()> {
     let daemon_socket = client_daemon_socket(&args, &identity);
 
     if args.print_viewer_key {
-        let key = identity.viewer_key_b64.as_deref().context(
+        // Prints what a viewer types, which is the phrase when there is one.
+        let key = identity.viewer_key_shareable.as_deref().context(
             "no viewer key is configured; remove --no-viewer-key to create a persistent one",
         )?;
         println!("{key}");
@@ -414,7 +426,7 @@ fn print_sharing_summary(
     if let Some(viewer_url) = &identity.viewer_url {
         println!("  viewer page  {viewer_url}");
     }
-    match identity.viewer_key_b64.as_deref() {
+    match identity.viewer_key_shareable.as_deref() {
         Some(key) => println!("  viewer key   {key}"),
         None => println!("  viewer key   (none configured; publishing will fail)"),
     }
@@ -918,6 +930,7 @@ async fn run_dash_connection(
             },
             source: source.clone(),
             source_label: identity.label.map(str::to_string),
+            viewer_key_salt: identity.client.viewer_key_salt_b64.clone(),
             resend_low: low,
             resend_high: high,
         }))
@@ -2042,11 +2055,14 @@ fn resolve_client_identity(args: &Args) -> Result<ClientIdentity> {
                 .unwrap_or_else(|| default_viewer_key_file(&client_id)),
         )
     };
-    let viewer_key_b64 = match (&configured_viewer_key, &viewer_key_file) {
-        (Some(key), _) => Some(key.clone()),
-        (None, Some(path)) => Some(load_or_create_viewer_key(path)?),
+    let viewer_key = match (&configured_viewer_key, &viewer_key_file) {
+        (Some(key), _) => Some(ViewerKeyMaterial::from_raw_b64(key.clone())),
+        (None, Some(path)) => Some(load_or_create_viewer_key(path, args.new_viewer_key)?),
         (None, None) => None,
     };
+    let viewer_key_b64 = viewer_key.as_ref().map(|key| key.key_b64.clone());
+    let viewer_key_shareable = viewer_key.as_ref().map(|key| key.shareable.clone());
+    let viewer_key_salt_b64 = viewer_key.as_ref().and_then(|key| key.salt_b64.clone());
     let display_name = args
         .display_name
         .clone()
@@ -2065,6 +2081,8 @@ fn resolve_client_identity(args: &Args) -> Result<ClientIdentity> {
         auth_token,
         ingest_server_key,
         viewer_key_b64,
+        viewer_key_shareable,
+        viewer_key_salt_b64,
         display_name,
         viewer_key_file,
         viewer_url,
@@ -2123,43 +2141,157 @@ fn default_log_file(client_id: &str) -> PathBuf {
 ///
 /// Returns an error when the file exists but is group- or world-accessible, is
 /// not a regular file, or does not contain exactly one 32-byte key.
-fn load_or_create_viewer_key(path: &std::path::Path) -> Result<String> {
-    match read_viewer_key(path) {
-        Ok(key) => return Ok(key),
-        Err(err) if path.exists() => return Err(err),
-        Err(_) => {}
+/// A viewer key, in both the form shared with people and the form used as key
+/// material.
+///
+/// These differ because a key phrase is what someone can actually retype from a
+/// message, while the 32 bytes derived from it are what the media is encrypted
+/// under. Keeping both together means the summary can never print a phrase that
+/// does not produce the key in use.
+#[derive(Debug, Clone)]
+struct ViewerKeyMaterial {
+    /// The form handed to viewers: a key phrase, or raw base64 for a key that
+    /// predates phrases or was supplied on the command line.
+    shareable: String,
+    /// URL-safe base64 of the 32 key bytes.
+    key_b64: String,
+    /// Public per-publisher salt, present only for a derived key.
+    salt_b64: Option<String>,
+}
+
+impl ViewerKeyMaterial {
+    /// Wraps a raw 32-byte key given as URL-safe base64.
+    fn from_raw_b64(key_b64: String) -> Self {
+        Self {
+            shareable: key_b64.clone(),
+            key_b64,
+            salt_b64: None,
+        }
+    }
+
+    /// Derives key material from a phrase and its salt.
+    fn from_phrase(phrase: &str, salt: &[u8; viewer_key::SALT_LEN]) -> Result<Self> {
+        let canonical =
+            viewer_key::normalize_phrase(phrase).map_err(|error| anyhow::anyhow!("{error}"))?;
+        let key = viewer_key::derive_viewer_key_normalized(&canonical, salt);
+        Ok(Self {
+            shareable: canonical,
+            key_b64: encode_key_b64(&key),
+            salt_b64: Some(viewer_key::encode_salt(salt)),
+        })
+    }
+}
+
+/// Loads the persisted viewer key, creating a fresh key phrase if there is none.
+///
+/// `regenerate` replaces an existing key, which invalidates every key already
+/// shared for this publisher.
+fn load_or_create_viewer_key(
+    path: &std::path::Path,
+    regenerate: bool,
+) -> Result<ViewerKeyMaterial> {
+    if !regenerate {
+        match read_viewer_key(path) {
+            Ok(material) => return Ok(material),
+            Err(err) if path.exists() => return Err(err),
+            Err(_) => {}
+        }
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating viewer key directory {}", parent.display()))?;
     }
-    let mut key = [0u8; 32];
-    OsRng.fill_bytes(&mut key);
-    let encoded = encode_key_b64(&key);
-    let mut file = match std::fs::OpenOptions::new()
+    let phrase = viewer_key::generate_phrase().context("generating a viewer key phrase")?;
+    let salt = viewer_key::generate_salt().context("generating a viewer key salt")?;
+    let material = ViewerKeyMaterial::from_phrase(&phrase, &salt)?;
+    let contents = format!(
+        "{VIEWER_KEY_PHRASE_PREFIX}{}\n{VIEWER_KEY_SALT_PREFIX}{}\n",
+        material.shareable,
+        material.salt_b64.as_deref().unwrap_or_default(),
+    );
+
+    let mut options = std::fs::OpenOptions::new();
+    options
         .write(true)
-        .create_new(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-    {
+        .custom_flags(libc::O_NOFOLLOW);
+    if regenerate {
+        options.create(true).truncate(true);
+    } else {
+        options.create_new(true);
+    }
+    let mut file = match options.open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Another publisher for the same client id won the race; its key is
+            // the one to publish under.
             return read_viewer_key(path);
         }
         Err(err) => {
             return Err(err).with_context(|| format!("creating viewer key {}", path.display()));
         }
     };
-    file.write_all(encoded.as_bytes())
-        .and_then(|()| file.write_all(b"\n"))
+    file.write_all(contents.as_bytes())
         .and_then(|()| file.sync_all())
         .with_context(|| format!("writing viewer key {}", path.display()))?;
-    Ok(encoded)
+    Ok(material)
 }
 
+/// Marks the key-phrase line of a viewer key file.
+const VIEWER_KEY_PHRASE_PREFIX: &str = "phrase ";
+/// Marks the salt line of a viewer key file.
+const VIEWER_KEY_SALT_PREFIX: &str = "salt ";
+
 /// Reads and validates a persisted viewer key.
-fn read_viewer_key(path: &std::path::Path) -> Result<String> {
+///
+/// Two formats are accepted: the current phrase-and-salt pair, and a bare
+/// base64 key from before phrases existed. The older form keeps working
+/// untouched, because rewriting it would silently change the key every viewer
+/// already holds.
+fn read_viewer_key(path: &std::path::Path) -> Result<ViewerKeyMaterial> {
+    let raw = read_viewer_key_file(path)?;
+    let mut phrase = None;
+    let mut salt = None;
+    for line in raw.lines() {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix(VIEWER_KEY_PHRASE_PREFIX) {
+            phrase = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix(VIEWER_KEY_SALT_PREFIX) {
+            salt = Some(value.trim().to_string());
+        }
+    }
+
+    match (phrase, salt) {
+        (Some(phrase), Some(salt_b64)) => {
+            let salt = viewer_key::decode_salt(&salt_b64).with_context(|| {
+                format!(
+                    "viewer key {} salt must be URL-safe base64 for {} bytes",
+                    path.display(),
+                    viewer_key::SALT_LEN
+                )
+            })?;
+            ViewerKeyMaterial::from_phrase(&phrase, &salt)
+                .with_context(|| format!("viewer key {} has an invalid phrase", path.display()))
+        }
+        (None, None) => {
+            let key = non_empty_trimmed("viewer key", raw)?;
+            decode_key_b64(&key).with_context(|| {
+                format!(
+                    "viewer key {} must be URL-safe base64 for 32 bytes",
+                    path.display()
+                )
+            })?;
+            Ok(ViewerKeyMaterial::from_raw_b64(key))
+        }
+        _ => bail!(
+            "viewer key {} must contain both a phrase and a salt",
+            path.display()
+        ),
+    }
+}
+
+/// Opens a viewer key file, enforcing that it is private and regular.
+fn read_viewer_key_file(path: &std::path::Path) -> Result<String> {
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
@@ -2175,14 +2307,7 @@ fn read_viewer_key(path: &std::path::Path) -> Result<String> {
     let mut raw = String::new();
     file.read_to_string(&mut raw)
         .with_context(|| format!("reading viewer key {}", path.display()))?;
-    let key = non_empty_trimmed("viewer key", raw)?;
-    decode_key_b64(&key).with_context(|| {
-        format!(
-            "viewer key {} must be URL-safe base64 for 32 bytes",
-            path.display()
-        )
-    })?;
-    Ok(key)
+    Ok(raw)
 }
 
 fn non_empty_trimmed(field: &str, value: String) -> Result<String> {
@@ -6761,6 +6886,8 @@ mod tests {
                 auth_token: None,
                 ingest_server_key: None,
                 viewer_key_b64: None,
+                viewer_key_shareable: None,
+                viewer_key_salt_b64: None,
                 display_name: "Chooser".to_string(),
                 viewer_key_file: None,
                 viewer_url: None,
@@ -6797,8 +6924,14 @@ mod tests {
         let root = std::env::temp_dir().join(format!("glacialcast-viewer-key-{}", Uuid::new_v4()));
         let path = root.join("viewer.key");
 
-        let created = load_or_create_viewer_key(&path).unwrap();
-        assert_eq!(decode_key_b64(&created).unwrap().len(), 32);
+        let created = load_or_create_viewer_key(&path, false).unwrap();
+        assert_eq!(decode_key_b64(&created.key_b64).unwrap().len(), 32);
+        assert_eq!(
+            created.shareable.split('-').count(),
+            viewer_key::PHRASE_WORDS,
+            "a fresh key is shared as a phrase, not as raw base64"
+        );
+        assert!(created.salt_b64.is_some());
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600,
@@ -6806,23 +6939,73 @@ mod tests {
         );
         // Restarting the publisher must republish under the same key so the
         // secret already shared with viewers keeps working.
-        assert_eq!(load_or_create_viewer_key(&path).unwrap(), created);
+        let reloaded = load_or_create_viewer_key(&path, false).unwrap();
+        assert_eq!(reloaded.key_b64, created.key_b64);
+        assert_eq!(reloaded.shareable, created.shareable);
+        assert_eq!(reloaded.salt_b64, created.salt_b64);
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(
-            load_or_create_viewer_key(&path).is_err(),
+            load_or_create_viewer_key(&path, false).is_err(),
             "a group- or world-readable viewer key must be rejected, not reused"
         );
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::write(&path, "not-a-32-byte-key\n").unwrap();
         assert!(
-            load_or_create_viewer_key(&path).is_err(),
+            load_or_create_viewer_key(&path, false).is_err(),
             "a malformed viewer key must be rejected, not silently replaced"
         );
 
         std::fs::write(&path, "").unwrap();
-        assert!(load_or_create_viewer_key(&path).is_err());
+        assert!(load_or_create_viewer_key(&path, false).is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A publisher that has already shared a raw base64 key must keep using it.
+    /// Rewriting it into a phrase would silently invalidate every key already
+    /// handed out.
+    #[test]
+    fn a_pre_phrase_viewer_key_file_keeps_working_untouched() {
+        let root = std::env::temp_dir().join(format!("glacialcast-legacy-key-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("viewer.key");
+        let legacy = encode_key_b64(&[9u8; 32]);
+        std::fs::write(&path, format!("{legacy}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let loaded = load_or_create_viewer_key(&path, false).unwrap();
+        assert_eq!(loaded.key_b64, legacy);
+        assert_eq!(loaded.shareable, legacy);
+        assert_eq!(
+            loaded.salt_b64, None,
+            "a raw key needs no salt, because nothing is derived from it"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            legacy,
+            "loading must not rewrite an existing key file"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn regenerating_replaces_the_shared_key() {
+        let root = std::env::temp_dir().join(format!("glacialcast-rotate-key-{}", Uuid::new_v4()));
+        let path = root.join("viewer.key");
+
+        let first = load_or_create_viewer_key(&path, false).unwrap();
+        let second = load_or_create_viewer_key(&path, true).unwrap();
+        assert_ne!(first.shareable, second.shareable);
+        assert_ne!(first.key_b64, second.key_b64);
+        // The replacement must survive, or the next start would go back to the
+        // key the operator just retired.
+        assert_eq!(
+            load_or_create_viewer_key(&path, false).unwrap().key_b64,
+            second.key_b64
+        );
 
         std::fs::remove_dir_all(root).unwrap();
     }

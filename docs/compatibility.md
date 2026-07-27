@@ -52,9 +52,23 @@ Additive HTTP JSON fields are compatible when existing fields retain their
 meaning and clients ignore unknown fields. Removing or redefining a field,
 route, authorization rule, or configuration default is incompatible.
 
+## Protocol version history
+
+| Version | Change |
+| --- | --- |
+| 6 | `StreamHello.source_label`, so one authenticated publisher can own several durable stream identities. |
+| 7 | `StreamHello.viewer_key_salt`, the public per-publisher salt a viewer needs to turn a key phrase into the viewer key. `PublicStream` gained `publisher` and `viewer_key_salt` alongside it. |
+
+Version 7 also changes how a viewer key is shared, without changing what a
+viewer key is. Key material is still 32 bytes and the epoch derivation is
+untouched, so retained objects and portable files are unaffected. A publisher
+whose key file predates the change keeps sharing raw base64 and sends no salt;
+its viewers are unaffected. `--new-viewer-key` opts into a phrase and, by
+design, invalidates keys already shared.
+
 ## Golden vectors and fuzzing
 
-[`test-vectors/protocol-v6.json`](../test-vectors/protocol-v6.json) fixes the
+[`test-vectors/protocol-v7.json`](../test-vectors/protocol-v7.json) fixes the
 derived keys and exact portable bytes for deterministic test inputs. The
 workspace test decodes and authenticates it on every normal test run.
 

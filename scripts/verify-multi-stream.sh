@@ -45,8 +45,16 @@ ingest_server_key="$(
     --print-ingest-server-key
 )"
 # One key for every stream, matching how a publisher casting several screens
-# shares a single viewer key.
-viewer_key="$(node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))")"
+# shares a single viewer key. Creating the key file before any publisher starts
+# means they all derive from the same phrase and salt, which is what makes the
+# "enter one key, unlock every screen" path real here rather than simulated.
+viewer_key_file="${work_dir}/viewer.key"
+viewer_key="$(
+  target/debug/glacialcast-client \
+    --config "${work_dir}/missing-client.toml" \
+    --viewer-key-file "${viewer_key_file}" \
+    --print-viewer-key
+)"
 
 target/debug/glacialcast-server \
   --config "${work_dir}/missing-server.toml" \
@@ -67,7 +75,7 @@ for index in $(seq 1 "${publishers}"); do
     --config "${work_dir}/missing-client.toml" \
     --ingest-addr "${ingest_addr}" \
     "--ingest-server-key=${ingest_server_key}" \
-    "--viewer-key=${viewer_key}" \
+    --viewer-key-file "${viewer_key_file}" \
     --foreground \
     --client-id "multi-stream-${index}" \
     --display-name "Multi Stream ${index}" \

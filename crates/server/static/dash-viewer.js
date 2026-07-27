@@ -21,6 +21,43 @@ const decoder = new TextDecoder();
  * socket, its reconnect timers, and the animation-frame loop all outlive the
  * DOM otherwise.
  */
+// Hoisted out of createPlayer so the standalone key check below authenticates
+// an object with exactly the same bytes the player does; two copies of this
+// layout would be two chances to disagree.
+function kindCode(kind) {
+  const code = {
+    Epoch: 0,
+    Initialization: 1,
+    Media: 2,
+    Cursor: 3,
+    Index: 4,
+    End: 5,
+  }[kind];
+  if (code === undefined) throw new Error(`Unknown DASH object kind ${kind}.`);
+  return code;
+}
+
+function authenticationBytes(header) {
+  const mime = encoder.encode(header.mime);
+  return concatBytes(
+    encoder.encode('glacial-dash-object-v1'),
+    unsignedBigEndian(header.format_version, 2),
+    uuidToBytes(header.stream_id),
+    uuidToBytes(header.epoch_id),
+    new Uint8Array([kindCode(header.kind)]),
+    unsignedBigEndian(header.sequence, 8),
+    unsignedBigEndian(header.segment_number, 8),
+    unsignedBigEndian(header.chunk_index, 2),
+    unsignedBigEndian(header.timestamp, 8),
+    unsignedBigEndian(header.duration, 8),
+    new Uint8Array([header.random_access ? 1 : 0]),
+    unsignedBigEndian(mime.byteLength, 2),
+    mime,
+    unsignedBigEndian(header.payload_len, 4),
+    new Uint8Array(header.payload_sha256),
+  );
+}
+
 function createPlayer(root, options) {
   const streamId = options.streamId;
   const onStatus = options.onStatus || (() => {});
@@ -275,40 +312,6 @@ function createPlayer(root, options) {
       authenticated,
     );
     if (!valid) throw new Error(`Object ${header.sequence} failed authentication.`);
-  }
-
-  function authenticationBytes(header) {
-    const mime = encoder.encode(header.mime);
-    return concatBytes(
-      encoder.encode('glacial-dash-object-v1'),
-      unsignedBigEndian(header.format_version, 2),
-      uuidToBytes(header.stream_id),
-      uuidToBytes(header.epoch_id),
-      new Uint8Array([kindCode(header.kind)]),
-      unsignedBigEndian(header.sequence, 8),
-      unsignedBigEndian(header.segment_number, 8),
-      unsignedBigEndian(header.chunk_index, 2),
-      unsignedBigEndian(header.timestamp, 8),
-      unsignedBigEndian(header.duration, 8),
-      new Uint8Array([header.random_access ? 1 : 0]),
-      unsignedBigEndian(mime.byteLength, 2),
-      mime,
-      unsignedBigEndian(header.payload_len, 4),
-      new Uint8Array(header.payload_sha256),
-    );
-  }
-
-  function kindCode(kind) {
-    const code = {
-      Epoch: 0,
-      Initialization: 1,
-      Media: 2,
-      Cursor: 3,
-      Index: 4,
-      End: 5,
-    }[kind];
-    if (code === undefined) throw new Error(`Unknown DASH object kind ${kind}.`);
-    return code;
   }
 
   function validateDescriptor(descriptor, header) {
@@ -981,8 +984,63 @@ function createPlayer(root, options) {
   };
 }
 
+/**
+ * Reports whether `viewerKey` really opens `streamId`.
+ *
+ * A key is right or wrong before any tile is built, so the viewer can say "that
+ * key does not open this stream" instead of starting a player that fails
+ * halfway through with a decoding error. The check is the same authentication
+ * the player performs on every object: derive the epoch keys and verify one
+ * epoch descriptor's HMAC. That costs a single small fetch.
+ */
+async function verifyViewerKey(streamId, viewerKey) {
+  const response = await fetch(`/api/dash/streams/${streamId}/objects`, { cache: 'no-store' });
+  if (!response.ok) return false;
+  const headers = await response.json();
+  const epoch = headers
+    .filter(header => header.kind === 'Epoch')
+    .sort((left, right) => right.sequence - left.sequence)[0];
+  // A stream that has not published an epoch yet cannot confirm or deny the
+  // key. Treat that as "no reason to reject" rather than as a wrong key.
+  if (!epoch) return true;
+
+  const payloadResponse = await fetch(
+    `/api/dash/streams/${streamId}/objects/${epoch.sequence}`,
+  );
+  if (!payloadResponse.ok) return false;
+  const payload = new Uint8Array(await payloadResponse.arrayBuffer());
+
+  const saltInput = concatBytes(
+    new TextEncoder().encode('glacialcast epoch key salt'),
+    uuidToBytes(streamId),
+    uuidToBytes(epoch.epoch_id),
+  );
+  const salt = new Uint8Array(await crypto.subtle.digest('SHA-256', saltInput));
+  const inputKey = await crypto.subtle.importKey('raw', viewerKey, 'HKDF', false, ['deriveBits']);
+  const material = new Uint8Array(await crypto.subtle.deriveBits({
+    name: 'HKDF',
+    hash: 'SHA-256',
+    salt,
+    info: new TextEncoder().encode('glacialcast dash epoch keys v1'),
+  }, inputKey, 80 * 8));
+  const authenticationKey = await crypto.subtle.importKey(
+    'raw',
+    material.slice(48, 80),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['verify'],
+  );
+
+  return crypto.subtle.verify(
+    'HMAC',
+    authenticationKey,
+    new Uint8Array(epoch.authentication_tag),
+    concatBytes(authenticationBytes(epoch), payload),
+  );
+}
+
 if (typeof globalThis !== 'undefined') {
-  globalThis.GlacialCastPlayer = { createPlayer };
+  globalThis.GlacialCastPlayer = { createPlayer, verifyViewerKey };
 }
 
 function once(target, event) {

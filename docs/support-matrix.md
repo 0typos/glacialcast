@@ -23,7 +23,7 @@ scrambled pixels still produce valid encrypted objects.
 
 | Target | Required behavior | Current evidence |
 | --- | --- | --- |
-| Firefox on Linux | Clear Key EME keyring, retained multi-epoch history, live publisher transitions, independent cursor paint/move/hide/restore | Validated by the browser gates; Firefox is primary |
+| Firefox on Linux | Clear Key EME sessions, retained multi-epoch history, live publisher transitions, independent cursor paint/move/hide/restore | Validated by the browser gates; Firefox is primary |
 | Chromium on Linux | Same constrained CENC/fMP4 multi-epoch presentation and cursor behavior | Validated by the browser gates |
 | Portable offline viewer | Incremental `.gco` arrival, multi-epoch history, and live epoch transitions in both browsers | Validated by the synthetic and browser gates |
 | Internet HTTPS profile | Login, scoped authorization, Caddy TLS, secure session, playback in both browsers | Validated by the Internet browser gate |

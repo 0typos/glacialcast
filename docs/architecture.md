@@ -17,7 +17,7 @@ The MVP is complete when all of the following are true:
 
 1. The client captures a selected Wayland monitor or window through the XDG
    Desktop Portal and PipeWire.
-2. Video defaults to 1 frame per second. A captured frame is available to an
+2. Video defaults to 5 frames per second. A captured frame is available to an
    already-connected viewer within 250 milliseconds under local test
    conditions.
 3. Cursor position, visibility, hotspot, and bitmap changes are carried
@@ -97,7 +97,7 @@ The initial interoperable media profile is:
 - H.264/AVC constrained baseline where the encoder supports it
 - MPEG Common Encryption using the `cenc` AES-CTR scheme
 - 90,000 tick media timescale
-- 1 FPS default video cadence
+- 5 FPS default video cadence
 - no B-frames
 - four-second group of pictures and segment target
 - one complete `moof`/`mdat` fragment per published frame
@@ -318,13 +318,20 @@ session, and cursor overlay, and each is destroyed when its tile is emptied.
 The relay's per-principal WebSocket limit accounts for a four-tile view plus
 the operations dashboard's control socket.
 
-Persisting viewer keys for the side panel is a deliberate exposure change. Keys
-are wrapped with AES-GCM under a PBKDF2-SHA-256 key derived from an operator
-passphrase and stored in `localStorage`; the passphrase is never stored and
-unwrapped keys exist only in memory for the session. Every entry is decrypted
-at unlock so a wrong passphrase fails loudly instead of presenting an empty
-keyring that would then be overwritten. The relay still never receives a viewer
-key.
+A viewing key is transferred as a seven-word phrase and turned into 32 bytes
+with PBKDF2-HMAC-SHA-256 over a per-publisher salt, which the publisher sends in
+its hello and the relay republishes as public stream metadata. Because the salt
+is per publisher rather than per stream, one phrase resolves to one key for
+every screen that publisher casts, and the viewer applies it to all of them from
+a single entry. The derivation is implemented twice — in `viewer_key.rs` and in
+`viewer-key.js` — from one shared wordlist and one shared vector file, since a
+disagreement between them would look like a valid key that decrypts nothing.
+
+Before a key is accepted, the viewer authenticates one real epoch object with
+it. That turns a wrong key into an immediate, accurate message instead of tiles
+that build and then fail during decode. The unlocked key is held in
+`sessionStorage`, so it survives a reload but not the tab; nothing is written to
+disk and the relay still never receives a viewer key.
 
 ### Publishing several screens
 
@@ -365,7 +372,7 @@ Release verification covers:
 - the wlroots portal family
 - niri's supported portal path
 
-The browser gate verifies MSE fragmented-MP4 playback, an EME Clear Key keyring,
+The browser gate verifies MSE fragmented-MP4 playback, EME Clear Key sessions,
 live append across forced publisher reconnects, retained multi-epoch history
 seeking, and cursor synchronization in both live and copied-file viewers. Each
 epoch's zero-based media and cursor clocks are rebased into one continuous

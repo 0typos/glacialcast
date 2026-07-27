@@ -35,35 +35,25 @@
     <aside id="sidebar" aria-labelledby="sidebar-title">
       <h2 id="sidebar-title">Your streams</h2>
 
-      <form id="unlock-keyring" class="panel">
+      <ul id="stream-list" class="stream-list"></ul>
+      <p id="empty-hint" class="help" hidden>
+        No streams unlocked yet. Enter the viewing key you were given.
+      </p>
+
+      <form id="unlock" class="panel">
+        <label for="viewing-key">Viewing key</label>
+        <input id="viewing-key" type="password" autocomplete="off" spellcheck="false"
+               placeholder="seven words, or a viewer key" required>
+        <button type="submit">Unlock</button>
+        <p id="unlock-status" class="help" role="status"></p>
+        <p id="unlock-error" class="error" role="alert" hidden></p>
         <p class="help">
-          Your viewer keys are stored in this browser, encrypted with a passphrase.
-          They are never sent to the relay.
+          One key unlocks every screen a publisher casts. It is kept for this
+          browser tab only and is never sent to the relay.
         </p>
-        <label for="passphrase">Keyring passphrase</label>
-        <input id="passphrase" type="password" autocomplete="current-password" required>
-        <button type="submit">Open keyring</button>
-        <p id="keyring-error" class="error" role="alert" hidden></p>
       </form>
 
-      <div id="keyring-panel" hidden>
-        <ul id="stream-list" class="stream-list"></ul>
-        <p id="empty-hint" class="help" hidden>
-          No stored keys yet. Add one below.
-        </p>
-
-        <form id="add-key" class="panel">
-          <h3>Add a stream key</h3>
-          <label for="add-stream">Stream</label>
-          <select id="add-stream" required></select>
-          <label for="add-key-value">Viewer key</label>
-          <input id="add-key-value" type="password" autocomplete="off" spellcheck="false" required>
-          <button type="submit">Remember key</button>
-          <p id="add-error" class="error" role="alert" hidden></p>
-        </form>
-
-        <button id="forget-all" type="button" class="danger">Forget all keys</button>
-      </div>
+      <button id="forget-all" type="button" class="danger" hidden>Forget keys</button>
     </aside>
 
     <section id="grid" class="grid layout-1" aria-label="Stream tiles"></section>
@@ -94,7 +84,7 @@
 
   <script src="/assets/dash-viewer-core.js"></script>
   <script src="/assets/dash-viewer.js"></script>
-  <script src="/assets/keyring.js"></script>
+  <script src="/assets/viewer-key.js"></script>
   <script src="/assets/watch.js"></script>
 </body>
 </html>
