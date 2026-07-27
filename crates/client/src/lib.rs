@@ -947,18 +947,18 @@ async fn run_dash_connection(
     let epoch_id = Uuid::new_v4();
     let keys = EpochKeys::derive(viewer_key, stream_id, epoch_id)
         .context("deriving encrypted DASH epoch keys")?;
-    let mut encoder = DashH264Encoder::new(
-        args.dash_encoder,
-        &args.vaapi_device,
-        args.openh264_library.as_deref(),
+    let encoder = EncoderActor::spawn(EncoderConfig {
+        mode: args.dash_encoder,
+        vaapi_device: args.vaapi_device.clone(),
+        openh264_library: args.openh264_library.clone(),
         width,
         height,
-        args.fps,
-        args.video_bitrate,
-        args.segment_frames,
-    )?;
+        fps: args.fps,
+        bitrate: args.video_bitrate,
+        segment_frames: args.segment_frames,
+    })?;
     let mut last_frame_fingerprint = first_frame.content_fingerprint();
-    let first_encoded = encoder.encode(&first_frame, false)?;
+    let first_encoded = encoder.encode(first_frame.clone(), false).await?;
     if !first_encoded.keyframe {
         bail!("H.264 encoder did not begin the epoch with a random-access frame");
     }
@@ -1245,11 +1245,11 @@ async fn run_dash_connection(
                 }
                 if let Some(timestamp) = decision.publish_current_timestamp {
                     let encoded = encode_media_frame(
-                        &mut encoder,
-                        &capture.frame,
+                        &encoder,
+                        capture.frame,
                         media_index,
                         args.segment_frames,
-                    )?;
+                    ).await?;
                     publish_encoded_media(
                         &mut socket,
                         resend,
@@ -1266,11 +1266,11 @@ async fn run_dash_connection(
                     last_frame_fingerprint = fingerprint;
                 } else if let Some(timestamp) = decision.encode_pending_timestamp {
                     let encoded = encode_media_frame(
-                        &mut encoder,
-                        &capture.frame,
+                        &encoder,
+                        capture.frame,
                         media_index,
                         args.segment_frames,
-                    )?;
+                    ).await?;
                     pending_media = Some(PendingEncodedMedia { timestamp, encoded });
                 } else {
                     capture.frame.discard();
@@ -1494,18 +1494,141 @@ fn next_dash_object(
     .context("authenticating DASH object")
 }
 
-fn encode_media_frame(
-    encoder: &mut DashH264Encoder,
-    frame: &DashInputFrame,
+/// Runs the H.264 encoder on a thread of its own.
+///
+/// The VA-API encoder holds thread-affine handles and is deliberately not
+/// `Send`, so it cannot simply be moved onto a blocking pool. Owning it on a
+/// dedicated thread and talking to it over channels keeps every millisecond of
+/// encoding off the runtime thread, which is what lets the cursor task be
+/// scheduled while a frame is encoded.
+struct EncoderActor {
+    requests: std::sync::mpsc::Sender<EncodeRequest>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    backend_name: &'static str,
+}
+
+impl EncoderActor {
+    /// Names the encoder backend the thread actually built.
+    fn backend_name(&self) -> &'static str {
+        self.backend_name
+    }
+}
+
+/// One frame to encode, with the channel its result comes back on.
+struct EncodeRequest {
+    frame: DashInputFrame,
+    segment_start: bool,
+    reply: tokio::sync::oneshot::Sender<Result<dash_encoder::EncodedH264Frame>>,
+}
+
+impl EncoderActor {
+    /// Starts the encoder on its own thread.
+    ///
+    /// Construction happens on that thread too, because the encoder is not
+    /// `Send` and so cannot be built here and moved across.
+    fn spawn(config: EncoderConfig) -> Result<Self> {
+        let (requests, rx) = std::sync::mpsc::channel::<EncodeRequest>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<&'static str>>();
+        let thread = std::thread::Builder::new()
+            .name("glacialcast-encode".to_string())
+            .spawn(move || {
+                let mut encoder = match DashH264Encoder::new(
+                    config.mode,
+                    &config.vaapi_device,
+                    config.openh264_library.as_deref(),
+                    config.width,
+                    config.height,
+                    config.fps,
+                    config.bitrate,
+                    config.segment_frames,
+                ) {
+                    Ok(encoder) => {
+                        let _ = ready_tx.send(Ok(encoder.backend_name()));
+                        encoder
+                    }
+                    Err(err) => {
+                        let _ = ready_tx.send(Err(err));
+                        return;
+                    }
+                };
+                while let Ok(request) = rx.recv() {
+                    let result = encoder
+                        .encode(&request.frame, request.segment_start)
+                        .and_then(|encoded| {
+                            if request.segment_start && !encoded.keyframe {
+                                bail!(
+                                    "H.264 encoder did not produce an IDR at the segment boundary"
+                                );
+                            }
+                            Ok(encoded)
+                        });
+                    // A caller that went away simply drops the result.
+                    let _ = request.reply.send(result);
+                }
+            })
+            .context("spawning encoder thread")?;
+        let backend_name = ready_rx
+            .recv()
+            .context("encoder thread stopped before reporting readiness")??;
+        Ok(Self {
+            requests,
+            thread: Some(thread),
+            backend_name,
+        })
+    }
+
+    /// Encodes one frame, awaiting the dedicated thread rather than blocking.
+    async fn encode(
+        &self,
+        frame: DashInputFrame,
+        segment_start: bool,
+    ) -> Result<dash_encoder::EncodedH264Frame> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.requests
+            .send(EncodeRequest {
+                frame,
+                segment_start,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("encoder thread stopped"))?;
+        response
+            .await
+            .context("encoder thread dropped the request")?
+    }
+}
+
+impl Drop for EncoderActor {
+    fn drop(&mut self) {
+        // Closing the request channel ends the loop; join so the encoder is
+        // fully torn down before the capture it borrows from goes away.
+        let (dead, _) = std::sync::mpsc::channel();
+        let _ = std::mem::replace(&mut self.requests, dead);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Everything the encoder thread needs to build its encoder.
+struct EncoderConfig {
+    mode: DashEncoderMode,
+    vaapi_device: PathBuf,
+    openh264_library: Option<PathBuf>,
+    width: u32,
+    height: u32,
+    fps: f64,
+    bitrate: u32,
+    segment_frames: u16,
+}
+
+async fn encode_media_frame(
+    encoder: &EncoderActor,
+    frame: DashInputFrame,
     media_index: u64,
     segment_frames: u16,
 ) -> Result<dash_encoder::EncodedH264Frame> {
     let segment_start = media_index.is_multiple_of(u64::from(segment_frames));
-    let encoded = encoder.encode(frame, segment_start)?;
-    if segment_start && !encoded.keyframe {
-        bail!("H.264 encoder did not produce an IDR at the segment boundary");
-    }
-    Ok(encoded)
+    encoder.encode(frame, segment_start).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2602,11 +2725,19 @@ impl NativePipewireCapture {
         max_height: u32,
     ) -> Result<ImageBuffer<Rgb<u8>, Vec<u8>>> {
         let frame = self.next_frame().await?;
-        Ok(resize_rgb_image_to_fit(
-            raw_frame_to_rgb_image(&frame)?,
-            max_width,
-            max_height,
-        ))
+        // Unpacking and scaling a full-resolution frame is tens of
+        // milliseconds of pure CPU. The cursor now samples on its own task, so
+        // getting this off the runtime thread is what lets that task actually
+        // be scheduled while a video frame is being prepared.
+        tokio::task::spawn_blocking(move || {
+            Ok(resize_rgb_image_to_fit(
+                raw_frame_to_rgb_image(&frame)?,
+                max_width,
+                max_height,
+            ))
+        })
+        .await
+        .context("frame conversion task panicked")?
     }
 
     async fn next_frame(&mut self) -> Result<RawFrame> {
