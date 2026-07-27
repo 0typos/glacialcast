@@ -452,9 +452,20 @@ Measured on niri 26.04 with PipeWire 1.6.8, three 2560x1440 outputs at 60 Hz:
 
 The worst-case figure is bounded by the compositor, not by this code: the
 overlay's play-out smoothing paints *more* evenly than its input, turning a
-734 ms hole into a 350 ms one. Frame size does not move it — 1280x720 and
-2560x1440 both pause for 267 ms on a single output — so it is not this
-process's per-frame cost, and scaling frames on the GPU would not change it.
+734 ms hole into a 350 ms one.
+
+Two controlled comparisons place that pause outside this process. Capturing at
+0.5 fps instead of 5, which is ten times less readback and encoding, gives
+34.4 against 33.3 buffers per second, 25.9 cursor samples per second either
+way, and a worst pause of 272 against 277 ms. Switching an output to its
+143.998 Hz mode gives 33.1 buffers and 26.0 cursor samples per second — lower
+than at 59.951 Hz, so panel refresh bounds the rate without being what
+currently limits it. Neither video work nor panel mode moves the pause, so
+moving per-frame work to the GPU would not move it either.
+
+Note that varying `--max-frame-width`/`--max-frame-height` does *not* test this:
+scaling happens after readback, so both a 720p and a 1440p output read back the
+same full-size DMA-BUF and cost the same. Vary `--fps` to vary the work.
 
 ## 7. Test VA-API and DMA-BUF
 
