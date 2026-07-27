@@ -172,8 +172,27 @@ function createPlayer(root, options) {
     if (epochHeaders.length === 0) {
       throw new Error('The stream has not published an epoch descriptor.');
     }
+    // An epoch this key cannot open is skipped rather than fatal. Retained
+    // history can outlive a viewer key — rotating one leaves the relay holding
+    // objects encrypted to the old key for the rest of the retention window —
+    // and a viewer holding the current key must still be able to watch the
+    // current stream. Failing the whole load would make a rotated key look
+    // broken until the old history aged out.
+    const failures = [];
     for (const header of epochHeaders) {
-      await loadEpochDescriptor(header);
+      try {
+        await loadEpochDescriptor(header);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (state.epochOrder.length === 0) {
+      throw failures[0] ?? new Error('No stream epoch could be authenticated with this key.');
+    }
+    if (failures.length > 0) {
+      console.info(
+        `Skipped ${failures.length} epoch(s) this viewer key does not open.`,
+      );
     }
   }
 
@@ -209,7 +228,11 @@ function createPlayer(root, options) {
   }
 
   function installInitialEpochTimeline(headers) {
-    const timeline = ViewerCore.buildEpochTimeline(headers);
+    // Only epochs that authenticated get a place on the timeline; objects
+    // belonging to a skipped epoch are not playable and must not reserve time.
+    const timeline = ViewerCore.buildEpochTimeline(
+      headers.filter(header => state.epochs.has(header.epoch_id)),
+    );
     for (const planned of timeline) {
       const epoch = state.epochs.get(planned.epoch_id);
       if (!epoch?.descriptor) {
@@ -645,7 +668,15 @@ function createPlayer(root, options) {
     const headers = await fetchHeaders();
     state.headers = headers;
     for (const header of headers.filter(header => header.kind === 'Epoch')) {
-      const epoch = await loadEpochDescriptor(header);
+      // Same reasoning as the initial load: an epoch this key cannot open is
+      // skipped, not fatal, so retained history from a rotated key does not
+      // stop live playback.
+      let epoch;
+      try {
+        epoch = await loadEpochDescriptor(header);
+      } catch {
+        continue;
+      }
       await installEpochKey(epoch);
     }
 
