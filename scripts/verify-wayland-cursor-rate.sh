@@ -24,6 +24,9 @@ ingest_addr="${GLACIALCAST_VERIFY_INGEST_ADDR:-127.0.0.1:18988}"
 backend="${GLACIALCAST_VERIFY_SCREENCAST_BACKEND:-auto}"
 monitor_name="${GLACIALCAST_VERIFY_MONITOR_NAME:-}"
 measure_seconds="${GLACIALCAST_CURSOR_RATE_SECONDS:-20}"
+# Pointer steps per second. The compositor cannot deliver above panel
+# refresh, so measuring a high-refresh output means raising this to match.
+probe_rate_hz="${GLACIALCAST_CURSOR_PROBE_HZ:-60}"
 # The publisher can only forward what the compositor hands it, and a little is
 # legitimately lost to the batching interval at the window edges.
 min_ratio="${GLACIALCAST_CURSOR_RATE_MIN_RATIO:-0.70}"
@@ -171,7 +174,8 @@ NODE
 
 # The probe outlives the measurement at both ends, so the pointer is already
 # moving when measurement starts and has not stopped when it ends.
-python3 scripts/pointer-probe.py "$((measure_seconds + 40))" >"${work_dir}/probe.log" 2>&1 &
+python3 scripts/pointer-probe.py "$((measure_seconds + 40))" "${probe_rate_hz}" \
+  >"${work_dir}/probe.log" 2>&1 &
 probe_pid="$!"
 # A probe that died on startup would otherwise surface several steps later as a
 # publishing failure, which is the most misleading thing this gate could do.

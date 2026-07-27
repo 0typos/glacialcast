@@ -75,13 +75,23 @@ try {
     // work in the viewer, not missing cursor data.
     let maxFrameDelta = 0;
     let lastFrameAt = startedAt;
+    // How far the play-out clock trails the newest sample it holds. A clock
+    // that falls behind and cannot catch up looks exactly like a stall.
+    let maxLag = 0;
+    let minLag = Number.POSITIVE_INFINITY;
 
     await new Promise(resolve => {
       const step = () => {
         const frameNow = performance.now();
         maxFrameDelta = Math.max(maxFrameDelta, frameNow - lastFrameAt);
         lastFrameAt = frameNow;
-        const shown = player.metrics().cursor.shownTimestamp;
+        const cursor = player.metrics().cursor;
+        if (cursor.shownTimestamp !== null && cursor.newestTimestamp !== null) {
+          const lag = cursor.newestTimestamp - cursor.shownTimestamp;
+          maxLag = Math.max(maxLag, lag);
+          minLag = Math.min(minLag, lag);
+        }
+        const shown = cursor.shownTimestamp;
         if (shown !== null && shown !== lastShown) {
           const now = performance.now();
           if (lastShown !== null) {
@@ -104,6 +114,8 @@ try {
       gaps,
       gapOffsets,
       maxFrameDelta,
+      maxLag,
+      minLag: Number.isFinite(minLag) ? minLag : null,
     };
   }, seconds * 1000);
 
@@ -127,6 +139,7 @@ try {
       max: gaps.length === 0 ? null : Number(gaps.at(-1).toFixed(1)),
     },
     max_animation_frame_gap_ms: Number(result.maxFrameDelta.toFixed(1)),
+    playout_lag_ticks: { min: result.minLag, max: result.maxLag },
     worst_gap_at_second: result.gaps.length === 0
       ? null
       : Number((result.gapOffsets[worstIndex] / 1000).toFixed(1)),

@@ -336,23 +336,20 @@ It is the dominant term in how smooth the overlay looks, because the viewer can
 only animate through samples it has: raising it saves relay objects and costs
 smoothness.
 
-What the compositor actually delivers is worth measuring rather than assuming.
-On niri 26.04 with three 2560x1440 outputs at 60 Hz, it advertises a
-`videoMaxFramerate` of 59.951 but delivers 37–38 buffers per second, of which
-about 30 carry cursor motion; the publisher forwards 89–93% of those. It also
-pauses cursor delivery entirely for 267 ms at a time with one output and 734 ms
-with three, which is more than any smoothing downstream can hide — the overlay
-paints more evenly than its input and still shows a worst-case gap around
-350 ms.
+What the compositor actually delivers is worth measuring rather than assuming,
+and it is easy to measure it wrong. On niri 26.04 with three 2560x1440 outputs
+at 60 Hz, a moving pointer produces 59.7 buffers per second, every one of them
+carrying cursor motion, with a worst pause between cursor samples of 19–35 ms.
+That is the panel rate, which is the documented ceiling.
 
-Those pauses are the compositor's, not this process's. Running the same capture
-at 0.5 fps instead of 5 — ten times less readback and encoding — changes
-nothing: 34.4 against 33.3 buffers per second, 25.9 cursor samples per second
-either way, and a worst pause of 272 against 277 ms. Raising a panel to its
-143.998 Hz mode does not help either; delivery *falls* to 33 buffers and 26
-cursor samples per second, so panel refresh is a ceiling rather than the
-binding constraint here. `scripts/verify-wayland-cursor-rate.sh` measures all of
-this on a real session.
+Reaching it depends on how the pointer moves. A synthetic *absolute*
+pointing device — a virtual tablet — is coalesced somewhere between libinput
+and the compositor: the same machine reports 37 buffers and 30 cursor samples
+per second with pauses up to 267 ms when driven that way. Nothing is wrong with
+the compositor in that case; the input is. `scripts/pointer-probe.py` therefore
+emits relative motion, as a mouse does, and
+`scripts/verify-wayland-cursor-rate.sh` measures against what the compositor
+delivered rather than against a fixed number.
 
 For repeatable bandwidth tests, `--test-pattern` accepts `static`, `typing`,
 `scroll`, and `motion`.
