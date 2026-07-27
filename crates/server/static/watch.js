@@ -1,26 +1,28 @@
 'use strict';
 
-// The multi-stream viewer: a side panel of streams this browser holds keys
-// for, and a grid of one, two, or four tiles they can be dragged into.
+// The multi-stream viewer: a side panel of the streams this tab has unlocked,
+// and a grid of one, two, or four tiles they can be dragged into.
 //
 // Each tile owns an independent player instance, so tiles start and stop
 // without disturbing one another and each can be full-screened on its own.
+//
+// A viewing key is entered once. One key covers every screen a publisher
+// casts, so entering it unlocks all of them at once rather than asking again
+// per monitor, and it is held in session storage so a reload does not ask
+// again either. Session storage is deliberate: the key lives as long as the
+// tab and no longer, so closing the browser leaves nothing behind on disk.
 
 const Player = globalThis.GlacialCastPlayer;
-const Keyring = globalThis.GlacialCastKeyring;
-if (!Player || !Keyring) throw new Error('The GlacialCast viewer failed to load.');
+const ViewerKey = globalThis.GlacialCastViewerKey;
+if (!Player || !ViewerKey) throw new Error('The GlacialCast viewer failed to load.');
 
 const els = {
-  unlockForm: document.querySelector('#unlock-keyring'),
-  passphrase: document.querySelector('#passphrase'),
-  keyringError: document.querySelector('#keyring-error'),
-  keyringPanel: document.querySelector('#keyring-panel'),
+  unlockForm: document.querySelector('#unlock'),
+  viewingKey: document.querySelector('#viewing-key'),
+  unlockError: document.querySelector('#unlock-error'),
+  unlockStatus: document.querySelector('#unlock-status'),
   streamList: document.querySelector('#stream-list'),
   emptyHint: document.querySelector('#empty-hint'),
-  addForm: document.querySelector('#add-key'),
-  addStream: document.querySelector('#add-stream'),
-  addKey: document.querySelector('#add-key-value'),
-  addError: document.querySelector('#add-error'),
   forgetAll: document.querySelector('#forget-all'),
   grid: document.querySelector('#grid'),
   headline: document.querySelector('#headline'),
@@ -31,51 +33,123 @@ const els = {
 };
 
 const SIDEBAR_STORAGE_KEY = 'glacialcast.sidebar.collapsed';
+const SESSION_KEY_STORE = 'glacialcast.session.keys.v1';
 
 const MAX_TILES = 4;
 const state = {
-  keyring: null,
+  /** Unlocked viewer keys as URL-safe base64, by stream ID. */
+  keys: new Map(),
   /** Relay stream metadata by stream ID. */
   streams: new Map(),
   /** One entry per visible tile. */
   tiles: [],
-  layout: 1,
+  layout: 4,
 };
+
+/** Reads the keys this tab already unlocked. */
+function loadSessionKeys() {
+  try {
+    const raw = globalThis.sessionStorage.getItem(SESSION_KEY_STORE);
+    if (!raw) return;
+    for (const [streamId, key] of Object.entries(JSON.parse(raw))) {
+      if (typeof key === 'string') state.keys.set(streamId, key);
+    }
+  } catch {
+    // A corrupt or unavailable store just means unlocking again.
+  }
+}
+
+function saveSessionKeys() {
+  try {
+    globalThis.sessionStorage.setItem(
+      SESSION_KEY_STORE,
+      JSON.stringify(Object.fromEntries(state.keys)),
+    );
+  } catch {
+    // Without session storage the key still works, it just has to be retyped
+    // after a reload.
+  }
+}
+
+/**
+ * Applies one typed key to every stream it actually opens.
+ *
+ * Streams are grouped by publisher because a publisher's screens share a key
+ * and each publisher has its own salt. Deriving is deliberately expensive, so
+ * it happens once per publisher rather than once per screen. Each derived key
+ * is then checked against a real object, which is what lets a wrong key be
+ * reported as wrong instead of producing tiles that fail later.
+ */
+async function unlockWithKey(typed) {
+  const publishers = new Map();
+  for (const stream of state.streams.values()) {
+    if (!publishers.has(stream.publisher)) publishers.set(stream.publisher, []);
+    publishers.get(stream.publisher).push(stream);
+  }
+  if (publishers.size === 0) throw new Error('No streams are published yet.');
+
+  let unlocked = 0;
+  const failures = [];
+  for (const streams of publishers.values()) {
+    let bytes;
+    try {
+      bytes = await ViewerKey.resolveKey(typed, streams[0].viewer_key_salt);
+    } catch (error) {
+      failures.push(error);
+      continue;
+    }
+    // One screen answers for the publisher: the key is the same for all of
+    // them, so checking every screen would only repeat the same fetch.
+    if (!await Player.verifyViewerKey(streams[0].stream_id, bytes)) continue;
+
+    const encoded = ViewerKey.bytesToBase64Url(bytes);
+    for (const stream of streams) state.keys.set(stream.stream_id, encoded);
+    unlocked += streams.length;
+  }
+
+  if (unlocked === 0) {
+    // Every publisher rejected the key. If none of them could even parse it,
+    // the parse error is the more useful thing to say.
+    if (failures.length === publishers.size && failures[0]) throw failures[0];
+    throw new Error('That key does not open any stream published here.');
+  }
+  saveSessionKeys();
+  return unlocked;
+}
 
 els.unlockForm.addEventListener('submit', async event => {
   event.preventDefault();
-  showError(els.keyringError, null);
+  showError(els.unlockError, null);
+  const typed = els.viewingKey.value;
+  const submit = els.unlockForm.querySelector('button[type="submit"]');
+  submit.disabled = true;
+  els.unlockStatus.textContent = 'Checking the key\u2026';
   try {
-    state.keyring = await Keyring.unlock(els.passphrase.value);
-    els.passphrase.value = '';
-    els.unlockForm.hidden = true;
-    els.keyringPanel.hidden = false;
     await refreshStreams();
-    setLayout(state.layout);
-  } catch (error) {
-    showError(els.keyringError, error);
-  }
-});
-
-els.addForm.addEventListener('submit', async event => {
-  event.preventDefault();
-  showError(els.addError, null);
-  try {
-    await state.keyring.remember(els.addStream.value, els.addKey.value);
-    els.addKey.value = '';
+    const unlocked = await unlockWithKey(typed);
+    els.viewingKey.value = '';
+    els.unlockStatus.textContent = unlocked === 1
+      ? 'Unlocked 1 stream.'
+      : `Unlocked ${unlocked} streams.`;
     renderStreamList();
+    showUnlockedStreams();
   } catch (error) {
-    showError(els.addError, error);
+    els.unlockStatus.textContent = '';
+    showError(els.unlockError, error);
+  } finally {
+    submit.disabled = false;
   }
 });
 
 els.forgetAll.addEventListener('click', () => {
-  if (!globalThis.confirm('Forget every stored viewer key in this browser?')) return;
   for (const tile of state.tiles) detachTile(tile);
-  state.keyring.forgetAll();
-  state.keyring = null;
-  els.keyringPanel.hidden = true;
-  els.unlockForm.hidden = false;
+  state.keys.clear();
+  try {
+    globalThis.sessionStorage.removeItem(SESSION_KEY_STORE);
+  } catch {
+    // Nothing stored means nothing to remove.
+  }
+  renderStreamList();
 });
 
 for (const button of document.querySelectorAll('[data-layout]')) {
@@ -134,7 +208,9 @@ function streamTitle(streamId) {
 }
 
 function renderStreamList() {
-  const known = state.keyring ? state.keyring.streamIds() : [];
+  // Ordered by the relay's own ordering rather than by unlock order, so the
+  // panel reads the same way every time.
+  const known = [...state.streams.keys()].filter(streamId => state.keys.has(streamId));
   els.streamList.textContent = '';
   for (const streamId of known) {
     const item = document.createElement('li');
@@ -156,19 +232,7 @@ function renderStreamList() {
     // touch users, so every stream is also one click away from a free tile.
     watch.addEventListener('click', () => assignToFirstFreeTile(streamId));
 
-    const forget = document.createElement('button');
-    forget.type = 'button';
-    forget.className = 'link';
-    forget.textContent = 'Forget';
-    forget.addEventListener('click', () => {
-      for (const tile of state.tiles) {
-        if (tile.streamId === streamId) detachTile(tile);
-      }
-      state.keyring.forget(streamId);
-      renderStreamList();
-    });
-
-    item.append(title, hint, watch, forget);
+    item.append(title, hint, watch);
     item.addEventListener('dragstart', event => {
       event.dataTransfer.setData('text/plain', streamId);
       event.dataTransfer.effectAllowed = 'copy';
@@ -176,14 +240,10 @@ function renderStreamList() {
     els.streamList.append(item);
   }
   els.emptyHint.hidden = known.length > 0;
-
-  els.addStream.textContent = '';
-  for (const [streamId, stream] of state.streams) {
-    const option = document.createElement('option');
-    option.value = streamId;
-    option.textContent = `${stream.display_name} — ${streamId.slice(0, 8)}`;
-    els.addStream.append(option);
-  }
+  els.forgetAll.hidden = known.length === 0;
+  // Once something is unlocked the form is no longer the point of the panel,
+  // but it stays reachable for a second publisher's key.
+  els.unlockForm.classList.toggle('secondary', known.length > 0);
 }
 
 function setLayout(count) {
@@ -258,9 +318,9 @@ function assignToFirstFreeTile(streamId) {
 }
 
 function attachTile(tile, streamId) {
-  const key = state.keyring?.getEncoded(streamId);
+  const key = state.keys.get(streamId);
   if (!key) {
-    tile.message.textContent = 'No stored key for that stream.';
+    tile.message.textContent = 'That stream is not unlocked in this tab.';
     return;
   }
   // Moving a stream that is already on screen swaps the two tiles rather than
@@ -311,10 +371,43 @@ globalThis.GlacialCastWatch = {
   })),
   layout: () => state.layout,
   sidebarCollapsed: () => els.main.classList.contains('sidebar-collapsed'),
+  unlockedStreams: () => [...state.keys.keys()],
 };
 
-restoreSidebar();
-setLayout(1);
-if (!Keyring.exists()) {
-  els.headline.textContent = 'Open a keyring, then add the viewer keys you were given';
+/**
+ * Fills the grid with whatever is already unlocked.
+ *
+ * Arriving at a viewer that holds your keys and shows an empty grid is a
+ * chore: the obvious next action is always "put them on screen". The layout is
+ * sized to what there is, so three screens land in a four-up grid and one lands
+ * on its own rather than in a mostly empty one.
+ */
+function showUnlockedStreams() {
+  const available = [...state.streams.keys()].filter(streamId => state.keys.has(streamId));
+  if (available.length === 0) return;
+  const fitted = available.length > 2 ? 4 : available.length;
+  if (fitted !== state.layout) setLayout(fitted);
+  for (const [index, streamId] of available.slice(0, state.tiles.length).entries()) {
+    // Reattaching a tile tears down a working player, so a stream already on
+    // screen is left exactly where it is.
+    if (state.tiles.some(tile => tile.streamId === streamId)) continue;
+    if (state.tiles[index].streamId) continue;
+    attachTile(state.tiles[index], streamId);
+  }
 }
+
+restoreSidebar();
+setLayout(state.layout);
+loadSessionKeys();
+
+// Streams are listed before anything is unlocked so the panel can say whether
+// the relay has anything to show at all, and so a key entered a moment later
+// has publishers to match against.
+refreshStreams()
+  .then(() => {
+    showUnlockedStreams();
+    els.headline.textContent = state.keys.size > 0
+      ? 'Drag a stream into a tile'
+      : 'Enter the viewing key you were given';
+  })
+  .catch(error => showError(els.unlockError, error));

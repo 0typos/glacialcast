@@ -29,9 +29,10 @@ use uuid::Uuid;
 /// Helpers shared by the client and server daemon-control implementations.
 pub mod daemon;
 pub mod transfer;
+pub mod viewer_key;
 
 /// Publisher/relay message schema version.
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 /// Absolute maximum serialized message size accepted by [`NoiseSocket`].
 pub const MAX_FRAME_LEN: usize = 32 * 1024 * 1024;
 const MAX_WIRE_PACKET_LEN: usize = 65_535;
@@ -123,6 +124,13 @@ pub struct StreamHello {
     /// identity, so the outputs do not collide on a single stream record.
     /// `None` keeps the historical single-stream identity.
     pub source_label: Option<String>,
+    /// Public salt a viewer needs to turn a key phrase into the viewer key.
+    ///
+    /// Not a secret: it exists so one phrase derives different key material for
+    /// each publisher, and so an attacker cannot precompute one table against
+    /// every deployment. The relay republishes it verbatim as stream metadata.
+    /// `None` means this publisher shares a raw 32-byte key instead.
+    pub viewer_key_salt: Option<String>,
     /// Lowest object sequence still available for retransmission.
     pub resend_low: Option<u64>,
     /// Highest object sequence still available for retransmission.
@@ -585,6 +593,17 @@ pub struct PublicStream {
     pub stream_id: Uuid,
     /// Publisher-provided human-readable label.
     pub display_name: String,
+    /// Authenticated principal that publishes this stream.
+    ///
+    /// Every screen one publisher casts shares a viewer key, so this is what
+    /// lets a viewer apply one key to all of them instead of asking for the
+    /// same key once per monitor.
+    pub publisher: String,
+    /// Public salt for deriving the viewer key from a key phrase.
+    ///
+    /// Mirrors [`StreamHello::viewer_key_salt`]. `None` means the publisher
+    /// shares a raw 32-byte key rather than a phrase.
+    pub viewer_key_salt: Option<String>,
     /// Public capture-source metadata.
     pub source: CaptureSource,
     /// Whether a publisher currently owns an ingest connection.
@@ -1045,7 +1064,7 @@ mod tests {
     #[test]
     fn protocol_golden_vector_is_stable_and_decodable() {
         let vector: serde_json::Value =
-            serde_json::from_str(include_str!("../../../test-vectors/protocol-v6.json")).unwrap();
+            serde_json::from_str(include_str!("../../../test-vectors/protocol-v7.json")).unwrap();
         let string = |field: &str| vector[field].as_str().unwrap();
         let viewer_key: [u8; 32] = URL_SAFE_NO_PAD
             .decode(string("viewer_key_b64"))

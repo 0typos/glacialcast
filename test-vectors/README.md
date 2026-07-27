@@ -1,6 +1,6 @@
 # Protocol Golden Vectors
 
-`protocol-v6.json` fixes one deterministic key-derivation and portable-object
+`protocol-v7.json` fixes one deterministic key-derivation and portable-object
 example for independent implementations and accidental-format-change tests.
 It contains test-only keys and must never be used for a real stream.
 

@@ -26,9 +26,10 @@ standard_checks() {
   run cargo deny -L error check
   run bash -n scripts/*.sh packaging/*.sh
   run node scripts/test-viewer-core.mjs
+  run node scripts/test-viewer-key.mjs
+  run node scripts/generate-viewer-key-wordlist.mjs --check
   run node scripts/test-index-ui.mjs
   run node scripts/test-compare-frame.mjs
-  run node scripts/test-keyring.mjs
 }
 
 full_checks() {

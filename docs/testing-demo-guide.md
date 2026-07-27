@@ -114,7 +114,7 @@ They verify:
 - viewer/admin roles, publisher scopes, CSRF, exact origins, throttling,
   security headers, private configuration, and fail-closed listeners;
 - several concurrent tiles in the multi-stream viewer, each decoding its own
-  stream from the encrypted keyring;
+  stream, all unlocked by one viewing key;
 - static, typing, scroll, and moving application-traffic ceilings, measured at
   the shipped default frame and cursor rates; and
 - conservative crypto, packaging, and durable-storage throughput floors.
@@ -282,9 +282,9 @@ target/release/glacialcast-client \
   --segment-frames 4
 ```
 
-Open `http://127.0.0.1:8899` in Firefox first, open the keyring, and store the
-contents of `viewer-key.txt` against **GlacialCast Demo**. Then press its
-**Watch** button to put it in a tile.
+Open `http://127.0.0.1:8899` in Firefox first and enter the contents of
+`viewer-key.txt` as the viewing key. Then press **Watch** on **GlacialCast
+Demo** to put it in a tile.
 
 Expected behavior:
 

@@ -39,6 +39,7 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     routing::{delete, get, post},
 };
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use glacialcast_protocol::{
@@ -50,6 +51,7 @@ use glacialcast_protocol::{
     },
     encode_noise_public_key, encode_ws_event, generate_noise_keypair, now_ms, parse_human_bytes,
     responder_handshake,
+    viewer_key::SALT_LEN,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -718,7 +720,7 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
         .route("/assets/dash-viewer-core.js", get(dash_viewer_core_js))
         .route("/assets/dash-viewer.js", get(dash_viewer_js))
         .route("/assets/dash-viewer-page.js", get(dash_viewer_page_js))
-        .route("/assets/keyring.js", get(keyring_js))
+        .route("/assets/viewer-key.js", get(viewer_key_js))
         .route("/assets/watch.js", get(watch_js))
         .route("/assets/watch.css", get(watch_css))
         .with_state(state)
@@ -970,10 +972,10 @@ async fn watch_js() -> Response {
     )
 }
 
-async fn keyring_js() -> Response {
+async fn viewer_key_js() -> Response {
     static_response(
         "text/javascript; charset=utf-8",
-        include_str!("../static/keyring.js"),
+        include_str!("../static/viewer-key.js"),
     )
 }
 
@@ -1799,10 +1801,12 @@ async fn handle_ingest(
             return Ok(());
         }
     };
+    let viewer_key_salt = validate_viewer_key_salt(hello.viewer_key_salt.as_deref())?;
     let stream_id = state.store.ensure_stream_for_client(
         &authenticated.identity,
         &hello.display_name,
         &hello.source,
+        viewer_key_salt,
     )?;
     let last_seq = state.dash_store.last_sequence(stream_id)?.unwrap_or(0);
     socket
@@ -1986,6 +1990,28 @@ fn validate_source_label(label: &str) -> Result<&str> {
         anyhow::bail!("source label may only contain ASCII letters, digits, '-', and '_'");
     }
     Ok(label)
+}
+
+/// Validates a publisher-supplied viewer-key salt.
+///
+/// The salt is not a secret, but it is publisher-controlled data that the relay
+/// stores and hands back to every viewer, so it is bounded to exactly what a
+/// salt can be: unpadded URL-safe base64 decoding to [`SALT_LEN`] bytes.
+/// Anything else is rejected rather than stored and echoed.
+fn validate_viewer_key_salt(salt: Option<&str>) -> Result<Option<&str>> {
+    let Some(salt) = salt else {
+        return Ok(None);
+    };
+    let decoded = URL_SAFE_NO_PAD
+        .decode(salt)
+        .context("viewer key salt must be unpadded URL-safe base64")?;
+    if decoded.len() != SALT_LEN {
+        anyhow::bail!(
+            "viewer key salt must decode to {SALT_LEN} bytes, got {}",
+            decoded.len()
+        );
+    }
+    Ok(Some(salt))
 }
 
 fn hash_token(token: &str) -> [u8; 32] {

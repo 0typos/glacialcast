@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// Drives the multi-stream viewer: stores keys in the passphrase-protected
-// keyring, fills a four-tile layout, full-screens one tile, and requires every
-// tile to keep decoding independently.
+// Drives the multi-stream viewer: unlocks with one viewing key, fills a
+// four-tile layout, full-screens one tile, and requires every tile to keep
+// decoding independently.
 //
 // This is the regression test for the player-factory refactor. A singleton
 // player passes every single-stream gate and still fails here.
@@ -29,7 +29,6 @@ if (!['firefox', 'chromium'].includes(browserName)) {
   process.exit(2);
 }
 
-const PASSPHRASE = 'multi-stream gate passphrase';
 const tileCount = Math.min(4, streamIds.length);
 const browserType = browserName === 'firefox' ? firefox : chromium;
 const executablePath = browserName === 'firefox'
@@ -61,19 +60,25 @@ try {
   });
 
   await page.goto(`${origin}/`, { waitUntil: 'domcontentloaded' });
-  await page.locator('#passphrase').fill(PASSPHRASE);
-  await page.locator('#unlock-keyring button[type="submit"]').click();
-  await page.locator('#keyring-panel').waitFor({ state: 'visible', timeout: 15_000 });
 
-  for (const streamId of streamIds.slice(0, tileCount)) {
-    await page.locator('#add-stream').selectOption(streamId);
-    await page.locator('#add-key-value').fill(viewerKey);
-    await page.locator('#add-key button[type="submit"]').click();
-    await page.locator(`#stream-list li[data-stream-id="${streamId}"]`).waitFor({
-      timeout: 10_000,
-    });
+  // A wrong key has to be reported as wrong. Silently unlocking nothing, or
+  // unlocking tiles that then fail to decode, is the failure this guards.
+  await page.locator('#viewing-key').fill('able-about-acid-acorn-acre-actor-adapt');
+  await page.locator('#unlock button[type="submit"]').click();
+  await page.locator('#unlock-error').waitFor({ state: 'visible', timeout: 30_000 });
+  if (await page.evaluate(() => globalThis.GlacialCastWatch.unlockedStreams().length) !== 0) {
+    throw new Error('a wrong viewing key unlocked a stream');
   }
-  console.log(`stored ${tileCount} viewer keys in the encrypted keyring`);
+
+  // One key, entered once, must unlock every stream the publisher casts.
+  await page.locator('#viewing-key').fill(viewerKey);
+  await page.locator('#unlock button[type="submit"]').click();
+  await page.waitForFunction(
+    expected => globalThis.GlacialCastWatch.unlockedStreams().length >= expected,
+    tileCount,
+    { timeout: 30_000 },
+  );
+  console.log(`one viewing key unlocked ${tileCount} streams`);
 
   const layout = tileCount > 2 ? 4 : tileCount;
   await page.locator(`[data-layout="${layout}"]`).click();
@@ -143,6 +148,14 @@ try {
   await page.waitForFunction(() => globalThis.GlacialCastWatch?.sidebarCollapsed?.() === true, null, {
     timeout: 15_000,
   });
+
+  // The key was entered once. A reload must not ask for it again.
+  await page.waitForFunction(
+    expected => globalThis.GlacialCastWatch.unlockedStreams().length >= expected,
+    tileCount,
+    { timeout: 15_000 },
+  );
+  console.log('the viewing key survived a reload without being entered again');
   await page.locator('#sidebar-toggle').click();
   await page.waitForFunction(() => globalThis.GlacialCastWatch.sidebarCollapsed() === false);
   console.log('sidebar collapsed, stayed collapsed across a reload, and reopened');

@@ -158,7 +158,7 @@ printing the viewer key, the log path, and its control socket:
 
 ```text
 GlacialCast publisher "Workstation"
-  viewer key   O8VyOonGQ4Bf1Cz9JHyuX6BcLXrt3NNsEwZZsPQXIr0
+  viewer key   dodge-pen-laugh-magic-crab-badge-hip
   key file     /home/you/.local/state/glacialcast/viewer-workstation.key
   log file     /home/you/.local/state/glacialcast/client-workstation.log
   control      /tmp/glacialcast-client-workstation.sock
@@ -169,6 +169,31 @@ secret they need and it does not change when the publisher restarts. Use
 `--foreground` when another supervisor owns the process, `--log-file` to place
 the detached log elsewhere, and `--daemon-status` or `--daemon-stop` to inspect
 or end the running publisher.
+
+### What a viewing key is
+
+The key is seven words drawn from a fixed 1024-word list — 70 bits, generated
+by the publisher, never chosen by hand. Sharing a key is the one manual step in
+setting up a stream, and 43 characters of base64 is not something anyone reads
+over a phone or retypes without a mistake; seven short words is.
+
+The words are only how the secret travels. The 32 bytes the media is actually
+encrypted under are derived from the phrase with PBKDF2-HMAC-SHA-256 at 600,000
+iterations, over a random per-publisher salt the relay republishes as ordinary
+stream metadata. The salt is not secret. It exists so that one phrase produces
+different key material for each publisher, and so guessing work cannot be
+precomputed once and reused against every deployment.
+
+Entry is forgiving in the ways that do not cost anything: case is ignored, words
+may be separated by spaces or hyphens, and any word may be shortened to its
+first three letters, because no two words in the list share them. Entry is
+strict in the way that matters — a word that is not in the list is rejected
+rather than quietly resolved to something else.
+
+Keys created before this format was introduced are raw base64 and keep working
+unchanged; loading one never rewrites it, because that would silently invalidate
+every key already shared. `--new-viewer-key` replaces the stored key with a
+fresh phrase, which does invalidate them.
 
 Open `http://127.0.0.1:8899` and enter the viewer key. The browser receives
 encrypted DASH objects from the relay and performs content authentication and
@@ -187,16 +212,15 @@ collapsed until you open it again.
 The operations dashboard — stream health, retention, admin controls — is at
 `/streams`. A single stream can still be deep-linked at `/dash/{stream_id}`.
 
-The side panel lists the streams this browser holds a key for, which means the
-keys have to persist. They are kept in `localStorage` wrapped with AES-GCM under
-a key derived from a passphrase by PBKDF2-SHA-256, so the passphrase is asked
-for once per session and never stored. This is a real change in exposure over
-pasting a key per visit: a stolen browser profile yields ciphertext and a salt
-rather than nothing at all, and anyone who learns the passphrase and has that
-profile gets every stream in it. A wrong passphrase is reported rather than
-silently opening an empty keyring. **Forget all keys** clears the store.
+The viewing key is entered once. One key covers every screen a publisher casts,
+so entering it unlocks all of them rather than asking again per monitor, and the
+unlocked key is held in `sessionStorage` so a reload does not ask again either.
+It lives as long as the browser tab and no longer, which means closing the
+browser leaves nothing on disk. A key that opens nothing published here is
+reported as wrong rather than silently unlocking tiles that then fail to
+decode — the check authenticates a real object with the derived key.
 
-Viewer keys still never leave the page and are never sent to the relay.
+Viewer keys never leave the page and are never sent to the relay.
 
 For a noninteractive transport test, publish the built-in pattern:
 

@@ -1090,6 +1090,7 @@ dependencies = [
  "base64",
  "bytes",
  "glacialcast-dash",
+ "hmac",
  "libc",
  "postcard",
  "serde",
