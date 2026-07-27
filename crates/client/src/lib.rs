@@ -2628,6 +2628,10 @@ struct WaylandPipewireCapture {
     opened: Option<ScreenCastCapture>,
     fps: f64,
     cursor_hz: u64,
+    /// Frame size the encoder wants, so the readback can shrink on the GPU
+    /// rather than moving full-size pixels the CPU is about to discard.
+    target_width: u32,
+    target_height: u32,
     portal_source: PortalSourceMode,
     screencast_backend: ScreenCastBackend,
     monitor_name: Option<String>,
@@ -2649,6 +2653,8 @@ impl WaylandPipewireCapture {
             monitor_name: target.connector,
             portal_cursor: args.portal_cursor,
             require_cursor_metadata: args.require_cursor_metadata,
+            target_width: args.max_frame_width,
+            target_height: args.max_frame_height,
             prefer_dmabuf: args.capture == CaptureMode::DashWayland
                 && should_capture_dmabuf(args.dash_encoder, &args.vaapi_device),
             gpu_device: args.vaapi_device.clone(),
@@ -2666,6 +2672,8 @@ impl WaylandPipewireCapture {
                     NativePipewireCaptureConfig {
                         fps: self.fps,
                         cursor_hz: self.cursor_hz,
+                        target_width: self.target_width,
+                        target_height: self.target_height,
                         portal_source: self.portal_source,
                         screencast_backend: self.screencast_backend,
                         monitor_name: self.monitor_name.as_deref(),
@@ -2778,6 +2786,10 @@ enum NativePipewireFrames {
 struct NativePipewireCaptureConfig<'a> {
     fps: f64,
     cursor_hz: u64,
+    /// Frame size the encoder wants, so the readback can shrink on the GPU
+    /// rather than moving full-size pixels the CPU is about to discard.
+    target_width: u32,
+    target_height: u32,
     portal_source: PortalSourceMode,
     screencast_backend: ScreenCastBackend,
     monitor_name: Option<&'a str>,
@@ -2795,6 +2807,8 @@ impl NativePipewireCapture {
         let NativePipewireCaptureConfig {
             fps,
             cursor_hz,
+            target_width,
+            target_height,
             portal_source,
             screencast_backend,
             monitor_name,
@@ -2822,6 +2836,8 @@ impl NativePipewireCapture {
             node_id: capture.node_id,
             width: capture.width,
             height: capture.height,
+            target_width,
+            target_height,
             remote: capture.remote.try_clone()?,
             fps,
             cursor_hz,
@@ -4296,6 +4312,8 @@ struct PipewireThreadConfig {
     node_id: u32,
     width: u32,
     height: u32,
+    target_width: u32,
+    target_height: u32,
     remote: PipewireRemote,
     fps: f64,
     cursor_hz: u64,
@@ -4370,6 +4388,8 @@ fn run_pipewire_loop(
         node_id,
         width,
         height,
+        target_width,
+        target_height,
         remote,
         fps,
         cursor_hz,
@@ -4392,6 +4412,8 @@ fn run_pipewire_loop(
     let _published_mainloop =
         PublishedPipewireMainloop::new(mainloop_ptr_out.clone(), mainloop_ptr);
     let data = PipewireUserData {
+        target_width,
+        target_height,
         format: Default::default(),
         latest,
         cursor_latest,
@@ -4574,11 +4596,22 @@ fn run_pipewire_loop(
             }
             user_data.last_frame_copied_at = Some(now);
 
-            let (frame_data, frame_stride, frame_format) = if needs_gpu_readback {
+            let (frame_data, frame_stride, frame_format, frame_width, frame_height) =
+                if needs_gpu_readback {
                 let Some(fd_offset) = map_offset.checked_add(offset) else {
                     return;
                 };
-                match user_data.gpu_readback.copy_dmabuf(
+                // Shrinking on the GPU means glReadPixels only transfers the
+                // pixels that survive scaling. The driver may decline, in which
+                // case the readback comes back at source size and the CPU path
+                // scales it exactly as before.
+                let (target_width, target_height) = fit_even_dimensions(
+                    video_size.width,
+                    video_size.height,
+                    user_data.target_width,
+                    user_data.target_height,
+                );
+                match user_data.gpu_readback.copy_dmabuf_scaled(
                     fd,
                     fd_offset,
                     video_size.width,
@@ -4586,6 +4619,8 @@ fn run_pipewire_loop(
                     stride,
                     user_data.format.format(),
                     modifier,
+                    target_width,
+                    target_height,
                 ) {
                     Ok(readback) => {
                         if !user_data.unmapped_buffer_logged {
@@ -4604,7 +4639,13 @@ fn run_pipewire_loop(
                                 "copied PipeWire DMA-BUF through driver-backed GPU readback"
                             );
                         }
-                        (readback.data, readback.stride, readback.format)
+                        (
+                            readback.data,
+                            readback.stride,
+                            readback.format,
+                            readback.width,
+                            readback.height,
+                        )
                     }
                     Err(err) => {
                         let message = format!(
@@ -4676,14 +4717,20 @@ fn run_pipewire_loop(
                     mapped
                     }
                 };
-                (frame_data, stride, format)
+                (
+                    frame_data,
+                    stride,
+                    format,
+                    video_size.width,
+                    video_size.height,
+                )
             };
             user_data.serial = user_data.serial.wrapping_add(1);
             let frame = RawFrame {
                 serial: user_data.serial,
                 damage: user_data.pending_video_damage.take(),
-                width: video_size.width,
-                height: video_size.height,
+                width: frame_width,
+                height: frame_height,
                 stride: frame_stride,
                 format: frame_format,
                 data: frame_data,
@@ -4752,6 +4799,11 @@ fn run_pipewire_video_loop(
         node_id,
         width,
         height,
+        // This loop forwards the DMA-BUF to the encoder, which scales it
+        // itself through VA-API video processing, so there is nothing to
+        // shrink during readback here.
+        target_width: _target_width,
+        target_height: _target_height,
         remote,
         fps,
         cursor_hz,
@@ -5637,6 +5689,11 @@ struct DmaBufReadback {
     data: Vec<u8>,
     /// Distance in bytes between consecutive rows of `data`.
     stride: usize,
+    /// Extent of `data`, which is the requested target only when the driver
+    /// scaled during readback; otherwise it is the source extent.
+    width: u32,
+    /// Height of `data`, on the same terms as `width`.
+    height: u32,
     /// Byte order of `data`, which need not match the negotiated PipeWire
     /// format because the GPU path reads whatever the driver renders best.
     format: RawFrameFormat,
@@ -5723,7 +5780,10 @@ impl GpuReadback {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn copy_dmabuf(
+    /// Reads a DMA-BUF back, shrinking it on the GPU when a smaller target is
+    /// asked for and the driver supports it.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_dmabuf_scaled(
         &mut self,
         fd: RawFd,
         offset: usize,
@@ -5732,6 +5792,34 @@ impl GpuReadback {
         stride: usize,
         video_format: spa::param::video::VideoFormat,
         modifier: u64,
+        target_width: u32,
+        target_height: u32,
+    ) -> Result<DmaBufReadback> {
+        self.copy_dmabuf_inner(
+            fd,
+            offset,
+            width,
+            height,
+            stride,
+            video_format,
+            modifier,
+            target_width,
+            target_height,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_dmabuf_inner(
+        &mut self,
+        fd: RawFd,
+        offset: usize,
+        width: u32,
+        height: u32,
+        stride: usize,
+        video_format: spa::param::video::VideoFormat,
+        modifier: u64,
+        target_width: u32,
+        target_height: u32,
     ) -> Result<DmaBufReadback> {
         let gbm_error = if self.gbm_unusable {
             None
@@ -5750,9 +5838,13 @@ impl GpuReadback {
                         raw_frame_format_for_video_format(video_format).with_context(|| {
                             format!("unsupported PipeWire video format {video_format:?}")
                         })?;
+                    // GBM maps the buffer as it is; scaling stays on the CPU
+                    // for this path, so the extent is the source extent.
                     return Ok(DmaBufReadback {
                         data,
                         stride,
+                        width,
+                        height,
                         format,
                         path: "gbm",
                     });
@@ -5773,7 +5865,17 @@ impl GpuReadback {
                 "no driver-backed readback path remains for modifier {modifier:#018x}; refusing raw DMA-BUF mapping because it can publish tiled or corrupt pixels"
             );
         }
-        match self.copy_dmabuf_with_egl(fd, offset, width, height, stride, video_format, modifier) {
+        match self.copy_dmabuf_with_egl(
+            fd,
+            offset,
+            width,
+            height,
+            stride,
+            video_format,
+            modifier,
+            target_width,
+            target_height,
+        ) {
             Ok(readback) => Ok(readback),
             Err(egl_error) => {
                 self.egl_unusable = true;
@@ -5801,6 +5903,8 @@ impl GpuReadback {
         stride: usize,
         video_format: spa::param::video::VideoFormat,
         modifier: u64,
+        target_width: u32,
+        target_height: u32,
     ) -> Result<DmaBufReadback> {
         let fourcc = drm_fourcc_for_video_format(video_format)
             .with_context(|| format!("no DRM fourcc mapping for {video_format:?}"))?;
@@ -5813,10 +5917,14 @@ impl GpuReadback {
             fourcc,
             modifier,
         };
-        let readback = self.egl()?.read_dmabuf(&plane)?;
+        let readback = self
+            .egl()?
+            .read_dmabuf_scaled(&plane, target_width, target_height)?;
         Ok(DmaBufReadback {
             data: readback.data,
             stride: readback.stride,
+            width: readback.width,
+            height: readback.height,
             format: match readback.layout {
                 ReadbackLayout::Rgba => RawFrameFormat::Rgbx,
                 ReadbackLayout::Bgra => RawFrameFormat::Bgrx,
@@ -6331,6 +6439,9 @@ fn format_prop_pairs(props: &[(String, String)]) -> String {
 }
 
 struct PipewireUserData {
+    /// Frame size the encoder wants, used to shrink during readback.
+    target_width: u32,
+    target_height: u32,
     format: spa::param::video::VideoInfoRaw,
     latest: watch::Sender<Option<RawFrame>>,
     cursor_latest: watch::Sender<Option<PipewireCursorSample>>,

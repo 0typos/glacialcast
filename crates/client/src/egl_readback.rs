@@ -21,6 +21,7 @@ use std::{
     marker::PhantomData,
     os::fd::RawFd,
 };
+use tracing::{debug, warn};
 
 /// Byte order of the pixels produced by [`EglReadback::read_dmabuf`].
 ///
@@ -59,6 +60,11 @@ pub(crate) struct Readback {
     pub(crate) data: Vec<u8>,
     /// Distance in bytes between consecutive rows of `data`.
     pub(crate) stride: usize,
+    /// Width of the returned image, which is the requested target only when
+    /// the driver scaled it; otherwise it is the source width.
+    pub(crate) width: u32,
+    /// Height of the returned image, on the same terms as `width`.
+    pub(crate) height: u32,
     /// Byte order of each four-byte pixel in `data`.
     pub(crate) layout: ReadbackLayout,
 }
@@ -97,6 +103,15 @@ const GL_PACK_ALIGNMENT: u32 = 0x0D05;
 const GL_IMPLEMENTATION_COLOR_READ_FORMAT: u32 = 0x8B9B;
 const GL_IMPLEMENTATION_COLOR_READ_TYPE: u32 = 0x8B9A;
 const GL_NO_ERROR: u32 = 0;
+const GL_LINEAR: i32 = 0x2601;
+const GL_VERTEX_SHADER: u32 = 0x8B31;
+const GL_FRAGMENT_SHADER: u32 = 0x8B30;
+const GL_COMPILE_STATUS: u32 = 0x8B81;
+const GL_LINK_STATUS: u32 = 0x8B82;
+const GL_FLOAT: u32 = 0x1406;
+const GL_TRIANGLE_STRIP: u32 = 0x0005;
+const GL_TEXTURE0: u32 = 0x84C0;
+const GL_FALSE_U8: u8 = 0;
 
 /// The largest frame this module will allocate a readback buffer for.
 ///
@@ -135,6 +150,32 @@ type GlGetIntegerv = unsafe extern "C" fn(u32, *mut i32);
 type GlGetError = unsafe extern "C" fn() -> u32;
 type GlFinish = unsafe extern "C" fn();
 
+// Only needed by the scaling pass. They are resolved with the rest so a driver
+// missing any of them disables scaling at construction rather than failing
+// partway through the first frame.
+type GlCreateShader = unsafe extern "C" fn(u32) -> u32;
+type GlShaderSource = unsafe extern "C" fn(u32, i32, *const *const c_char, *const i32);
+type GlCompileShader = unsafe extern "C" fn(u32);
+type GlGetShaderiv = unsafe extern "C" fn(u32, u32, *mut i32);
+type GlGetShaderInfoLog = unsafe extern "C" fn(u32, i32, *mut i32, *mut c_char);
+type GlDeleteShader = unsafe extern "C" fn(u32);
+type GlCreateProgram = unsafe extern "C" fn() -> u32;
+type GlAttachShader = unsafe extern "C" fn(u32, u32);
+type GlLinkProgram = unsafe extern "C" fn(u32);
+type GlGetProgramiv = unsafe extern "C" fn(u32, u32, *mut i32);
+type GlGetProgramInfoLog = unsafe extern "C" fn(u32, i32, *mut i32, *mut c_char);
+type GlUseProgram = unsafe extern "C" fn(u32);
+type GlDeleteProgram = unsafe extern "C" fn(u32);
+type GlGetAttribLocation = unsafe extern "C" fn(u32, *const c_char) -> i32;
+type GlGetUniformLocation = unsafe extern "C" fn(u32, *const c_char) -> i32;
+type GlUniform1i = unsafe extern "C" fn(i32, i32);
+type GlVertexAttribPointer = unsafe extern "C" fn(u32, i32, u32, u8, i32, *const c_void);
+type GlEnableVertexAttribArray = unsafe extern "C" fn(u32);
+type GlDrawArrays = unsafe extern "C" fn(u32, i32, i32);
+type GlViewport = unsafe extern "C" fn(i32, i32, i32, i32);
+type GlActiveTexture = unsafe extern "C" fn(u32);
+type GlTexImage2D = unsafe extern "C" fn(u32, i32, i32, i32, i32, i32, u32, u32, *const c_void);
+
 /// Runtime-resolved EGL and OpenGL ES entry points.
 ///
 /// The two libraries are kept alive for as long as the entry points are
@@ -165,8 +206,35 @@ struct Entrypoints {
     gl_get_integerv: GlGetIntegerv,
     gl_get_error: GlGetError,
     gl_finish: GlFinish,
+    scale: Option<ScaleEntrypoints>,
     _gles: Library,
     _egl: Library,
+}
+
+/// Entry points used only by the GPU scaling pass.
+struct ScaleEntrypoints {
+    gl_create_shader: GlCreateShader,
+    gl_shader_source: GlShaderSource,
+    gl_compile_shader: GlCompileShader,
+    gl_get_shaderiv: GlGetShaderiv,
+    gl_get_shader_info_log: GlGetShaderInfoLog,
+    gl_delete_shader: GlDeleteShader,
+    gl_create_program: GlCreateProgram,
+    gl_attach_shader: GlAttachShader,
+    gl_link_program: GlLinkProgram,
+    gl_get_programiv: GlGetProgramiv,
+    gl_get_program_info_log: GlGetProgramInfoLog,
+    gl_use_program: GlUseProgram,
+    gl_delete_program: GlDeleteProgram,
+    gl_get_attrib_location: GlGetAttribLocation,
+    gl_get_uniform_location: GlGetUniformLocation,
+    gl_uniform1i: GlUniform1i,
+    gl_vertex_attrib_pointer: GlVertexAttribPointer,
+    gl_enable_vertex_attrib_array: GlEnableVertexAttribArray,
+    gl_draw_arrays: GlDrawArrays,
+    gl_viewport: GlViewport,
+    gl_active_texture: GlActiveTexture,
+    gl_tex_image_2d: GlTexImage2D,
 }
 
 /// Reads a raw library symbol and copies out its function pointer.
@@ -247,11 +315,184 @@ impl Entrypoints {
                 gl_get_integerv: symbol(&gles, "glGetIntegerv")?,
                 gl_get_error: symbol(&gles, "glGetError")?,
                 gl_finish: symbol(&gles, "glFinish")?,
+                // Optional as a group: a stack missing any of these can still
+                // read frames back, it just cannot scale them on the GPU.
+                scale: ScaleEntrypoints::load(&gles).ok(),
                 _gles: gles,
                 _egl: egl,
             })
         }
     }
+}
+
+impl ScaleEntrypoints {
+    /// # Safety
+    ///
+    /// `gles` must be the OpenGL ES client library, and it must outlive every
+    /// copied pointer. The caller moves it into the same owning value.
+    unsafe fn load(gles: &Library) -> Result<Self> {
+        // SAFETY: every signature below is transcribed from OpenGL ES 2.0, and
+        // the caller guarantees the library outlives the pointers.
+        unsafe {
+            Ok(Self {
+                gl_create_shader: symbol(gles, "glCreateShader")?,
+                gl_shader_source: symbol(gles, "glShaderSource")?,
+                gl_compile_shader: symbol(gles, "glCompileShader")?,
+                gl_get_shaderiv: symbol(gles, "glGetShaderiv")?,
+                gl_get_shader_info_log: symbol(gles, "glGetShaderInfoLog")?,
+                gl_delete_shader: symbol(gles, "glDeleteShader")?,
+                gl_create_program: symbol(gles, "glCreateProgram")?,
+                gl_attach_shader: symbol(gles, "glAttachShader")?,
+                gl_link_program: symbol(gles, "glLinkProgram")?,
+                gl_get_programiv: symbol(gles, "glGetProgramiv")?,
+                gl_get_program_info_log: symbol(gles, "glGetProgramInfoLog")?,
+                gl_use_program: symbol(gles, "glUseProgram")?,
+                gl_delete_program: symbol(gles, "glDeleteProgram")?,
+                gl_get_attrib_location: symbol(gles, "glGetAttribLocation")?,
+                gl_get_uniform_location: symbol(gles, "glGetUniformLocation")?,
+                gl_uniform1i: symbol(gles, "glUniform1i")?,
+                gl_vertex_attrib_pointer: symbol(gles, "glVertexAttribPointer")?,
+                gl_enable_vertex_attrib_array: symbol(gles, "glEnableVertexAttribArray")?,
+                gl_draw_arrays: symbol(gles, "glDrawArrays")?,
+                gl_viewport: symbol(gles, "glViewport")?,
+                gl_active_texture: symbol(gles, "glActiveTexture")?,
+                gl_tex_image_2d: symbol(gles, "glTexImage2D")?,
+            })
+        }
+    }
+}
+
+/// Draws the imported frame into a smaller framebuffer before it is read back.
+///
+/// Reading a 2560x1440 frame back and shrinking it on the CPU spends the full
+/// source bandwidth to produce a fraction of it. Doing the filtering on the GPU
+/// means `glReadPixels` only ever transfers the pixels that are kept.
+///
+/// Mip levels cannot serve here: a texture bound to an `EGLImage` has level 0
+/// and nothing else, so `glGenerateMipmap` has no storage to write into. This
+/// is therefore a real draw into a second, ordinary texture.
+struct ScalePass {
+    program: u32,
+    position: u32,
+    sampler: i32,
+    /// Destination texture and framebuffer, reallocated when the size changes.
+    texture: u32,
+    framebuffer: u32,
+    size: (u32, u32),
+}
+
+/// A full-viewport triangle strip in clip space, with texture coordinates
+/// derived from position in the vertex shader.
+const SCALE_VERTICES: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
+
+const SCALE_VERTEX_SHADER: &str = "attribute vec2 position;\n\
+varying vec2 uv;\n\
+void main() {\n\
+  uv = position * 0.5 + 0.5;\n\
+  gl_Position = vec4(position, 0.0, 1.0);\n\
+}\n";
+
+const SCALE_FRAGMENT_SHADER: &str = "precision mediump float;\n\
+uniform sampler2D source;\n\
+varying vec2 uv;\n\
+void main() {\n\
+  gl_FragColor = texture2D(source, uv);\n\
+}\n";
+
+impl ScalePass {
+    /// Compiles the program once. Errors leave the caller on the CPU path.
+    fn build(gl: &ScaleEntrypoints) -> Result<Self> {
+        // SAFETY: a context is current on this thread for every call below,
+        // and each shader source is a NUL-terminated string kept alive across
+        // its use.
+        unsafe {
+            let vertex = compile_shader(gl, GL_VERTEX_SHADER, SCALE_VERTEX_SHADER)?;
+            let fragment = compile_shader(gl, GL_FRAGMENT_SHADER, SCALE_FRAGMENT_SHADER)?;
+            let program = (gl.gl_create_program)();
+            if program == 0 {
+                (gl.gl_delete_shader)(vertex);
+                (gl.gl_delete_shader)(fragment);
+                bail!("glCreateProgram returned no program object");
+            }
+            (gl.gl_attach_shader)(program, vertex);
+            (gl.gl_attach_shader)(program, fragment);
+            (gl.gl_link_program)(program);
+            // The program keeps its own reference once linked.
+            (gl.gl_delete_shader)(vertex);
+            (gl.gl_delete_shader)(fragment);
+
+            let mut linked = 0;
+            (gl.gl_get_programiv)(program, GL_LINK_STATUS, &mut linked);
+            if linked == 0 {
+                let log = info_log(4096, |length, written, buffer| {
+                    (gl.gl_get_program_info_log)(program, length, written, buffer);
+                });
+                (gl.gl_delete_program)(program);
+                bail!("linking the scaling program failed: {log}");
+            }
+
+            let position = (gl.gl_get_attrib_location)(program, c"position".as_ptr());
+            let sampler = (gl.gl_get_uniform_location)(program, c"source".as_ptr());
+            if position < 0 || sampler < 0 {
+                (gl.gl_delete_program)(program);
+                bail!("the scaling program is missing its position or sampler binding");
+            }
+            Ok(Self {
+                program,
+                position: position as u32,
+                sampler,
+                texture: 0,
+                framebuffer: 0,
+                size: (0, 0),
+            })
+        }
+    }
+}
+
+/// Compiles one shader stage and reports the driver's own diagnostic.
+///
+/// # Safety
+///
+/// A GL context must be current on the calling thread.
+unsafe fn compile_shader(gl: &ScaleEntrypoints, stage: u32, source: &str) -> Result<u32> {
+    let mut bytes = source.as_bytes().to_vec();
+    bytes.push(0);
+    // SAFETY: the caller guarantees a current context; `bytes` is NUL
+    // terminated and outlives the glShaderSource call that reads it.
+    unsafe {
+        let shader = (gl.gl_create_shader)(stage);
+        if shader == 0 {
+            bail!("glCreateShader returned no shader object for stage {stage:#x}");
+        }
+        let pointer = bytes.as_ptr().cast::<c_char>();
+        (gl.gl_shader_source)(shader, 1, &raw const pointer, std::ptr::null());
+        (gl.gl_compile_shader)(shader);
+        let mut compiled = 0;
+        (gl.gl_get_shaderiv)(shader, GL_COMPILE_STATUS, &mut compiled);
+        if compiled == 0 {
+            let log = info_log(4096, |length, written, buffer| {
+                (gl.gl_get_shader_info_log)(shader, length, written, buffer);
+            });
+            (gl.gl_delete_shader)(shader);
+            bail!("compiling the scaling shader failed: {log}");
+        }
+        Ok(shader)
+    }
+}
+
+/// Collects a driver info log into a lossy `String`.
+fn info_log(capacity: i32, fill: impl FnOnce(i32, *mut i32, *mut c_char)) -> String {
+    let mut buffer = vec![0i8; capacity as usize];
+    let mut written = 0;
+    fill(capacity, &raw mut written, buffer.as_mut_ptr());
+    let length = written.clamp(0, capacity - 1) as usize;
+    String::from_utf8_lossy(
+        &buffer[..length]
+            .iter()
+            .map(|b| *b as u8)
+            .collect::<Vec<_>>(),
+    )
+    .into_owned()
 }
 
 /// A GPU-backed DMA-BUF reader bound to one thread and one render device.
@@ -263,6 +504,10 @@ pub(crate) struct EglReadback {
     framebuffer: u32,
     read_format: u32,
     layout: ReadbackLayout,
+    /// Built on first use; `None` once the driver has refused it, so a
+    /// rejection costs one attempt rather than one per frame.
+    scale: Option<ScalePass>,
+    scale_unavailable: bool,
     /// Human-readable driver identity, for one-time operator logging.
     renderer: String,
     /// `EglReadback` owns thread-affine EGL state and must not cross threads.
@@ -399,6 +644,8 @@ impl EglReadback {
             framebuffer,
             read_format: GL_RGBA,
             layout: ReadbackLayout::Rgba,
+            scale: None,
+            scale_unavailable: false,
             renderer,
             _not_send: PhantomData,
         })
@@ -418,7 +665,24 @@ impl EglReadback {
     ///
     /// Returns an error when the descriptor is invalid, when the driver
     /// refuses the import, or when the framebuffer is not renderable.
-    pub(crate) fn read_dmabuf(&mut self, plane: &DmaBufPlane) -> Result<Readback> {
+    /// Reads the frame back at `target_width` x `target_height`.
+    ///
+    /// When the target is smaller than the source the shrink happens on the
+    /// GPU, so `glReadPixels` transfers only the pixels that are kept. A driver
+    /// that cannot do that falls back to reading the full frame, and the caller
+    /// scales it as before; the returned `Readback` says which happened through
+    /// its extent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the descriptor is invalid or when the full-size
+    /// readback itself fails. A scaling failure alone is not an error.
+    pub(crate) fn read_dmabuf_scaled(
+        &mut self,
+        plane: &DmaBufPlane,
+        target_width: u32,
+        target_height: u32,
+    ) -> Result<Readback> {
         if plane.fd < 0 {
             bail!("PipeWire supplied an invalid DMA-BUF descriptor");
         }
@@ -495,20 +759,43 @@ impl EglReadback {
             destroy: self.entrypoints.egl_destroy_image,
         };
 
-        let result = self.read_image(image.image, plane.width, plane.height);
+        let result = self.read_image(
+            image.image,
+            plane.width,
+            plane.height,
+            target_width,
+            target_height,
+        );
         drop(image);
         result
     }
 
     /// Binds `image` to the reusable texture and reads the framebuffer back.
-    fn read_image(&mut self, image: *mut c_void, width: u32, height: u32) -> Result<Readback> {
+    fn read_image(
+        &mut self,
+        image: *mut c_void,
+        width: u32,
+        height: u32,
+        target_width: u32,
+        target_height: u32,
+    ) -> Result<Readback> {
+        let scaling = (target_width, target_height) != (width, height)
+            && target_width > 0
+            && target_height > 0
+            && target_width <= width
+            && target_height <= height
+            && self.ensure_scale_pass();
+
         // SAFETY: a context is current on this thread, `self.texture` and
         // `self.framebuffer` were generated by this context, and `image` is a
         // live EGLImage for the duration of the call.
         unsafe {
             (self.entrypoints.gl_bind_texture)(GL_TEXTURE_2D, self.texture);
-            (self.entrypoints.gl_tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-            (self.entrypoints.gl_tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            // Minifying with GL_NEAREST would alias; a straight readback is
+            // one-to-one and does not care either way.
+            let filter = if scaling { GL_LINEAR } else { GL_NEAREST };
+            (self.entrypoints.gl_tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+            (self.entrypoints.gl_tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
             (self.entrypoints.gl_tex_parameteri)(
                 GL_TEXTURE_2D,
                 GL_TEXTURE_WRAP_S,
@@ -528,6 +815,65 @@ impl EglReadback {
             bail!("glEGLImageTargetTexture2DOES failed with GL error {bind_error:#x}");
         }
 
+        // Scaling renders into its own framebuffer; a plain readback attaches
+        // the imported texture directly and reads it where it lies.
+        let (read_width, read_height) = if scaling {
+            match self.draw_scaled(target_width, target_height) {
+                Ok(()) => (target_width, target_height),
+                Err(error) => {
+                    // One failure disables the pass rather than repeating it
+                    // every frame, and the frame itself still gets published
+                    // through the unscaled path below.
+                    warn!(%error, "GPU frame scaling failed; falling back to full-size readback");
+                    self.scale = None;
+                    self.scale_unavailable = true;
+                    self.attach_source_framebuffer()?;
+                    (width, height)
+                }
+            }
+        } else {
+            self.attach_source_framebuffer()?;
+            (width, height)
+        };
+
+        self.select_read_format();
+
+        let stride = (read_width as usize) * 4;
+        let length = stride
+            .checked_mul(read_height as usize)
+            .context("DMA-BUF readback size overflowed")?;
+        let mut data = vec![0u8; length];
+        // SAFETY: `data` holds exactly `width * height * 4` bytes, which is the
+        // amount `glReadPixels` writes for an 8-bit four-component format with
+        // a pack alignment of one.
+        unsafe {
+            (self.entrypoints.gl_read_pixels)(
+                0,
+                0,
+                read_width as i32,
+                read_height as i32,
+                self.read_format,
+                GL_UNSIGNED_BYTE,
+                data.as_mut_ptr().cast::<c_void>(),
+            );
+            (self.entrypoints.gl_finish)();
+        }
+        // SAFETY: as above.
+        let read_error = unsafe { (self.entrypoints.gl_get_error)() };
+        if read_error != GL_NO_ERROR {
+            bail!("glReadPixels failed with GL error {read_error:#x}");
+        }
+        Ok(Readback {
+            data,
+            stride,
+            width: read_width,
+            height: read_height,
+            layout: self.layout,
+        })
+    }
+
+    /// Points the reusable framebuffer at the imported texture.
+    fn attach_source_framebuffer(&mut self) -> Result<()> {
         // SAFETY: the framebuffer and texture names are live in this context.
         unsafe {
             (self.entrypoints.gl_bind_framebuffer)(GL_FRAMEBUFFER, self.framebuffer);
@@ -544,39 +890,148 @@ impl EglReadback {
         if status != GL_FRAMEBUFFER_COMPLETE {
             bail!("imported DMA-BUF is not renderable (framebuffer status {status:#x})");
         }
+        Ok(())
+    }
 
-        self.select_read_format();
+    /// Builds the scaling program on first use.
+    ///
+    /// Returns whether scaling is available. A driver that refuses it is
+    /// recorded so the attempt is not repeated for every frame.
+    fn ensure_scale_pass(&mut self) -> bool {
+        if self.scale.is_some() {
+            return true;
+        }
+        if self.scale_unavailable {
+            return false;
+        }
+        // An escape hatch for a driver that accepts the pass and then renders
+        // it wrongly, which no runtime check here could detect.
+        if std::env::var_os("GLACIALCAST_DISABLE_GPU_SCALING").is_some() {
+            self.scale_unavailable = true;
+            debug!("GPU frame scaling disabled by GLACIALCAST_DISABLE_GPU_SCALING");
+            return false;
+        }
+        let Some(gl) = self.entrypoints.scale.as_ref() else {
+            self.scale_unavailable = true;
+            debug!("the GL stack lacks the entry points needed to scale frames on the GPU");
+            return false;
+        };
+        match ScalePass::build(gl) {
+            Ok(pass) => {
+                debug!("scaling frames on the GPU before readback");
+                self.scale = Some(pass);
+                true
+            }
+            Err(error) => {
+                warn!(%error, "GPU frame scaling is unavailable; reading frames back full size");
+                self.scale_unavailable = true;
+                false
+            }
+        }
+    }
 
-        let stride = (width as usize) * 4;
-        let length = stride
-            .checked_mul(height as usize)
-            .context("DMA-BUF readback size overflowed")?;
-        let mut data = vec![0u8; length];
-        // SAFETY: `data` holds exactly `width * height * 4` bytes, which is the
-        // amount `glReadPixels` writes for an 8-bit four-component format with
-        // a pack alignment of one.
+    /// Renders the imported texture into the destination framebuffer.
+    ///
+    /// Leaves that framebuffer bound so the caller reads back from it.
+    fn draw_scaled(&mut self, target_width: u32, target_height: u32) -> Result<()> {
+        let gl = self
+            .entrypoints
+            .scale
+            .as_ref()
+            .context("the scaling entry points went missing")?;
+        let pass = self
+            .scale
+            .as_mut()
+            .context("the scaling program went missing")?;
+
+        if pass.size != (target_width, target_height) {
+            // SAFETY: a context is current; names are generated on demand and
+            // the old storage is replaced by this same call.
+            unsafe {
+                if pass.texture == 0 {
+                    (self.entrypoints.gl_gen_textures)(1, &raw mut pass.texture);
+                }
+                if pass.framebuffer == 0 {
+                    (self.entrypoints.gl_gen_framebuffers)(1, &raw mut pass.framebuffer);
+                }
+                if pass.texture == 0 || pass.framebuffer == 0 {
+                    bail!("the driver returned no destination texture or framebuffer");
+                }
+                (self.entrypoints.gl_bind_texture)(GL_TEXTURE_2D, pass.texture);
+                (gl.gl_tex_image_2d)(
+                    GL_TEXTURE_2D,
+                    0,
+                    GL_RGBA as i32,
+                    target_width as i32,
+                    target_height as i32,
+                    0,
+                    GL_RGBA,
+                    GL_UNSIGNED_BYTE,
+                    std::ptr::null(),
+                );
+                (self.entrypoints.gl_tex_parameteri)(
+                    GL_TEXTURE_2D,
+                    GL_TEXTURE_MIN_FILTER,
+                    GL_LINEAR,
+                );
+                (self.entrypoints.gl_tex_parameteri)(
+                    GL_TEXTURE_2D,
+                    GL_TEXTURE_MAG_FILTER,
+                    GL_LINEAR,
+                );
+                (self.entrypoints.gl_tex_parameteri)(
+                    GL_TEXTURE_2D,
+                    GL_TEXTURE_WRAP_S,
+                    GL_CLAMP_TO_EDGE,
+                );
+                (self.entrypoints.gl_tex_parameteri)(
+                    GL_TEXTURE_2D,
+                    GL_TEXTURE_WRAP_T,
+                    GL_CLAMP_TO_EDGE,
+                );
+            }
+            pass.size = (target_width, target_height);
+        }
+
+        // SAFETY: every name below is live in the current context, the vertex
+        // array is four two-component floats matching the declared attribute,
+        // and the source texture is bound to unit zero as the sampler expects.
         unsafe {
-            (self.entrypoints.gl_read_pixels)(
+            (self.entrypoints.gl_bind_framebuffer)(GL_FRAMEBUFFER, pass.framebuffer);
+            (self.entrypoints.gl_framebuffer_texture_2d)(
+                GL_FRAMEBUFFER,
+                GL_COLOR_ATTACHMENT0,
+                GL_TEXTURE_2D,
+                pass.texture,
                 0,
-                0,
-                width as i32,
-                height as i32,
-                self.read_format,
-                GL_UNSIGNED_BYTE,
-                data.as_mut_ptr().cast::<c_void>(),
             );
-            (self.entrypoints.gl_finish)();
+            let status = (self.entrypoints.gl_check_framebuffer_status)(GL_FRAMEBUFFER);
+            if status != GL_FRAMEBUFFER_COMPLETE {
+                bail!("the scaling framebuffer is incomplete (status {status:#x})");
+            }
+
+            (gl.gl_viewport)(0, 0, target_width as i32, target_height as i32);
+            (gl.gl_use_program)(pass.program);
+            (gl.gl_active_texture)(GL_TEXTURE0);
+            (self.entrypoints.gl_bind_texture)(GL_TEXTURE_2D, self.texture);
+            (gl.gl_uniform1i)(pass.sampler, 0);
+            (gl.gl_enable_vertex_attrib_array)(pass.position);
+            (gl.gl_vertex_attrib_pointer)(
+                pass.position,
+                2,
+                GL_FLOAT,
+                GL_FALSE_U8,
+                0,
+                SCALE_VERTICES.as_ptr().cast::<c_void>(),
+            );
+            (gl.gl_draw_arrays)(GL_TRIANGLE_STRIP, 0, 4);
         }
-        // SAFETY: as above.
-        let read_error = unsafe { (self.entrypoints.gl_get_error)() };
-        if read_error != GL_NO_ERROR {
-            bail!("glReadPixels failed with GL error {read_error:#x}");
+        // SAFETY: taking the current error code needs only a current context.
+        let error = unsafe { (self.entrypoints.gl_get_error)() };
+        if error != GL_NO_ERROR {
+            bail!("the scaling draw failed with GL error {error:#x}");
         }
-        Ok(Readback {
-            data,
-            stride,
-            layout: self.layout,
-        })
+        Ok(())
     }
 
     /// Prefers the driver's native read format when it avoids a CPU swizzle.
