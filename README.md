@@ -284,8 +284,10 @@ delivers: a screen-capture stream carries cursor metadata on its buffers, so a
 60 Hz panel yields at most 60 samples per second. Run the publisher with
 `RUST_LOG=glacialcast_client=debug` to see the measured `compositor capture
 rate` line reporting both the delivered buffer rate and the rate at which the
-cursor actually moved. `--cursor-flush-ms` (default 100) bounds how long a
-sample waits to be batched, trading live cursor latency against object count.
+cursor actually moved. `--cursor-flush-ms` (default 50) bounds how long a
+sample waits to be batched. It is the dominant term in how smooth the overlay
+looks, because the viewer can only animate through samples it has: raising it
+saves relay objects and costs smoothness.
 
 For repeatable bandwidth tests, `--test-pattern` accepts `static`, `typing`,
 `scroll`, and `motion`.

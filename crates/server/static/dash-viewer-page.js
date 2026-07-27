@@ -22,4 +22,8 @@ unlockForm.addEventListener('submit', event => {
   player.start(viewerKeyInput.value.trim()).catch(() => {});
 });
 
+// Exposed so the browser gates can inspect player state without reaching
+// into module internals.
+globalThis.GlacialCastActivePlayer = player;
+
 globalThis.addEventListener('pagehide', () => player.destroy());

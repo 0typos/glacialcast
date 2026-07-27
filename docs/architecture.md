@@ -112,9 +112,16 @@ while such a sample is pending, the client publishes the completed idle span
 before immediately publishing the changed frame. This keeps retained history
 continuous without resending static pixels every video tick. Independent live
 cursor rendering does not wait for the media clock. Samples arrive batched, so
-the viewer paces them against a wall clock a fixed distance behind the newest
-sample rather than rendering only the newest of each batch, which would reduce
-the cursor to the publisher's flush rate.
+the viewer paces them against a wall clock rather than rendering only the newest
+of each batch, which would reduce the cursor to the publisher's flush rate.
+
+The overlay plays from a small buffer held a fixed distance behind the newest
+sample; that distance is the entire budget for absorbing a late batch. Running
+dry once must not cost the buffer permanently, so the playhead rebuilds it by
+running fractionally slow rather than by rewinding, which would show the pointer
+retracing itself. When the source stops the playhead converges on the newest
+sample, or the cursor would come to rest where the pointer was a moment before
+it stopped.
 
 The relay may assemble four published fragments into one retained `.m4s`
 object without delaying live notification. Segment timeline duration spans

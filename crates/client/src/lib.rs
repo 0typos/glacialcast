@@ -178,7 +178,7 @@ struct Args {
     idle_heartbeat_seconds: u64,
     #[arg(long, default_value_t = 60)]
     cursor_hz: u64,
-    #[arg(long, value_parser = parse_cursor_flush_ms, default_value_t = 100)]
+    #[arg(long, value_parser = parse_cursor_flush_ms, default_value_t = 50)]
     cursor_flush_ms: u64,
     #[arg(long, default_value_t = 250_000)]
     video_bitrate: u32,

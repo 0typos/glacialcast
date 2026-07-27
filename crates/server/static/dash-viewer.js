@@ -121,9 +121,12 @@ function createPlayer(root, options) {
 
     if (els.unlockPanel) els.unlockPanel.hidden = true;
     if (els.playerPanel) els.playerPanel.hidden = false;
-    await loadHistoricalCursors(headers);
+    // Live first: replaying history can take a while on a long retention
+    // window, and nothing about it should delay or endanger the live cursor.
     connectLive();
     setStatus('Live encrypted DASH playback ready.');
+    updateMetrics();
+    await loadHistoricalCursors(headers);
     updateMetrics();
   }
 
@@ -491,13 +494,29 @@ function createPlayer(root, options) {
         && !state.seenSequences.has(header.sequence);
     });
     const concurrency = 12;
+    let dropped = 0;
     for (let index = 0; index < cursors.length; index += concurrency) {
       const decoded = await Promise.all(
-        cursors
-          .slice(index, index + concurrency)
-          .map(async header => [header, await decodeCursorObject(header)]),
+        cursors.slice(index, index + concurrency).map(async header => {
+          try {
+            return [header, await decodeCursorObject(header)];
+          } catch (error) {
+            // Retention evicts the oldest objects while this runs, so a
+            // listed object can be gone by the time it is fetched. Replay is
+            // best-effort by design: losing part of it must never cost the
+            // live stream, which used to be abandoned along with it.
+            dropped += 1;
+            console.warn(`skipping cursor object ${header.sequence}:`, error);
+            return null;
+          }
+        }),
       );
-      for (const [header, batch] of decoded) commitCursorObject(header, batch);
+      for (const entry of decoded) {
+        if (entry) commitCursorObject(entry[0], entry[1]);
+      }
+    }
+    if (dropped > 0) {
+      console.warn(`${dropped} retained cursor objects were unavailable and were skipped`);
     }
   }
 
@@ -914,11 +933,26 @@ function createPlayer(root, options) {
       });
     },
     metrics() {
+      const newest = state.cursorEvents.at(-1) || null;
+      // Report what the last frame drew rather than asking for a fresh
+      // decision: the clock advances when sampled, so a caller polling this
+      // would otherwise pull the overlay's own playback forward.
+      const shown = state.lastRenderedCursor || null;
       return {
         appendedMedia: state.appendedMedia,
         cursorEvents: state.cursorEvents.length,
         epochs: state.epochOrder.length,
         live: state.live,
+        // Cursor selection state, which is otherwise invisible from outside
+        // and is where overlay problems actually live.
+        cursor: {
+          newestTimestamp: newest?.timestamp ?? null,
+          newestVisible: newest?.visible ?? null,
+          shownTimestamp: shown?.timestamp ?? null,
+          shownVisible: shown?.visible ?? null,
+          shownBitmapKey: shown?.bitmap_key ?? null,
+          bitmapsCached: state.cursorBitmaps.size,
+        },
       };
     },
     destroy() {

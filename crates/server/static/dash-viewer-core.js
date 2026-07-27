@@ -274,6 +274,11 @@
   // Beyond this the overlay is not smoothing, it is simply stale, so it jumps
   // rather than crawling through a backlog.
   const DEFAULT_CURSOR_DRIFT_MS = 600;
+  // Play-out rates used to restore the buffer after it runs dry or drain it
+  // after a burst. Both are close enough to real time to be invisible: a 10%
+  // deviation on pointer motion is well under what anyone can perceive.
+  const CURSOR_REBUILD_RATE = 0.9;
+  const CURSOR_DRAIN_RATE = 1.1;
 
   /**
    * Paces live cursor playback against a wall clock.
@@ -295,11 +300,11 @@
     const driftTicks = Math.max(lagTicks, Math.round(
       (options.maxDriftMs ?? DEFAULT_CURSOR_DRIFT_MS) * CURSOR_TICKS_PER_MS,
     ));
-    let anchorMedia = null;
+    let position = null;
     let anchorWall = 0;
 
     function anchor(media, nowMs) {
-      anchorMedia = media;
+      position = media;
       anchorWall = nowMs;
       return media;
     }
@@ -307,7 +312,7 @@
     return {
       /** Drops the anchor so the next sample re-synchronises, after a seek. */
       reset() {
-        anchorMedia = null;
+        position = null;
       },
       /**
        * Returns the cursor timestamp to display now, given the newest sample
@@ -315,16 +320,29 @@
        */
       sample(newestTimestamp, nowMs) {
         if (!Number.isFinite(newestTimestamp)) return null;
-        if (anchorMedia === null) return anchor(newestTimestamp - lagTicks, nowMs);
-        const target = anchorMedia + (nowMs - anchorWall) * CURSOR_TICKS_PER_MS;
-        // Ran past the queue: hold at the newest sample and restart the clock
-        // there, so a later burst does not replay stale positions.
-        if (target >= newestTimestamp) return anchor(newestTimestamp, nowMs);
-        // Fell too far behind, usually a stalled tab or a delivery burst.
-        if (newestTimestamp - target > driftTicks) {
-          return anchor(newestTimestamp - lagTicks, nowMs);
-        }
-        return target;
+        if (position === null) return anchor(newestTimestamp - lagTicks, nowMs);
+
+        // Samples arrive a batch at a time, so the overlay plays from a small
+        // buffer: the playhead advances with the wall clock while the buffer
+        // absorbs late deliveries. `depth` is how much play-out is in hand.
+        const depth = newestTimestamp - position;
+        if (depth > driftTicks) return anchor(newestTimestamp - lagTicks, nowMs);
+
+        // Running dry once must not cost the buffer permanently. Rebuilding it
+        // by rewinding would make the pointer retrace itself, so the playhead
+        // instead runs fractionally slow until the cushion is back — far below
+        // the threshold where a viewer could see the difference.
+        let rate = 1;
+        if (depth < lagTicks) rate = CURSOR_REBUILD_RATE;
+        else if (depth > lagTicks * 3) rate = CURSOR_DRAIN_RATE;
+
+        // Clamp the elapsed time: a caller handing back a stale clock reading
+        // must never make the pointer retrace its path.
+        const elapsed = Math.max(0, nowMs - anchorWall);
+        const advanced = position + elapsed * CURSOR_TICKS_PER_MS * rate;
+        // Nothing left to show: hold at the newest sample. This is also how the
+        // overlay comes to rest in the right place when the pointer stops.
+        return anchor(Math.max(position, Math.min(advanced, newestTimestamp)), nowMs);
       },
     };
   }

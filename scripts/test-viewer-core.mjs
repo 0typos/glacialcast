@@ -409,16 +409,58 @@ test('live cursor clock plays batches out instead of snapping to the newest', ()
   assert.ok(later < newest, 'still trailing the newest sample');
 });
 
-test('live cursor clock holds at the newest sample and does not run ahead', () => {
+test('live cursor clock converges on the final sample once the pointer stops', () => {
   const ticks = core.CURSOR_TICKS_PER_MS;
   const clock = core.createCursorClock({ targetLagMs: 100, maxDriftMs: 500 });
   const newest = 5_000 * ticks;
   clock.sample(newest, 0);
-  // Far past the queue with nothing new delivered.
+  // Nothing new arrives: the pointer stopped, so the overlay must play out
+  // what it has and rest where the pointer actually is, not one lag behind.
   assert.equal(clock.sample(newest, 10_000), newest);
-  // Having caught up, it resumes from there rather than replaying the gap.
-  const resumed = clock.sample(newest + 30 * ticks, 10_020);
-  assert.equal(resumed, newest + 20 * ticks);
+});
+
+test('live cursor clock rebuilds its buffer after running dry', () => {
+  const ticks = core.CURSOR_TICKS_PER_MS;
+  const clock = core.createCursorClock({ targetLagMs: 100, maxDriftMs: 5_000 });
+  // Starve it: the playhead catches up to the newest sample and holds.
+  let newest = 1_000 * ticks;
+  let now = 0;
+  clock.sample(newest, now);
+  now += 500;
+  assert.equal(clock.sample(newest, now), newest, 'holds when nothing is buffered');
+
+  // Steady delivery resumes at real time. Riding the live edge from here is
+  // the regression: every late batch would then be a visible freeze.
+  for (let frame = 0; frame < 200; frame += 1) {
+    now += 16;
+    newest += 16 * ticks;
+    clock.sample(newest, now);
+  }
+  const depth = (newest - clock.sample(newest, now)) / ticks;
+  assert.ok(depth > 80, `buffer only recovered to ${depth.toFixed(0)}ms`);
+
+  // With the buffer back, a batch arriving 80 ms late still animates.
+  const before = clock.sample(newest, now + 40);
+  const during = clock.sample(newest, now + 80);
+  assert.ok(during > before, 'the overlay kept moving through a late batch');
+  assert.ok(during <= newest, 'and never ran past the samples it has');
+});
+
+test('live cursor clock never rewinds', () => {
+  const ticks = core.CURSOR_TICKS_PER_MS;
+  const clock = core.createCursorClock({ targetLagMs: 100, maxDriftMs: 500 });
+  let newest = 5_000 * ticks;
+  let now = 0;
+  let previous = clock.sample(newest, now);
+  for (const [advanceNewest, advanceWall] of [[0, 500], [30, 20], [0, 5], [200, 10], [0, 1_000]]) {
+    newest += advanceNewest * ticks;
+    now += advanceWall;
+    const shown = clock.sample(newest, now);
+    assert.ok(shown >= previous, `overlay rewound from ${previous} to ${shown}`);
+    previous = shown;
+  }
+  // A clock reading that goes backwards must not rewind the overlay either.
+  assert.ok(clock.sample(newest, now - 5_000) >= previous);
 });
 
 test('live cursor clock jumps forward instead of crawling through a backlog', () => {
