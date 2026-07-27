@@ -409,6 +409,53 @@ GLACIALCAST_PLAYWRIGHT_MODULE="$pw_root/node_modules/playwright" \
 scripts/verify-wayland-cursor-metadata.sh
 ```
 
+### Cursor rate
+
+That gate proves cursor objects exist. Every cursor defect this project has had
+passed it: a sampler polling below the compositor's rate, a flush starved by
+its own sampler, a loop that stalled whenever the screen was static. All of
+them still produced cursor objects. What separates them from working software
+is the rate, so there is a second gate for that:
+
+```sh
+GLACIALCAST_PLAYWRIGHT_MODULE="$pw_root/node_modules/playwright" \
+scripts/verify-wayland-cursor-rate.sh
+```
+
+It publishes every output at the shipped defaults, drives the pointer with a
+virtual absolute pointing device, and measures in Firefox how many cursor
+updates actually arrive and how evenly they are painted. It needs a writable
+`/dev/uinput`, and it builds release rather than debug — its siblings check
+correctness, where a debug build answers honestly, while this one measures a
+rate that a debug build would misreport.
+
+Thresholds are relative, not absolute, because the compositor sets a ceiling
+this code cannot exceed: cursor metadata rides on video buffers, so the cursor
+rate cannot beat the buffer rate. The gate requires the viewer to receive at
+least 70% of what the compositor sampled, a median painted gap within two
+display frames and p90 within four, and no more than 150 ms of stall beyond
+what the compositor itself paused for. `GLACIALCAST_CURSOR_MAX_GAP_MS` adds an
+absolute ceiling for an acceptance run; it is off by default so that a
+compositor limitation cannot be mistaken for a regression here.
+
+Measured on niri 26.04 with PipeWire 1.6.8, three 2560x1440 outputs at 60 Hz:
+
+| Measurement | Value |
+| --- | --- |
+| Compositor buffer rate | 37–38/s, against an advertised `videoMaxFramerate` of 59.951 |
+| Compositor cursor samples | 30/s |
+| Delivered to the viewer | 27–28/s, or 89–93% of what was sampled |
+| Painted gap, median | 17 ms — one display frame |
+| Painted gap, p90 | 34–35 ms — two display frames |
+| Painted gap, worst | 318–351 ms |
+| Compositor's own worst pause | 267 ms with one output, 734 ms with three |
+
+The worst-case figure is bounded by the compositor, not by this code: the
+overlay's play-out smoothing paints *more* evenly than its input, turning a
+734 ms hole into a 350 ms one. Frame size does not move it — 1280x720 and
+2560x1440 both pause for 267 ms on a single output — so it is not this
+process's per-frame cost, and scaling frames on the GPU would not change it.
+
 ## 7. Test VA-API and DMA-BUF
 
 Run:

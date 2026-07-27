@@ -326,13 +326,26 @@ you know you want a different segment duration.
 `--cursor-hz` defaults to 60 and is the rate the publisher forwards cursor
 samples at, independent of `--fps`. It cannot exceed what the compositor
 delivers: a screen-capture stream carries cursor metadata on its buffers, so a
-60 Hz panel yields at most 60 samples per second. Run the publisher with
+60 Hz panel yields at most 60 samples per second, and asking for 120 on a 60 Hz
+output changes nothing. Run the publisher with
 `RUST_LOG=glacialcast_client=debug` to see the measured `compositor capture
-rate` line reporting both the delivered buffer rate and the rate at which the
-cursor actually moved. `--cursor-flush-ms` (default 25) bounds how long a
-sample waits to be batched. It is the dominant term in how smooth the overlay
-looks, because the viewer can only animate through samples it has: raising it
-saves relay objects and costs smoothness.
+rate` line, which reports the delivered buffer rate, the rate at which the
+cursor actually moved, and the longest pause between two cursor samples.
+`--cursor-flush-ms` (default 25) bounds how long a sample waits to be batched.
+It is the dominant term in how smooth the overlay looks, because the viewer can
+only animate through samples it has: raising it saves relay objects and costs
+smoothness.
+
+What the compositor actually delivers is worth measuring rather than assuming.
+On niri 26.04 with three 2560x1440 outputs at 60 Hz, it advertises a
+`videoMaxFramerate` of 59.951 but delivers 37–38 buffers per second, of which
+about 30 carry cursor motion; the publisher forwards 89–93% of those. It also
+pauses cursor delivery entirely for 267 ms at a time with one output and 734 ms
+with three, which is more than any smoothing downstream can hide — the overlay
+paints more evenly than its input and still shows a worst-case gap around
+350 ms. That pause does not change with frame size, so it is not the cost of
+capturing or scaling. `scripts/verify-wayland-cursor-rate.sh` measures all of
+this on a real session.
 
 For repeatable bandwidth tests, `--test-pattern` accepts `static`, `typing`,
 `scroll`, and `motion`.
