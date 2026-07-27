@@ -1,7 +1,10 @@
 [package]
 name = "glacialcast-server"
 edition.workspace = true
+description = "GlacialCast relay: opaque durable object store, viewer surface, and Noise NK ingest."
 license.workspace = true
+repository.workspace = true
+publish = false
 version.workspace = true
 
 [dependencies]

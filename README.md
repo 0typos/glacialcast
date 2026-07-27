@@ -2,8 +2,8 @@
 
 GlacialCast is an end-to-end-encrypted, low-bandwidth Wayland screen viewer
 with bounded history. It captures a selected monitor or window through the XDG
-Desktop Portal and PipeWire, sends H.264 video at about one frame per second,
-and renders cursor updates as an independent higher-rate overlay.
+Desktop Portal and PipeWire, sends H.264 video at a few frames per second, and
+renders cursor updates as an independent, much higher-rate overlay.
 
 The current pre-1.0 implementation provides:
 
@@ -11,7 +11,8 @@ The current pre-1.0 implementation provides:
 - direct VA-API H.264 encoding on supported Intel/AMD devices;
 - an in-process OpenH264 software fallback without FFmpeg;
 - CENC-encrypted fragmented MP4 presented as MPEG-DASH;
-- authenticated cursor batches at up to 30 updates per second;
+- authenticated cursor batches at up to 60 updates per second, on a timeline
+  independent of the video;
 - a durable relay bounded by both object age and bytes per stream;
 - a dependency-free Firefox/Chromium viewer using MSE and EME Clear Key; and
 - portable `.gco` object files and a self-contained offline viewer.
@@ -149,9 +150,7 @@ Publish a selected Wayland monitor:
   --portal-source monitor \
   --portal-cursor metadata \
   --require-cursor-metadata \
-  --fps 1 \
-  --idle-heartbeat-seconds 10 \
-  --cursor-hz 60
+  --idle-heartbeat-seconds 10
 ```
 
 The publisher detaches into the background and returns immediately, after
@@ -278,20 +277,22 @@ content is represented by a variable-duration sample at
 frame is still published on the next video tick, while cursor objects continue
 at `--cursor-hz`. Set the heartbeat to `1` for a denser compatibility profile.
 
-Capture defaults to 1920x1080 at 1.2 Mbit/s, which is a legibility choice
-rather than a bandwidth one: a screen is mostly text, and the damage-aware
-cadence means a still screen costs almost nothing regardless of the cap. Three
-2560x1440 screens published together measured 0.4 to 0.9 MB/min each in normal
-use. Raise `--max-frame-width`/`--max-frame-height` toward the native size and
-`--video-bitrate` with them if you would rather spend more for sharper text.
+Capture defaults to 2560x1440 at 2.5 Mbit/s. That is a legibility choice rather
+than a bandwidth one: a screen is mostly text, and downscaling is what makes
+text look soft, far more than the bitrate does. Publishing a 2560x1440 panel at
+its native size measured 2.8 to 3.1 MB/min per screen under continuous use and
+correlated 0.978 with the compositor's own screenshot. The damage-aware cadence
+means a still screen costs almost nothing regardless of the cap. Lower
+`--max-frame-width`/`--max-frame-height` if you would rather spend less; the
+frame is only ever scaled down, never up.
 
 `--fps` defaults to 5. Segment length follows it so a segment stays near four
 seconds: segment boundaries force a keyframe, and holding the frame count fixed
-while raising the frame rate multiplies keyframes rather than frames. Measured
-across three 2560x1440 screens, five frames per second with four-second
-segments costs about 1 MB/min per screen; the same rate with the old four-frame
-segments cost five times that. Override with `--segment-frames` only if you
-know you want a different segment duration.
+while raising the frame rate multiplies keyframes rather than frames. This is
+why the frame rate is nearly free — going from 1 to 5 fps at a fixed segment
+*duration* cost about 20% more, while the same change at the old fixed four-frame
+segment count cost five times as much. Override with `--segment-frames` only if
+you know you want a different segment duration.
 
 `--cursor-hz` defaults to 60 and is the rate the publisher forwards cursor
 samples at, independent of `--fps`. It cannot exceed what the compositor
@@ -299,7 +300,7 @@ delivers: a screen-capture stream carries cursor metadata on its buffers, so a
 60 Hz panel yields at most 60 samples per second. Run the publisher with
 `RUST_LOG=glacialcast_client=debug` to see the measured `compositor capture
 rate` line reporting both the delivered buffer rate and the rate at which the
-cursor actually moved. `--cursor-flush-ms` (default 50) bounds how long a
+cursor actually moved. `--cursor-flush-ms` (default 25) bounds how long a
 sample waits to be batched. It is the dominant term in how smooth the overlay
 looks, because the viewer can only animate through samples it has: raising it
 saves relay objects and costs smoothness.
@@ -460,9 +461,10 @@ monitoring, and fail-closed configuration. The Internet browser gate places
 the relay behind a real Caddy HTTPS proxy and verifies authenticated playback
 and cursor behavior in both Firefox and Chromium. The performance gate runs
 conservative release-mode throughput and durable-object floors. The bandwidth
-gate enforces application-byte ceilings for the default moving 1280×720,
-1 FPS video and independent 60 Hz cursor profile; framing overhead remains a
-deployment measurement. Hardware checks require the corresponding host
+gate enforces application-byte ceilings across static, typing, scroll, and
+motion profiles, measured at the shipped default frame rate and cursor rate so
+a change to those defaults has to face its own bandwidth cost; framing overhead
+remains a deployment measurement. Hardware checks require the corresponding host
 capabilities and are described in `docs/completion-audit.md`. The
 release-validation targets and evidence collection command are in
 `docs/support-matrix.md`.

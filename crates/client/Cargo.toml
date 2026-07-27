@@ -1,7 +1,10 @@
 [package]
 name = "glacialcast-client"
 edition.workspace = true
+description = "Wayland screen capture publisher: portal/PipeWire capture, H.264 encoding, and encrypted ingest."
 license.workspace = true
+repository.workspace = true
+publish = false
 version.workspace = true
 
 [dependencies]

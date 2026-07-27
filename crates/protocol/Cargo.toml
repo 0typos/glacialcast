@@ -1,7 +1,10 @@
 [package]
 name = "glacialcast-protocol"
 edition.workspace = true
+description = "Wire types and envelopes shared by the GlacialCast publisher and relay."
 license.workspace = true
+repository.workspace = true
+publish = false
 version.workspace = true
 
 [dependencies]

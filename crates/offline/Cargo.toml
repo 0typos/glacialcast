@@ -1,7 +1,10 @@
 [package]
 name = "glacialcast-offline"
 edition.workspace = true
+description = "Self-contained offline viewer for portable GlacialCast .gco object files."
 license.workspace = true
+repository.workspace = true
+publish = false
 version.workspace = true
 
 [dependencies]
