@@ -1101,11 +1101,14 @@ async fn run_dash_connection(
             }
             _ = frame_tick.tick() => {
                 let publish_started = Instant::now();
-                let capture = normalize_captured_dash_frame(
-                    capture.capture_dash_frame(args.max_frame_width, args.max_frame_height).await?,
-                    Some((width, height)),
-                );
+                let raw = capture
+                    .capture_dash_frame(args.max_frame_width, args.max_frame_height)
+                    .await?;
+                let dequeued_at = Instant::now();
+                let capture = normalize_captured_dash_frame(raw, Some((width, height)));
+                let normalized_at = Instant::now();
                 let fingerprint = capture.frame.content_fingerprint();
+                let fingerprinted_at = Instant::now();
                 let changed = frame_changed(
                     capture.change,
                     last_frame_fingerprint.as_ref(),
@@ -1170,6 +1173,13 @@ async fn run_dash_connection(
                     changed,
                     media_index,
                     capture_to_ack_ms = publish_started.elapsed().as_millis(),
+                    // Everything after the dequeue runs on the same task as the
+                    // cursor timeline, so these are the windows in which cursor
+                    // samples cannot be forwarded.
+                    wait_ms = dequeued_at.duration_since(publish_started).as_millis(),
+                    resize_ms = normalized_at.duration_since(dequeued_at).as_millis(),
+                    fingerprint_ms = fingerprinted_at.duration_since(normalized_at).as_millis(),
+                    encode_publish_ms = fingerprinted_at.elapsed().as_millis(),
                     pending = pending_media.is_some(),
                     "processed adaptive DASH media cadence"
                 );
