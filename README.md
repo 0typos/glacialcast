@@ -170,17 +170,22 @@ secret they need and it does not change when the publisher restarts. Use
 the detached log elsewhere, and `--daemon-status` or `--daemon-stop` to inspect
 or end the running publisher.
 
-Open `http://127.0.0.1:8899`, select the stream, and enter the viewer key. The
-browser receives encrypted DASH objects from the relay and performs content
-authentication and decryption locally.
+Open `http://127.0.0.1:8899` and enter the viewer key. The browser receives
+encrypted DASH objects from the relay and performs content authentication and
+decryption locally.
 
-## Watching several streams at once
+## Watching
 
-`/watch` shows up to four streams together. Pick a 1, 2, or 4 tile layout, drag
-a stream from the side panel into a tile — or press its **Watch** button, which
-does the same thing from a keyboard — and full-screen any tile on its own.
-Dropping a stream onto an occupied tile swaps the two, and shrinking the layout
-destroys the players it drops rather than leaving them decoding out of sight.
+`/` is the viewer: up to four streams at once. Pick a 1, 2, or 4 tile layout,
+drag a stream from the side panel into a tile — or press its **Watch** button,
+which does the same thing from a keyboard — and full-screen any tile on its
+own. Dropping a stream onto an occupied tile swaps the two, and shrinking the
+layout destroys the players it drops rather than leaving them decoding out of
+sight. The side panel collapses with the button beside the title, and stays
+collapsed until you open it again.
+
+The operations dashboard — stream health, retention, admin controls — is at
+`/streams`. A single stream can still be deep-linked at `/dash/{stream_id}`.
 
 The side panel lists the streams this browser holds a key for, which means the
 keys have to persist. They are kept in `localStorage` wrapped with AES-GCM under

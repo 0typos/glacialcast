@@ -60,7 +60,7 @@ try {
     }
   });
 
-  await page.goto(`${origin}/watch`, { waitUntil: 'domcontentloaded' });
+  await page.goto(`${origin}/`, { waitUntil: 'domcontentloaded' });
   await page.locator('#passphrase').fill(PASSPHRASE);
   await page.locator('#unlock-keyring button[type="submit"]').click();
   await page.locator('#keyring-panel').waitFor({ state: 'visible', timeout: 15_000 });
@@ -125,6 +125,27 @@ try {
     throw new Error(`expected one tile after shrinking, saw ${afterShrink.length}`);
   }
   console.log('layout shrink released the other tiles');
+
+  // Collapsing must survive a reload, and must not disturb what is playing:
+  // the panel is a control surface, not part of the stream.
+  const playingBefore = await page.evaluate(
+    () => globalThis.GlacialCastWatch.tiles()[0]?.metrics?.appendedMedia ?? 0,
+  );
+  await page.locator('#sidebar-toggle').click();
+  await page.waitForFunction(() => globalThis.GlacialCastWatch.sidebarCollapsed());
+  await page.waitForFunction(
+    was => (globalThis.GlacialCastWatch.tiles()[0]?.metrics?.appendedMedia ?? 0) > was,
+    playingBefore,
+    { timeout: 60_000 },
+  );
+
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.waitForFunction(() => globalThis.GlacialCastWatch?.sidebarCollapsed?.() === true, null, {
+    timeout: 15_000,
+  });
+  await page.locator('#sidebar-toggle').click();
+  await page.waitForFunction(() => globalThis.GlacialCastWatch.sidebarCollapsed() === false);
+  console.log('sidebar collapsed, stayed collapsed across a reload, and reopened');
 
   if (errors.length > 0) {
     throw new Error(`browser reported errors:\n${errors.join('\n')}`);

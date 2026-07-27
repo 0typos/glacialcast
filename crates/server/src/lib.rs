@@ -666,10 +666,14 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
     });
 
     let app = Router::new()
-        .route("/", get(index))
+        // Watching is what this server is for, so the multi-stream view is the
+        // landing page and the operations dashboard lives one click away.
+        .route("/", get(watch_viewer))
+        .route("/streams", get(index))
         .route("/login", get(login_page))
         .route("/dash/{stream_id}", get(dash_viewer))
-        .route("/watch", get(watch_viewer))
+        // Kept so links handed out before the move still land somewhere useful.
+        .route("/watch", get(|| async { Redirect::permanent("/") }))
         .route("/favicon.ico", get(favicon))
         .route("/api/auth/login", post(login))
         .route("/api/auth/logout", post(logout))

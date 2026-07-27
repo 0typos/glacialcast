@@ -120,13 +120,15 @@ status="$(
   exit 1
 }
 
-status="$(
-  curl -sS -o /dev/null -w '%{http_code}' "${local_origin}/"
-)"
-[[ "${status}" == "303" ]] || {
-  echo "anonymous dashboard returned ${status}, expected 303" >&2
-  exit 1
-}
+for page in "/" "/streams"; do
+  status="$(
+    curl -sS -o /dev/null -w '%{http_code}' "${local_origin}${page}"
+  )"
+  [[ "${status}" == "303" ]] || {
+    echo "anonymous ${page} returned ${status}, expected 303" >&2
+    exit 1
+  }
+done
 curl -fsS "${local_origin}/login" >/dev/null
 
 security_headers="$(
