@@ -357,6 +357,17 @@ this on a real session.
 For repeatable bandwidth tests, `--test-pattern` accepts `static`, `typing`,
 `scroll`, and `motion`.
 
+When a frame is published smaller than the source, the shrink happens on the
+GPU: a shader pass renders the imported DMA-BUF into a smaller framebuffer and
+`glReadPixels` transfers only the pixels that survive it. Three 2560x1440
+outputs published at 1280x720 cost 12% of one core that way against 46% reading
+them back full size, because the readback moves 3.7 MB per frame instead of
+14.7 MB. At the default frame size the pass is skipped entirely, since the
+target already equals the source. A driver that lacks the entry points or
+refuses the program falls back to a full-size readback and a CPU resize, once,
+rather than per frame; `GLACIALCAST_DISABLE_GPU_SCALING=1` forces that path for
+a driver that accepts the pass but renders it wrongly.
+
 `--dash-encoder auto` first tries constrained-baseline VA-API on
 `/dev/dri/renderD128`, then OpenH264. Use another render node with
 `--vaapi-device`; that option also selects the GBM device used to read

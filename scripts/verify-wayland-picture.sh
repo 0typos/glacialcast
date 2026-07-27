@@ -86,6 +86,15 @@ client_args=(
 if [[ -n "${monitor_name}" ]]; then
   client_args+=(--monitor-name "${monitor_name}")
 fi
+# Publishing smaller than the source is what puts the GPU scaling pass on the
+# path. The comparison is scale-invariant, so the same correlation threshold
+# holds and a shader that flips, swizzles, or garbles the frame fails here.
+if [[ -n "${GLACIALCAST_VERIFY_MAX_FRAME_WIDTH:-}" ]]; then
+  client_args+=(--max-frame-width "${GLACIALCAST_VERIFY_MAX_FRAME_WIDTH}")
+fi
+if [[ -n "${GLACIALCAST_VERIFY_MAX_FRAME_HEIGHT:-}" ]]; then
+  client_args+=(--max-frame-height "${GLACIALCAST_VERIFY_MAX_FRAME_HEIGHT}")
+fi
 
 RUST_LOG=glacialcast_client=info target/debug/glacialcast-client "${client_args[@]}" \
   >"${client_log}" 2>&1 &
