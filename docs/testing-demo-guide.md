@@ -467,6 +467,21 @@ Note that varying `--max-frame-width`/`--max-frame-height` does *not* test this:
 scaling happens after readback, so both a 720p and a 1440p output read back the
 same full-size DMA-BUF and cost the same. Vary `--fps` to vary the work.
 
+The same debug output separates where per-frame time actually goes. At the
+shipped defaults a release publisher reports `resize_ms=0`, `fingerprint_ms=4`
+and `encode_publish_ms` averaging 40 ms: there is no scaling step at all,
+because `--max-frame-width`/`--max-frame-height` default to the native size of
+these outputs, and what remains is the H.264 encode. Scaling only costs
+anything when an operator asks for a frame smaller than the source.
+
+Cursor scheduling is reported separately as `cursor timeline scheduling` with
+`worst_tick_lateness_ms`. That is the direct check that video work cannot delay
+cursor sampling: measured with all three outputs publishing and the pointer
+moving, the cursor task's ticks are 12 ms late at the median and 17 ms at worst,
+and those figures are unchanged at 0.5 fps, at 5 fps, and with one output
+instead of three. The residual is the timer's own granularity against a 16.7 ms
+interval, not blocking — ten times less video work does not move it.
+
 ## 7. Test VA-API and DMA-BUF
 
 Run:
