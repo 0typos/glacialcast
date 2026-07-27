@@ -115,7 +115,8 @@ They verify:
   security headers, private configuration, and fail-closed listeners;
 - several concurrent tiles in the multi-stream viewer, each decoding its own
   stream from the encrypted keyring;
-- a moving 1280×720, 1 FPS, default-cursor application-traffic ceiling; and
+- static, typing, scroll, and moving application-traffic ceilings, measured at
+  the shipped default frame and cursor rates; and
 - conservative crypto, packaging, and durable-storage throughput floors.
 
 Each script prints a final line beginning with `PASS:`. A failure is meaningful:
