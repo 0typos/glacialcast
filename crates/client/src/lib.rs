@@ -1127,8 +1127,29 @@ async fn run_dash_connection(
                 let mut bitmap_state = DashCursorBitmapState::default();
                 let mut pending: Vec<DashCursorEvent> = Vec::new();
                 let mut last_flush = Instant::now();
+                // How late this task's ticks actually fire. The whole point of
+                // running the cursor on its own task is that video work cannot
+                // delay it; lateness here is the direct measurement of whether
+                // that holds, and it is reported rather than assumed.
+                let mut last_tick = Instant::now();
+                let mut worst_lateness = Duration::ZERO;
+                let mut lateness_reported = Instant::now();
                 loop {
                     ticker.tick().await;
+                    let now = Instant::now();
+                    worst_lateness = worst_lateness.max(
+                        now.saturating_duration_since(last_tick)
+                            .saturating_sub(interval),
+                    );
+                    last_tick = now;
+                    if lateness_reported.elapsed() >= CAPTURE_RATE_WINDOW {
+                        debug!(
+                            worst_tick_lateness_ms = worst_lateness.as_millis(),
+                            "cursor timeline scheduling"
+                        );
+                        worst_lateness = Duration::ZERO;
+                        lateness_reported = now;
+                    }
                     if let Some(cursor) = source.next() {
                         let timestamp = duration_to_media_ticks(epoch_started.elapsed());
                         match cursor_to_dash_event(
