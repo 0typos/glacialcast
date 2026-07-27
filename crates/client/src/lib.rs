@@ -168,9 +168,9 @@ struct Args {
     width: u32,
     #[arg(long, default_value_t = 720)]
     height: u32,
-    #[arg(long, default_value_t = 1920)]
+    #[arg(long, default_value_t = 2560)]
     max_frame_width: u32,
-    #[arg(long, default_value_t = 1080)]
+    #[arg(long, default_value_t = 1440)]
     max_frame_height: u32,
     #[arg(long, value_parser = parse_update_rate, default_value = "5")]
     fps: f64,
@@ -180,7 +180,7 @@ struct Args {
     cursor_hz: u64,
     #[arg(long, value_parser = parse_cursor_flush_ms, default_value_t = 50)]
     cursor_flush_ms: u64,
-    #[arg(long, default_value_t = 1_200_000)]
+    #[arg(long, default_value_t = 2_500_000)]
     video_bitrate: u32,
     #[arg(long)]
     segment_frames: Option<u16>,
@@ -1085,10 +1085,6 @@ async fn run_dash_connection(
     let mut cursor_ticks: u64 = 0;
     let mut cursor_samples: u64 = 0;
     let mut cursor_reported = Instant::now();
-    // How long the video timeline may hold the loop waiting for a new frame.
-    // Short enough that the cursor keeps flowing, long enough to catch a frame
-    // that is already on its way.
-    let frame_wait_budget = Duration::from_millis(args.cursor_flush_ms.max(1));
     let cursor_flush_interval = Duration::from_millis(args.cursor_flush_ms.max(1));
     let mut last_cursor_flush = Instant::now();
     let mut media_index = 1u64;
@@ -1192,47 +1188,18 @@ async fn run_dash_connection(
             }
             _ = frame_tick.tick() => {
                 let publish_started = Instant::now();
-                // Waiting here for a brand new frame would hold the whole
-                // select! loop, and the cursor timeline with it. A static
-                // screen produces frames barely once a second, so the cursor
-                // would stop entirely whenever the pointer stopped moving and
-                // nothing else redrew — which is exactly when a viewer is
-                // looking at it. Bound the wait and treat "no new frame" as
-                // unchanged content, which the cadence already models.
-                let raw = match timeout(
-                    frame_wait_budget,
-                    capture.capture_dash_frame(args.max_frame_width, args.max_frame_height),
-                )
-                .await
-                {
-                    Ok(frame) => Some(frame?),
-                    Err(_) => None,
-                };
-                let Some(raw) = raw else {
-                    let decision = media_cadence.observe(
-                        duration_to_media_ticks(epoch_started.elapsed()),
-                        false,
-                    );
-                    if let Some(duration) = decision.flush_pending_duration {
-                        let pending = pending_media
-                            .take()
-                            .context("adaptive cadence lost its pending encoded frame")?;
-                        publish_encoded_media(
-                            &mut socket,
-                            resend,
-                            &mut sequence,
-                            &keys,
-                            stream_id,
-                            epoch_id,
-                            &mut media_index,
-                            pending.timestamp,
-                            duration,
-                            args.segment_frames(),
-                            pending.encoded,
-                        ).await?;
-                    }
-                    continue;
-                };
+                // Waiting for a new frame here is fine now that the cursor
+                // samples on its own task: this await no longer holds the
+                // cursor timeline, only the delivery of already-timestamped
+                // batches, which the viewer's play-out buffer absorbs.
+                //
+                // It must be an unbounded wait. The cadence is a state machine
+                // driven by actual frames, so a tick that gives up without one
+                // either corrupts it or, if skipped outright, stops the
+                // heartbeat and lets a still screen go silent entirely.
+                let raw = capture
+                    .capture_dash_frame(args.max_frame_width, args.max_frame_height)
+                    .await?;
                 let dequeued_at = Instant::now();
                 let capture = normalize_captured_dash_frame(raw, Some((width, height)));
                 let normalized_at = Instant::now();
