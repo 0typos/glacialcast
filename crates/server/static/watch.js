@@ -25,7 +25,12 @@ const els = {
   grid: document.querySelector('#grid'),
   headline: document.querySelector('#headline'),
   tileTemplate: document.querySelector('#tile-template'),
+  main: document.querySelector('main'),
+  sidebar: document.querySelector('#sidebar'),
+  sidebarToggle: document.querySelector('#sidebar-toggle'),
 };
+
+const SIDEBAR_STORAGE_KEY = 'glacialcast.sidebar.collapsed';
 
 const MAX_TILES = 4;
 const state = {
@@ -76,6 +81,40 @@ els.forgetAll.addEventListener('click', () => {
 for (const button of document.querySelectorAll('[data-layout]')) {
   button.addEventListener('click', () => setLayout(Number(button.dataset.layout)));
 }
+
+/**
+ * Shows or hides the stream list.
+ *
+ * The choice is remembered because someone who watches with the panel closed
+ * wants it closed every time, not once per page load.
+ */
+function setSidebarCollapsed(collapsed, { persist = true } = {}) {
+  els.main.classList.toggle('sidebar-collapsed', collapsed);
+  els.sidebar.inert = collapsed;
+  els.sidebarToggle.setAttribute('aria-expanded', String(!collapsed));
+  els.sidebarToggle.title = collapsed ? 'Show the stream list' : 'Hide the stream list';
+  if (!persist) return;
+  try {
+    globalThis.localStorage.setItem(SIDEBAR_STORAGE_KEY, collapsed ? '1' : '0');
+  } catch {
+    // A browser with storage disabled still gets a working toggle, just not a
+    // remembered one.
+  }
+}
+
+function restoreSidebar() {
+  let collapsed = false;
+  try {
+    collapsed = globalThis.localStorage.getItem(SIDEBAR_STORAGE_KEY) === '1';
+  } catch {
+    collapsed = false;
+  }
+  setSidebarCollapsed(collapsed, { persist: false });
+}
+
+els.sidebarToggle.addEventListener('click', () => {
+  setSidebarCollapsed(!els.main.classList.contains('sidebar-collapsed'));
+});
 
 function showError(element, error) {
   if (!element) return;
@@ -271,8 +310,10 @@ globalThis.GlacialCastWatch = {
     metrics: tile.player?.metrics() || null,
   })),
   layout: () => state.layout,
+  sidebarCollapsed: () => els.main.classList.contains('sidebar-collapsed'),
 };
 
+restoreSidebar();
 setLayout(1);
 if (!Keyring.exists()) {
   els.headline.textContent = 'Open a keyring, then add the viewer keys you were given';

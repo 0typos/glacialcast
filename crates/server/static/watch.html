@@ -9,9 +9,17 @@
 </head>
 <body>
   <header>
-    <div>
-      <h1>GlacialCast</h1>
-      <div id="headline" class="muted">Watch up to four encrypted streams</div>
+    <div class="header-title">
+      <button id="sidebar-toggle" type="button" class="icon-button"
+              aria-controls="sidebar" aria-expanded="true"
+              title="Hide the stream list">
+        <span aria-hidden="true">☰</span>
+        <span class="visually-hidden">Toggle the stream list</span>
+      </button>
+      <div>
+        <h1>GlacialCast</h1>
+        <div id="headline" class="muted">Watch up to four encrypted streams</div>
+      </div>
     </div>
     <div class="header-actions">
       <div class="layouts" role="group" aria-label="Layout">
@@ -19,7 +27,7 @@
         <button type="button" data-layout="2" aria-pressed="false">2</button>
         <button type="button" data-layout="4" aria-pressed="false">4</button>
       </div>
-      <a href="/">All streams</a>
+      <a href="/streams">All streams</a>
     </div>
   </header>
 

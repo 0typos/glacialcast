@@ -32,6 +32,43 @@ header {
   border-bottom: 1px solid var(--line);
 }
 
+.header-title {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.1rem;
+  height: 2.1rem;
+  padding: 0;
+  font-size: 1rem;
+  line-height: 1;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.icon-button:hover {
+  border-color: var(--accent);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
 h1 {
   margin: 0;
   font-size: 1.1rem;
@@ -115,6 +152,32 @@ main {
   display: grid;
   grid-template-columns: minmax(240px, 20rem) 1fr;
   min-height: 0;
+  transition: grid-template-columns 160ms ease;
+}
+
+/* Collapsing folds the sidebar column to nothing rather than hiding it, so the
+   tiles reclaim the width instead of leaving a gap where it used to be. */
+main.sidebar-collapsed {
+  grid-template-columns: 0 1fr;
+}
+
+main.sidebar-collapsed > aside {
+  padding-left: 0;
+  padding-right: 0;
+  border-right-width: 0;
+  overflow: hidden;
+}
+
+/* Inert as well as invisible: a zero-width column still holds focusable
+   controls, and tabbing into one the operator cannot see is disorienting. */
+main.sidebar-collapsed > aside > * {
+  visibility: hidden;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  main {
+    transition: none;
+  }
 }
 
 aside {

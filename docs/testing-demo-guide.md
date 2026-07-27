@@ -282,8 +282,9 @@ target/release/glacialcast-client \
   --segment-frames 4
 ```
 
-Open `http://127.0.0.1:8899` in Firefox first, select **GlacialCast Demo**, and
-paste the contents of `viewer-key.txt` into the unlock form.
+Open `http://127.0.0.1:8899` in Firefox first, open the keyring, and store the
+contents of `viewer-key.txt` against **GlacialCast Demo**. Then press its
+**Watch** button to put it in a tile.
 
 Expected behavior:
 
