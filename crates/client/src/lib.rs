@@ -19,8 +19,8 @@ use futures_util::StreamExt;
 use glacialcast_dash::{
     CursorBatch as DashCursorBatch, CursorBitmap as DashCursorBitmap,
     CursorContext as DashCursorContext, CursorEvent as DashCursorEvent, DASH_FORMAT_VERSION,
-    DEFAULT_SEGMENT_FRAMES, EpochDescriptor, EpochKeys, FragmentInput, MEDIA_TIMESCALE,
-    build_encrypted_fragment, build_encrypted_init_segment, encrypt_cursor_batch,
+    EpochDescriptor, EpochKeys, FragmentInput, MEDIA_TIMESCALE, build_encrypted_fragment,
+    build_encrypted_init_segment, encrypt_cursor_batch,
 };
 use glacialcast_protocol::{
     CaptureSource, ClientMessage, DashObject, DashObjectKind, NewDashObject, NoiseSocket,
@@ -168,11 +168,11 @@ struct Args {
     width: u32,
     #[arg(long, default_value_t = 720)]
     height: u32,
-    #[arg(long, default_value_t = 1600)]
+    #[arg(long, default_value_t = 1920)]
     max_frame_width: u32,
-    #[arg(long, default_value_t = 900)]
+    #[arg(long, default_value_t = 1080)]
     max_frame_height: u32,
-    #[arg(long, value_parser = parse_update_rate, default_value = "1")]
+    #[arg(long, value_parser = parse_update_rate, default_value = "5")]
     fps: f64,
     #[arg(long, value_parser = parse_idle_heartbeat_seconds, default_value_t = 10)]
     idle_heartbeat_seconds: u64,
@@ -180,10 +180,10 @@ struct Args {
     cursor_hz: u64,
     #[arg(long, value_parser = parse_cursor_flush_ms, default_value_t = 50)]
     cursor_flush_ms: u64,
-    #[arg(long, default_value_t = 250_000)]
+    #[arg(long, default_value_t = 1_200_000)]
     video_bitrate: u32,
-    #[arg(long, default_value_t = DEFAULT_SEGMENT_FRAMES)]
-    segment_frames: u16,
+    #[arg(long)]
+    segment_frames: Option<u16>,
     #[arg(long, value_enum, default_value_t = DashEncoderMode::Auto)]
     dash_encoder: DashEncoderMode,
     #[arg(long, default_value = "/dev/dri/renderD128")]
@@ -207,6 +207,28 @@ struct Args {
     #[arg(long)]
     log_file: Option<PathBuf>,
 }
+
+impl Args {
+    /// Frames per media segment, holding segment duration near four seconds.
+    ///
+    /// Segment boundaries force an IDR, and an IDR costs far more than a
+    /// predicted frame. Holding the frame count fixed while the frame rate
+    /// rises therefore multiplies keyframes and with them the bitrate: at five
+    /// frames per second the shipped four-frame segment measured 13 MB/min
+    /// across three screens against 2.4 MB/min once the duration was restored.
+    fn segment_frames(&self) -> u16 {
+        self.segment_frames.unwrap_or_else(|| {
+            let frames = (self.fps * f64::from(SEGMENT_TARGET_SECONDS)).round();
+            (frames as u16).clamp(1, MAX_SEGMENT_FRAMES)
+        })
+    }
+}
+
+/// Segment duration the publisher aims for, in seconds.
+const SEGMENT_TARGET_SECONDS: u16 = 4;
+/// Upper bound on frames per segment, so a high frame rate cannot produce a
+/// segment the viewer must buffer for an unreasonable time before it decodes.
+const MAX_SEGMENT_FRAMES: u16 = 120;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -862,7 +884,7 @@ async fn run_dash_connection(
     resend: &mut DashResendBuffer,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    if args.segment_frames == 0 {
+    if args.segment_frames() == 0 {
         bail!("--segment-frames must be at least 1");
     }
     let ingest_server_key = identity.client.ingest_server_key.as_ref().context(
@@ -955,7 +977,7 @@ async fn run_dash_connection(
         height,
         fps: args.fps,
         bitrate: args.video_bitrate,
-        segment_frames: args.segment_frames,
+        segment_frames: args.segment_frames(),
     })?;
     let mut last_frame_fingerprint = first_frame.content_fingerprint();
     let first_encoded = encoder.encode(first_frame.clone(), false).await?;
@@ -978,7 +1000,7 @@ async fn run_dash_connection(
         height: u16::try_from(height).context("video height does not fit MPEG-DASH metadata")?,
         codec,
         timescale: MEDIA_TIMESCALE,
-        segment_frames: args.segment_frames,
+        segment_frames: args.segment_frames(),
         availability_start_time: chrono::Utc::now()
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
     };
@@ -1036,7 +1058,7 @@ async fn run_dash_connection(
         0,
         0,
         frame_duration,
-        args.segment_frames,
+        args.segment_frames(),
         &first_encoded,
     )?;
     let first_bytes = first_media.payload.len();
@@ -1148,7 +1170,7 @@ async fn run_dash_connection(
                         &mut media_index,
                         pending.timestamp,
                         duration,
-                        args.segment_frames,
+                        args.segment_frames(),
                         pending.encoded,
                     ).await?;
                 }
@@ -1162,7 +1184,7 @@ async fn run_dash_connection(
                     width,
                     height,
                     frame_duration,
-                    args.segment_frames,
+                    args.segment_frames(),
                     &mut pending_cursor_events,
                 ).await?;
                 info!(%stream_id, "shutdown requested; closing encrypted DASH stream");
@@ -1205,7 +1227,7 @@ async fn run_dash_connection(
                             &mut media_index,
                             pending.timestamp,
                             duration,
-                            args.segment_frames,
+                            args.segment_frames(),
                             pending.encoded,
                         ).await?;
                     }
@@ -1239,7 +1261,7 @@ async fn run_dash_connection(
                         &mut media_index,
                         pending.timestamp,
                         duration,
-                        args.segment_frames,
+                        args.segment_frames(),
                         pending.encoded,
                     ).await?;
                 }
@@ -1248,7 +1270,7 @@ async fn run_dash_connection(
                         &encoder,
                         capture.frame,
                         media_index,
-                        args.segment_frames,
+                        args.segment_frames(),
                     ).await?;
                     publish_encoded_media(
                         &mut socket,
@@ -1260,7 +1282,7 @@ async fn run_dash_connection(
                         &mut media_index,
                         timestamp,
                         frame_duration,
-                        args.segment_frames,
+                        args.segment_frames(),
                         encoded,
                     ).await?;
                     last_frame_fingerprint = fingerprint;
@@ -1269,7 +1291,7 @@ async fn run_dash_connection(
                         &encoder,
                         capture.frame,
                         media_index,
-                        args.segment_frames,
+                        args.segment_frames(),
                     ).await?;
                     pending_media = Some(PendingEncodedMedia { timestamp, encoded });
                 } else {
@@ -1303,7 +1325,7 @@ async fn run_dash_connection(
                     width,
                     height,
                     frame_duration,
-                    args.segment_frames,
+                    args.segment_frames(),
                     &mut pending_cursor_events,
                 ).await?;
             }
@@ -1350,7 +1372,7 @@ async fn run_dash_connection(
                         width,
                         height,
                         frame_duration,
-                        args.segment_frames,
+                        args.segment_frames(),
                         &mut pending_cursor_events,
                     ).await?;
                 }
@@ -7105,6 +7127,24 @@ mod tests {
         assert_eq!(sanitize_source_label(""), "output");
         assert_eq!(sanitize_source_label("---"), "output");
         assert!(sanitize_source_label(&"x".repeat(200)).len() <= 64);
+    }
+
+    #[test]
+    fn segment_length_tracks_the_frame_rate() {
+        let args_at =
+            |fps: f64| Args::parse_from(["glacialcast-client", "--fps", &fps.to_string()]);
+        // Segment boundaries force an IDR, so the frame count has to rise with
+        // the frame rate or the keyframe rate rises instead and takes the
+        // bitrate with it.
+        assert_eq!(args_at(1.0).segment_frames(), 4);
+        assert_eq!(args_at(5.0).segment_frames(), 20);
+        assert_eq!(args_at(15.0).segment_frames(), 60);
+        assert_eq!(args_at(0.5).segment_frames(), 2);
+
+        // An explicit choice still wins.
+        let explicit =
+            Args::parse_from(["glacialcast-client", "--fps", "5", "--segment-frames", "4"]);
+        assert_eq!(explicit.segment_frames(), 4);
     }
 
     #[test]

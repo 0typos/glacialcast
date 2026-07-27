@@ -20,10 +20,15 @@ case "${profile}" in
     default_max_media=262144
     ;;
   scroll)
-    default_max_media=1048576
+    # Scrolling defeats inter-frame prediction, so its cost tracks the frame
+    # rate almost linearly. Measured 1.12 MB/min at the shipped five frames per
+    # second; the ceiling keeps meaningful headroom without hiding a
+    # regression.
+    default_max_media=1572864
     ;;
   motion)
-    default_max_media=2097152
+    # Full-frame motion at five frames per second measured 3.38 MB/min.
+    default_max_media=4718592
     ;;
   *)
     echo "GLACIALCAST_BANDWIDTH_PROFILE must be all, static, typing, scroll, or motion" >&2
@@ -107,9 +112,7 @@ target/debug/glacialcast-client \
   --dash-encoder openh264 \
   --width 1280 \
   --height 720 \
-  --fps 1 \
   --video-bitrate 250000 \
-  --segment-frames 4 \
   >"${client_log}" 2>&1 &
 client_pid="$!"
 
@@ -184,7 +187,7 @@ const mediaPerMinute = Math.ceil(mediaBytes * scale);
 const cursorPerMinute = Math.ceil(cursorBytes * scale);
 const totalPerMinute = Math.ceil((mediaBytes + cursorBytes + otherBytes) * scale);
 const result = {
-  profile: `${profile}-pattern-1280x720-1fps-default-cursor-250kbps`,
+  profile: `${profile}-pattern-1280x720-default-profile-250kbps`,
   sample_seconds: seconds,
   media_bytes_per_minute: mediaPerMinute,
   cursor_bytes_per_minute: cursorPerMinute,

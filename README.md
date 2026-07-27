@@ -278,6 +278,21 @@ content is represented by a variable-duration sample at
 frame is still published on the next video tick, while cursor objects continue
 at `--cursor-hz`. Set the heartbeat to `1` for a denser compatibility profile.
 
+Capture defaults to 1920x1080 at 1.2 Mbit/s, which is a legibility choice
+rather than a bandwidth one: a screen is mostly text, and the damage-aware
+cadence means a still screen costs almost nothing regardless of the cap. Three
+2560x1440 screens published together measured 0.4 to 0.9 MB/min each in normal
+use. Raise `--max-frame-width`/`--max-frame-height` toward the native size and
+`--video-bitrate` with them if you would rather spend more for sharper text.
+
+`--fps` defaults to 5. Segment length follows it so a segment stays near four
+seconds: segment boundaries force a keyframe, and holding the frame count fixed
+while raising the frame rate multiplies keyframes rather than frames. Measured
+across three 2560x1440 screens, five frames per second with four-second
+segments costs about 1 MB/min per screen; the same rate with the old four-frame
+segments cost five times that. Override with `--segment-frames` only if you
+know you want a different segment duration.
+
 `--cursor-hz` defaults to 60 and is the rate the publisher forwards cursor
 samples at, independent of `--fps`. It cannot exceed what the compositor
 delivers: a screen-capture stream carries cursor metadata on its buffers, so a
