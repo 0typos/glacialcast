@@ -1049,9 +1049,11 @@ async fn run_dash_connection(
     let cursor_interval = Duration::from_secs_f64(1.0 / args.cursor_hz.max(1) as f64);
     let mut cursor_tick = tokio::time::interval(cursor_interval);
     cursor_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut cursor_flush_tick =
-        tokio::time::interval(Duration::from_millis(args.cursor_flush_ms.max(1)));
-    cursor_flush_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut cursor_ticks: u64 = 0;
+    let mut cursor_samples: u64 = 0;
+    let mut cursor_reported = Instant::now();
+    let cursor_flush_interval = Duration::from_millis(args.cursor_flush_ms.max(1));
+    let mut last_cursor_flush = Instant::now();
     let mut media_index = 1u64;
     let heartbeat_ticks = args
         .idle_heartbeat_seconds
@@ -1186,7 +1188,20 @@ async fn run_dash_connection(
             }
             _ = cursor_tick.tick() => {
                 cursor_sequence = cursor_sequence.saturating_add(1);
+                cursor_ticks += 1;
+                if cursor_reported.elapsed() >= Duration::from_secs(5) {
+                    debug!(
+                        %stream_id,
+                        ticks_per_second = cursor_ticks / 5,
+                        samples_per_second = cursor_samples / 5,
+                        "cursor timeline throughput"
+                    );
+                    cursor_ticks = 0;
+                    cursor_samples = 0;
+                    cursor_reported = Instant::now();
+                }
                 if let Some(cursor) = capture.cursor(cursor_sequence).await? {
+                    cursor_samples += 1;
                     let timestamp = duration_to_media_ticks(epoch_started.elapsed());
                     pending_cursor_events.push(cursor_to_dash_event(
                         cursor,
@@ -1196,21 +1211,28 @@ async fn run_dash_connection(
                         &mut cursor_bitmap_state,
                     )?);
                 }
-            }
-            _ = cursor_flush_tick.tick() => {
-                flush_dash_cursor_batch(
-                    &mut socket,
-                    resend,
-                    &mut sequence,
-                    &keys,
-                    stream_id,
-                    epoch_id,
-                    width,
-                    height,
-                    frame_duration,
-                    args.segment_frames,
-                    &mut pending_cursor_events,
-                ).await?;
+                // Flushing here rather than from its own timer is deliberate.
+                // `select!` completes one branch per iteration, so a separate
+                // flush tick competes with this sampler for iterations and, at
+                // 60 Hz against a loop that also encodes video, loses almost
+                // every time: samples pile up and ship in rare huge batches,
+                // which the viewer can only render as a frozen cursor.
+                if last_cursor_flush.elapsed() >= cursor_flush_interval {
+                    last_cursor_flush = Instant::now();
+                    flush_dash_cursor_batch(
+                        &mut socket,
+                        resend,
+                        &mut sequence,
+                        &keys,
+                        stream_id,
+                        epoch_id,
+                        width,
+                        height,
+                        frame_duration,
+                        args.segment_frames,
+                        &mut pending_cursor_events,
+                    ).await?;
+                }
             }
         }
     }
