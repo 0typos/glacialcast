@@ -3139,11 +3139,12 @@ fn maybe_emit_pipewire_cursor(
 
 /// Emits the periodic capture-rate line for one delivered buffer.
 fn report_capture_rate(meter: &mut CaptureRateMeter, cursor_changed: bool, label: &str) {
-    if let Some((buffer_hz, cursor_hz)) = meter.record(Instant::now(), cursor_changed) {
+    if let Some(rates) = meter.record(Instant::now(), cursor_changed) {
         debug!(
             label,
-            buffer_hz = format!("{buffer_hz:.1}"),
-            cursor_hz = format!("{cursor_hz:.1}"),
+            buffer_hz = format!("{:.1}", rates.buffer_hz),
+            cursor_hz = format!("{:.1}", rates.cursor_hz),
+            max_cursor_gap_ms = rates.max_cursor_gap.as_millis(),
             "compositor capture rate"
         );
     }
@@ -6345,6 +6346,22 @@ struct CaptureRateMeter {
     window_started: Instant,
     buffers: u32,
     cursor_samples: u32,
+    last_cursor_sample: Option<Instant>,
+    max_cursor_gap: Duration,
+}
+
+/// One window's worth of what the compositor delivered.
+struct CaptureRates {
+    buffer_hz: f64,
+    cursor_hz: f64,
+    /// Longest interval between two cursor-carrying buffers in the window.
+    ///
+    /// The average rate hides a pause: thirty samples a second with a
+    /// third-of-a-second hole in the middle averages the same as thirty evenly
+    /// spaced ones, and only one of those looks smooth. This is also the number
+    /// that separates a stall this process caused from one it merely relayed,
+    /// because nothing downstream can be smoother than its input.
+    max_cursor_gap: Duration,
 }
 
 impl CaptureRateMeter {
@@ -6353,26 +6370,39 @@ impl CaptureRateMeter {
             window_started: now,
             buffers: 0,
             cursor_samples: 0,
+            last_cursor_sample: None,
+            max_cursor_gap: Duration::ZERO,
         }
     }
 
-    /// Records one delivered buffer and returns the closed window's rates in
-    /// hertz once `CAPTURE_RATE_WINDOW` has elapsed.
-    fn record(&mut self, now: Instant, cursor_changed: bool) -> Option<(f64, f64)> {
+    /// Records one delivered buffer and returns the closed window's rates once
+    /// `CAPTURE_RATE_WINDOW` has elapsed.
+    fn record(&mut self, now: Instant, cursor_changed: bool) -> Option<CaptureRates> {
         self.buffers = self.buffers.saturating_add(1);
         if cursor_changed {
             self.cursor_samples = self.cursor_samples.saturating_add(1);
+            if let Some(previous) = self.last_cursor_sample {
+                self.max_cursor_gap = self
+                    .max_cursor_gap
+                    .max(now.saturating_duration_since(previous));
+            }
+            self.last_cursor_sample = Some(now);
         }
         let elapsed = now.saturating_duration_since(self.window_started);
         if elapsed < CAPTURE_RATE_WINDOW {
             return None;
         }
         let seconds = elapsed.as_secs_f64();
-        let rates = (
-            f64::from(self.buffers) / seconds,
-            f64::from(self.cursor_samples) / seconds,
-        );
+        let rates = CaptureRates {
+            buffer_hz: f64::from(self.buffers) / seconds,
+            cursor_hz: f64::from(self.cursor_samples) / seconds,
+            max_cursor_gap: self.max_cursor_gap,
+        };
+        let last_cursor_sample = self.last_cursor_sample;
         *self = Self::new(now);
+        // Carried across the boundary so a gap spanning two windows is still
+        // measured rather than reset to zero halfway through.
+        self.last_cursor_sample = last_cursor_sample;
         Some(rates)
     }
 }
@@ -7224,16 +7254,56 @@ mod tests {
     fn capture_rate_meter_reports_once_per_window() {
         let start = Instant::now();
         let mut meter = CaptureRateMeter::new(start);
-        assert_eq!(meter.record(start + Duration::from_secs(1), true), None);
-        let (buffer_hz, cursor_hz) = meter
+        assert!(meter.record(start + Duration::from_secs(1), true).is_none());
+        let rates = meter
             .record(start + CAPTURE_RATE_WINDOW, false)
             .expect("the window closes once it is full");
-        assert!((buffer_hz - 0.4).abs() < 1e-9, "{buffer_hz}");
-        assert!((cursor_hz - 0.2).abs() < 1e-9, "{cursor_hz}");
+        assert!((rates.buffer_hz - 0.4).abs() < 1e-9, "{}", rates.buffer_hz);
+        assert!((rates.cursor_hz - 0.2).abs() < 1e-9, "{}", rates.cursor_hz);
         // A closed window restarts empty rather than accumulating forever.
-        assert_eq!(
-            meter.record(start + CAPTURE_RATE_WINDOW + Duration::from_secs(1), true),
-            None
+        assert!(
+            meter
+                .record(start + CAPTURE_RATE_WINDOW + Duration::from_secs(1), true)
+                .is_none()
+        );
+    }
+
+    /// An average rate hides a pause, and a pause is what a person sees. The
+    /// gap has to survive a window boundary too, or a stall straddling one
+    /// would be reported as two short ones.
+    #[test]
+    fn capture_rate_meter_measures_the_worst_pause_across_windows() {
+        let start = Instant::now();
+        let mut meter = CaptureRateMeter::new(start);
+        let step = Duration::from_millis(20);
+        meter.record(start, true);
+        meter.record(start + step, true);
+        // One 500 ms hole, with steady sampling either side of it, so the
+        // reported gap has to be the hole rather than the sampling interval.
+        meter.record(start + Duration::from_millis(520), true);
+        let mut at = Duration::from_millis(520);
+        let mut closed = None;
+        while closed.is_none() {
+            at += step;
+            closed = meter.record(start + at, true);
+        }
+        let rates = closed.expect("the window closes once it is full");
+        assert_eq!(rates.max_cursor_gap, Duration::from_millis(500));
+
+        // The next window starts fresh, but still remembers when the last
+        // sample was, so a gap straddling the boundary is measured whole
+        // rather than as two shorter ones.
+        at += Duration::from_millis(300);
+        let mut closed = meter.record(start + at, true);
+        while closed.is_none() {
+            at += step;
+            closed = meter.record(start + at, true);
+        }
+        let next = closed.expect("the second window closes too");
+        assert!(
+            next.max_cursor_gap >= Duration::from_millis(300),
+            "a gap across the window boundary was lost: {:?}",
+            next.max_cursor_gap
         );
     }
 
