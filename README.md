@@ -343,8 +343,15 @@ about 30 carry cursor motion; the publisher forwards 89–93% of those. It also
 pauses cursor delivery entirely for 267 ms at a time with one output and 734 ms
 with three, which is more than any smoothing downstream can hide — the overlay
 paints more evenly than its input and still shows a worst-case gap around
-350 ms. That pause does not change with frame size, so it is not the cost of
-capturing or scaling. `scripts/verify-wayland-cursor-rate.sh` measures all of
+350 ms.
+
+Those pauses are the compositor's, not this process's. Running the same capture
+at 0.5 fps instead of 5 — ten times less readback and encoding — changes
+nothing: 34.4 against 33.3 buffers per second, 25.9 cursor samples per second
+either way, and a worst pause of 272 against 277 ms. Raising a panel to its
+143.998 Hz mode does not help either; delivery *falls* to 33 buffers and 26
+cursor samples per second, so panel refresh is a ceiling rather than the
+binding constraint here. `scripts/verify-wayland-cursor-rate.sh` measures all of
 this on a real session.
 
 For repeatable bandwidth tests, `--test-pattern` accepts `static`, `typing`,
