@@ -438,49 +438,40 @@ what the compositor itself paused for. `GLACIALCAST_CURSOR_MAX_GAP_MS` adds an
 absolute ceiling for an acceptance run; it is off by default so that a
 compositor limitation cannot be mistaken for a regression here.
 
-Measured on niri 26.04 with PipeWire 1.6.8, three 2560x1440 outputs at 60 Hz:
+Measured on niri 26.04 with PipeWire 1.6.8, three 2560x1440 outputs at 60 Hz,
+with the pointer driven by relative motion at 60 steps per second:
 
 | Measurement | Value |
 | --- | --- |
-| Compositor buffer rate | 37–38/s, against an advertised `videoMaxFramerate` of 59.951 |
-| Compositor cursor samples | 30/s |
-| Delivered to the viewer | 27–28/s, or 89–93% of what was sampled |
+| Compositor buffer rate | 59.7/s, against an advertised `videoMaxFramerate` of 59.951 |
+| Compositor cursor samples | 59.7/s — every buffer carries cursor motion |
+| Compositor's worst pause between samples | 19–35 ms |
 | Painted gap, median | 17 ms — one display frame |
-| Painted gap, p90 | 34–35 ms — two display frames |
-| Painted gap, worst | 318–351 ms |
-| Compositor's own worst pause | 267 ms with one output, 734 ms with three |
+| Painted gap, p90 | 18–33 ms |
 
-The worst-case figure is bounded by the compositor, not by this code: the
-overlay's play-out smoothing paints *more* evenly than its input, turning a
-734 ms hole into a 350 ms one.
+How the pointer is driven decides what the compositor appears to do, and
+getting that wrong invents a limit that is not there. A synthetic *absolute*
+pointing device is coalesced somewhere between libinput and the compositor: on
+this machine it yields 37 buffers and 30 cursor samples per second with pauses
+up to 267 ms, and it does not improve at a 143.998 Hz panel mode — delivery
+*falls* to 33. Driven by relative motion, the same machine reaches the full
+59.7. `pointer-probe.py` emits relative motion for that reason, and a caller
+measuring a high-refresh output should raise its step rate to match.
 
-Two controlled comparisons place that pause outside this process. Capturing at
-0.5 fps instead of 5, which is ten times less readback and encoding, gives
-34.4 against 33.3 buffers per second, 25.9 cursor samples per second either
-way, and a worst pause of 272 against 277 ms. Switching an output to its
-143.998 Hz mode gives 33.1 buffers and 26.0 cursor samples per second — lower
-than at 59.951 Hz, so panel refresh bounds the rate without being what
-currently limits it. Neither video work nor panel mode moves the pause, so
-moving per-frame work to the GPU would not move it either.
-
-Note that varying `--max-frame-width`/`--max-frame-height` does *not* test this:
-scaling happens after readback, so both a 720p and a 1440p output read back the
-same full-size DMA-BUF and cost the same. Vary `--fps` to vary the work.
-
-The same debug output separates where per-frame time actually goes. At the
-shipped defaults a release publisher reports `resize_ms=0`, `fingerprint_ms=4`
-and `encode_publish_ms` averaging 40 ms: there is no scaling step at all,
-because `--max-frame-width`/`--max-frame-height` default to the native size of
-these outputs, and what remains is the H.264 encode. Scaling only costs
-anything when an operator asks for a frame smaller than the source.
+The per-frame breakdown separates where time goes. At the shipped defaults a
+release publisher reports `resize_ms=0`, `fingerprint_ms=4` and
+`encode_publish_ms` averaging 40 ms: there is no scaling step, because
+`--max-frame-width`/`--max-frame-height` default to the native size of these
+outputs, and what remains is the H.264 encode. Scaling only costs anything when
+an operator asks for a frame smaller than the source, and then it happens on
+the GPU.
 
 Cursor scheduling is reported separately as `cursor timeline scheduling` with
 `worst_tick_lateness_ms`. That is the direct check that video work cannot delay
-cursor sampling: measured with all three outputs publishing and the pointer
-moving, the cursor task's ticks are 12 ms late at the median and 17 ms at worst,
-and those figures are unchanged at 0.5 fps, at 5 fps, and with one output
-instead of three. The residual is the timer's own granularity against a 16.7 ms
-interval, not blocking — ten times less video work does not move it.
+cursor sampling: with all three outputs publishing, the cursor task's ticks are
+12 ms late at the median and 17 ms at worst, unchanged at 0.5 fps, at 5 fps, and
+with one output instead of three. The residual is the timer's own granularity
+against a 16.7 ms interval, not blocking.
 
 ## 7. Test VA-API and DMA-BUF
 
