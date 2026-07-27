@@ -750,6 +750,17 @@ fn sanitize_source_label(connector: &str) -> String {
     }
 }
 
+/// Stops the cursor sampling task when its connection ends.
+struct CursorTaskGuard(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for CursorTaskGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
 async fn sleep_or_shutdown(duration: Duration, shutdown_rx: &mut watch::Receiver<bool>) -> bool {
     tokio::select! {
         _ = tokio::time::sleep(duration) => false,
@@ -1068,6 +1079,58 @@ async fn run_dash_connection(
     let mut pending_cursor_events = Vec::new();
     let mut cursor_bitmap_state = DashCursorBitmapState::default();
 
+    // Sample the cursor on its own task when the capture can supply a feed.
+    // Video work holds this loop for as long as it takes to unpack, scale and
+    // encode a frame; sampling from here would inherit every one of those
+    // stalls and stamp the samples late as well. The task only ever produces
+    // finished batches, which this loop forwards as soon as it is free, and
+    // the viewer's play-out buffer absorbs that delivery jitter.
+    let (cursor_batch_tx, mut cursor_batch_rx) = tokio::sync::mpsc::channel(64);
+    let cursor_task = match capture.cursor_source().await? {
+        Some(mut source) => {
+            let interval = cursor_interval;
+            let flush_every = cursor_flush_interval;
+            Some(tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(interval);
+                ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                let mut bitmap_state = DashCursorBitmapState::default();
+                let mut pending: Vec<DashCursorEvent> = Vec::new();
+                let mut last_flush = Instant::now();
+                loop {
+                    ticker.tick().await;
+                    if let Some(cursor) = source.next() {
+                        let timestamp = duration_to_media_ticks(epoch_started.elapsed());
+                        match cursor_to_dash_event(
+                            cursor,
+                            timestamp,
+                            width,
+                            height,
+                            &mut bitmap_state,
+                        ) {
+                            Ok(event) => pending.push(event),
+                            Err(err) => {
+                                warn!(?err, "dropping an unrepresentable cursor sample");
+                            }
+                        }
+                    }
+                    if last_flush.elapsed() >= flush_every && !pending.is_empty() {
+                        last_flush = Instant::now();
+                        if cursor_batch_tx
+                            .send(std::mem::take(&mut pending))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }))
+        }
+        None => None,
+    };
+    let sampling_cursor_inline = cursor_task.is_none();
+    let _cursor_task = CursorTaskGuard(cursor_task);
+
     loop {
         tokio::select! {
             _ = wait_for_shutdown(&mut shutdown_rx) => {
@@ -1228,7 +1291,23 @@ async fn run_dash_connection(
                     "processed adaptive DASH media cadence"
                 );
             }
-            _ = cursor_tick.tick() => {
+            Some(events) = cursor_batch_rx.recv() => {
+                pending_cursor_events.extend(events);
+                flush_dash_cursor_batch(
+                    &mut socket,
+                    resend,
+                    &mut sequence,
+                    &keys,
+                    stream_id,
+                    epoch_id,
+                    width,
+                    height,
+                    frame_duration,
+                    args.segment_frames,
+                    &mut pending_cursor_events,
+                ).await?;
+            }
+            _ = cursor_tick.tick(), if sampling_cursor_inline => {
                 cursor_sequence = cursor_sequence.saturating_add(1);
                 cursor_ticks += 1;
                 if cursor_reported.elapsed() >= Duration::from_secs(5) {
@@ -2111,6 +2190,15 @@ trait Capture: Send {
         })
     }
     async fn cursor(&mut self, seq: u64) -> Result<Option<CursorMessage>>;
+
+    /// Returns a cursor feed that can be polled from another task.
+    ///
+    /// `None` keeps the caller sampling inline, which is what the synthetic
+    /// test source does because it derives the cursor from its own frame
+    /// counter rather than from capture metadata.
+    async fn cursor_source(&mut self) -> Result<Option<PipewireCursorSource>> {
+        Ok(None)
+    }
 }
 
 struct CapturedDashFrame {
@@ -2351,6 +2439,37 @@ impl Capture for WaylandPipewireCapture {
             .await?
             .next_cursor_sample()
             .map(|sample| sample.to_message()))
+    }
+
+    async fn cursor_source(&mut self) -> Result<Option<PipewireCursorSource>> {
+        let inner = self.ensure_started().await?;
+        Ok(Some(PipewireCursorSource {
+            latest: inner.cursor_latest.clone(),
+            last_serial: inner.last_cursor_serial,
+        }))
+    }
+}
+
+/// A cursor feed that can be driven independently of video capture.
+///
+/// Cursor metadata rides on capture buffers, but reading it needs nothing from
+/// the capture object itself: the PipeWire thread publishes each sample to a
+/// watch channel. Handing a receiver to its own task is what keeps cursor
+/// sampling off the timeline that unpacks, scales, and encodes video.
+struct PipewireCursorSource {
+    latest: watch::Receiver<Option<PipewireCursorSample>>,
+    last_serial: u64,
+}
+
+impl PipewireCursorSource {
+    /// Returns the newest sample if it has not been returned already.
+    fn next(&mut self) -> Option<CursorMessage> {
+        let sample = self.latest.borrow().clone()?;
+        if sample.serial == self.last_serial {
+            return None;
+        }
+        self.last_serial = sample.serial;
+        Some(sample.to_message())
     }
 }
 
