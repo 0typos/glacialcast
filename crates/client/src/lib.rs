@@ -178,7 +178,7 @@ struct Args {
     idle_heartbeat_seconds: u64,
     #[arg(long, default_value_t = 60)]
     cursor_hz: u64,
-    #[arg(long, value_parser = parse_cursor_flush_ms, default_value_t = 50)]
+    #[arg(long, value_parser = parse_cursor_flush_ms, default_value_t = 25)]
     cursor_flush_ms: u64,
     #[arg(long, default_value_t = 2_500_000)]
     video_bitrate: u32,
@@ -1197,9 +1197,37 @@ async fn run_dash_connection(
                 // driven by actual frames, so a tick that gives up without one
                 // either corrupts it or, if skipped outright, stops the
                 // heartbeat and lets a still screen go silent entirely.
-                let raw = capture
-                    .capture_dash_frame(args.max_frame_width, args.max_frame_height)
-                    .await?;
+                // Waiting for a frame can take most of a second on a screen
+                // with nothing moving on it. Cursor batches are already
+                // timestamped by then and only need putting on the wire, so
+                // service them while waiting rather than letting them queue
+                // behind the video timeline -- that queueing is what a viewer
+                // sees as a pointer trailing well behind the real one.
+                let raw = loop {
+                    tokio::select! {
+                        biased;
+                        Some(events) = cursor_batch_rx.recv() => {
+                            pending_cursor_events.extend(events);
+                            flush_dash_cursor_batch(
+                                &mut socket,
+                                resend,
+                                &mut sequence,
+                                &keys,
+                                stream_id,
+                                epoch_id,
+                                width,
+                                height,
+                                frame_duration,
+                                args.segment_frames(),
+                                &mut pending_cursor_events,
+                            ).await?;
+                        }
+                        frame = capture
+                            .capture_dash_frame(args.max_frame_width, args.max_frame_height) => {
+                            break frame?;
+                        }
+                    }
+                };
                 let dequeued_at = Instant::now();
                 let capture = normalize_captured_dash_frame(raw, Some((width, height)));
                 let normalized_at = Instant::now();

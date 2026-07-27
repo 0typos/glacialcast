@@ -267,10 +267,11 @@
 
   // Cursor timestamps are carried on the 90 kHz media timescale.
   const CURSOR_TICKS_PER_MS = 90;
-  // How far behind the newest sample the live overlay deliberately runs. One
-  // publisher flush interval of slack means there is normally a queue of
-  // samples to play out, so the overlay animates instead of snapping.
-  const DEFAULT_CURSOR_LAG_MS = 120;
+  // How far behind the newest sample the live overlay deliberately runs. It
+  // buys smoothness with latency, and on a pointer the latency is what a
+  // viewer notices first, so it is kept to roughly one publisher flush
+  // interval rather than the several it started at.
+  const DEFAULT_CURSOR_LAG_MS = 40;
   // Beyond this the overlay is not smoothing, it is simply stale, so it jumps
   // rather than crawling through a backlog.
   const DEFAULT_CURSOR_DRIFT_MS = 600;
