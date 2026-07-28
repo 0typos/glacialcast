@@ -453,7 +453,7 @@ fi
 grep -Fq "private regular file with mode 0600" "${work_dir}/unsafe.log"
 
 if target/debug/glacialcast-server \
-  --config "${work_dir}/missing.toml" \
+  --no-config \
   --control-addr 0.0.0.0:19699 \
   --ingest-addr 127.0.0.1:19700 \
   --data-dir "${work_dir}/public-http-data" \

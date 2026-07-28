@@ -80,7 +80,7 @@ fi
 cargo build --release -p glacialcast-server -p glacialcast-client
 
 ingest_server_key="$(
-  target/release/glacialcast-server --data-dir "${work_dir}/data" --print-ingest-server-key
+  target/release/glacialcast-server --no-config --data-dir "${work_dir}/data" --print-ingest-server-key
 )"
 viewer_key="$(
   target/release/glacialcast-client \

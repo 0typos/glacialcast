@@ -39,6 +39,7 @@ fi
 cargo build -p glacialcast-server -p glacialcast-client
 ingest_server_key="$(
   target/debug/glacialcast-server \
+    --no-config \
     --data-dir "${work_dir}/data" \
     --print-ingest-server-key
 )"
