@@ -54,7 +54,7 @@ ingest_server_key="$(
 viewer_key="$(node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))")"
 
 target/debug/glacialcast-server \
-  --config "${work_dir}/missing-server.toml" \
+  --no-config \
   --control-addr "${control_addr}" \
   --ingest-addr "${ingest_addr}" \
   --data-dir "${work_dir}/data" \
@@ -69,7 +69,7 @@ curl -fsS "${origin}/api/streams" >/dev/null
 
 client_args=(
   --foreground
-  --config "${work_dir}/missing-client.toml"
+  --no-config
   --ingest-addr "${ingest_addr}"
   "--ingest-server-key=${ingest_server_key}"
   "--viewer-key=${viewer_key}"

@@ -51,13 +51,13 @@ ingest_server_key="$(
 viewer_key_file="${work_dir}/viewer.key"
 viewer_key="$(
   target/debug/glacialcast-client \
-    --config "${work_dir}/missing-client.toml" \
+    --no-config \
     --viewer-key-file "${viewer_key_file}" \
     --print-viewer-key
 )"
 
 target/debug/glacialcast-server \
-  --config "${work_dir}/missing-server.toml" \
+  --no-config \
   --control-addr "${control_addr}" \
   --ingest-addr "${ingest_addr}" \
   --data-dir "${work_dir}/data" \
@@ -72,7 +72,7 @@ curl -fsS "${origin}/api/streams" >/dev/null
 
 for index in $(seq 1 "${publishers}"); do
   target/debug/glacialcast-client \
-    --config "${work_dir}/missing-client.toml" \
+    --no-config \
     --ingest-addr "${ingest_addr}" \
     "--ingest-server-key=${ingest_server_key}" \
     --viewer-key-file "${viewer_key_file}" \

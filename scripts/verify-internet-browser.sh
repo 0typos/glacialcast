@@ -122,7 +122,7 @@ curl --insecure --fail --silent "${public_origin}/health/ready" >/dev/null
 
 viewer_key="$(node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))")"
 RUST_LOG=glacialcast_client=info target/debug/glacialcast-client \
-  --config "${work_dir}/missing-client.toml" \
+  --no-config \
   --ingest-addr "${ingest_addr}" \
   "--ingest-server-key=${ingest_server_key}" \
   "--viewer-key=${viewer_key}" \
