@@ -37,7 +37,8 @@ tar -xzf dist/glacialcast-v*-x86_64-unknown-linux-gnu.tar.gz
 sudo useradd --system --home-dir /var/lib/glacialcast --shell /usr/sbin/nologin glacialcast
 sudo install -D -o root -g root -m 0755 \
   glacialcast-v*/bin/glacialcast-server /usr/local/bin/glacialcast-server
-sudo install -d -o glacialcast -g glacialcast -m 0700 /var/lib/glacialcast
+# /var/lib/glacialcast is created by the unit's StateDirectory=; /etc is made
+# here because the configuration has to be in place before the first start.
 sudo install -d -o root -g glacialcast -m 0750 /etc/glacialcast
 sudo install -o glacialcast -g glacialcast -m 0600 \
   glacialcast-v*/deploy/server.internet.toml.example /etc/glacialcast/server.toml
@@ -54,6 +55,11 @@ Generate independent values for every token:
 ```sh
 openssl rand -base64 32
 ```
+
+The unit passes no `--config`: `/etc/glacialcast/server.toml` is one of the
+standard locations it searches. To keep the configuration elsewhere, add a
+drop-in setting `Environment=GLACIALCAST_CONFIG=/path/to/server.toml` rather
+than editing the unit.
 
 Edit `/etc/glacialcast/server.toml`, set `security.public_origin` to the final
 HTTPS origin, and replace every example token. Token names and publisher scopes

@@ -27,6 +27,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
 /// Helpers shared by the client and server daemon-control implementations.
+pub mod config_path;
 pub mod daemon;
 pub mod transfer;
 pub mod viewer_key;

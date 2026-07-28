@@ -102,6 +102,32 @@ with the startup summary so the invitation is complete.
 Neither key belongs in a URL, log, or server configuration. The ingest server
 key is public; the viewer key is secret.
 
+### Where configuration is found
+
+Both binaries take `--config`, or `GLACIALCAST_CONFIG` in the environment. A
+path given that way is used exactly as given, and a file that is not there
+fails startup rather than falling back to built-in defaults — under a service
+manager that difference is the gap between a broken unit and a relay running
+with no ingest tokens.
+
+Without one, the standard locations are searched in order:
+
+1. `$XDG_CONFIG_HOME/glacialcast/<name>.toml`, or
+   `$HOME/.config/glacialcast/<name>.toml`
+2. `/etc/glacialcast/<name>.toml`
+3. `<name>.toml` in the working directory
+
+The user location comes first so a desktop publisher prefers the operator's own
+file; a system service reaches `/etc` because its unit denies it a home
+directory. The working directory stays last so running from a source checkout
+keeps working. Finding nothing is the ordinary first-run case and starts on
+defaults. Both binaries log which file they read, and the publisher prints it
+in its startup summary.
+
+A relative default would not survive a service manager: a unit without
+`WorkingDirectory=` runs with `/` as its working directory, so `server.toml`
+would mean `/server.toml`.
+
 Configuration files containing credentials must be private regular files with
 mode `0600`. Unknown configuration keys are rejected.
 
