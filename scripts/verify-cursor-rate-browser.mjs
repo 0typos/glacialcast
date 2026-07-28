@@ -79,6 +79,21 @@ try {
     // that falls behind and cannot catch up looks exactly like a stall.
     let maxLag = 0;
     let minLag = Number.POSITIVE_INFINITY;
+    // The clock re-anchors whenever it falls more than its drift threshold
+    // behind, so a lag far above that means the newest timestamp itself moved
+    // discontinuously. Record the largest forward jump to find out.
+    // Time the newest sample reports the pointer as off this output. There is
+    // nothing to paint then, and counting it as a stall measures the probe's
+    // drift rather than this project's smoothness.
+    let hiddenMs = 0;
+    let hiddenSpans = 0;
+    let wasVisible = null;
+    let hiddenSince = null;
+    let visibleThroughout = true;
+    let previousNewest = null;
+    let maxNewestJump = 0;
+    let jumpFrom = null;
+    let jumpTo = null;
 
     await new Promise(resolve => {
       const step = () => {
@@ -86,6 +101,28 @@ try {
         maxFrameDelta = Math.max(maxFrameDelta, frameNow - lastFrameAt);
         lastFrameAt = frameNow;
         const cursor = player.metrics().cursor;
+        if (cursor.newestVisible !== null) {
+          if (cursor.newestVisible === false) visibleThroughout = false;
+          if (cursor.newestVisible === false && wasVisible !== false) {
+            hiddenSince = performance.now();
+            hiddenSpans += 1;
+          } else if (cursor.newestVisible === true && wasVisible === false && hiddenSince !== null) {
+            hiddenMs += performance.now() - hiddenSince;
+            hiddenSince = null;
+          }
+          wasVisible = cursor.newestVisible;
+        }
+        if (cursor.newestTimestamp !== null) {
+          if (previousNewest !== null) {
+            const jump = cursor.newestTimestamp - previousNewest;
+            if (jump > maxNewestJump) {
+              maxNewestJump = jump;
+              jumpFrom = previousNewest;
+              jumpTo = cursor.newestTimestamp;
+            }
+          }
+          previousNewest = cursor.newestTimestamp;
+        }
         if (cursor.shownTimestamp !== null && cursor.newestTimestamp !== null) {
           const lag = cursor.newestTimestamp - cursor.shownTimestamp;
           maxLag = Math.max(maxLag, lag);
@@ -94,12 +131,16 @@ try {
         const shown = cursor.shownTimestamp;
         if (shown !== null && shown !== lastShown) {
           const now = performance.now();
-          if (lastShown !== null) {
+          // A gap spanning a period when the pointer was on another output is
+          // not a stall: there was nothing to paint. Counting it would measure
+          // the probe's drift instead of this project's smoothness.
+          if (lastShown !== null && visibleThroughout) {
             gaps.push(now - lastChangeAt);
             gapOffsets.push(now - startedAt);
           }
           lastShown = shown;
           lastChangeAt = now;
+          visibleThroughout = true;
         }
         if (performance.now() - startedAt < ms) requestAnimationFrame(step);
         else resolve();
@@ -116,6 +157,11 @@ try {
       maxFrameDelta,
       maxLag,
       minLag: Number.isFinite(minLag) ? minLag : null,
+      maxNewestJump,
+      jumpFrom,
+      jumpTo,
+      hiddenMs: hiddenMs + (hiddenSince === null ? 0 : performance.now() - hiddenSince),
+      hiddenSpans,
     };
   }, seconds * 1000);
 
@@ -140,6 +186,16 @@ try {
     },
     max_animation_frame_gap_ms: Number(result.maxFrameDelta.toFixed(1)),
     playout_lag_ticks: { min: result.minLag, max: result.maxLag },
+    pointer_off_this_output: {
+      total_ms: Number(result.hiddenMs.toFixed(0)),
+      spans: result.hiddenSpans,
+    },
+    newest_timestamp_jump: {
+      max_ticks: result.maxNewestJump,
+      max_ms: Number((result.maxNewestJump / 90).toFixed(1)),
+      from: result.jumpFrom,
+      to: result.jumpTo,
+    },
     worst_gap_at_second: result.gaps.length === 0
       ? null
       : Number((result.gapOffsets[worstIndex] / 1000).toFixed(1)),

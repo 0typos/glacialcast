@@ -336,20 +336,29 @@ It is the dominant term in how smooth the overlay looks, because the viewer can
 only animate through samples it has: raising it saves relay objects and costs
 smoothness.
 
-What the compositor actually delivers is worth measuring rather than assuming,
-and it is easy to measure it wrong. On niri 26.04 with three 2560x1440 outputs
-at 60 Hz, a moving pointer produces 59.7 buffers per second, every one of them
-carrying cursor motion, with a worst pause between cursor samples of 19–35 ms.
-That is the panel rate, which is the documented ceiling.
+What the compositor actually delivers is worth measuring rather than assuming.
+On niri 26.04 with three 2560x1440 outputs at 60 Hz, a moving pointer produces
+55–59 buffers per second, every one of them carrying cursor motion, with a
+worst pause between cursor samples of 32–37 ms. The publisher forwards 90–100%
+of those, and the overlay paints a median gap of 17 ms — one display frame —
+with a p90 of 33 ms and a worst case of 51–52 ms.
 
-Reaching it depends on how the pointer moves. A synthetic *absolute*
-pointing device — a virtual tablet — is coalesced somewhere between libinput
+At the same panels' 143.998 Hz mode the compositor delivers *fewer*: 48 per
+second, with one output or three. The publisher still forwards 100% of them.
+So `--cursor-hz 60` is fully served, while a request for 120 is bounded by what
+the compositor hands over rather than by anything here.
+
+Measuring this correctly is harder than it looks, and two mistakes are easy.
+A synthetic *absolute* pointing device is coalesced somewhere between libinput
 and the compositor: the same machine reports 37 buffers and 30 cursor samples
-per second with pauses up to 267 ms when driven that way. Nothing is wrong with
-the compositor in that case; the input is. `scripts/pointer-probe.py` therefore
-emits relative motion, as a mouse does, and
-`scripts/verify-wayland-cursor-rate.sh` measures against what the compositor
-delivered rather than against a fixed number.
+per second with pauses up to 267 ms when driven that way, which looks exactly
+like a compositor limit and is not one. And a pointer that wanders onto another
+output publishes "not visible" for the output being measured, so counting that
+as a stall measures the probe rather than the stream — it produced apparent
+stalls of 6 to 16 seconds that were nothing of the kind.
+`scripts/pointer-probe.py` therefore emits relative motion, as a mouse does,
+and `scripts/verify-wayland-cursor-rate.sh` excludes the periods when the
+pointer is elsewhere.
 
 For repeatable bandwidth tests, `--test-pattern` accepts `static`, `typing`,
 `scroll`, and `motion`.
