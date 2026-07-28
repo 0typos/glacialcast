@@ -31,4 +31,50 @@ grep -Fq -- '--foreground' deploy/glacialcast-publisher.service || {
   echo "publisher unit must pass --foreground so systemd can supervise it" >&2
   exit 1
 }
-echo "PASS: systemd units are valid"
+
+# A relative --config resolves against the working directory, which for a unit
+# without WorkingDirectory= is /. That silently reads /server.toml, or nothing.
+for unit in deploy/glacialcast-server.service deploy/glacialcast-publisher.service; do
+  # Comments discuss --config at length; only what is executed matters here.
+  if grep -v '^[[:space:]]*#' "${unit}" \
+      | grep -oP -- '--config\s+\K\S+' \
+      | grep -qv '^[/%]'; then
+    echo "${unit} passes a relative --config; a unit's working directory is /" >&2
+    exit 1
+  fi
+done
+
+# Naming a configuration file that is not there must stop the service rather
+# than start it on built-in defaults, which for the relay would mean no ingest
+# tokens and for the publisher a stream nobody is expecting.
+for binary in glacialcast-server glacialcast-client; do
+  if "${repo_root}/target/release/${binary}" \
+      --config "${work_dir}/definitely-absent.toml" \
+      --print-viewer-key --print-ingest-server-key >/dev/null 2>&1; then
+    echo "${binary} accepted a --config path that does not exist" >&2
+    exit 1
+  fi
+done
+
+# The standard location has to be found without --config, or the units above
+# would start on defaults while appearing to work.
+mkdir -p "${work_dir}/xdg/glacialcast"
+printf '[ingest]\nrequire_token = false\n' >"${work_dir}/xdg/glacialcast/server.toml"
+chmod 600 "${work_dir}/xdg/glacialcast/server.toml"
+discovered="$(
+  cd "${work_dir}" && XDG_CONFIG_HOME="${work_dir}/xdg" RUST_LOG=glacialcast_server=info \
+    timeout 10 "${repo_root}/target/release/glacialcast-server" \
+    --data-dir "${work_dir}/data" \
+    --control-addr 127.0.0.1:19797 \
+    --ingest-addr 127.0.0.1:19798 2>&1 &
+  sleep 4
+  pkill -f 'control-addr 127.0.0.1:19797' >/dev/null 2>&1 || true
+  wait
+)" || true
+grep -Fq "${work_dir}/xdg/glacialcast/server.toml" <<<"${discovered}" || {
+  echo "the relay did not discover its config in the standard location" >&2
+  echo "${discovered}" | head -5 >&2
+  exit 1
+}
+
+echo "PASS: systemd units are valid and configuration resolves as documented"

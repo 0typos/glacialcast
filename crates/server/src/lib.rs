@@ -45,6 +45,7 @@ use futures_util::{SinkExt, StreamExt};
 use glacialcast_protocol::{
     ClientMessage, ControlEvent, DashObjectHeader, NOISE_KEY_LEN, NoiseKeypair, ServerMessage,
     StreamHello,
+    config_path::{self, ConfigSource},
     daemon::{
         daemonize_if_requested, install_signal_handlers, manager_command, serve_control_socket,
         wait_for_shutdown,
@@ -77,8 +78,11 @@ use uuid::Uuid;
 #[derive(Debug, Parser)]
 #[command(version)]
 struct Args {
-    #[arg(long, env = "GLACIALCAST_CONFIG", default_value = "server.toml")]
-    config: PathBuf,
+    /// Configuration file. Without it the standard locations are searched:
+    /// `$XDG_CONFIG_HOME/glacialcast/server.toml`, `/etc/glacialcast/server.toml`,
+    /// then `server.toml` in the working directory.
+    #[arg(long, env = "GLACIALCAST_CONFIG")]
+    config: Option<PathBuf>,
     #[arg(
         long,
         env = "GLACIALCAST_CONTROL_ADDR",
@@ -234,6 +238,29 @@ struct ServerMetrics {
     active_ingest_connections: AtomicU64,
     ingest_rejected: AtomicU64,
     ingest_auth_failures: AtomicU64,
+}
+
+/// Loads the configuration named by `source`.
+///
+/// A file the operator named must exist: silently falling back to defaults
+/// there would start a relay with, among other things, no ingest tokens,
+/// because of a typo in a unit file.
+fn load_server_config_from(source: &ConfigSource) -> Result<ServerConfig> {
+    let Some(path) = source.path() else {
+        return Ok(ServerConfig::default());
+    };
+    if source.must_exist() && !path.exists() {
+        anyhow::bail!(
+            "server config {} does not exist.\nSearched when none is given: {}",
+            path.display(),
+            config_path::search_paths("server.toml")
+                .iter()
+                .map(|candidate| candidate.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    load_server_config(&path.to_path_buf())
 }
 
 fn load_server_config(path: &PathBuf) -> Result<ServerConfig> {
@@ -499,7 +526,19 @@ fn server_daemon_socket(args: &Args) -> PathBuf {
 
 async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
     let serve_control = args.daemon_child || args.daemon_socket.is_some();
-    let config = load_server_config(&args.config)?;
+    let config_source = config_path::resolve(args.config.clone(), "server.toml");
+    let config = load_server_config_from(&config_source)?;
+    // Which file a service actually read is the first thing anyone needs when
+    // a unit behaves unexpectedly, and the last thing they can work out from
+    // the outside.
+    info!(
+        config = config_source.path().map_or_else(
+            || "<defaults>".to_string(),
+            |path| path.display().to_string()
+        ),
+        origin = config_source.origin(),
+        "loaded server configuration"
+    );
     let SecurityConfig {
         public_origin: configured_public_origin,
         session_secret_file,

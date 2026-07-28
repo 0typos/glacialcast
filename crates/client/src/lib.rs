@@ -25,6 +25,7 @@ use glacialcast_dash::{
 use glacialcast_protocol::{
     CaptureSource, ClientMessage, DashObject, DashObjectKind, NewDashObject, NoiseSocket,
     PROTOCOL_VERSION, ServerMessage, StreamHello,
+    config_path::{self, ConfigSource},
     daemon::{
         daemonize_if_requested, install_signal_handlers, manager_command,
         sanitize_socket_component, serve_control_socket, wait_for_shutdown,
@@ -118,8 +119,11 @@ struct CursorMessage {
 #[derive(Debug, Parser)]
 #[command(version)]
 struct Args {
-    #[arg(long, default_value = "client.toml")]
-    config: PathBuf,
+    /// Configuration file. Without it the standard locations are searched:
+    /// `$XDG_CONFIG_HOME/glacialcast/client.toml`, `/etc/glacialcast/client.toml`,
+    /// then `client.toml` in the working directory.
+    #[arg(long, env = "GLACIALCAST_CONFIG")]
+    config: Option<PathBuf>,
     #[arg(long, default_value = "127.0.0.1:8900")]
     ingest_addr: String,
     #[arg(long, allow_hyphen_values = true)]
@@ -274,6 +278,9 @@ struct ClientIdentity {
     viewer_key_file: Option<PathBuf>,
     /// Operator-supplied viewer page address, printed with the sharing summary.
     viewer_url: Option<String>,
+    /// Configuration actually read, so the summary and the log can say which
+    /// file a detached publisher is running on.
+    config_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -430,6 +437,9 @@ fn print_sharing_summary(
         Some(key) => println!("  viewer key   {key}"),
         None => println!("  viewer key   (none configured; publishing will fail)"),
     }
+    if let Some(path) = &identity.config_path {
+        println!("  config       {}", path.display());
+    }
     if let Some(path) = &identity.viewer_key_file {
         println!("  key file     {}", path.display());
     }
@@ -455,6 +465,10 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
     info!(
         client_id = %identity.client_id,
         e2e_encrypted = identity.viewer_key_b64.is_some(),
+        config = identity
+            .config_path
+            .as_ref()
+            .map_or_else(|| "<defaults>".to_string(), |path| path.display().to_string()),
         "stream credentials ready"
     );
 
@@ -2041,7 +2055,8 @@ fn is_fatal_capture_error(err: &anyhow::Error) -> bool {
 }
 
 fn resolve_client_identity(args: &Args) -> Result<ClientIdentity> {
-    let config = load_client_config(&args.config)?;
+    let config_source = config_path::resolve(args.config.clone(), "client.toml");
+    let config = load_client_config_from(&config_source)?;
     let client_id = args
         .client_id
         .clone()
@@ -2107,6 +2122,7 @@ fn resolve_client_identity(args: &Args) -> Result<ClientIdentity> {
         display_name,
         viewer_key_file,
         viewer_url,
+        config_path: config_source.path().map(std::path::Path::to_path_buf),
     })
 }
 
@@ -2337,6 +2353,30 @@ fn non_empty_trimmed(field: &str, value: String) -> Result<String> {
         bail!("{field} must not be empty");
     }
     Ok(value)
+}
+
+/// Loads the configuration named by `source`.
+///
+/// A file the operator named must exist. Falling back to defaults there would
+/// publish with a generated client id and no ingest token because of a typo in
+/// a unit file, which looks like a working service until nobody can find the
+/// stream.
+fn load_client_config_from(source: &ConfigSource) -> Result<ClientConfig> {
+    let Some(path) = source.path() else {
+        return Ok(ClientConfig::default());
+    };
+    if source.must_exist() && !path.exists() {
+        bail!(
+            "client config {} does not exist.\nSearched when none is given: {}",
+            path.display(),
+            config_path::search_paths("client.toml")
+                .iter()
+                .map(|candidate| candidate.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    load_client_config(&path.to_path_buf())
 }
 
 fn load_client_config(path: &PathBuf) -> Result<ClientConfig> {
@@ -7053,6 +7093,7 @@ mod tests {
                 display_name: "Chooser".to_string(),
                 viewer_key_file: None,
                 viewer_url: None,
+                config_path: None,
             };
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let mut capture = NeverOpeningCapture;

@@ -1,8 +1,8 @@
 [Unit]
 Description=GlacialCast encrypted screen publisher
-Documentation=https://github.com/glacialcast/glacialcast
-# The publisher captures the running graphical session, so it must start with
-# that session and stop with it. Install it as a user unit, not a system unit:
+Documentation=https://github.com/0typos/glacialcast
+# The publisher captures the running graphical session, so it starts with that
+# session and stops with it. Install it as a user unit, not a system unit:
 #   mkdir -p ~/.config/systemd/user
 #   cp glacialcast-publisher.service ~/.config/systemd/user/
 #   systemctl --user enable --now glacialcast-publisher.service
@@ -14,24 +14,40 @@ Wants=pipewire.service
 Type=simple
 UMask=0077
 Environment=RUST_LOG=glacialcast_client=info
-# --foreground keeps the process in the foreground because systemd, not the
-# publisher, supervises it here. Without it the unit would exit immediately
-# after detaching. Print the viewer key to share with:
-#   glacialcast-client --config %h/.config/glacialcast/client.toml \
-#     --print-viewer-key
+
+# For a user unit systemd puts these under $XDG_CONFIG_HOME and
+# $XDG_STATE_HOME, which is exactly where the publisher looks for its config
+# and keeps its viewer key. Nothing to create by hand.
+ConfigurationDirectory=glacialcast
+ConfigurationDirectoryMode=0700
+StateDirectory=glacialcast
+StateDirectoryMode=0700
+
+# --foreground because systemd supervises this process, not the publisher's own
+# daemoniser; without it the unit would exit as soon as it detached.
+#
+# No --config: the publisher finds $XDG_CONFIG_HOME/glacialcast/client.toml on
+# its own, falling back to /etc/glacialcast/client.toml. Point it elsewhere with
+# a drop-in under ~/.config/systemd/user/glacialcast-publisher.service.d/:
+#   [Service]
+#   Environment=GLACIALCAST_CONFIG=%h/somewhere/else.toml
+#
+# Frame rate, cursor rate, and frame size are left at their defaults, which are
+# the values the bandwidth and cursor gates measure. Add --all-monitors to
+# publish every output rather than the primary one.
 ExecStart=/usr/local/bin/glacialcast-client \
     --foreground \
-    --config %h/.config/glacialcast/client.toml \
     --ingest-addr 127.0.0.1:8900 \
     --capture dash-wayland \
-    --portal-source monitor \
-    --fps 1 \
-    --idle-heartbeat-seconds 10 \
-    --cursor-hz 30
+    --portal-source monitor
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
 
+# The startup summary carries the viewer key, so it is printed to the journal
+# only when an operator asks for it:
+#   systemctl --user stop glacialcast-publisher
+#   glacialcast-client --print-viewer-key
 NoNewPrivileges=yes
 ProtectClock=yes
 ProtectHostname=yes
