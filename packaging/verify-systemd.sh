@@ -77,4 +77,29 @@ grep -Fq "${work_dir}/xdg/glacialcast/server.toml" <<<"${discovered}" || {
   exit 1
 }
 
+# A gate that names no configuration now discovers whatever sits in a standard
+# location on the machine running it, so its result would depend on the
+# developer's dotfiles. Every invocation in a gate must say which it wants.
+unisolated=0
+for script in scripts/*.sh; do
+  while IFS= read -r offender; do
+    echo "${script}: starts a binary without --config or --no-config: ${offender}" >&2
+    unisolated=1
+  done < <(
+    awk '
+      /target\/(debug|release)\/glacialcast-(server|client)/ { collecting = 1; buffer = "" }
+      collecting {
+        buffer = buffer " " $0
+        if ($0 !~ /\\$/) {
+          if (buffer !~ /--config/ && buffer !~ /--no-config/ && buffer !~ /client_args/) {
+            print substr(buffer, 1, 70)
+          }
+          collecting = 0
+        }
+      }
+    ' "${script}"
+  )
+done
+[[ "${unisolated}" -eq 0 ]] || exit 1
+
 echo "PASS: systemd units are valid and configuration resolves as documented"
