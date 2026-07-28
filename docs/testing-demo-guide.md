@@ -439,24 +439,31 @@ absolute ceiling for an acceptance run; it is off by default so that a
 compositor limitation cannot be mistaken for a regression here.
 
 Measured on niri 26.04 with PipeWire 1.6.8, three 2560x1440 outputs at 60 Hz,
-with the pointer driven by relative motion at 60 steps per second:
+with the pointer driven by relative motion, across three 30-second runs:
 
 | Measurement | Value |
 | --- | --- |
-| Compositor buffer rate | 59.7/s, against an advertised `videoMaxFramerate` of 59.951 |
-| Compositor cursor samples | 59.7/s — every buffer carries cursor motion |
-| Compositor's worst pause between samples | 19–35 ms |
+| Compositor buffer rate | 55–59/s, against an advertised `videoMaxFramerate` of 59.951 |
+| Compositor cursor samples | 55–59/s — every buffer carries cursor motion |
+| Compositor's worst pause between samples | 32–37 ms |
+| Delivered to the viewer | 90–100% of what was sampled |
 | Painted gap, median | 17 ms — one display frame |
-| Painted gap, p90 | 18–33 ms |
+| Painted gap, p90 | 33 ms — two display frames |
+| Painted gap, worst | 51–52 ms |
 
-How the pointer is driven decides what the compositor appears to do, and
-getting that wrong invents a limit that is not there. A synthetic *absolute*
-pointing device is coalesced somewhere between libinput and the compositor: on
-this machine it yields 37 buffers and 30 cursor samples per second with pauses
-up to 267 ms, and it does not improve at a 143.998 Hz panel mode — delivery
-*falls* to 33. Driven by relative motion, the same machine reaches the full
-59.7. `pointer-probe.py` emits relative motion for that reason, and a caller
-measuring a high-refresh output should raise its step rate to match.
+At the 143.998 Hz mode those panels deliver 48 buffers and 48 cursor samples a
+second, with one output or with three, and the publisher forwards 100% of them.
+A higher panel mode does not raise the cursor rate on this compositor.
+
+Two measurement mistakes are easy here, and both invent a limit that is not
+there. A synthetic *absolute* pointing device is coalesced somewhere between
+libinput and the compositor: on this machine it yields 37 buffers and 30 cursor
+samples per second with pauses up to 267 ms. And a pointer that drifts onto
+another output makes the measured output publish "not visible", which counts as
+a multi-second stall if the measurement does not exclude it — that artefact
+produced apparent stalls of 6 to 16 seconds. `pointer-probe.py` emits relative
+motion, and the gate discounts any gap spanning a period when the pointer was
+elsewhere.
 
 The per-frame breakdown separates where time goes. At the shipped defaults a
 release publisher reports `resize_ms=0`, `fingerprint_ms=4` and

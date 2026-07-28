@@ -30,10 +30,11 @@ probe_rate_hz="${GLACIALCAST_CURSOR_PROBE_HZ:-60}"
 # The publisher can only forward what the compositor hands it, and a little is
 # legitimately lost to the batching interval at the window edges.
 min_ratio="${GLACIALCAST_CURSOR_RATE_MIN_RATIO:-0.70}"
-# Absolute worst-case ceiling, off by default: the compositor's own pauses set
-# a floor this code cannot go below, so an absolute number here would fail for
-# reasons outside it. Set it for an acceptance run on a known-good host.
-max_gap_ms="${GLACIALCAST_CURSOR_MAX_GAP_MS:-0}"
+# Absolute worst-case ceiling. A painted update this far apart is a visible
+# stutter regardless of what caused it, and it is reachable: measured 51-52 ms
+# across three runs once the measurement stopped counting periods when the
+# pointer was on another output. Set to 0 to measure without enforcing it.
+max_gap_ms="${GLACIALCAST_CURSOR_MAX_GAP_MS:-100}"
 # How much worse than the compositor's own worst pause the overlay may be.
 max_added_gap_ms="${GLACIALCAST_CURSOR_MAX_ADDED_GAP_MS:-150}"
 # Two and four display frames at 60 Hz: the typical case has to stay smooth
