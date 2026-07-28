@@ -33,7 +33,12 @@ jobs:
             libopenh264-dev \
             libpipewire-0.3-dev \
             libspa-0.2-dev \
-            libva-dev
+            libva-dev \
+            nasm
+      - name: Install OpenH264 2.6
+        # ubuntu-24.04 packages 2.4 under a different soname, which builds and
+        # then fails at runtime. See the script for why this is built.
+        run: sudo scripts/ci-install-openh264.sh
       - name: Install pinned Rust tools
         run: cargo install cargo-deny --version 0.20.2 --locked
       - name: Install browser test runtime
@@ -70,7 +75,12 @@ jobs:
             libopenh264-dev \
             libpipewire-0.3-dev \
             libspa-0.2-dev \
-            libva-dev
+            libva-dev \
+            nasm
+      - name: Install OpenH264 2.6
+        # ubuntu-24.04 packages 2.4 under a different soname, which builds and
+        # then fails at runtime. See the script for why this is built.
+        run: sudo scripts/ci-install-openh264.sh
       - name: Build and verify archive
         env:
           GLACIALCAST_REQUIRE_CLEAN: "1"
