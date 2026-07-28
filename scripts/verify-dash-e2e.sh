@@ -67,7 +67,7 @@ viewer_key="$(node -e "console.log(require('crypto').randomBytes(32).toString('b
 
 start_client() {
   RUST_LOG=glacialcast_client=debug target/debug/glacialcast-client \
-    --config "${work_dir}/missing-client.toml" \
+    --no-config \
     --ingest-addr "${ingest_addr}" \
     "--ingest-server-key=${ingest_server_key}" \
     "--viewer-key=${viewer_key}" \
@@ -187,7 +187,7 @@ run_browser_with_epoch_transition() {
 }
 
 target/debug/glacialcast-server \
-  --config "${work_dir}/missing-server.toml" \
+  --no-config \
   --control-addr "${control_addr}" \
   --ingest-addr "${ingest_addr}" \
   --data-dir "${work_dir}/data" \

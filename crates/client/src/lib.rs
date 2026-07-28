@@ -124,6 +124,12 @@ struct Args {
     /// then `client.toml` in the working directory.
     #[arg(long, env = "GLACIALCAST_CONFIG")]
     config: Option<PathBuf>,
+    /// Ignores every configuration file and runs on built-in defaults.
+    ///
+    /// For a test or a deliberately minimal deployment that must not inherit
+    /// whatever happens to sit in a standard location on the host.
+    #[arg(long, conflicts_with = "config")]
+    no_config: bool,
     #[arg(long, default_value = "127.0.0.1:8900")]
     ingest_addr: String,
     #[arg(long, allow_hyphen_values = true)]
@@ -408,9 +414,12 @@ pub fn run() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "glacialcast_client=info".into()),
         )
+        // Diagnostics go to stderr, leaving stdout for values a caller
+        // captures, such as `--print-viewer-key`.
+        .with_writer(std::io::stderr)
         // A detached publisher writes this stream to a log file, so colour it
         // only when a human is actually watching a terminal.
-        .with_ansi(std::io::stdout().is_terminal())
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -2055,7 +2064,11 @@ fn is_fatal_capture_error(err: &anyhow::Error) -> bool {
 }
 
 fn resolve_client_identity(args: &Args) -> Result<ClientIdentity> {
-    let config_source = config_path::resolve(args.config.clone(), "client.toml");
+    let config_source = if args.no_config {
+        ConfigSource::Defaults
+    } else {
+        config_path::resolve(args.config.clone(), "client.toml")
+    };
     let config = load_client_config_from(&config_source)?;
     let client_id = args
         .client_id

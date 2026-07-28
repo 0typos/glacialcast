@@ -144,9 +144,11 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "glacialcast_offline=info".into()),
         )
+        // Diagnostics go to stderr so a caller can capture stdout alone.
+        .with_writer(std::io::stderr)
         // Transfer runs are commonly piped into a file or a log collector,
         // which should not receive terminal colour escapes.
-        .with_ansi(std::io::stdout().is_terminal())
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
     match Args::parse().command {
         Command::Mirror {

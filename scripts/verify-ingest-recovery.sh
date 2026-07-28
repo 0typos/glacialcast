@@ -157,7 +157,7 @@ NODE
 start_server
 
 RUST_LOG=glacialcast_client=info target/debug/glacialcast-client \
-  --config "${work_dir}/missing-client.toml" \
+  --no-config \
   --ingest-addr "${ingest_addr}" \
   "--ingest-server-key=${ingest_server_key}" \
   "--viewer-key=${viewer_key}" \
@@ -184,7 +184,7 @@ wait "${invalid_pid}" 2>/dev/null || true
 invalid_pid=""
 
 RUST_LOG=glacialcast_client=info target/debug/glacialcast-client \
-  --config "${work_dir}/missing-client.toml" \
+  --no-config \
   --ingest-addr "${ingest_addr}" \
   "--ingest-server-key=${ingest_server_key}" \
   "--viewer-key=${viewer_key}" \

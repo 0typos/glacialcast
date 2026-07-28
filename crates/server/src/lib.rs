@@ -83,6 +83,12 @@ struct Args {
     /// then `server.toml` in the working directory.
     #[arg(long, env = "GLACIALCAST_CONFIG")]
     config: Option<PathBuf>,
+    /// Ignores every configuration file and runs on built-in defaults.
+    ///
+    /// For a test or a deliberately minimal deployment that must not inherit
+    /// whatever happens to sit in a standard location on the host.
+    #[arg(long, conflicts_with = "config")]
+    no_config: bool,
     #[arg(
         long,
         env = "GLACIALCAST_CONTROL_ADDR",
@@ -506,9 +512,14 @@ pub fn run() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "glacialcast_server=info,tower_http=info".into()),
         )
+        // Diagnostics go to stderr so stdout carries only what a caller asked
+        // to capture. `--print-ingest-server-key` is read straight into a shell
+        // variable, and a log line landing in the middle of it produced a key
+        // that failed to decode several steps later.
+        .with_writer(std::io::stderr)
         // Journald, a redirected file, and a daemon log all read better
         // without terminal colour escapes.
-        .with_ansi(std::io::stdout().is_terminal())
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -526,7 +537,11 @@ fn server_daemon_socket(args: &Args) -> PathBuf {
 
 async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
     let serve_control = args.daemon_child || args.daemon_socket.is_some();
-    let config_source = config_path::resolve(args.config.clone(), "server.toml");
+    let config_source = if args.no_config {
+        ConfigSource::Defaults
+    } else {
+        config_path::resolve(args.config.clone(), "server.toml")
+    };
     let config = load_server_config_from(&config_source)?;
     // Which file a service actually read is the first thing anyone needs when
     // a unit behaves unexpectedly, and the last thing they can work out from
