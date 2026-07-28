@@ -2,6 +2,9 @@ name: Release archive
 
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
 
 permissions:
   contents: read
@@ -72,12 +75,54 @@ jobs:
         env:
           GLACIALCAST_REQUIRE_CLEAN: "1"
         run: scripts/verify-packaging.sh
-      - name: Upload archive, checksum, and optional signatures
+      - name: Install nfpm
+        run: |
+          curl -sSfL -o /tmp/nfpm.deb \
+            https://github.com/goreleaser/nfpm/releases/download/v2.43.1/nfpm_2.43.1_amd64.deb
+          echo "${NFPM_SHA256}  /tmp/nfpm.deb" | sha256sum --check --strict
+          sudo dpkg -i /tmp/nfpm.deb
+        env:
+          # Pinned by digest as well as by version, matching how every other
+          # dependency here is fixed.
+          NFPM_SHA256: 0feddb5c839f3f91638e5ba04fe7f78066ae53ea0f5e8122651f65cba7d8848b
+      - name: Build rpm and deb packages
+        run: scripts/build-packages.sh
+      - name: Verify packages install nothing that starts by itself
+        run: packaging/verify-packages.sh
+      - name: Upload archive, packages, checksums, and optional signatures
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: glacialcast-linux-${{ github.sha }}
           path: |
             dist/*.tar.gz
+            dist/*.rpm
+            dist/*.deb
             dist/*.sha256
             dist/*.minisig
           if-no-files-found: error
+
+  publish:
+    name: Publish release
+    runs-on: ubuntu-24.04
+    needs: package
+    # Only a tag becomes a release. A manual run still builds and verifies
+    # everything, and leaves the artifacts attached to the workflow run.
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: glacialcast-linux-${{ github.sha }}
+          path: dist
+      - name: Attach artifacts to the release
+        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.rpm
+            dist/*.deb
+            dist/*.sha256
+            dist/*.minisig
+          fail_on_unmatched_files: false
+          generate_release_notes: true
