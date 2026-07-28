@@ -1,0 +1,23 @@
+#!/bin/sh
+# Nothing is enabled here either. The publisher captures a logged-in graphical
+# session, so it is a user unit: there is no system-wide "on", and only the
+# person at the session can decide to start it.
+set -e
+
+if [ "$1" = "1" ] || { [ "$1" = "configure" ] && [ -z "$2" ]; }; then
+    cat <<'NOTE'
+glacialcast-client is installed and not running.
+
+As the user whose screen is to be published, not as root:
+
+  1. mkdir -p ~/.config/glacialcast && cp \
+       /usr/share/doc/glacialcast-client/client.toml.example \
+       ~/.config/glacialcast/client.toml
+     chmod 600 ~/.config/glacialcast/client.toml
+     Then set ingest_server_key to what the relay prints.
+  2. systemctl --user enable --now glacialcast-publisher
+
+Print the viewing key to share out of band:
+  glacialcast-client --print-viewer-key
+NOTE
+fi

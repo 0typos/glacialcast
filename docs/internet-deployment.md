@@ -50,6 +50,19 @@ Verify the archive checksum before extracting it. See the
 [release operations runbook](release-operations.md) for SBOM, optional
 signature, backup, upgrade, and rollback procedures.
 
+> [!CAUTION]
+> **The packaged configurations ship working example secrets.** The relay's
+> tokens and the publisher's `viewer_key_phrase` are both published — in this
+> repository, in the README, and in every copy of the package. A deployment
+> reachable by anyone else must replace all of them before it is exposed.
+>
+> The two are independent. The relay never receives a viewer key, so rotating
+> ingest and access tokens does nothing for a stream still published under the
+> example phrase: an observer who knows it can decrypt everything the relay
+> carries, whatever the relay is configured with. Change
+> `viewer_key_phrase` in the publisher's `client.toml`, or delete the line so a
+> private one is generated. The publisher warns on every start until you do.
+
 Generate independent values for every token:
 
 ```sh

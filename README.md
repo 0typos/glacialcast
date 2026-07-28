@@ -27,6 +27,112 @@ origin enforcement, request/connection limits, and operational probes.
 GlacialCast is video-only and view-only. Audio and remote input are outside the
 current product contract.
 
+## Quickstart
+
+Two machines, or one playing both parts. The relay stores encrypted objects;
+the publisher captures a screen; a browser watches. Nothing is enabled
+automatically — you decide when a service starts.
+
+### 1. Install
+
+Download the packages for your architecture from the
+[latest release](https://github.com/0typos/glacialcast/releases/latest).
+
+```sh
+# Fedora, RHEL, openSUSE
+sudo dnf install ./glacialcast-server-*.x86_64.rpm   # the relay
+sudo dnf install ./glacialcast-client-*.x86_64.rpm   # the publisher
+
+# Debian, Ubuntu
+sudo apt install ./glacialcast-server_*_amd64.deb
+sudo apt install ./glacialcast-client_*_amd64.deb
+```
+
+The relay depends on nothing but glibc, so a headless host does not pull in a
+graphics stack. Install only the publisher on a desktop, only the relay on a
+server, or both on one machine to try it out.
+
+> [!CAUTION]
+> **The shipped configuration contains a viewer key phrase that is public.**
+> It is in this README and in every copy of the package. Until you change it,
+> anyone who can reach the relay can watch your screen. The publisher prints a
+> warning on every start until you do. See [Securing it](#4-securing-it).
+
+### 2. Start the relay
+
+```sh
+sudo install -d -o root -g glacialcast -m 0750 /etc/glacialcast
+sudo install -o glacialcast -g glacialcast -m 0600 \
+  /usr/share/doc/glacialcast-server/server.toml.example \
+  /etc/glacialcast/server.toml
+sudo systemctl enable --now glacialcast-server
+```
+
+Then read the relay's public identity, which the publisher pins:
+
+```sh
+sudo -u glacialcast glacialcast-server \
+  --data-dir /var/lib/glacialcast --print-ingest-server-key
+```
+
+The relay's identity is stored in its data directory, so this has to name the
+same one the unit uses or it prints a different key than the service presents.
+
+### 3. Start the publisher
+
+As the user whose screen is being published, not as root:
+
+```sh
+mkdir -p ~/.config/glacialcast
+cp /usr/share/doc/glacialcast-client/client.toml.example \
+  ~/.config/glacialcast/client.toml
+chmod 600 ~/.config/glacialcast/client.toml
+```
+
+Edit `~/.config/glacialcast/client.toml`: set `ingest_server_key` to what the
+relay printed, and `ingest_token` to the token you put in the relay's config.
+Then:
+
+```sh
+systemctl --user enable --now glacialcast-publisher
+```
+
+Every connected monitor is published, each as its own stream, all unlocked by
+one key. Open `http://<relay-host>:8899` and enter the viewing key:
+
+```sh
+glacialcast-client --print-viewer-key
+```
+
+### 4. Securing it
+
+The example configurations exist so the previous three steps work. They are not
+a deployment.
+
+- **Change `viewer_key_phrase`** in `~/.config/glacialcast/client.toml`. Either
+  set your own seven words from the built-in list, or delete the line entirely
+  to have a private one generated and stored with mode 0600 — the better choice.
+  Then `systemctl --user restart glacialcast-publisher` and share the new key.
+- **Replace every token** in `/etc/glacialcast/server.toml` with
+  `openssl rand -base64 32`.
+- **Reaching it from the Internet** needs the fail-closed profile: set
+  `security.public_origin` and put HTTPS in front. See
+  [`docs/internet-deployment.md`](docs/internet-deployment.md).
+
+Changing tokens does not protect a stream still published under the example
+phrase. The relay never sees the viewer key, so nothing it is configured with
+can substitute for changing that phrase.
+
+### Trying it without packages
+
+```sh
+cargo build --workspace --release
+./target/release/glacialcast-server --data-dir ./data &
+./target/release/glacialcast-client --no-config --ingest-addr 127.0.0.1:8900
+```
+
+The publisher prints a generated viewing key and the page to enter it on.
+
 ## Dependencies
 
 The default build uses the exact Rust release pinned in

@@ -1,0 +1,86 @@
+# Publisher package: the process that captures a Wayland screen.
+#
+# This one genuinely needs a graphics stack. The dependency lists below are the
+# libraries `ldd` reports against the built binary, named per distribution;
+# nothing is guessed. Anything the publisher opens with dlopen at runtime is a
+# recommendation instead, because it is optional in fact: VA-API is tried first
+# and OpenH264 is the fallback, and the EGL path is only reached on a driver
+# whose DMA-BUFs cannot be mapped through GBM. A hard dependency on those would
+# make the package uninstallable on hosts where it would have worked, and
+# OpenH264 in particular ships from a separate repository on Fedora.
+name: glacialcast-client
+arch: ${GLACIALCAST_PACKAGE_ARCH}
+platform: linux
+version: ${GLACIALCAST_VERSION}
+section: video
+priority: optional
+maintainer: typo <https://github.com/0typos>
+description: |
+  End-to-end-encrypted low-bandwidth Wayland screen publisher.
+  Captures a monitor through the XDG Desktop Portal and PipeWire, encodes
+  H.264, and publishes CENC-encrypted fragmented MP4 with an independent cursor
+  overlay. The relay it publishes to cannot decrypt the stream.
+vendor: typo
+homepage: https://github.com/0typos/glacialcast
+license: MIT
+
+contents:
+  - src: ./target/release/glacialcast-client
+    dst: /usr/bin/glacialcast-client
+    file_info:
+      mode: 0755
+  # A user unit, not a system one: the publisher captures a logged-in graphical
+  # session and has to start and stop with it.
+  - src: ./target/package-staging/systemd/glacialcast-publisher.service
+    dst: /usr/lib/systemd/user/glacialcast-publisher.service
+    file_info:
+      mode: 0644
+  - src: ./LICENSE
+    dst: /usr/share/doc/glacialcast-client/LICENSE
+    file_info:
+      mode: 0644
+  - src: ./packaging/client.toml.example
+    dst: /usr/share/doc/glacialcast-client/client.toml.example
+    file_info:
+      mode: 0644
+
+scripts:
+  postinstall: ./packaging/scripts/client-postinstall.sh
+
+overrides:
+  deb:
+    depends:
+      # Versioned, so a distribution too old to run this refuses to install it
+      # rather than installing something that cannot start.
+      - ${GLACIALCAST_LIBC_DEB}
+      - libpipewire-0.3-0
+      - libva2
+      - libva-drm2
+      - libgbm1
+      - libdrm2
+      - libexpat1
+    recommends:
+      # dlopen'd: the software encoder fallback and the EGL readback path.
+      - libopenh264-7
+      - libegl1
+      - libgles2
+      - xdg-desktop-portal
+  rpm:
+    depends:
+      - ${GLACIALCAST_LIBC_RPM}
+      - pipewire-libs
+      - libva
+      - mesa-libgbm
+      - libdrm
+      - expat
+    recommends:
+      - openh264
+      - mesa-libEGL
+      - mesa-libGLES
+      - xdg-desktop-portal
+
+rpm:
+  group: Applications/Multimedia
+  compression: gzip:-1
+deb:
+  compression: gzip

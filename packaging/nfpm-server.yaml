@@ -1,0 +1,83 @@
+# Relay package: the service that stores and serves encrypted objects.
+#
+# Kept separate from the publisher because their dependencies have nothing in
+# common. The relay and the offline viewer link nothing beyond libc — verified
+# by `ldd`, which reports no shared objects for either — so a headless host can
+# run one without installing PipeWire, VA-API, or a GPU stack. Combining them
+# would make every relay drag in a graphics stack it will never call.
+name: glacialcast-server
+arch: ${GLACIALCAST_PACKAGE_ARCH}
+platform: linux
+version: ${GLACIALCAST_VERSION}
+section: net
+priority: optional
+maintainer: typo <https://github.com/0typos>
+description: |
+  End-to-end-encrypted low-bandwidth screen relay.
+  Stores and serves opaque encrypted stream objects with bounded history. The
+  relay never receives a viewer key and cannot decrypt media or cursor
+  contents. Includes the self-contained offline viewer for portable .gco files.
+vendor: typo
+homepage: https://github.com/0typos/glacialcast
+license: MIT
+
+contents:
+  - src: ./target/release/glacialcast-server
+    dst: /usr/bin/glacialcast-server
+    file_info:
+      mode: 0755
+  - src: ./target/release/glacialcast-offline
+    dst: /usr/bin/glacialcast-offline
+    file_info:
+      mode: 0755
+  - src: ./target/package-staging/systemd/glacialcast-server.service
+    dst: /usr/lib/systemd/system/glacialcast-server.service
+    file_info:
+      mode: 0644
+  # Shipped as an example rather than as the live config: the real one holds
+  # ingest tokens, and a package upgrade must never overwrite those.
+  - src: ./packaging/server.toml.example
+    dst: /usr/share/doc/glacialcast-server/server.toml.example
+    file_info:
+      mode: 0644
+  - src: ./deploy/server.internet.toml.example
+    dst: /usr/share/doc/glacialcast-server/server.internet.toml.example
+    file_info:
+      mode: 0644
+  - src: ./LICENSE
+    dst: /usr/share/doc/glacialcast-server/LICENSE
+    file_info:
+      mode: 0644
+  - src: ./docs/internet-deployment.md
+    dst: /usr/share/doc/glacialcast-server/internet-deployment.md
+    file_info:
+      mode: 0644
+  # systemd creates /etc/glacialcast and /var/lib/glacialcast through the
+  # unit's ConfigurationDirectory= and StateDirectory=, so the package declares
+  # neither. One place decides those paths and their modes.
+
+scripts:
+  preinstall: ./packaging/scripts/server-preinstall.sh
+  postinstall: ./packaging/scripts/server-postinstall.sh
+  preremove: ./packaging/scripts/server-preremove.sh
+  postremove: ./packaging/scripts/server-postremove.sh
+
+overrides:
+  deb:
+    depends:
+      # Versioned, so a distribution too old to run this refuses to install it
+      # rather than installing something that cannot start.
+      - ${GLACIALCAST_LIBC_DEB}
+    recommends:
+      - systemd
+  rpm:
+    depends:
+      - ${GLACIALCAST_LIBC_RPM}
+    recommends:
+      - systemd
+
+rpm:
+  group: Applications/Internet
+  compression: gzip:-1
+deb:
+  compression: gzip
