@@ -564,6 +564,28 @@ offline viewer refuses a non-loopback listener unless
 `--allow-non-loopback` is supplied explicitly; use that escape hatch only on a
 trusted network.
 
+## Packages
+
+`scripts/build-packages.sh` produces `.rpm` and `.deb` for both binaries into
+`dist/`, using [nfpm](https://nfpm.goreleaser.com/). Pushing a `v*` tag runs the
+full acceptance gate, builds them, and attaches them to a GitHub release along
+with the tarball and checksums.
+
+The two packages are separate because their dependencies are: the relay and the
+offline viewer link nothing beyond glibc, so a headless host installing
+`glacialcast-server` gets no PipeWire and no GPU stack. `glacialcast-client`
+depends on what it links and recommends what it loads at runtime, since VA-API,
+OpenH264, and the EGL readback path are each optional.
+
+The required glibc is read out of the built binaries rather than assumed, so a
+distribution too old to run them declines to install rather than installing
+something that cannot start. Release artifacts are built on ubuntu-24.04; for
+anything older, build from source.
+
+Neither package enables or starts a service.
+`packaging/verify-packages.sh` checks that against a stubbed `systemctl`, along
+with an upgrade leaving a running relay alone and a removal stopping it.
+
 ## Release archive
 
 Build and validate a versioned Linux archive with:
