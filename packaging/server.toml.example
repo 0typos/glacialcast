@@ -1,0 +1,62 @@
+# GlacialCast relay configuration.
+#
+# Copy to /etc/glacialcast/server.toml, own it by the glacialcast user, and
+# chmod 600. That path is searched automatically, so the shipped systemd unit
+# passes no --config at all.
+#
+# This file holds ingest and viewer credentials, so it must be a private
+# regular file with mode 0600. Unknown keys are rejected rather than ignored.
+#
+# The defaults below suit a trusted LAN: the relay listens for viewers on
+# loopback only, and publishers authenticate with a token. For anything reached
+# from the Internet, see /usr/share/doc/glacialcast-server/internet-deployment.md
+# and set security.public_origin, which switches on the fail-closed profile.
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SECURITY: replace every token below before this relay is reachable by
+#  anyone else. They are published in the documentation and in every copy of
+#  this package. Generate real ones with:
+#     openssl rand -base64 32
+#  Note also that the publisher ships an example viewer key phrase. That phrase
+#  is what decrypts the stream, and the relay never sees it — changing tokens
+#  here does not protect a stream still published under the example phrase.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[ingest]
+# Publishers must present a token. Only turn this off on loopback, where the
+# relay refuses a non-loopback plaintext listener anyway.
+require_token = true
+
+# One entry per publisher. The name is the durable identity the relay recovers
+# a stream under, and it is what viewer scopes are matched against, so it
+# outlives the token itself.
+[[ingest.tokens]]
+name = "workstation"
+token = "replace-me-with-openssl-rand-base64-32"
+
+# Viewer access to the web interface. Omit this whole section on a trusted LAN
+# to leave the viewer unauthenticated; it is required once
+# security.public_origin is set.
+#
+# [[access.tokens]]
+# name = "operator"
+# token = "replace-me-with-openssl-rand-base64-32"
+# role = "admin"
+#
+# [[access.tokens]]
+# name = "colleague"
+# token = "replace-me-with-openssl-rand-base64-32"
+# role = "viewer"
+# # Restricts this viewer to one publisher's streams. Matched against the
+# # ingest token name above, and it covers every screen that publisher casts.
+# publishers = ["workstation"]
+
+# [security]
+# Setting this to an HTTPS origin switches on the Internet profile: viewer
+# tokens become mandatory, cookies are issued Secure and HSTS is sent, and a
+# non-loopback plaintext listener is refused. Leave it unset for a LAN.
+# public_origin = "https://cast.example.com"
+#
+# Trust X-Forwarded-For. Only enable behind a reverse proxy you control, or
+# clients can forge their own source address for rate limiting.
+# trust_forwarded_for = true

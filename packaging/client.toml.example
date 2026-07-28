@@ -1,0 +1,51 @@
+# GlacialCast publisher configuration.
+#
+# Copy to ~/.config/glacialcast/client.toml and chmod 600. That path is
+# searched automatically, so no --config is needed. /etc/glacialcast/client.toml
+# is searched too, for a host where one publisher serves the machine rather
+# than a particular person.
+#
+# This file holds an ingest credential and the viewer key phrase, so it must be
+# a private regular file with mode 0600. Unknown keys are rejected rather than
+# ignored, so a typo fails loudly instead of being silently dropped.
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SECURITY: change viewer_key_phrase before anyone else can reach the relay.
+#  The value shipped here is in the documentation and in every copy of this
+#  package. Until you change it, anyone who can reach the relay can watch.
+#  The publisher prints a warning on every start while it is unchanged.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# The secret a viewer types to watch. Seven words; case, spacing, and hyphens
+# do not matter, and each word may be shortened to its first three letters.
+#
+# Delete this line entirely to have a private one generated on first start and
+# kept in $XDG_STATE_HOME/glacialcast/viewer-<client_id>.key. That is the right
+# choice for anything real. Read it back at any time with:
+#   glacialcast-client --print-viewer-key
+viewer_key_phrase = "demo-only-weak-amend-now-open-free"
+
+# Durable identity for this publisher. The relay recovers the same stream after
+# a reconnect from it, so keep it stable.
+client_id = "workstation"
+
+# Shown to viewers. When several screens are published, each stream appends its
+# output name to this, giving "Workstation (DP-1)" and so on.
+display_name = "Workstation"
+
+# Publish every connected output rather than only the primary one. Each output
+# becomes its own stream, and one viewer key unlocks all of them.
+all_monitors = true
+
+# Credential the relay was configured to accept. Required unless the relay
+# explicitly allows unauthenticated ingest, which it only permits on loopback.
+# ingest_token = "replace-with-the-token-the-relay-was-given"
+
+# The relay's public Noise key, printed by:
+#   sudo -u glacialcast glacialcast-server --print-ingest-server-key
+# Pinning it is what stops a substituted relay from accepting this publisher,
+# so it is worth copying accurately.
+# ingest_server_key = "replace-with-the-key-the-relay-printed"
+
+# Printed with the startup summary so an invitation to a viewer is complete.
+# viewer_url = "https://cast.example.com"

@@ -142,6 +142,9 @@ struct Args {
     ingest_server_key: Option<String>,
     #[arg(long, allow_hyphen_values = true)]
     viewer_key: Option<String>,
+    /// Viewer key as a word phrase, instead of letting one be generated.
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "viewer_key")]
+    viewer_key_phrase: Option<String>,
     #[arg(long, conflicts_with = "viewer_key")]
     no_viewer_key: bool,
     #[arg(long)]
@@ -252,9 +255,35 @@ struct ClientConfig {
     ingest_token: Option<String>,
     ingest_server_key: Option<String>,
     viewer_key_b64: Option<String>,
+    /// Viewer key as a word phrase, which is what a person is given.
+    ///
+    /// Takes the place of a generated one, so several publishers can share a
+    /// key deliberately and an operator can choose a memorable one. The salt is
+    /// still generated per publisher and published as stream metadata, so a
+    /// phrase reused across deployments does not produce the same key material
+    /// in each.
+    viewer_key_phrase: Option<String>,
     display_name: Option<String>,
     viewer_url: Option<String>,
+    /// Publishes every connected output rather than the primary one.
+    all_monitors: Option<bool>,
 }
+
+/// Salt used when a phrase is supplied but no key file is kept.
+///
+/// Deterministic on purpose: with `--no-viewer-key` there is nowhere to persist
+/// a random salt, and a phrase that derived a different key on every start
+/// would be unusable. A publisher that keeps a key file gets a random salt
+/// instead, which is the normal case.
+const DERIVED_PHRASE_FALLBACK_SALT: [u8; viewer_key::SALT_LEN] = *b"glacialcast-derv";
+
+/// The phrase shipped in the example configuration.
+///
+/// Present so an install works immediately, and therefore public: anyone who
+/// can reach the relay and has read the documentation can decrypt a stream
+/// published under it. The publisher warns on every start until it is changed,
+/// because a default secret that is never mentioned again is one that stays.
+const EXAMPLE_VIEWER_KEY_PHRASE: &str = "demo-only-weak-amend-now-open-free";
 
 /// Identifies one published stream to the relay.
 ///
@@ -287,6 +316,9 @@ struct ClientIdentity {
     /// Configuration actually read, so the summary and the log can say which
     /// file a detached publisher is running on.
     config_path: Option<PathBuf>,
+    /// Publish every output, from `all_monitors` in the configuration file.
+    /// The `--all-monitors` flag turns it on independently.
+    all_monitors: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -667,7 +699,7 @@ async fn resolve_publish_targets(
             .collect());
     }
 
-    let connectors = if args.all_monitors {
+    let connectors = if args.all_monitors || identity.all_monitors {
         let connection = Connection::session().await?;
         let all = list_mutter_connectors(&connection).await?;
         if all.is_empty() {
@@ -2104,11 +2136,45 @@ fn resolve_client_identity(args: &Args) -> Result<ClientIdentity> {
                 .unwrap_or_else(|| default_viewer_key_file(&client_id)),
         )
     };
-    let viewer_key = match (&configured_viewer_key, &viewer_key_file) {
-        (Some(key), _) => Some(ViewerKeyMaterial::from_raw_b64(key.clone())),
-        (None, Some(path)) => Some(load_or_create_viewer_key(path, args.new_viewer_key)?),
-        (None, None) => None,
+    let configured_phrase = args
+        .viewer_key_phrase
+        .clone()
+        .or(config.viewer_key_phrase)
+        .map(|phrase| non_empty_trimmed("viewer_key_phrase", phrase))
+        .transpose()?;
+    let viewer_key = match (&configured_viewer_key, &configured_phrase, &viewer_key_file) {
+        (Some(key), _, _) => Some(ViewerKeyMaterial::from_raw_b64(key.clone())),
+        // A chosen phrase still needs a salt, and it must be the same one on
+        // every restart or viewers would have to be told the key again. The
+        // salt file serves that purpose; only the phrase within it is replaced.
+        (None, Some(phrase), path) => {
+            let salt = match path {
+                Some(path) => load_or_create_viewer_key(path, args.new_viewer_key)?
+                    .salt_b64
+                    .and_then(|encoded| viewer_key::decode_salt(&encoded)),
+                None => None,
+            }
+            .unwrap_or(DERIVED_PHRASE_FALLBACK_SALT);
+            Some(ViewerKeyMaterial::from_phrase(phrase, &salt)?)
+        }
+        (None, None, Some(path)) => Some(load_or_create_viewer_key(path, args.new_viewer_key)?),
+        (None, None, None) => None,
     };
+    if let Some(phrase) = &configured_phrase
+        && viewer_key::normalize_phrase(phrase).ok().as_deref()
+            == viewer_key::normalize_phrase(EXAMPLE_VIEWER_KEY_PHRASE)
+                .ok()
+                .as_deref()
+    {
+        // Printed rather than logged, so it reaches an operator running this by
+        // hand as well as one reading a journal.
+        eprintln!(
+            "WARNING: publishing under the example viewer key phrase. It is in the \n\
+             shipped configuration and the documentation, so anyone who can reach \n\
+             the relay can decrypt this stream. Set viewer_key_phrase in \n\
+             client.toml, or remove it to have a private one generated."
+        );
+    }
     let viewer_key_b64 = viewer_key.as_ref().map(|key| key.key_b64.clone());
     let viewer_key_shareable = viewer_key.as_ref().map(|key| key.shareable.clone());
     let viewer_key_salt_b64 = viewer_key.as_ref().and_then(|key| key.salt_b64.clone());
@@ -2136,6 +2202,7 @@ fn resolve_client_identity(args: &Args) -> Result<ClientIdentity> {
         viewer_key_file,
         viewer_url,
         config_path: config_source.path().map(std::path::Path::to_path_buf),
+        all_monitors: config.all_monitors.unwrap_or(false),
     })
 }
 
@@ -7107,6 +7174,7 @@ mod tests {
                 viewer_key_file: None,
                 viewer_url: None,
                 config_path: None,
+                all_monitors: false,
             };
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let mut capture = NeverOpeningCapture;
