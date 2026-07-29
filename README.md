@@ -703,7 +703,7 @@ systemctl --user status xdg-desktop-portal.service xdg-desktop-portal-gnome.serv
 
 `scripts/verify-wayland-picture.sh` is the acceptance check for the published
 image itself: it publishes the real screen, decodes a frame in Firefox or
-Chromium with the viewer key, and requires it to match a `grim` screenshot of
+Chromium with the viewer key, and requires it to match the compositor's own screenshot of
 the same output. Object-level gates cannot catch a tiled or wrongly swizzled
 readback, because scrambled pixels still produce valid encrypted objects.
 

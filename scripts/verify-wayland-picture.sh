@@ -40,10 +40,15 @@ if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
   echo "WAYLAND_DISPLAY is not set; run this gate inside the target Wayland session" >&2
   exit 1
 fi
-command -v grim >/dev/null || {
-  echo "SKIP: grim is required to screenshot the captured output for comparison"
+# Any one of grim, spectacle, or the portal will do; which one depends on the
+# desktop. Checked up front so the gate skips before building rather than after
+# publishing a stream it cannot verify.
+if ! scripts/screenshot-output.sh "${work_dir}/probe.png" >/dev/null 2>&1; then
+  echo "SKIP: no way to screenshot this desktop, so a published picture cannot be compared"
+  echo "      (install grim on wlroots or niri, spectacle on KDE, or a working portal)"
   exit 0
-}
+fi
+rm -f "${work_dir}/probe.png"
 
 cargo build -p glacialcast-server -p glacialcast-client
 ingest_server_key="$(
@@ -155,7 +160,7 @@ for attempt in $(seq 1 "${attempts}"); do
     "${origin}" "${stream_id}" "${viewer_key}" "${candidate}" "${browser}"
   # Take the reference as soon as the viewer frame lands so an active desktop
   # has the least opportunity to change between the two.
-  grim -o "${connector}" "${reference}"
+  reference_source="$(scripts/screenshot-output.sh "${reference}" "${connector}")"
   if node scripts/compare-frame.mjs "${reference}" "${candidate}" "${minimum}"; then
     status=0
     break
@@ -169,4 +174,5 @@ if [[ "${status}" -ne 0 ]]; then
   exit 1
 fi
 
-echo "PASS: ${browser} decoded the published stream and it matches the compositor's ${connector}"
+echo "PASS: ${browser} decoded the published stream and it matches the compositor's" \
+     "${connector}, referenced with ${reference_source:-unknown}"

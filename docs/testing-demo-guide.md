@@ -393,8 +393,23 @@ GLACIALCAST_PLAYWRIGHT_MODULE="$pw_root/node_modules/playwright" \
 scripts/verify-wayland-picture.sh
 ```
 
-It needs `grim`, and skips rather than guesses when the portal chooser decided
-which output is published; pass `GLACIALCAST_VERIFY_MONITOR_NAME` in that case.
+It needs some way to screenshot the desktop, and which one depends on the
+desktop: `grim` on niri and other wlroots compositors, `spectacle` on KDE, and
+the XDG Desktop Portal anywhere else. GNOME allows only the last of those — its
+Shell screenshot interface refuses callers that are not the Shell — and asks
+for permission the first time. Grant it once interactively, or beforehand for
+an unattended run:
+
+```sh
+gdbus call --session --dest org.freedesktop.impl.portal.PermissionStore \
+  --object-path /org/freedesktop/impl/portal/PermissionStore \
+  --method org.freedesktop.impl.portal.PermissionStore.SetPermission \
+  screenshot true screenshot "" '["yes"]'
+```
+
+The gate names which mechanism it used in its PASS line, and skips rather than
+guessing when the portal chooser decided which output is published; pass
+`GLACIALCAST_VERIFY_MONITOR_NAME` in that case.
 A correct capture scores about 0.99 and an unrelated screen scores near zero,
 so the 0.85 default leaves room for compression and a slightly changed desktop.
 Run both browsers for a release candidate.
