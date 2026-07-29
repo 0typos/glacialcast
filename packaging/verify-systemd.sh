@@ -9,6 +9,17 @@ command -v systemd-analyze >/dev/null || {
   exit 0
 }
 
+# systemd-analyze resolves ExecStart and fails when the binary is absent, so
+# the units can only be checked against binaries that exist. A developer's
+# checkout usually has them; a clean one does not, and verify-packaging.sh
+# builds into throwaway target directories to compare two independent builds,
+# so running under it is no guarantee either.
+for binary in glacialcast-server glacialcast-client; do
+  if [[ ! -x "target/release/${binary}" ]]; then
+    cargo build --release --locked -p "${binary}" >&2
+  fi
+done
+
 work_dir="$(mktemp -d /tmp/glacialcast-systemd.XXXXXX)"
 cleanup() {
   rm -rf "${work_dir}"
