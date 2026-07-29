@@ -48,6 +48,10 @@ jobs:
       - name: Run full deterministic gate
         env:
           GLACIALCAST_REQUIRE_CLEAN: "1"
+          # The full profile includes the multi-stream browser gate, so it
+          # needs the Playwright installed above. Without this the gate fails
+          # on a missing module rather than on anything about the release.
+          GLACIALCAST_PLAYWRIGHT_MODULE: /tmp/glacialcast-playwright/node_modules/playwright
         run: scripts/verify-quality.sh full
       - name: Run Firefox and Chromium live/offline gate
         env:
