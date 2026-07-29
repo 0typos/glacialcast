@@ -676,6 +676,16 @@ async fn resolve_publish_targets(
                  portal chooses its own sources in its dialog"
             );
         }
+        if args.all_monitors || identity.all_monitors {
+            // Silently ignoring it would look like the setting worked. The
+            // portal's own chooser decides how many sources a session grants,
+            // and this process only learns the answer afterwards.
+            warn!(
+                "all_monitors has no effect on the desktop portal: its chooser decides \
+                 which outputs are shared. Select them in the dialog, or use a compositor \
+                 with a ScreenCast interface this can drive directly"
+            );
+        }
         // One dialog grants the whole selection, so the session is opened here
         // rather than once per publisher thread.
         let restore = PortalRestoreToken::load(

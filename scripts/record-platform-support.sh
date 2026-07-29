@@ -58,10 +58,13 @@ video_status="not-run"
 cursor_log=""
 picture_log=""
 video_log=""
+rate_status="not-run"
+rate_log=""
 if [[ "${run_gates}" == "1" ]]; then
   cursor_log="${output}.cursor.log"
   picture_log="${output}.picture.log"
   video_log="${output}.video.log"
+  rate_log="${output}.cursor-rate.log"
   if scripts/verify-wayland-cursor-metadata.sh >"${cursor_log}" 2>&1; then
     cursor_status="pass"
   else
@@ -79,6 +82,20 @@ if [[ "${run_gates}" == "1" ]]; then
     video_status="pass"
   else
     video_status="fail"
+  fi
+  # The most informative gate on an unfamiliar compositor: it reports what that
+  # compositor actually delivers rather than only whether capture worked. Needs
+  # a writable /dev/uinput and Playwright, so a skip here is not a failure of
+  # the compositor.
+  if [[ -w /dev/uinput ]] && { [[ -n "${GLACIALCAST_PLAYWRIGHT_MODULE:-}" ]] \
+      || node -e "require('playwright')" 2>/dev/null; }; then
+    if scripts/verify-wayland-cursor-rate.sh >"${rate_log}" 2>&1; then
+      rate_status="pass"
+    else
+      rate_status="fail"
+    fi
+  else
+    rate_status="skip"
   fi
 fi
 
@@ -113,6 +130,7 @@ libva_version="$(vainfo --version 2>/dev/null | head -1 || true)"
   echo "| Independent cursor metadata | ${cursor_status} | ${cursor_log:-n/a} |"
   echo "| Published picture matches the screen | ${picture_status} | ${picture_log:-n/a} |"
   echo "| VA-API / DMA-BUF video | ${video_status} | ${video_log:-n/a} |"
+  echo "| Cursor rate against the compositor's | ${rate_status} | ${rate_log:-n/a} |"
   echo
   echo "A release support claim requires these logs, the compositor/portal version,"
   echo "GPU model, and a human playback check in Firefox."
@@ -122,6 +140,7 @@ echo "Platform evidence written to ${output}"
 if [[ "${run_gates}" == "1" ]] \
   && [[ "${cursor_status}" != "pass" \
     || "${picture_status}" == "fail" \
+    || "${rate_status}" == "fail" \
     || "${video_status}" != "pass" ]]; then
   exit 1
 fi
