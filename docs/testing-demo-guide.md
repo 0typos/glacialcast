@@ -480,6 +480,41 @@ cursor sampling: with all three outputs publishing, the cursor task's ticks are
 with one output instead of three. The residual is the timer's own granularity
 against a 16.7 ms interval, not blocking.
 
+### Running these on GNOME, KDE, or sway
+
+Only niri is validated. The gates run on any Wayland session, and what they
+report on an unvalidated one is the point of running them.
+
+Everything except niri goes through the XDG Desktop Portal, which changes two
+things about how the gates behave:
+
+- **A chooser appears, and someone has to click it.** The gates print a line
+  saying so and then wait. The grant is stored as a restore token, so a second
+  run of the same gate reuses it without prompting — each gate has its own
+  client id and therefore its own token, so expect one dialog per gate the first
+  time.
+- **`GLACIALCAST_VERIFY_MONITOR_NAME` will not work.** Naming an output needs a
+  ScreenCast interface this can drive directly. Under the portal the dialog
+  decides, so pick the output there. The picture gate then compares against
+  whichever output was granted, and skips rather than guessing if it cannot tell
+  which that was.
+
+Record what you find:
+
+```sh
+GLACIALCAST_PLAYWRIGHT_MODULE="$pw_root/node_modules/playwright" \
+scripts/record-platform-support.sh \
+  --compositor "kwin 6.2.4" \
+  --gpu-vendor amd --gpu-model "Radeon 780M" \
+  --run-gates
+```
+
+That writes a report naming the commit, compositor, PipeWire and libva
+versions, and the result of each gate, which is what a support claim in
+`docs/support-matrix.md` has to rest on. A failure is a useful result: it is the
+difference between "implemented" and "validated", and nothing moves out of
+"pending" without one of these reports.
+
 ## 7. Test VA-API and DMA-BUF
 
 Run:

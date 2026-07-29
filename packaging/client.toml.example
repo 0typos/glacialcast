@@ -35,6 +35,11 @@ display_name = "Workstation"
 
 # Publish every connected output rather than only the primary one. Each output
 # becomes its own stream, and one viewer key unlocks all of them.
+#
+# This applies only where the compositor exposes a ScreenCast interface this can
+# drive directly, which today means niri. Everywhere else the XDG Desktop Portal
+# is used and its own chooser decides which outputs are shared, so select them
+# in the dialog instead; the publisher warns rather than pretending this worked.
 all_monitors = true
 
 # Credential the relay was configured to accept. Required unless the relay

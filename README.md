@@ -133,6 +133,62 @@ cargo build --workspace --release
 
 The publisher prints a generated viewing key and the page to enter it on.
 
+## Will this work on my desktop?
+
+Honestly: it is built against the XDG Desktop Portal, which every Wayland
+desktop implements, but only niri has been validated end to end. The difference
+between "implemented" and "validated" matters here, because a capture path can
+produce perfectly valid encrypted objects out of scrambled pixels — only the
+picture gate, which compares what a browser decodes against the compositor's own
+screenshot, can tell those apart.
+
+| Desktop | Capture path | Status |
+| --- | --- | --- |
+| niri | Its Mutter-compatible ScreenCast interface, chosen automatically | Validated: cursor metadata, published picture at 0.978–0.99 correlation, three outputs at once, on NVIDIA with software encoding |
+| GNOME | XDG Desktop Portal | Implemented, unvalidated. The portal code path was exercised on a niri host through `xdg-desktop-portal-gnome`, which is not the same as running on GNOME |
+| KDE Plasma | XDG Desktop Portal | Implemented, unvalidated |
+| sway and other wlroots | XDG Desktop Portal via `xdg-desktop-portal-wlr` | Implemented, unvalidated |
+
+Two behaviours differ by path, and they are the ones most likely to surprise:
+
+- **Choosing outputs.** On niri, `all_monitors` and `--monitor-name` select
+  outputs directly and no dialog appears. On the portal, the desktop's own
+  chooser decides what is shared; `--monitor-name` is refused and
+  `all_monitors` is ignored with a warning rather than silently doing nothing.
+- **Multi-output selection.** Publishing several screens at once is only
+  exercised on niri. The portal is asked for multiple sources and each becomes
+  its own stream, but no desktop whose chooser offers that has been tested.
+
+If you run one of the unvalidated desktops, the gates in
+[`docs/testing-demo-guide.md`](docs/testing-demo-guide.md) are the way to find
+out where it stands, and `scripts/record-platform-support.sh` captures the
+evidence. Reports are welcome; so is a failure.
+
+## Known limitations
+
+- **Video only, view only.** No audio, and no remote input. That is the product
+  contract, not a gap waiting to be filled.
+- **The cursor cannot exceed the compositor's buffer rate.** Cursor metadata
+  rides on video buffers. Measured on niri at 60 Hz: 55–59 samples a second
+  reach the viewer. At a 143.998 Hz panel mode the same compositor delivers
+  *fewer*, 48, so a higher refresh rate does not raise it.
+- **VA-API hardware encoding is unvalidated.** The Intel and AMD paths are
+  implemented but have never run on representative hardware. NVIDIA's
+  proprietary driver exposes no H.264 encode entry point at all, so it uses the
+  software encoder after an EGL DMA-BUF readback — which is the only combination
+  that has been exercised.
+- **One relay, no clustering, no federation.** Retention is bounded by age and
+  by bytes per stream, and history beyond that is gone.
+- **Packages are x86_64 only**, built against glibc 2.39. Older distributions
+  are refused rather than sold a binary that cannot start.
+- **Pre-1.0 wire format.** `PROTOCOL_VERSION` has moved twice in recent work;
+  publisher and relay must match, and retained objects do not survive a format
+  change.
+- **The browser must reach the relay over HTTPS or loopback.** Encrypted Media
+  Extensions are unavailable on a plaintext non-loopback origin, so a LAN
+  deployment either uses loopback, a tunnel, or the Internet profile with a
+  real certificate.
+
 ## Dependencies
 
 The default build uses the exact Rust release pinned in
