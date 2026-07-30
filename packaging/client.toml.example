@@ -52,5 +52,13 @@ all_monitors = true
 # so it is worth copying accurately.
 # ingest_server_key = "replace-with-the-key-the-relay-printed"
 
-# Printed with the startup summary so an invitation to a viewer is complete.
+# The address viewers reach the relay on. Setting this makes the publisher print
+# a one-click invitation link at startup:
+#
+#   https://cast.example.com/#k=<your-viewer-key>
+#
+# Opening that link starts playing with nothing to type. The key sits after the
+# '#', which browsers never send to a server, so the relay cannot read it out of
+# the link. Anyone holding the link can watch, exactly as anyone holding the key
+# can, so send it the same way you would send the key.
 # viewer_url = "https://cast.example.com"

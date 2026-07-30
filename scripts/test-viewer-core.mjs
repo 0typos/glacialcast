@@ -481,4 +481,28 @@ test('live cursor clock resynchronises after a reset', () => {
   assert.equal(clock.sample(Number.NaN, 6), null);
 });
 
+// The missing epoch is the case that matters here. An epoch whose descriptor the
+// viewer key cannot open is deleted from the epoch map, so callers look one up
+// and get `undefined`. This guard used to be written inline as
+// `epoch?.offset !== null`, which admits `undefined` because `undefined !== null`
+// is true; the caller then dereferenced it. That blanked the player on any
+// stream carrying more than one epoch and reported a message naming an object
+// that did not exist.
+test('a missing epoch is not playable', () => {
+  assert.equal(core.isPlayableEpoch(undefined), false);
+  assert.equal(core.isPlayableEpoch(null), false);
+});
+
+test('an epoch with no timeline offset is not playable', () => {
+  assert.equal(core.isPlayableEpoch({ offset: null }), false);
+  assert.equal(core.isPlayableEpoch({}), false);
+});
+
+test('an epoch placed on the timeline is playable', () => {
+  // The first epoch on a timeline has offset 0, so a plain truthiness test here
+  // would discard the only epoch a single-epoch stream has.
+  assert.equal(core.isPlayableEpoch({ offset: 0 }), true);
+  assert.equal(core.isPlayableEpoch({ offset: 12_345 }), true);
+});
+
 console.log(`PASS viewer core: ${tests} tests`);

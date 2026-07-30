@@ -368,6 +368,24 @@
     );
   }
 
+  /**
+   * Whether an epoch can carry playback: it authenticated, and it has been
+   * given a place on the timeline.
+   *
+   * An epoch whose descriptor the viewer key cannot open is deleted from the
+   * epoch map rather than kept, so looking one up returns `undefined`, and
+   * callers hand that `undefined` straight to this test. Writing the test
+   * inline as `epoch?.offset !== null` looks like it covers the missing epoch
+   * and does the exact opposite: `undefined !== null` is true, so the missing
+   * epoch passes and the next line dereferences it. That blanked the entire
+   * player on any stream carrying more than one epoch, which is why the test
+   * lives here as a named function with tests instead of as an expression
+   * copied to each call site.
+   */
+  function isPlayableEpoch(epoch) {
+    return Boolean(epoch) && epoch.offset !== null && epoch.offset !== undefined;
+  }
+
   function buildEpochTimeline(headers) {
     if (!Array.isArray(headers)) throw new TypeError('DASH headers must be an array.');
     const epochIds = [];
@@ -455,6 +473,7 @@
     containedVideoRectangle,
     createCursorClock,
     findCursorEvent,
+    isPlayableEpoch,
     mergeSortedCursorEvents,
     parseCursorBatch,
     parseEncryptedCursorPayload,

@@ -35,6 +35,7 @@ standard_checks() {
 full_checks() {
   standard_checks
   run scripts/verify-dash-e2e.sh
+  run scripts/verify-viewer-onboarding.sh
   run scripts/verify-multi-stream.sh
   run scripts/verify-ingest-recovery.sh
   run scripts/verify-internet-security.sh

@@ -58,6 +58,29 @@ function authenticationBytes(header) {
   );
 }
 
+/**
+ * A stream the relay knows about that has nothing playable in it yet.
+ *
+ * This is an ordinary state rather than a fault. The relay registers a stream
+ * the moment the publisher connects, and on GNOME and KDE that happens before
+ * anyone has accepted the screen-sharing prompt, so the first viewer to arrive
+ * finds a live stream with no media behind it. Retention reaching the end of an
+ * idle stream looks the same from here.
+ *
+ * It used to be reported as a hard failure, which left a black tile carrying an
+ * internal string until the page was reloaded by hand. Marking it retryable lets
+ * the caller wait for the stream to start instead.
+ */
+function streamNotReadyError() {
+  const error = new Error(
+    'Waiting for this screen to start sending. If the publisher has just '
+    + 'started this clears on its own; on GNOME and KDE it is waiting for the '
+    + 'screen-sharing prompt to be accepted on the publisher’s machine.',
+  );
+  error.retryable = true;
+  return error;
+}
+
 function createPlayer(root, options) {
   const streamId = options.streamId;
   const onStatus = options.onStatus || (() => {});
@@ -144,7 +167,7 @@ function createPlayer(root, options) {
     await loadEpochDescriptors(headers);
     const timeline = installInitialEpochTimeline(headers);
     if (timeline.length === 0) {
-      throw new Error('No retained random-access media is available.');
+      throw streamNotReadyError();
     }
     state.descriptor = state.epochs.get(timeline.at(-1).epoch_id).descriptor;
     const descriptor = state.descriptor;
@@ -170,7 +193,7 @@ function createPlayer(root, options) {
   async function loadEpochDescriptors(headers) {
     const epochHeaders = headers.filter(header => header.kind === 'Epoch');
     if (epochHeaders.length === 0) {
-      throw new Error('The stream has not published an epoch descriptor.');
+      throw streamNotReadyError();
     }
     // An epoch this key cannot open is skipped rather than fatal. Retained
     // history can outlive a viewer key — rotating one leaves the relay holding
@@ -516,7 +539,7 @@ function createPlayer(root, options) {
     const cursors = headers.filter(header => {
       const epoch = state.epochs.get(header.epoch_id);
       return header.kind === 'Cursor'
-        && epoch?.offset !== null
+        && ViewerCore.isPlayableEpoch(epoch)
         && !state.seenSequences.has(header.sequence);
     });
     const concurrency = 12;
@@ -548,7 +571,7 @@ function createPlayer(root, options) {
 
   async function decodeCursorObject(header) {
     const epoch = state.epochs.get(header.epoch_id);
-    if (!epoch?.descriptor || epoch.offset === null) {
+    if (!ViewerCore.isPlayableEpoch(epoch) || !epoch.descriptor) {
       throw new Error(`Cursor object ${header.sequence} belongs to an unplayable epoch.`);
     }
     const payload = await fetchObject(header.sequence);
@@ -709,8 +732,11 @@ function createPlayer(root, options) {
       header => header.kind === 'Media' && header.random_access
     );
     if (firstRandomAccess) {
+      // The oldest retained random-access point can belong to an epoch this key
+      // cannot open, which is absent from the epoch map rather than present and
+      // empty. Trimming to it is an optimisation; skipping it costs nothing.
       const epoch = state.epochs.get(firstRandomAccess.epoch_id);
-      if (epoch?.offset !== null) {
+      if (ViewerCore.isPlayableEpoch(epoch)) {
         await trimPlaybackHistory(epoch.offset + firstRandomAccess.timestamp);
       }
     }
@@ -949,8 +975,12 @@ function createPlayer(root, options) {
   }
 
   function showError(error) {
-    console.error(error);
     const message = error?.message || String(error);
+    // The stream and the message both go in the text, not only in the object.
+    // A console holding several players' failures is unreadable when every line
+    // renders as the word "Error", and that is the view anyone debugging this
+    // from a browser actually has.
+    console.error(`glacialcast ${streamId}: ${message}`, error);
     els.status?.classList.add('error');
     if (els.status) els.status.textContent = message;
     if (els.stageMessage) els.stageMessage.textContent = message;
