@@ -41,6 +41,10 @@ max_added_gap_ms="${GLACIALCAST_CURSOR_MAX_ADDED_GAP_MS:-150}"
 # even when the worst case is bounded by something upstream.
 max_p50_ms="${GLACIALCAST_CURSOR_MAX_P50_MS:-34}"
 max_p90_ms="${GLACIALCAST_CURSOR_MAX_P90_MS:-68}"
+# The cursor timeline must not block for longer than this on anything. Well under
+# a display frame, because the point of splitting the timelines is that video work
+# cannot delay cursor sampling at all; a tick this late means it did.
+max_tick_lateness_ms="${GLACIALCAST_CURSOR_MAX_TICK_LATENESS_MS:-10}"
 origin="http://${control_addr}"
 work_dir="$(mktemp -d /tmp/glacialcast-cursor-rate.XXXXXX)"
 server_log="${work_dir}/server.log"
@@ -252,8 +256,35 @@ if [[ -z "${compositor_cursor_hz}" ]]; then
   echo "(expected debug lines 'compositor capture rate'; is RUST_LOG set?)" >&2
   exit 1
 fi
+# How late the cursor timeline's own tick ran, worst case.
+#
+# The delivered rate can look healthy while the cursor task is being blocked by
+# video work, because a tick that runs late still samples the newest value and
+# the average recovers. This is the measurement that separates "independent
+# timeline" from "usually fast enough", and it is the one that regresses first if
+# encoding or readback is ever moved back onto the cursor task.
+#
+# Startup is excluded the same way the compositor pause is: the first ticks run
+# while capture is still being negotiated.
+cursor_tick_lateness_ms="$(
+  grep -o 'worst_tick_lateness_ms=[0-9]*' "${client_log}" | cut -d= -f2 \
+    | awk '$1 < 2000' | sort -n | tail -1
+)"
 echo "compositor: buffer_hz=${compositor_buffer_hz} cursor_hz=${compositor_cursor_hz}" \
      "max_cursor_gap_ms=${compositor_gap_ms:-unknown}"
+echo "cursor timeline: worst_tick_lateness_ms=${cursor_tick_lateness_ms:-unknown}"
+# Every window, not just the worst one. A single late tick as capture is still
+# being negotiated says something very different from one in every window, and
+# the maximum alone cannot tell those apart.
+echo "cursor timeline: per-window lateness (ms, in order):" \
+  "$(grep -o 'worst_tick_lateness_ms=[0-9]*' "${client_log}" | cut -d= -f2 | tr '\n' ' ')"
+if [[ -n "${cursor_tick_lateness_ms}" ]] \
+  && (( cursor_tick_lateness_ms > max_tick_lateness_ms )); then
+  echo "FAIL: the cursor tick ran ${cursor_tick_lateness_ms}ms late," \
+       "above the ${max_tick_lateness_ms}ms ceiling; video work is blocking" \
+       "the cursor timeline" >&2
+  exit 1
+fi
 
 node - "${measurement}" "${compositor_cursor_hz}" "${compositor_buffer_hz}" \
       "${min_ratio}" "${max_gap_ms}" "${compositor_gap_ms:-0}" "${max_added_gap_ms}" \

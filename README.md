@@ -572,6 +572,18 @@ second, with one output or three. The publisher still forwards 100% of them.
 So `--cursor-hz 60` is fully served, while a request for 120 is bounded by what
 the compositor hands over rather than by anything here.
 
+Holding that rate depends on the cursor timeline not waiting behind video work,
+which is a property of how the publisher is scheduled rather than of any rate
+setting. Each publisher runs its capture loop on its own thread and gives the
+cursor task a runtime worker of its own, so a readback or an encode cannot delay
+cursor sampling. On a single shared thread it demonstrably does: with three
+2560x1440 outputs publishing at the shipped defaults, the worst cursor tick ran
+12–17 ms late in every five-second window — roughly one missed tick every five
+seconds, which is where the occasional two-frame painted gap came from. With the
+worker, the same measurement is 0–1 ms in every window.
+`scripts/verify-wayland-cursor-rate.sh` asserts it stays under 10 ms, because a
+starved cursor timeline is invisible in the average rate.
+
 Measuring this correctly is harder than it looks, and two mistakes are easy.
 A synthetic *absolute* pointing device is coalesced somewhere between libinput
 and the compositor: the same machine reports 37 buffers and 30 cursor samples
