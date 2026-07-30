@@ -596,7 +596,23 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
         let handle = std::thread::Builder::new()
             .name(format!("glacialcast-publish-{name}"))
             .spawn(move || -> Result<()> {
-                let runtime = tokio::runtime::Builder::new_current_thread()
+                // Two threads, not one, because the cursor timeline has to be
+                // able to run while video work is running.
+                //
+                // On a current-thread runtime the capture loop and the cursor
+                // task share the only thread that can poll them, so every
+                // readback and encode delays cursor sampling by however long it
+                // takes. Measured on three 2560x1440 outputs at the shipped
+                // defaults, that put the worst cursor tick 12-17ms late in every
+                // five-second window -- about one missed tick per five seconds,
+                // which is where the occasional two-frame painted gap came from.
+                //
+                // `block_on` keeps the capture loop on this thread, where the
+                // capture handle's non-Send state belongs; spawned tasks, which
+                // is what the cursor timeline is, get the worker.
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .thread_name(format!("glacialcast-cursor-{name}"))
                     .enable_all()
                     .build()
                     .context("building publisher runtime")?;
