@@ -79,5 +79,16 @@ jobs:
         run: scripts/verify-soak.sh
       - name: Enforce low-bandwidth profile
         run: scripts/verify-bandwidth.sh
+      - name: Install Playwright
+        run: |
+          npm install --prefix /tmp/glacialcast-playwright playwright@1.59.1
+          /tmp/glacialcast-playwright/node_modules/.bin/playwright install --with-deps firefox
+      - name: Verify viewer onboarding
+        # A synthetic capture, so this needs no Wayland session. It pins both that
+        # the viewing key is asked for at most once and that a stream carrying an
+        # epoch the key cannot open still plays.
+        env:
+          GLACIALCAST_PLAYWRIGHT_MODULE: /tmp/glacialcast-playwright/node_modules/playwright
+        run: scripts/verify-viewer-onboarding.sh
       - name: Build and verify release archive
         run: scripts/verify-packaging.sh

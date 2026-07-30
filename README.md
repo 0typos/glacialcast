@@ -56,7 +56,7 @@ server, or both on one machine to try it out.
 > **The shipped configuration contains a viewer key phrase that is public.**
 > It is in this README and in every copy of the package. Until you change it,
 > anyone who can reach the relay can watch your screen. The publisher prints a
-> warning on every start until you do. See [Securing it](#4-securing-it).
+> warning on every start until you do. See [Securing it](#5-securing-it).
 
 ### 2. Start the relay
 
@@ -98,13 +98,38 @@ systemctl --user enable --now glacialcast-publisher
 ```
 
 Every connected monitor is published, each as its own stream, all unlocked by
-one key. Open `http://<relay-host>:8899` and enter the viewing key:
+one key.
+
+### 4. Watch
+
+The publisher prints an invitation link when it starts. Open it and the stream
+plays — there is nothing to type:
+
+```
+Invitation link — opens and starts playing, with nothing to type:
+  https://cast.example.com/#k=tomb-bold-egg-inch-fuse-man-eager
+```
+
+The link only appears once `viewer_url` is set in `client.toml`, because only you
+know the address viewers reach the relay on.
+
+The key travels after the `#`, which browsers never send to a server, so the
+relay cannot read it out of the link even though the link points at the relay.
+Anyone holding the link can watch, exactly as anyone holding the key can — send
+it through the same channel you would send the key through.
+
+To hand over the key itself instead, open `http://<relay-host>:8899` and type it:
 
 ```sh
 glacialcast-client --print-viewer-key
 ```
 
-### 4. Securing it
+Either way it is asked for **once**. The browser remembers it, so a reload, a new
+tab, or a restart does not ask again, and a monitor added later unlocks itself.
+"Forget keys" in the sidebar erases it — worth using on a shared computer, where
+"remembered" means kept in that browser's profile on disk.
+
+### 5. Securing it
 
 The example configurations exist so the previous three steps work. They are not
 a deployment.
@@ -400,15 +425,26 @@ collapsed until you open it again.
 The operations dashboard — stream health, retention, admin controls — is at
 `/streams`. A single stream can still be deep-linked at `/dash/{stream_id}`.
 
-The viewing key is entered once. One key covers every screen a publisher casts,
-so entering it unlocks all of them rather than asking again per monitor, and the
-unlocked key is held in `sessionStorage` so a reload does not ask again either.
-It lives as long as the browser tab and no longer, which means closing the
-browser leaves nothing on disk. A key that opens nothing published here is
-reported as wrong rather than silently unlocking tiles that then fail to
-decode — the check authenticates a real object with the derived key.
+The viewing key is entered once, and once only. One key covers every screen a
+publisher casts, so entering it unlocks all of them rather than asking again per
+monitor. An invitation link (`/#k=<key>`) carries it in the URL fragment, which
+removes the interaction altogether.
 
-Viewer keys never leave the page and are never sent to the relay.
+What is remembered is the key you entered, not the per-stream keys derived from
+it, so a monitor the publisher adds later — or a stream that comes back under a
+new identity after a reconnect — unlocks itself instead of prompting again. It is
+kept in `localStorage`, so a reload, a new tab, and a browser restart all stay
+unlocked. That means it is stored in the browser profile on disk: a deliberate
+trade, because the earlier tab-scoped behaviour had viewers retyping the key
+constantly. **Forget keys** erases it, and is the right thing to use on a shared
+machine.
+
+A key that opens nothing published here is reported as wrong rather than silently
+unlocking tiles that then fail to decode — the check authenticates a real object
+with the derived key.
+
+Viewer keys never leave the page and are never sent to the relay. Neither is the
+fragment of an invitation link: browsers do not put it in a request.
 
 For a noninteractive transport test, publish the built-in pattern:
 

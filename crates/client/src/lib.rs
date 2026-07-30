@@ -486,12 +486,48 @@ fn print_sharing_summary(
     }
     println!("  log file     {}", log_file.display());
     println!("  control      {}", daemon_socket.display());
+    if let Some(link) = invite_link(identity) {
+        println!();
+        println!("Invitation link — opens and starts playing, with nothing to type:");
+        println!("  {link}");
+    }
     println!();
     println!(
         "Share the viewer key over a secure out-of-band channel. It is stable across\n\
          restarts, and one key unlocks every screen this publisher casts; the relay\n\
          cannot decrypt any of them."
     );
+}
+
+/// Builds the one-click invitation link for this publisher's viewer key.
+///
+/// The key goes in the URL fragment, after the `#`. Browsers do not send the
+/// fragment to the server, so the relay never receives the key even though the
+/// link points at the relay; a query parameter would arrive and be logged.
+///
+/// Anyone holding the link can watch, exactly as anyone holding the key can, so
+/// it belongs in the same secure channel as the key itself.
+fn invite_link(identity: &ClientIdentity) -> Option<String> {
+    let base = identity.viewer_url.as_deref()?.trim_end_matches('/');
+    let key = identity.viewer_key_shareable.as_deref()?;
+    Some(format!("{base}/#k={}", url_encode_fragment(key)))
+}
+
+/// Percent-encodes the characters that would end a URL fragment or be read as
+/// structure inside it. A generated key phrase is words and hyphens, and a raw
+/// viewer key is URL-safe base64, so this normally changes nothing — but a
+/// hand-chosen phrase is arbitrary text and must not be able to break the link.
+fn url_encode_fragment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 fn client_daemon_socket(args: &Args, identity: &ClientIdentity) -> PathBuf {
@@ -6965,6 +7001,75 @@ fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn invite_identity(viewer_url: Option<&str>, key: Option<&str>) -> ClientIdentity {
+        ClientIdentity {
+            client_id: "invite".to_string(),
+            auth_token: None,
+            ingest_server_key: None,
+            viewer_key_b64: None,
+            viewer_key_shareable: key.map(str::to_string),
+            viewer_key_salt_b64: None,
+            display_name: "Invite".to_string(),
+            viewer_key_file: None,
+            viewer_url: viewer_url.map(str::to_string),
+            config_path: None,
+            all_monitors: false,
+        }
+    }
+
+    #[test]
+    fn invite_link_carries_the_key_in_the_fragment() {
+        // After the '#', so browsers never send the key to the relay.
+        let identity = invite_identity(Some("https://cast.example.com"), Some("tomb-bold-egg"));
+        assert_eq!(
+            invite_link(&identity).as_deref(),
+            Some("https://cast.example.com/#k=tomb-bold-egg"),
+        );
+    }
+
+    #[test]
+    fn invite_link_does_not_double_the_separator() {
+        let identity = invite_identity(Some("https://cast.example.com/"), Some("tomb-bold-egg"));
+        assert_eq!(
+            invite_link(&identity).as_deref(),
+            Some("https://cast.example.com/#k=tomb-bold-egg"),
+        );
+    }
+
+    #[test]
+    fn invite_link_needs_both_a_url_and_a_key() {
+        assert_eq!(invite_link(&invite_identity(None, Some("phrase"))), None);
+        assert_eq!(
+            invite_link(&invite_identity(Some("https://cast.example.com"), None)),
+            None,
+        );
+    }
+
+    #[test]
+    fn invite_link_encodes_a_hand_chosen_phrase() {
+        // A configured phrase is arbitrary text and must not be able to break out
+        // of the fragment or introduce another parameter.
+        let identity = invite_identity(Some("https://cast.example.com"), Some("two words&k=x #y"));
+        assert_eq!(
+            invite_link(&identity).as_deref(),
+            Some("https://cast.example.com/#k=two%20words%26k%3Dx%20%23y"),
+        );
+    }
+
+    #[test]
+    fn invite_link_leaves_generated_keys_untouched() {
+        // Generated phrases are words and hyphens, and raw viewer keys are
+        // URL-safe base64: encoding must be a no-op for both.
+        assert_eq!(
+            url_encode_fragment("tomb-bold-egg-inch-fuse-man-eager"),
+            "tomb-bold-egg-inch-fuse-man-eager"
+        );
+        assert_eq!(
+            url_encode_fragment("QCOivvKXAHqxDo6Wogi8d81yx14wCM-2NkaXvJjOSiM"),
+            "QCOivvKXAHqxDo6Wogi8d81yx14wCM-2NkaXvJjOSiM",
+        );
+    }
 
     fn resend_object(stream_id: Uuid, sequence: u64, payload_len: usize) -> DashObject {
         let epoch_id = Uuid::from_u128(1);

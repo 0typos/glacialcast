@@ -329,9 +329,23 @@ disagreement between them would look like a valid key that decrypts nothing.
 
 Before a key is accepted, the viewer authenticates one real epoch object with
 it. That turns a wrong key into an immediate, accurate message instead of tiles
-that build and then fail during decode. The unlocked key is held in
-`sessionStorage`, so it survives a reload but not the tab; nothing is written to
-disk and the relay still never receives a viewer key.
+that build and then fail during decode.
+
+What the viewer stores is the secret that was entered, in `localStorage`, rather
+than the per-stream keys derived from it. Derived keys only open the streams that
+existed when they were made, so a screen added later would prompt again — and
+being prompted repeatedly was the single largest complaint about the viewer. The
+derived keys sit beside the secret purely as a cache, because each derivation is
+600,000 PBKDF2 iterations and redoing that per publisher on every page load is a
+visible stall; a cached key is still authenticated against a real object before
+use, so a rotated publisher key falls back to deriving rather than failing
+silently.
+
+Storing the secret puts it in the browser profile on disk, which the tab-scoped
+`sessionStorage` it replaced did not. That is the deliberate cost of asking once,
+and "Forget keys" removes it. The relay still never receives a viewer key, and
+neither does it receive the fragment of an invitation link — a `/#k=<key>` URL
+keeps the key after the `#`, which browsers do not transmit.
 
 ### Publishing several screens
 
