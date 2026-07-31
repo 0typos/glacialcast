@@ -92,13 +92,18 @@ RUST_LOG=glacialcast_client=info target/debug/glacialcast-client \
   >"${client_log}" 2>&1 &
 client_pid="$!"
 
+# The watcher throws the moment either process dies, so letting `set -e` abort
+# here skips the dump below and the failure reaches CI naming no cause at all --
+# which is how a missing OpenH264 reached three nightlies as only "client
+# process exited during soak". The status is kept and re-raised after the logs.
+soak_status=0
 node - \
   "${origin}" \
   "${duration_seconds}" \
   "${sample_seconds}" \
   "${max_stall_seconds}" \
   "${server_pid}" \
-  "${client_pid}" <<'NODE'
+  "${client_pid}" <<'NODE' || soak_status=$?
 const [origin, durationText, sampleText, stallText, serverPidText, clientPidText] =
   process.argv.slice(2);
 const durationMs = Number(durationText) * 1000;
@@ -178,6 +183,13 @@ console.log(JSON.stringify({
   cursor_bytes: streamTraffic.lifetime.cursor.bytes,
 }));
 NODE
+
+if (( soak_status != 0 )); then
+  echo "soak watcher failed; server and client output follows" >&2
+  sed -n '1,240p' "${server_log}" >&2
+  sed -n '1,240p' "${client_log}" >&2
+  exit "${soak_status}"
+fi
 
 if ! kill -0 "${server_pid}" 2>/dev/null || ! kill -0 "${client_pid}" 2>/dev/null; then
   echo "a soak process exited before final resource checks" >&2
