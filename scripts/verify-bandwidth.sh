@@ -14,7 +14,14 @@ if [[ "${profile}" == "all" ]]; then
 fi
 case "${profile}" in
   static)
-    default_max_media=65536
+    # An unchanged picture still has to be re-sent often enough that no sample
+    # lasts a second, because Firefox will not decode one that does. That is
+    # roughly two frames a second of a barely-changing screen rather than one
+    # every ten, and it measured 85 KB/min where the old ten-second heartbeat
+    # measured under 64 KB. The ceiling is set above that with headroom: this
+    # is the price of the stream playing at all, and 1.4 KB/s is still a
+    # low-bandwidth idle screen.
+    default_max_media=131072
     ;;
   typing)
     default_max_media=262144
