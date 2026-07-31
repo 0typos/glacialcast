@@ -10,6 +10,32 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
 /**
+ * Whether the page has started going away.
+ *
+ * Navigating cancels every request in flight, and the rejections that produces
+ * are the browser tearing the page down rather than any stream failing. They
+ * arrive before the tiles are destroyed -- nothing has destroyed them, the page
+ * is simply leaving -- so a per-player `destroyed` flag does not cover this and
+ * the failures were reported against streams that were fine.
+ *
+ * Module-level because it is a property of the page, not of one player.
+ *
+ * `beforeunload` is the one that is early enough. Measured in Firefox against
+ * three tiles with requests in flight, it arrives 1ms before the rejections and
+ * `pagehide` arrives 9ms after them, so a `pagehide` handler sets this flag
+ * only once the errors have already been reported. Both are registered because
+ * `beforeunload` is not guaranteed on every path a page can leave by, and the
+ * listener only sets a flag -- it neither calls `preventDefault` nor sets
+ * `returnValue`, so it does not raise a "leave site?" prompt.
+ */
+let pageUnloading = false;
+for (const event of ['beforeunload', 'pagehide']) {
+  globalThis.addEventListener?.(event, () => {
+    pageUnloading = true;
+  });
+}
+
+/**
  * Mounts one encrypted DASH player inside `root`.
  *
  * Elements are found by `data-role` within `root`, so several players can run
@@ -87,6 +113,12 @@ function createPlayer(root, options) {
   let destroyed = false;
   let cursorFrame = null;
   let objectUrl = null;
+  // Aborted when the player is destroyed, so a request still in flight ends
+  // with the tile rather than outliving it. Closing the socket was never
+  // enough: the reconcile pass fetches over plain HTTP, and a fetch left
+  // running past teardown rejects into the live queue's catch and gets
+  // reported as if the stream had failed.
+  const teardown = new AbortController();
 
   const els = {
     streamLabel: root.querySelector('[data-role="stream-label"]'),
@@ -284,6 +316,7 @@ function createPlayer(root, options) {
   async function fetchHeaders() {
     const response = await fetch(`/api/dash/streams/${streamId}/objects`, {
       cache: 'no-store',
+      signal: teardown.signal,
     });
     if (!response.ok) throw new Error(await response.text() || 'Unable to list DASH objects.');
     const headers = await response.json();
@@ -292,7 +325,9 @@ function createPlayer(root, options) {
   }
 
   async function fetchObject(sequence) {
-    const response = await fetch(`/api/dash/streams/${streamId}/objects/${sequence}`);
+    const response = await fetch(`/api/dash/streams/${streamId}/objects/${sequence}`, {
+      signal: teardown.signal,
+    });
     if (!response.ok) throw new Error(await response.text() || `Unable to load object ${sequence}.`);
     return new Uint8Array(await response.arrayBuffer());
   }
@@ -683,8 +718,24 @@ function createPlayer(root, options) {
   }
 
   function queueLiveTask(task) {
-    state.liveQueue = state.liveQueue.then(task).catch(showError);
+    state.liveQueue = state.liveQueue.then(task).catch(reportUnlessTornDown);
     return state.liveQueue;
+  }
+
+  /**
+   * Reports a live-queue failure unless the player caused it by shutting down.
+   *
+   * A tile that is going away aborts its own requests, and the rejection that
+   * produces is the teardown working, not the stream failing. Without this it
+   * reached `showError`, which paints the message onto the tile and writes it
+   * to the console -- so navigating away or pressing "Forget keys" while a
+   * reconcile was in flight logged `NetworkError when attempting to fetch
+   * resource` against a stream that was fine.
+   */
+  function reportUnlessTornDown(error) {
+    if (pageUnloading || destroyed || teardown.signal.aborted) return;
+    if (error?.name === 'AbortError') return;
+    showError(error);
   }
 
   async function reconcileLiveHeaders() {
@@ -992,7 +1043,10 @@ function createPlayer(root, options) {
     streamId,
     start(viewerKeyText) {
       return start(viewerKeyText).catch(error => {
-        showError(error);
+        // A start interrupted by teardown is the same non-event as an
+        // interrupted reconcile, and the caller's retry path already ignores a
+        // tile it has moved on from.
+        reportUnlessTornDown(error);
         throw error;
       });
     },
@@ -1021,6 +1075,7 @@ function createPlayer(root, options) {
     },
     destroy() {
       destroyed = true;
+      teardown.abort();
       if (cursorFrame !== null) cancelAnimationFrame(cursorFrame);
       clearTimeout(state.liveReconnectTimer);
       clearInterval(state.liveReconcileTimer);
