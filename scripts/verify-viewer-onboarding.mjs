@@ -43,11 +43,36 @@ function fail(message) {
   return false;
 }
 
+/**
+ * Runs `body` in the page, giving up rather than waiting forever.
+ *
+ * `page.evaluate` has no timeout in Playwright. A page whose main thread stops
+ * responding therefore hangs the caller with no output at all -- one CI run
+ * printed nothing for thirty-eight minutes and was killed by the job timeout,
+ * which says only that something took too long and nothing about where.
+ */
+async function evaluateWithin(page, body, timeoutMs = 15_000) {
+  let timer;
+  try {
+    return await Promise.race([
+      page.evaluate(body),
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`the page did not answer within ${timeoutMs}ms`)),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** Waits until at least one tile has actually decoded a frame. */
 async function waitForPlayingTile(page, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const playing = await page.evaluate(() => [...document.querySelectorAll('video')]
+    const playing = await evaluateWithin(page, () => [...document.querySelectorAll('video')]
       .filter(video => video.readyState >= 2 && video.videoWidth > 0).length);
     if (playing > 0) return playing;
     if (Date.now() > deadline) return 0;
@@ -56,7 +81,7 @@ async function waitForPlayingTile(page, timeoutMs) {
 }
 
 async function unlockedStreamCount(page) {
-  return page.evaluate(() => document.querySelectorAll('#stream-list li').length);
+  return evaluateWithin(page, () => document.querySelectorAll('#stream-list li').length);
 }
 
 const browser = await browserType.launch();
@@ -89,7 +114,7 @@ function significant(messages) {
  * only whether something is playing is not enough.
  */
 async function failedTiles(page) {
-  return page.evaluate(() => [...document.querySelectorAll('.tile.failed')].map(tile => {
+  return evaluateWithin(page, () => [...document.querySelectorAll('.tile.failed')].map(tile => {
     const stage = tile.querySelector('[data-role="stage-message"]')?.textContent?.trim();
     const status = tile.querySelector('[data-role="status"]')?.textContent?.trim();
     const title = tile.querySelector('.tile-title')?.textContent?.trim() || 'tile';
