@@ -39,8 +39,8 @@ fn cursor_probe(keys: &EpochKeys, stream_id: Uuid, epoch_id: Uuid) -> f64 {
     for index in 0..30 {
         events.push(CursorEvent {
             timestamp: 100 + index,
-            x_micropixels: index as i64 * 1_000_000,
-            y_micropixels: index as i64 * 500_000,
+            x_micropixels: i64::try_from(index).unwrap_or(0) * 1_000_000,
+            y_micropixels: i64::try_from(index).unwrap_or(0) * 500_000,
             visible: true,
             bitmap_id: 1,
             bitmap: (index == 0).then(|| CursorBitmap {
@@ -79,7 +79,7 @@ fn fragment_probe(keys: &EpochKeys) -> f64 {
     let mut access_unit = vec![0; payload_len];
     access_unit[..5].copy_from_slice(&[0, 0, 0, 1, 0x65]);
     for (index, byte) in access_unit[5..].iter_mut().enumerate() {
-        *byte = index as u8;
+        *byte = u8::try_from(index % 256).unwrap_or(0);
     }
     let iterations = 500;
     let elapsed = measure(iterations, || {

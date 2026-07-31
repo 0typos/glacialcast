@@ -6,7 +6,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let viewer_key = std::array::from_fn::<_, 32, _>(|index| index as u8);
+    let viewer_key =
+        std::array::from_fn::<_, 32, _>(|index| u8::try_from(index % 256).unwrap_or(0));
     let stream_id = Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef")?;
     let epoch_id = Uuid::parse_str("fedcba98-7654-3210-fedc-ba9876543210")?;
     let keys = EpochKeys::derive(&viewer_key, stream_id, epoch_id)?;

@@ -604,8 +604,12 @@ fn validate_cursor_batch(batch: &CursorBatch) -> Result<()> {
                 || bitmap.height > MAX_CURSOR_BITMAP_SIDE
                 || bitmap.hotspot_x < 0
                 || bitmap.hotspot_y < 0
-                || bitmap.hotspot_x >= bitmap.width as i32
-                || bitmap.hotspot_y >= bitmap.height as i32
+                // Compared in the unsigned space rather than casting the side
+                // down to it. The clauses above already rejected a negative
+                // hotspot, so widening it is exact, where narrowing the side
+                // would depend on a bound that lives elsewhere.
+                || bitmap.hotspot_x.unsigned_abs() >= bitmap.width
+                || bitmap.hotspot_y.unsigned_abs() >= bitmap.height
             {
                 return Err(DashError::InvalidCursorPayload);
             }
@@ -750,10 +754,15 @@ pub struct Subsample {
 
 /// Builds an AVC/CENC fragmented-MP4 initialization segment.
 pub fn build_encrypted_init_segment(config: &AvcConfig, key_id: [u8; 16]) -> Result<Vec<u8>> {
-    if config.sps.len() < 4 {
+    // Both bounds matter. `avcC` gives each parameter set a 16-bit length, so a
+    // longer one would be written with a truncated prefix and the segment would
+    // describe a different set of bytes than it carries -- silently, and only
+    // for the decoder to trip over. Real parameter sets are tens of bytes; this
+    // is here because the encoder hands these over and nothing else checks.
+    if config.sps.len() < 4 || config.sps.len() > u16::MAX as usize {
         return Err(DashError::InvalidSps);
     }
-    if config.pps.is_empty() {
+    if config.pps.is_empty() || config.pps.len() > u16::MAX as usize {
         return Err(DashError::InvalidPps);
     }
 
@@ -862,6 +871,16 @@ fn build_sample_table(config: &AvcConfig, key_id: [u8; 16]) -> Vec<u8> {
     })
 }
 
+/// # Invariants
+///
+/// `config.sps` and `config.pps` must each fit in a `u16`, which is what
+/// `build_encrypted_init_segment` checks before calling this. The `avcC` box
+/// gives each a 16-bit length, so a longer one would be written with a
+/// truncated prefix.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "parameter-set lengths are bounded to u16 by the caller, per the invariant above"
+)]
 fn build_encrypted_sample_entry(config: &AvcConfig, key_id: [u8; 16]) -> Vec<u8> {
     mp4_box(*b"encv", |entry| {
         entry.extend_from_slice(&[0; 6]);
@@ -911,6 +930,11 @@ fn build_encrypted_sample_entry(config: &AvcConfig, key_id: [u8; 16]) -> Vec<u8>
 }
 
 /// Converts one Annex-B access unit into an immediately appendable CENC fMP4 fragment.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "sample lengths are bounded by MAX_MEDIA_PAYLOAD, and the saiz and \
+              senc fields by the AuxiliaryInfoTooLarge check below"
+)]
 pub fn build_encrypted_fragment(
     cenc_key: &[u8; 16],
     input: FragmentInput<'_>,
@@ -1008,6 +1032,11 @@ fn patch_fragment_offsets(moof: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "each NAL is part of a total already refused above MAX_MEDIA_PAYLOAD, \
+              which is far below u32::MAX"
+)]
 fn annex_b_to_avcc(access_unit: &[u8]) -> Result<(Vec<u8>, Vec<std::ops::Range<usize>>)> {
     let nals = annex_b_nals(access_unit);
     if nals.is_empty() {
@@ -1483,7 +1512,9 @@ mod tests {
         assert_invalid_bitmap(|_, bitmap| bitmap.width = 0);
         assert_invalid_bitmap(|_, bitmap| bitmap.height = MAX_CURSOR_BITMAP_SIDE + 1);
         assert_invalid_bitmap(|_, bitmap| bitmap.hotspot_x = -1);
-        assert_invalid_bitmap(|_, bitmap| bitmap.hotspot_y = bitmap.height as i32);
+        assert_invalid_bitmap(|_, bitmap| {
+            bitmap.hotspot_y = i32::try_from(bitmap.height).unwrap();
+        });
         assert_invalid_bitmap(|_, bitmap| {
             bitmap.rgba.pop();
         });

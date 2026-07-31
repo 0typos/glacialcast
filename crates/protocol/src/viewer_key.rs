@@ -140,7 +140,12 @@ fn getrandom(buffer: &mut [u8]) -> std::io::Result<()> {
     // SAFETY: `getrandom` writes at most `len` bytes into `buf`, and the
     // pointer and length come from the same live slice.
     let filled = unsafe { libc::getrandom(buffer.as_mut_ptr().cast(), buffer.len(), 0) };
-    if filled < 0 || filled as usize != buffer.len() {
+    // A short read is as much a failure as a negative return: partially filled
+    // key material must never be treated as random.
+    let Ok(filled) = usize::try_from(filled) else {
+        return Err(std::io::Error::last_os_error());
+    };
+    if filled != buffer.len() {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
@@ -333,8 +338,8 @@ mod tests {
         let raw = include_str!("../../../test-vectors/viewer-key-vectors.json");
         let vectors: serde_json::Value = serde_json::from_str(raw).unwrap();
         assert_eq!(
-            vectors["iterations"].as_u64().unwrap() as u32,
-            PBKDF2_ITERATIONS
+            vectors["iterations"].as_u64().unwrap(),
+            u64::from(PBKDF2_ITERATIONS)
         );
         let cases = vectors["cases"].as_array().unwrap();
         assert!(
