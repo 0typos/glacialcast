@@ -4505,6 +4505,13 @@ struct PipewireThreadConfig {
     mainloop_ptr_out: Arc<Mutex<Option<usize>>>,
 }
 
+/// How long the PipeWire loop has to publish the pointer that stops it.
+///
+/// Generous, because exceeding it fails the capture: this is the difference
+/// between a slow machine and a loop that never came up, and only the second
+/// deserves an error.
+const PIPEWIRE_START_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn start_pipewire_thread(
     config: PipewireThreadConfig,
     latest: watch::Sender<Option<RawFrame>>,
@@ -4521,7 +4528,27 @@ fn start_pipewire_thread(
                 *slot = Some(err.to_string());
             }
         })?;
-    std::thread::sleep(Duration::from_millis(25));
+    // Wait for the loop to publish the pointer that stops it, rather than
+    // sleeping a fixed 25ms and hoping. A slower start left this holding `None`
+    // -- so `stop()` had nothing to signal, the thread outlived the capture it
+    // belonged to, and the failure was a leak rather than an error.
+    let deadline = Instant::now() + PIPEWIRE_START_TIMEOUT;
+    let started = loop {
+        if thread_error.lock().expect("error mutex poisoned").is_some() {
+            break false;
+        }
+        if mainloop_ptr
+            .lock()
+            .expect("mainloop pointer mutex poisoned")
+            .is_some()
+        {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
     let mut stop = PipewireThreadStop {
         mainloop_ptr,
         handle: Some(handle),
@@ -4529,6 +4556,13 @@ fn start_pipewire_thread(
     if let Some(err) = thread_error.lock().expect("error mutex poisoned").clone() {
         stop.stop();
         bail!("PipeWire thread failed to start: {err}");
+    }
+    if !started {
+        stop.stop();
+        bail!(
+            "PipeWire thread did not start within {}ms",
+            PIPEWIRE_START_TIMEOUT.as_millis()
+        );
     }
     Ok(stop)
 }
