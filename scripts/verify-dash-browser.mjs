@@ -61,6 +61,13 @@ try {
       errors.push(message.text());
     }
   });
+  // "Failed to load resource" in the console never names the resource, and a
+  // 404 with no URL is undiagnosable from a CI log. Record the request itself.
+  page.on('response', response => {
+    if (response.status() >= 400) {
+      errors.push(`HTTP ${response.status()} for ${response.url()}`);
+    }
+  });
   page.on('websocket', socket => {
     socket.on('framereceived', event => {
       if (!resolveNextLiveMedia || typeof event.payload !== 'string') return;

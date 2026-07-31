@@ -927,6 +927,7 @@ async fn serve(input: PathBuf, listen: SocketAddr, allow_non_loopback: bool) -> 
         .route("/assets/dash-viewer.js", get(viewer_js))
         .route("/assets/dash-viewer-page.js", get(viewer_page_js))
         .route("/assets/viewer-key.js", get(viewer_key_js))
+        .route("/api/streams", get(list_streams))
         .route("/api/dash/streams/{stream_id}/objects", get(list_objects))
         .route(
             "/api/dash/streams/{stream_id}/objects/{sequence}",
@@ -1074,6 +1075,38 @@ fn portable_paths(root: &FsPath) -> Result<Vec<PathBuf>> {
     }
     paths.sort();
     Ok(paths)
+}
+
+/// Lists the mirrored streams in the shape the viewer reads from a relay.
+///
+/// The viewer asks `/api/streams` for one thing beyond identity: the
+/// publisher's key-derivation salt, so a shared phrase can be resolved. A
+/// portable transfer does not carry the salt, so it is `null` here and a raw
+/// viewer key is what unlocks a mirror. Before this endpoint existed the page's
+/// lookup got a 404 -- harmless to a raw key, but Chromium reports every 404
+/// response as a console error, which failed the browser gate on a fetch the
+/// code had already handled.
+async fn list_streams(
+    State(state): State<OfflineState>,
+) -> Result<Json<Vec<serde_json::Value>>, OfflineError> {
+    let streams = load_all(&state)
+        .await?
+        .into_iter()
+        .map(|object| object.header.stream_id)
+        .collect::<BTreeSet<_>>();
+    Ok(Json(
+        streams
+            .into_iter()
+            .map(|stream_id| {
+                serde_json::json!({
+                    "stream_id": stream_id,
+                    "display_name": stream_id.to_string(),
+                    "active": false,
+                    "viewer_key_salt": serde_json::Value::Null,
+                })
+            })
+            .collect(),
+    ))
 }
 
 async fn index(State(state): State<OfflineState>) -> Result<Html<String>, OfflineError> {
