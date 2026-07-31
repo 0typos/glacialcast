@@ -1053,9 +1053,15 @@ fn annex_b_to_avcc(access_unit: &[u8]) -> Result<(Vec<u8>, Vec<std::ops::Range<u
     for nal in nals {
         put_u32(&mut sample, nal.len() as u32);
         sample.extend_from_slice(nal);
-        if nal.len() > 1 {
+        // Every NAL needs an entry, including one too short to hold any
+        // encrypted bytes. CENC defines a sample by its subsample table, so an
+        // entry left out does not make that NAL clear -- it makes the table
+        // stop short of the sample, and a decoder has no defined way to read
+        // the remainder. A one-byte NAL yields an empty encrypted range, which
+        // is five clear bytes and nothing protected.
+        if !nal.is_empty() {
             let start = sample.len() - nal.len() + 1;
-            encrypted_ranges.push(start..sample.len());
+            encrypted_ranges.push(start.min(sample.len())..sample.len());
         }
     }
     Ok((sample, encrypted_ranges))
@@ -1760,5 +1766,51 @@ mod tests {
         assert!(!verify_object_authentication(
             &key, b"header", b"other", &tag
         ));
+    }
+    #[test]
+    fn every_byte_of_a_sample_is_covered_by_the_subsample_table() {
+        // CENC requires the subsample table to account for the whole sample:
+        // each entry is (clear, encrypted) and the sum must equal its length.
+        // A decoder handed a table that stops short has no defined way to read
+        // the rest, which is why this fails silently rather than loudly.
+        let key = [7u8; 16];
+        let cases: &[(&str, &[u8])] = &[
+            (
+                "ordinary slice",
+                &[0, 0, 0, 1, 0x65, 1, 2, 3, 4, 5, 6, 7, 8],
+            ),
+            // A one-byte NAL: an end-of-sequence or end-of-stream marker is
+            // exactly this, and a static picture is where an encoder emits the
+            // smallest units it has.
+            (
+                "one-byte NAL present",
+                &[0, 0, 0, 1, 0x65, 9, 9, 9, 0, 0, 0, 1, 0x0a],
+            ),
+        ];
+        for (name, annex_b) in cases {
+            let fragment = build_encrypted_fragment(
+                &key,
+                FragmentInput {
+                    sequence: 1,
+                    decode_time: 0,
+                    duration: 3000,
+                    keyframe: true,
+                    annex_b,
+                    iv: [1u8; 16],
+                },
+            )
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let covered: usize = fragment
+                .subsamples
+                .iter()
+                .map(|s| usize::from(s.clear_bytes) + s.encrypted_bytes as usize)
+                .sum();
+            assert_eq!(
+                covered,
+                fragment.encrypted_sample.len(),
+                "{name}: subsample table covers {covered} of {} sample bytes",
+                fragment.encrypted_sample.len()
+            );
+        }
     }
 }
