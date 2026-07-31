@@ -75,6 +75,13 @@ use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+/// Bound when the listener is meant to be reached only from this host.
+const LOOPBACK_HOST: [u8; 4] = [127, 0, 0, 1];
+/// Bound when `--trusted-lan` opens the listener to the local network.
+const LAN_HOST: [u8; 4] = [0, 0, 0, 0];
+const DEFAULT_CONTROL_PORT: u16 = 8899;
+const DEFAULT_INGEST_PORT: u16 = 8900;
+
 #[derive(Debug, Parser)]
 #[command(version)]
 struct Args {
@@ -89,18 +96,30 @@ struct Args {
     /// whatever happens to sit in a standard location on the host.
     #[arg(long, conflicts_with = "config")]
     no_config: bool,
-    #[arg(
-        long,
-        env = "GLACIALCAST_CONTROL_ADDR",
-        default_value = "127.0.0.1:8899"
-    )]
-    control_addr: SocketAddr,
-    #[arg(
-        long,
-        env = "GLACIALCAST_INGEST_ADDR",
-        default_value = "127.0.0.1:8900"
-    )]
-    ingest_addr: SocketAddr,
+    /// HTTP listener for the viewer and the dashboard.
+    ///
+    /// Defaults to `127.0.0.1:8899`, or to `0.0.0.0:8899` under `--trusted-lan`.
+    #[arg(long, env = "GLACIALCAST_CONTROL_ADDR")]
+    control_addr: Option<SocketAddr>,
+    /// Publisher ingest listener.
+    ///
+    /// Defaults to `127.0.0.1:8900`, or to `0.0.0.0:8900` under `--trusted-lan`.
+    #[arg(long, env = "GLACIALCAST_INGEST_ADDR")]
+    ingest_addr: Option<SocketAddr>,
+    /// Serves a local network that is trusted: binds both listeners to every
+    /// interface, serves plaintext HTTP, and accepts publishers that present no
+    /// ingest token.
+    ///
+    /// This is the operator asserting the network is not hostile. Any host that
+    /// can reach the ingest port may then publish a stream. What it does not
+    /// give away: stream contents stay end-to-end encrypted, so a listener
+    /// without the viewer key sees ciphertext, and publishers still pin the
+    /// relay's Noise identity with `--ingest-server-key`.
+    ///
+    /// Refused together with an Internet `security.public_origin`. An address
+    /// given explicitly still wins over the defaults above.
+    #[arg(long, env = "GLACIALCAST_TRUSTED_LAN")]
+    trusted_lan: bool,
     #[arg(long, env = "GLACIALCAST_DATA_DIR", default_value = "data")]
     data_dir: PathBuf,
     #[arg(long, env = "GLACIALCAST_INGEST_KEY_FILE")]
@@ -130,6 +149,85 @@ struct Args {
     daemon_status: bool,
     #[arg(long)]
     log_file: Option<PathBuf>,
+}
+
+/// Where the two listeners bind, and what the deployment profile implies about
+/// the credentials reaching them.
+#[derive(Debug, PartialEq, Eq)]
+struct ListenerPlan {
+    control_addr: SocketAddr,
+    ingest_addr: SocketAddr,
+    /// Whether a configured ingest token must clear the 32-byte floor that
+    /// exists because an Internet-facing token is guessed at from anywhere.
+    require_strong_ingest: bool,
+}
+
+/// Resolves the listener addresses and enforces the rules tying a deployment
+/// profile to the network it is exposed on.
+///
+/// `--trusted-lan` is the operator asserting the local network is not hostile.
+/// It supplies the wildcard defaults, stands in for `--allow-insecure-http`,
+/// and waives both the ingest token that a non-loopback ingest listener
+/// otherwise demands and the token-strength floor above. An address given
+/// explicitly still wins over the defaults it carries.
+///
+/// `--trusted-lan` and Internet mode are refused together: one serves plaintext
+/// to a local segment and the other insists every public byte crossed TLS at a
+/// named origin, so the combination has no coherent reading.
+///
+/// # Errors
+///
+/// Returns an error when `--trusted-lan` is combined with an Internet
+/// `security.public_origin`; when a non-loopback HTTP listener is requested
+/// without either relaxation; when Internet mode is given a non-loopback HTTP
+/// listener; or when a non-loopback ingest listener is left without both an
+/// ingest token and `--trusted-lan`.
+fn plan_listeners(
+    args: &Args,
+    internet_mode: bool,
+    ingest_require_token: bool,
+) -> Result<ListenerPlan> {
+    if args.trusted_lan && internet_mode {
+        anyhow::bail!(
+            "--trusted-lan serves plaintext HTTP to a local network and cannot be combined with security.public_origin"
+        );
+    }
+    // A trusted LAN deployment is unreachable until it binds past loopback, so
+    // the flag carries the wildcard defaults rather than making every operator
+    // restate them alongside it.
+    let host = if args.trusted_lan {
+        LAN_HOST
+    } else {
+        LOOPBACK_HOST
+    };
+    let control_addr = args
+        .control_addr
+        .unwrap_or_else(|| SocketAddr::from((host, DEFAULT_CONTROL_PORT)));
+    let ingest_addr = args
+        .ingest_addr
+        .unwrap_or_else(|| SocketAddr::from((host, DEFAULT_INGEST_PORT)));
+    let allow_insecure_http = args.allow_insecure_http || args.trusted_lan;
+    if !control_addr.ip().is_loopback() && !allow_insecure_http {
+        anyhow::bail!(
+            "refusing a non-loopback HTTP listener; bind --control-addr to loopback behind an HTTPS reverse proxy, or pass --trusted-lan (or --allow-insecure-http) to serve a local network in plaintext"
+        );
+    }
+    if internet_mode && !control_addr.ip().is_loopback() {
+        anyhow::bail!(
+            "Internet mode requires a loopback HTTP listener behind the configured HTTPS origin"
+        );
+    }
+    if !ingest_addr.ip().is_loopback() && !ingest_require_token && !args.trusted_lan {
+        anyhow::bail!(
+            "a non-loopback ingest listener requires ingest.require_token = true, or --trusted-lan to accept publishers that present no token"
+        );
+    }
+    Ok(ListenerPlan {
+        control_addr,
+        ingest_addr,
+        require_strong_ingest: internet_mode
+            || (!ingest_addr.ip().is_loopback() && !args.trusted_lan),
+    })
 }
 
 #[derive(Clone)]
@@ -564,25 +662,16 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
     validate_limits(&limits)?;
     let public_origin = normalize_public_origin(configured_public_origin)?;
     let internet_mode = public_origin.is_some();
-    let require_strong_ingest = internet_mode || !args.ingest_addr.ip().is_loopback();
-    if !args.control_addr.ip().is_loopback() && !args.allow_insecure_http {
-        anyhow::bail!(
-            "refusing a non-loopback HTTP listener; bind --control-addr to loopback behind an HTTPS reverse proxy or explicitly pass --allow-insecure-http for a trusted LAN"
-        );
-    }
-    if internet_mode && !args.control_addr.ip().is_loopback() {
-        anyhow::bail!(
-            "Internet mode requires a loopback HTTP listener behind the configured HTTPS origin"
-        );
-    }
+    let ListenerPlan {
+        control_addr,
+        ingest_addr,
+        require_strong_ingest,
+    } = plan_listeners(&args, internet_mode, config.ingest.require_token)?;
     if trust_forwarded_for && !internet_mode {
         anyhow::bail!("security.trust_forwarded_for requires an HTTPS public_origin");
     }
     if internet_mode && !config.ingest.require_token {
         anyhow::bail!("Internet mode requires ingest.require_token = true");
-    }
-    if !args.ingest_addr.ip().is_loopback() && !config.ingest.require_token {
-        anyhow::bail!("a non-loopback ingest listener requires ingest.require_token = true");
     }
     tokio::fs::create_dir_all(&args.data_dir)
         .await
@@ -712,7 +801,6 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
         });
     }
 
-    let ingest_addr = args.ingest_addr;
     let ingest_state = state.clone();
     let ingest_shutdown = shutdown_rx.clone();
     tokio::spawn(async move {
@@ -796,13 +884,34 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
             }
         }));
 
+    if args.trusted_lan {
+        warn!(
+            control = %control_addr,
+            ingest = %ingest_addr,
+            "serving a trusted LAN in plaintext; any host that can reach the ingest port may publish a stream, and stream contents stay end-to-end encrypted"
+        );
+        // The publisher side of this profile is complete, but the browser side
+        // is not, and the operator finds that out as a viewer that refuses to
+        // play rather than as anything the relay said. A plaintext non-loopback
+        // origin is not a secure context, so Web Crypto and Encrypted Media
+        // Extensions are both absent and the player stops at validatePlatform.
+        if !control_addr.ip().is_loopback() {
+            warn!(
+                port = control_addr.port(),
+                "browsers reaching this relay at a plaintext address other than loopback cannot \
+                 play: encrypted playback needs a secure context. Publishing works; for viewing, \
+                 forward this port over SSH to the viewer's own loopback, or serve HTTPS with the \
+                 Internet profile"
+            );
+        }
+    }
     info!(
-        control = %args.control_addr,
-        ingest = %args.ingest_addr,
+        control = %control_addr,
+        ingest = %ingest_addr,
         ingest_server_key,
         "glacialcast server listening"
     );
-    let listener = TcpListener::bind(args.control_addr).await?;
+    let listener = TcpListener::bind(control_addr).await?;
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -2085,6 +2194,134 @@ mod tests {
                 previous_tokens: Vec::new(),
             }],
         }
+    }
+
+    /// Parses from an explicit argv so the flag wiring is covered too, and so a
+    /// `GLACIALCAST_*` variable in the developer's shell cannot decide the
+    /// result.
+    fn server_args(flags: &[&str]) -> Args {
+        let mut argv = vec!["glacialcast-server"];
+        argv.extend_from_slice(flags);
+        Args::parse_from(argv)
+    }
+
+    #[test]
+    fn listeners_stay_on_loopback_without_a_profile() {
+        let plan = plan_listeners(&server_args(&[]), false, false).unwrap();
+        assert_eq!(plan.control_addr, "127.0.0.1:8899".parse().unwrap());
+        assert_eq!(plan.ingest_addr, "127.0.0.1:8900".parse().unwrap());
+        // A loopback ingest listener is reachable only from this host, so no
+        // token is demanded and none has a strength floor to clear.
+        assert!(!plan.require_strong_ingest);
+    }
+
+    #[test]
+    fn trusted_lan_opens_both_listeners_and_waives_the_ingest_token() {
+        // The point of the flag: this is the whole publisher-side setup, with
+        // no server.toml and no shared secret.
+        let plan = plan_listeners(&server_args(&["--trusted-lan"]), false, false).unwrap();
+        assert_eq!(plan.control_addr, "0.0.0.0:8899".parse().unwrap());
+        assert_eq!(plan.ingest_addr, "0.0.0.0:8900".parse().unwrap());
+        // The floor exists for tokens guessed at from the Internet, and this
+        // listener is not on it.
+        assert!(!plan.require_strong_ingest);
+    }
+
+    #[test]
+    fn an_explicit_address_wins_over_the_profile_default() {
+        let plan = plan_listeners(
+            &server_args(&["--trusted-lan", "--control-addr", "127.0.0.1:9100"]),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(plan.control_addr, "127.0.0.1:9100".parse().unwrap());
+        // Only the address that was named moves; the other keeps the default
+        // the profile carries.
+        assert_eq!(plan.ingest_addr, "0.0.0.0:8900".parse().unwrap());
+    }
+
+    #[test]
+    fn a_non_loopback_listener_is_refused_without_a_profile() {
+        // Neither relaxation is in play, so both listeners must be refused
+        // rather than quietly served in plaintext or without a token.
+        let plaintext = plan_listeners(
+            &server_args(&["--control-addr", "0.0.0.0:8899"]),
+            false,
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            plaintext.contains("refusing a non-loopback HTTP listener"),
+            "{plaintext}"
+        );
+
+        let untokened = plan_listeners(
+            &server_args(&["--ingest-addr", "0.0.0.0:8900"]),
+            false,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            untokened.contains("requires ingest.require_token"),
+            "{untokened}"
+        );
+    }
+
+    #[test]
+    fn trusted_lan_is_refused_alongside_internet_mode() {
+        // The two profiles describe opposite networks. Letting this through
+        // would serve a public origin's traffic in plaintext and accept
+        // publishers off the Internet with no token at all.
+        let error = plan_listeners(&server_args(&["--trusted-lan"]), true, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("cannot be combined with security.public_origin"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn internet_mode_keeps_its_loopback_and_strength_requirements() {
+        // The trusted-LAN work must not have loosened the Internet profile.
+        let error = plan_listeners(
+            &server_args(&["--control-addr", "0.0.0.0:8899", "--allow-insecure-http"]),
+            true,
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("Internet mode requires a loopback HTTP listener"),
+            "{error}"
+        );
+
+        let plan = plan_listeners(&server_args(&[]), true, true).unwrap();
+        assert!(plan.require_strong_ingest);
+    }
+
+    #[test]
+    fn allow_insecure_http_alone_still_demands_an_ingest_token() {
+        // The older flag only ever spoke for the HTTP listener. Reading it as a
+        // blanket trusted-LAN assertion would waive a token the operator never
+        // agreed to waive.
+        let error = plan_listeners(
+            &server_args(&[
+                "--allow-insecure-http",
+                "--control-addr",
+                "0.0.0.0:8899",
+                "--ingest-addr",
+                "0.0.0.0:8900",
+            ]),
+            false,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("requires ingest.require_token"), "{error}");
     }
 
     #[test]
