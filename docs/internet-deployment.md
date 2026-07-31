@@ -9,7 +9,16 @@ publish the relay's plaintext HTTP port.
 
 - Caddy terminates TLS, renews the public certificate, overwrites
   `X-Forwarded-For`, and proxies HTTP and WebSocket traffic to
-  `127.0.0.1:8899`.
+  `127.0.0.1:8899`. The overwrite is the `header_up X-Forwarded-For
+  {remote_host}` line in the example: without it Caddy *appends* to whatever
+  the client sent, and the header becomes partly client-written.
+- The relay reads the **rightmost** `X-Forwarded-For` entry, which is the only
+  one a proxy writes itself, so it is correct whether the proxy appends or
+  overwrites. Both halves are deliberate: the relay does not depend on the
+  proxy being configured correctly, and the proxy does not leave a forgeable
+  value in the access log. This assumes exactly one trusted proxy — behind two,
+  the relay attributes traffic to the inner one, which binds its limits tighter
+  rather than trusting a forged address.
 - The relay authenticates browser access itself. Viewer sessions use a signed
   `__Host-` cookie with `HttpOnly`, `Secure`, and `SameSite=Strict`; state
   changes additionally require an exact origin and a session-bound CSRF value.
