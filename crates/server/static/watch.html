@@ -4,60 +4,68 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'">
-  <title>GlacialCast Multi-stream Viewer</title>
+  <title>GlacialCast</title>
   <link rel="stylesheet" href="/assets/watch.css">
 </head>
-<body>
+<!-- Which of the two pages this is depends on whether a remembered key opens
+     anything, and that is not known until the stream list arrives. Until then
+     neither is shown, rather than guessing and visibly correcting it. -->
+<body class="deciding">
   <header>
     <div class="header-title">
-      <button id="sidebar-toggle" type="button" class="icon-button"
+      <button id="sidebar-toggle" type="button" class="toggle-button"
               aria-controls="sidebar" aria-expanded="true"
-              title="Hide the stream list">
+              title="Hide the stream list ([)">
         <span aria-hidden="true">☰</span>
-        <span class="visually-hidden">Toggle the stream list</span>
+        <span class="toggle-label">Streams</span>
       </button>
-      <div>
-        <h1>GlacialCast</h1>
-        <div id="headline" class="muted">Watch up to four encrypted streams</div>
-      </div>
+      <h1>GlacialCast</h1>
     </div>
     <div class="header-actions">
-      <div class="layouts" role="group" aria-label="Layout">
+      <div id="layouts" class="layouts" role="group" aria-label="Tiles">
         <button type="button" data-layout="1" aria-pressed="true">1</button>
         <button type="button" data-layout="2" aria-pressed="false">2</button>
         <button type="button" data-layout="4" aria-pressed="false">4</button>
       </div>
-      <a href="/streams">All streams</a>
+      <a href="/streams" class="quiet-link">Dashboard</a>
     </div>
   </header>
 
   <main>
     <aside id="sidebar" aria-labelledby="sidebar-title">
-      <h2 id="sidebar-title">Your streams</h2>
-
+      <h2 id="sidebar-title">Streams</h2>
       <ul id="stream-list" class="stream-list"></ul>
-      <p id="empty-hint" class="help" hidden>
-        No streams unlocked yet. Enter the viewing key you were given.
-      </p>
-
-      <form id="unlock" class="panel">
-        <label for="viewing-key">Viewing key</label>
-        <input id="viewing-key" type="password" autocomplete="off" spellcheck="false"
-               placeholder="seven words, or a viewer key" required>
-        <button type="submit">Unlock</button>
-        <p id="unlock-status" class="help" role="status"></p>
-        <p id="unlock-error" class="error" role="alert" hidden></p>
-        <p class="help">
-          One key unlocks every screen a publisher casts, and you only enter it
-          once — it is remembered on this browser and never sent to the relay.
-          Use “Forget keys” on a shared computer.
-        </p>
-      </form>
-
+      <div id="sidebar-unlock" class="unlock-slot" hidden>
+        <h3>Add another key</h3>
+      </div>
       <button id="forget-all" type="button" class="danger" hidden>Forget keys</button>
     </aside>
 
     <section id="grid" class="grid layout-1" aria-label="Stream tiles"></section>
+
+    <!-- The first thing a viewer sees, and the only thing they can act on until
+         a key opens something. The unlock form below is moved in here while
+         that is true, and into the panel once it is not. -->
+    <section id="welcome" aria-labelledby="welcome-title">
+      <div class="welcome-card">
+        <h2 id="welcome-title">Watch a screen</h2>
+        <p class="welcome-lead">Enter the viewing key you were given.</p>
+        <div id="welcome-unlock" class="unlock-slot">
+          <form id="unlock">
+            <label for="viewing-key" class="visually-hidden">Viewing key</label>
+            <input id="viewing-key" type="password" autocomplete="off" spellcheck="false"
+                   placeholder="seven words, or a viewer key" required>
+            <button type="submit">Watch</button>
+            <p id="unlock-status" class="help" role="status"></p>
+            <p id="unlock-error" class="error" role="alert" hidden></p>
+          </form>
+        </div>
+        <p class="help">
+          One key opens every screen a publisher casts, and you enter it once —
+          it is remembered on this browser and never sent to the relay.
+        </p>
+      </div>
+    </section>
   </main>
 
   <template id="tile-template">
@@ -73,7 +81,7 @@
         <div data-role="stage" class="stage">
           <video data-role="video" muted autoplay playsinline></video>
           <canvas data-role="cursor-layer" aria-hidden="true"></canvas>
-          <div data-role="stage-message" class="stage-message">Drop a stream here</div>
+          <div data-role="stage-message" class="stage-message">Pick a stream</div>
         </div>
       </div>
       <div class="tile-status">

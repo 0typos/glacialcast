@@ -61,6 +61,30 @@ try {
 
   await page.goto(`${origin}/`, { waitUntil: 'domcontentloaded' });
 
+  // Before a key opens anything there is one thing to do, and the page shows
+  // only that. It used to open on a grid of empty tiles inviting a drop the
+  // viewer had nothing to make.
+  // Which page this is depends on the stream list, so wait for that to have
+  // been decided rather than reading the markup's starting point back.
+  await page.waitForFunction(
+    () => !document.body.classList.contains('deciding'),
+    null,
+    { timeout: 30_000 },
+  );
+  const firstRun = await page.evaluate(() => ({
+    asking: document.body.classList.contains('empty'),
+    unlockVisible: Boolean(document.querySelector('#welcome #unlock')),
+    tilesVisible: [...document.querySelectorAll('.tile')]
+      .filter(tile => tile.checkVisibility?.() ?? tile.offsetParent !== null).length,
+  }));
+  if (!firstRun.asking || !firstRun.unlockVisible) {
+    throw new Error('the first run did not open on the key prompt');
+  }
+  if (firstRun.tilesVisible !== 0) {
+    throw new Error(`the first run showed ${firstRun.tilesVisible} tile(s) before anything unlocked`);
+  }
+  console.log('the first run opens on the key prompt, with no empty tiles');
+
   // A wrong key has to be reported as wrong. Silently unlocking nothing, or
   // unlocking tiles that then fail to decode, is the failure this guards.
   await page.locator('#viewing-key').fill('able-about-acid-acorn-acre-actor-adapt');
@@ -159,6 +183,27 @@ try {
   await page.locator('#sidebar-toggle').click();
   await page.waitForFunction(() => globalThis.GlacialCastWatch.sidebarCollapsed() === false);
   console.log('sidebar collapsed, stayed collapsed across a reload, and reopened');
+
+  // Hiding the list is something done while watching, so it is worth a key as
+  // well as a trip to the header.
+  await page.locator('.tile').first().click();
+  await page.keyboard.press('[');
+  await page.waitForFunction(() => globalThis.GlacialCastWatch.sidebarCollapsed() === true, null, {
+    timeout: 5_000,
+  });
+  await page.keyboard.press('[');
+  await page.waitForFunction(() => globalThis.GlacialCastWatch.sidebarCollapsed() === false, null, {
+    timeout: 5_000,
+  });
+
+  // The same key inside the field is a character, not a command: a viewer
+  // typing a key must not have the panel toggling under them.
+  await page.locator('#viewing-key').fill('');
+  await page.locator('#viewing-key').press('[');
+  if (await page.evaluate(() => globalThis.GlacialCastWatch.sidebarCollapsed())) {
+    throw new Error('typing in the key field collapsed the panel');
+  }
+  console.log('the shortcut toggles the panel, and is inert while typing a key');
 
   if (errors.length > 0) {
     throw new Error(`browser reported errors:\n${errors.join('\n')}`);
