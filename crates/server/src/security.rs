@@ -973,30 +973,50 @@ impl FixedWindowLimiter {
     }
 }
 
+/// Resolves the address a request came from, honouring a trusted proxy.
+///
+/// Returns the peer address unless `trust_forwarded_for` says a trusted proxy
+/// terminates connections in front of this listener, which is only ever true in
+/// the Internet profile.
+///
+/// The **rightmost** `X-Forwarded-For` entry is the answer, not the leftmost.
+/// A proxy appends the address of the connection it accepted, so the last entry
+/// is the only one it wrote itself; everything to its left arrived in the
+/// client's own request and is forgeable. Reading the leftmost entry let any
+/// client choose the address this server rate-limits and logs it by, which
+/// defeated the per-address login limiter entirely and put attacker-chosen
+/// addresses in the audit log.
+///
+/// Exactly one trusted proxy is assumed, matching the deployment this ships
+/// with. Behind two, the last entry is the inner proxy rather than the client,
+/// which over-attributes traffic to one address rather than trusting a forged
+/// one -- the limits bind tighter, not looser.
 pub fn client_ip(headers: &HeaderMap, peer: IpAddr, trust_forwarded_for: bool) -> IpAddr {
     if !trust_forwarded_for {
         return peer;
     }
-    let Some(value) = headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-    else {
-        return peer;
-    };
-    if value.len() > 512 || value.trim() != value {
-        return peer;
+    // Repeated field lines are one list in order, so a client that sends its
+    // own header makes the proxy's value a second line rather than extending
+    // the first. Reading only the first line would read only the client's.
+    let mut addresses: Vec<IpAddr> = Vec::new();
+    for value in headers.get_all("x-forwarded-for") {
+        let Ok(value) = value.to_str() else {
+            return peer;
+        };
+        if value.len() > 512 || value.trim() != value {
+            return peer;
+        }
+        for entry in value.split(',') {
+            let Ok(address) = entry.trim().parse::<IpAddr>() else {
+                return peer;
+            };
+            addresses.push(address);
+            if addresses.len() > 16 {
+                return peer;
+            }
+        }
     }
-    let addresses: Option<Vec<IpAddr>> = value
-        .split(',')
-        .map(|value| value.trim().parse::<IpAddr>().ok())
-        .collect();
-    let Some(addresses) = addresses else {
-        return peer;
-    };
-    if addresses.is_empty() || addresses.len() > 16 {
-        return peer;
-    }
-    addresses[0]
+    addresses.last().copied().unwrap_or(peer)
 }
 
 fn unix_time_seconds() -> Result<u64> {
@@ -1441,15 +1461,45 @@ mod tests {
         headers.insert("x-forwarded-for", "203.0.113.8".parse().unwrap());
         assert_eq!(client_ip(&headers, peer, false), peer);
         assert_eq!(client_ip(&headers, peer, true), forwarded);
+        headers.insert("x-forwarded-for", "invalid, 203.0.113.8".parse().unwrap());
+        assert_eq!(client_ip(&headers, peer, true), peer);
+    }
+
+    #[test]
+    fn a_client_cannot_choose_the_address_it_is_limited_and_logged_by() {
+        let peer: IpAddr = "127.0.0.1".parse().unwrap();
+        // What the proxy actually saw, appended after whatever the client sent.
+        let proxy_saw: IpAddr = "203.0.113.8".parse().unwrap();
+
+        // One header, client value first. Reading the leftmost entry here is
+        // what let a caller rotate the key the login limiter counts by.
+        let mut headers = HeaderMap::new();
         headers.insert(
             "x-forwarded-for",
             "198.51.100.2, 203.0.113.8".parse().unwrap(),
         );
-        assert_eq!(
-            client_ip(&headers, peer, true),
-            "198.51.100.2".parse::<IpAddr>().unwrap()
-        );
-        headers.insert("x-forwarded-for", "invalid, 203.0.113.8".parse().unwrap());
+        assert_eq!(client_ip(&headers, peer, true), proxy_saw);
+
+        // Two header lines, which is what a client sending its own header
+        // produces when the proxy adds rather than replaces. Reading only the
+        // first line would read only the client's.
+        let mut headers = HeaderMap::new();
+        headers.append("x-forwarded-for", "198.51.100.2".parse().unwrap());
+        headers.append("x-forwarded-for", "203.0.113.8".parse().unwrap());
+        assert_eq!(client_ip(&headers, peer, true), proxy_saw);
+
+        // A forged chain long enough to hide the real entry is refused outright
+        // rather than attributed to whatever sits at the end of it.
+        let mut headers = HeaderMap::new();
+        let flood = std::iter::repeat_n("198.51.100.2", 17)
+            .collect::<Vec<_>>()
+            .join(", ");
+        headers.insert("x-forwarded-for", flood.parse().unwrap());
         assert_eq!(client_ip(&headers, peer, true), peer);
+
+        // And none of this applies without a proxy in front: the peer wins.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "198.51.100.2".parse().unwrap());
+        assert_eq!(client_ip(&headers, peer, false), peer);
     }
 }
