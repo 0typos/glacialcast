@@ -239,7 +239,15 @@ async fn handle_control_connection(
             // SAFETY: the target is this live process ID and SIGTERM is a
             // valid signal number; no pointer or borrowed memory crosses FFI.
             unsafe {
-                libc::kill(std::process::id() as libc::pid_t, libc::SIGTERM);
+                libc::kill(
+                    // Linux process IDs fit in `pid_t` by construction; this is
+                    // this process's own ID, not a value from anywhere else.
+                    #[allow(clippy::cast_possible_wrap, reason = "a pid always fits in pid_t")]
+                    {
+                        std::process::id() as libc::pid_t
+                    },
+                    libc::SIGTERM,
+                );
             }
             #[cfg(not(unix))]
             {

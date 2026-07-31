@@ -244,6 +244,10 @@ impl DashObjectHeader {
     /// Encodes the canonical header bytes covered by object authentication.
     ///
     /// The authentication tag itself is deliberately excluded.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "a MIME type longer than u16::MAX is refused on the first line"
+    )]
     pub fn authentication_bytes(&self) -> Result<Vec<u8>> {
         if self.mime.len() > u16::MAX as usize {
             return Err(ProtocolError::InvalidDashMetadata("MIME type is too long"));
@@ -618,6 +622,10 @@ pub struct PublicStream {
 }
 
 /// Returns the current Unix timestamp in milliseconds.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "milliseconds since 1970 exceed i64 around the year 292 million"
+)]
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -667,6 +675,11 @@ pub fn decode_key_b64(key: &str) -> Result<[u8; 32]> {
 /// assert_eq!(parse_human_bytes("2GB")?, 2_000_000_000);
 /// # Ok::<(), String>(())
 /// ```
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the value is refused above u64::MAX and below zero before rounding"
+)]
 pub fn parse_human_bytes(value: &str) -> std::result::Result<u64, String> {
     let value = value.trim();
     if value.is_empty() {
@@ -704,6 +717,10 @@ pub fn parse_human_bytes(value: &str) -> std::result::Result<u64, String> {
 /// Writes one length-prefixed unencrypted handshake packet.
 ///
 /// The packet is bounded by Noise's 65,535-byte wire-message limit.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "lengths above MAX_WIRE_PACKET_LEN are refused on the line above"
+)]
 pub async fn write_clear_frame<W: AsyncWrite + Unpin>(writer: &mut W, data: &[u8]) -> Result<()> {
     if data.len() > MAX_WIRE_PACKET_LEN {
         return Err(ProtocolError::FrameTooLarge(data.len()));
@@ -965,6 +982,10 @@ where
     }
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "both lengths are refused above u32::MAX immediately below"
+)]
 fn noise_segment(total_len: usize, offset: usize, chunk: &[u8]) -> Result<Vec<u8>> {
     if total_len > u32::MAX as usize
         || offset > u32::MAX as usize
@@ -1184,7 +1205,7 @@ mod tests {
 
     #[tokio::test]
     async fn clear_frame_rejects_oversized_wire_packet_before_reading_payload() {
-        let advertised_length = (MAX_WIRE_PACKET_LEN as u32 + 1).to_be_bytes();
+        let advertised_length = (u32::try_from(MAX_WIRE_PACKET_LEN).unwrap() + 1).to_be_bytes();
         assert!(matches!(
             read_clear_frame(&mut advertised_length.as_slice()).await,
             Err(ProtocolError::FrameTooLarge(length)) if length == MAX_WIRE_PACKET_LEN + 1
@@ -1422,7 +1443,10 @@ mod tests {
             Err(ProtocolError::InvalidPortableDashObject)
         ));
 
-        for header_length in [0u32, MAX_PORTABLE_DASH_HEADER_LEN as u32 + 1] {
+        for header_length in [
+            0u32,
+            u32::try_from(MAX_PORTABLE_DASH_HEADER_LEN).unwrap() + 1,
+        ] {
             let mut malformed = Vec::from(&PORTABLE_DASH_MAGIC[..]);
             malformed.extend_from_slice(&header_length.to_be_bytes());
             assert!(matches!(

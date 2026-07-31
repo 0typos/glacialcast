@@ -62,3 +62,13 @@ zvariant = "5.11"
 # cros-libva 0.0.12 does not initialize libva 1.23's new VP9 fields. Keep
 # cros-codecs' expected API and carry the one-line forward-compatibility fix.
 cros-libva = { path = "vendor/cros-libva" }
+
+# Numeric conversions that can silently lose data, denied in the crates that
+# parse untrusted bytes and build authenticated ones. Most existing casts are
+# already guarded a line or two above; this is what keeps the next one from
+# not being. Opted into per crate, because the client is mostly FFI where
+# casting to a C type is the point.
+[workspace.lints.clippy]
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_sign_loss = "deny"
