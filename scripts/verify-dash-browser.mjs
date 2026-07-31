@@ -10,6 +10,15 @@ const { chromium, firefox } = require(playwrightModule);
 const [origin, streamId, viewerKey, browserName = 'firefox'] = process.argv.slice(2);
 const accessToken = process.env.GLACIALCAST_VERIFY_ACCESS_TOKEN;
 const minimumEpochs = Number(process.env.GLACIALCAST_VERIFY_MIN_EPOCHS || 1);
+// How long the first live append may take after the relay announced the object.
+//
+// The default is what a developer machine does, and it is the number worth
+// holding the product to. It is raised only where the measurement stops being
+// about the relay: this is the first append after a cold browser launch, and it
+// ends when Playwright observes the metrics text change, so a shared runner
+// scheduling a fresh Chromium inflates it without anything having been slow.
+// Firefox measured 21ms on the same runner where Chromium measured 713ms.
+const maxAppendLatencyMs = Number(process.env.GLACIALCAST_VERIFY_MAX_APPEND_MS || 250);
 const epochTransitionMarker = process.env.GLACIALCAST_VERIFY_EPOCH_TRANSITION_MARKER;
 if (!origin || !streamId || !viewerKey || !['firefox', 'chromium'].includes(browserName)) {
   console.error(
@@ -263,7 +272,7 @@ try {
     { timeout: 3_000 },
   );
   const liveAppendLatencyMs = Date.now() - announcedAt;
-  if (liveAppendLatencyMs > 250) {
+  if (liveAppendLatencyMs > maxAppendLatencyMs) {
     throw new Error(
       `live media append took ${liveAppendLatencyMs} ms after its relay announcement`,
     );
