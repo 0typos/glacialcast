@@ -28,7 +28,7 @@ aes-gcm = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 cros-codecs = { version = "0.0.6", features = ["vaapi"] }
-ctr = "0.9"
+ctr = "0.10"
 futures-util = "0.3"
 gbm = { version = "0.15", default-features = false }
 hkdf = "0.12"
