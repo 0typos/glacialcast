@@ -53,15 +53,23 @@ const STREAM_STALL_TIMEOUT_MS = 25_000;
 /**
  * What a stalled tile says.
  *
- * Firefox is named because it is the engine this happens on: it stalls on
- * encrypted media that Chromium plays from the same relay, with the same key,
- * byte for byte. Until that is fixed, the useful thing to tell someone staring
- * at a blank tile is which browser will show them the picture.
+ * Deliberately about what was observed rather than why. This message once named
+ * Firefox, because at the time every stall was the same one: samples of a
+ * second or longer, which Firefox will not decode and Chromium will. The
+ * publisher now keeps samples under that, so a tile reaching this is more
+ * likely to be something not yet seen than the cause that has been fixed --
+ * and sending someone to a different browser for a reason that no longer
+ * applies wastes the one clue they have.
+ *
+ * Another browser is still worth trying, as a way to tell an engine-specific
+ * problem from a stream-specific one. It is offered as a diagnostic rather than
+ * as the answer.
  */
 const STALLED_MESSAGE =
-  'This stream is not starting. Media is arriving but the browser has not '
-  + 'decoded a frame. Firefox is known to stall on encrypted playback that '
-  + 'Chromium plays from the same relay — try Chromium for this stream.';
+  'This stream is not starting. Media is arriving, but the browser has not '
+  + 'decoded a frame from it. Reloading often clears this. If it keeps '
+  + 'happening, opening the same stream in another browser will show whether '
+  + 'it is specific to this one.';
 const state = {
   /** Unlocked viewer keys as URL-safe base64, by stream ID. */
   keys: new Map(),
@@ -574,9 +582,8 @@ function mountPlayer(tile, streamId, key) {
  * media" message for as long as the page stayed open -- no error, no retry, and
  * nothing to act on.
  *
- * This does not diagnose the cause. It converts silence into a sentence, and
- * names the one thing a viewer can actually do about it, which is worth having
- * whatever the cause turns out to be.
+ * This does not diagnose the cause. It converts silence into a sentence, which
+ * is worth having whatever the cause turns out to be.
  */
 function watchForFirstFrame(tile, streamId) {
   clearTimeout(tile.stallTimer);
