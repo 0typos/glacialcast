@@ -2139,7 +2139,16 @@ async fn ingest_loop(
                 let is_new = object.header.sequence == expected_sequence;
                 let object_kind = object.header.kind;
                 let object_bytes = u64::from(object.header.payload_len);
-                let stored = state.dash_store.store(object)?;
+                // Off the runtime: storing an object writes the payload and
+                // appends to the journal, and fsyncs both. On the async path
+                // that parked a worker thread for the length of a disk flush,
+                // once per object per publisher, delaying every websocket and
+                // HTTP request sharing that thread. Retention already runs this
+                // way; the hot path is the one that needed it.
+                let store = state.dash_store.clone();
+                let stored = tokio::task::spawn_blocking(move || store.store(object))
+                    .await
+                    .context("joining the DASH store task")??;
                 last_seq = last_seq.max(stored.header.sequence);
                 if is_new {
                     state.traffic.record(stream_id, object_kind, object_bytes);
