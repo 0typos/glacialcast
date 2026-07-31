@@ -48,6 +48,20 @@ const MAX_TILES = 4;
 const STREAM_RETRY_INTERVAL_MS = 3_000;
 /** How often to look for screens the publisher added after this page loaded. */
 const STREAM_POLL_INTERVAL_MS = 10_000;
+/** How long a tile may sit without a decoded frame before it says so. */
+const STREAM_STALL_TIMEOUT_MS = 25_000;
+/**
+ * What a stalled tile says.
+ *
+ * Firefox is named because it is the engine this happens on: it stalls on
+ * encrypted media that Chromium plays from the same relay, with the same key,
+ * byte for byte. Until that is fixed, the useful thing to tell someone staring
+ * at a blank tile is which browser will show them the picture.
+ */
+const STALLED_MESSAGE =
+  'This stream is not starting. Media is arriving but the browser has not '
+  + 'decoded a frame. Firefox is known to stall on encrypted playback that '
+  + 'Chromium plays from the same relay — try Chromium for this stream.';
 const state = {
   /** Unlocked viewer keys as URL-safe base64, by stream ID. */
   keys: new Map(),
@@ -535,6 +549,7 @@ function mountPlayer(tile, streamId, key) {
       tile.element.classList.toggle('failed', Boolean(update.error));
     },
   });
+  watchForFirstFrame(tile, streamId);
   tile.player.start(key).catch(error => {
     // A tile reassigned or emptied while the start was in flight has already
     // been torn down, and must not be revived here.
@@ -550,9 +565,43 @@ function mountPlayer(tile, streamId, key) {
   });
 }
 
+/**
+ * Says something when a tile never produces a picture.
+ *
+ * Starting a player can fail without ever rejecting: the media element waits
+ * for a frame that never arrives, and the promise chain simply does not settle.
+ * Nothing downstream of that runs, so the tile kept its "Preparing encrypted
+ * media" message for as long as the page stayed open -- no error, no retry, and
+ * nothing to act on.
+ *
+ * This does not diagnose the cause. It converts silence into a sentence, and
+ * names the one thing a viewer can actually do about it, which is worth having
+ * whatever the cause turns out to be.
+ */
+function watchForFirstFrame(tile, streamId) {
+  clearTimeout(tile.stallTimer);
+  tile.stallTimer = setTimeout(() => {
+    tile.stallTimer = null;
+    if (tile.streamId !== streamId) return;
+    const video = tile.element.querySelector('[data-role="video"]');
+    // readyState below HAVE_CURRENT_DATA means no frame was ever decoded.
+    if (video && video.readyState >= 2) return;
+    tile.element.classList.add('failed');
+    tile.message.textContent = STALLED_MESSAGE;
+    // A slow start is not a permanent one. If a frame does arrive later the
+    // player clears the message itself, so the mark has to go with it rather
+    // than leaving a tile flagged for the rest of the session.
+    video?.addEventListener('playing', () => {
+      tile.element.classList.remove('failed');
+    }, { once: true });
+  }, STREAM_STALL_TIMEOUT_MS);
+}
+
 function detachTile(tile) {
   clearTimeout(tile.retryTimer);
   tile.retryTimer = null;
+  clearTimeout(tile.stallTimer);
+  tile.stallTimer = null;
   tile.player?.destroy();
   tile.player = null;
   tile.streamId = null;
