@@ -27,7 +27,10 @@ header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 1rem;
+  /* Wraps rather than pushing the page sideways: the title, the tile counts and
+     the dashboard link together are wider than a phone. */
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
   padding: 0.75rem 1rem;
   border-bottom: 1px solid var(--line);
 }
@@ -38,14 +41,15 @@ header {
   gap: 0.75rem;
 }
 
-.icon-button {
+/* Labelled rather than a bare glyph: hiding the list is a thing viewers are
+   meant to reach for, and an unexplained ☰ is not an invitation. */
+.toggle-button {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
-  width: 2.1rem;
+  gap: 0.5rem;
   height: 2.1rem;
-  padding: 0;
-  font-size: 1rem;
+  padding: 0 0.7rem;
+  font-size: 0.9rem;
   line-height: 1;
   color: var(--text);
   background: var(--panel);
@@ -54,8 +58,19 @@ header {
   cursor: pointer;
 }
 
-.icon-button:hover {
+.toggle-button:hover {
   border-color: var(--accent);
+}
+
+.toggle-label {
+  color: var(--muted);
+}
+
+/* Nothing to list means nothing to toggle, and nothing to tile means nothing to
+   lay out, so both controls go away rather than sitting there doing nothing. */
+body.empty .toggle-button,
+body.empty #layouts {
+  display: none;
 }
 
 .visually-hidden {
@@ -97,6 +112,17 @@ h3 {
 }
 
 a {
+  color: var(--accent);
+}
+
+/* The operations dashboard is not what someone came here to do, so it stays
+   reachable without competing with the streams. */
+.quiet-link {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.quiet-link:hover {
   color: var(--accent);
 }
 
@@ -150,9 +176,66 @@ button.danger {
 main {
   flex: 1;
   display: grid;
-  grid-template-columns: minmax(240px, 20rem) 1fr;
+  grid-template-columns: minmax(240px, 18rem) 1fr;
   min-height: 0;
   transition: grid-template-columns 160ms ease;
+}
+
+/* Before a key opens anything there is nothing to list and nothing to tile, so
+   the page is one card asking for the key. An empty grid of "drop a stream
+   here" tiles used to fill this screen, which offered a viewer four places to
+   drop something they did not have yet. */
+#welcome {
+  display: none;
+  place-items: center;
+  padding: 1.5rem;
+  overflow-y: auto;
+}
+
+/* Held rather than hidden: the layout is settled and the tiles are built, so
+   revealing it costs nothing and there is no reflow to see. */
+body.deciding main,
+body.deciding .toggle-button,
+body.deciding #layouts {
+  visibility: hidden;
+}
+
+body.empty main {
+  grid-template-columns: 1fr;
+}
+
+body.empty > main > aside,
+body.empty > main > #grid {
+  display: none;
+}
+
+body.empty #welcome {
+  display: grid;
+}
+
+.welcome-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  width: min(26rem, 100%);
+  padding: 1.5rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.welcome-card h2 {
+  margin: 0;
+  font-size: 1.25rem;
+}
+
+.welcome-lead {
+  margin: 0;
+  color: var(--muted);
+}
+
+.welcome-card .help {
+  margin: 0;
 }
 
 /* Collapsing folds the sidebar column to nothing rather than hiding it, so the
@@ -189,32 +272,52 @@ aside {
   gap: 1rem;
 }
 
-.panel {
+/* One form, moved between the welcome card and the panel rather than written
+   twice, so there is a single input to find however the viewer arrived. */
+#unlock {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+#viewing-key {
+  flex: 1 1 11rem;
+  min-width: 0;
+}
+
+#unlock-status,
+#unlock-error {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+#unlock-status:empty {
+  display: none;
+}
+
+/* In the panel the form has already done its job, so it stacks and recedes
+   instead of competing with the list of streams above it. */
+.unlock-slot {
   display: flex;
   flex-direction: column;
-  gap: 0.4rem;
-  padding: 0.75rem;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--panel);
+  gap: 0.5rem;
 }
 
-.panel label {
-  font-size: 0.8rem;
-  color: var(--muted);
+#sidebar-unlock {
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--line);
 }
 
-/* Once something is unlocked the form has done its job, so it recedes rather
-   than competing with the stream list. It stays available for a second
-   publisher's key. */
-.panel.secondary {
-  background: transparent;
-  opacity: 0.7;
+/* Stacking turns the row basis above into a height, which grew the input into a
+   block and pushed the status line out past the panel. */
+#sidebar-unlock #unlock {
+  flex-direction: column;
 }
 
-.panel.secondary:focus-within {
-  background: var(--panel);
-  opacity: 1;
+#sidebar-unlock #viewing-key,
+#sidebar-unlock #unlock-status,
+#sidebar-unlock #unlock-error {
+  flex: none;
 }
 
 .error {
@@ -233,15 +336,6 @@ aside {
 }
 
 .stream-list li {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  grid-template-areas: 'name hint' 'watch forget';
-  gap: 0.3rem 0.5rem;
-  align-items: center;
-  padding: 0.5rem 0.6rem;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--panel);
   cursor: grab;
 }
 
@@ -249,14 +343,27 @@ aside {
   cursor: grabbing;
 }
 
+/* The whole row is the control. It used to be a name, a status, and a separate
+   "Watch" button on its own line, which made a list of three screens taller
+   than it needed to be and left the obvious gesture -- click the thing you want
+   -- doing nothing. */
+.stream-pick {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.5rem 0.6rem;
+  text-align: left;
+}
+
 .stream-name {
-  grid-area: name;
   font-weight: 600;
   overflow-wrap: anywhere;
 }
 
 .stream-hint {
-  grid-area: hint;
+  flex: none;
   font-size: 0.75rem;
   color: var(--muted);
 }
@@ -265,13 +372,10 @@ aside {
   color: #7ec699;
 }
 
-.stream-list li button:first-of-type {
-  grid-area: watch;
-}
-
-.stream-list li button.link {
-  grid-area: forget;
-  justify-self: end;
+/* The tile a stream is already showing in, so picking it again is visibly a
+   no-op rather than an unexplained one. */
+.stream-list li.on-screen .stream-pick {
+  border-color: var(--accent);
 }
 
 .grid {
@@ -403,5 +507,21 @@ aside {
   .grid.layout-4 {
     grid-template-columns: 1fr;
     grid-template-rows: none;
+  }
+
+  /* Stacked tiles share the height left over rather than a row each, which
+     divides a phone screen into slivers too short to hold a picture. Each gets
+     a real height and the grid scrolls. */
+  .grid .tile {
+    min-height: 12rem;
+  }
+
+  .grid {
+    overflow-y: auto;
+  }
+
+  /* The glyph carries it at this width; the word is what does not fit. */
+  .toggle-label {
+    display: none;
   }
 }

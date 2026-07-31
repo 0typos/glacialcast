@@ -27,17 +27,19 @@ const els = {
   unlockError: document.querySelector('#unlock-error'),
   unlockStatus: document.querySelector('#unlock-status'),
   streamList: document.querySelector('#stream-list'),
-  emptyHint: document.querySelector('#empty-hint'),
   forgetAll: document.querySelector('#forget-all'),
   grid: document.querySelector('#grid'),
-  headline: document.querySelector('#headline'),
   tileTemplate: document.querySelector('#tile-template'),
   main: document.querySelector('main'),
   sidebar: document.querySelector('#sidebar'),
   sidebarToggle: document.querySelector('#sidebar-toggle'),
+  welcomeUnlock: document.querySelector('#welcome-unlock'),
+  sidebarUnlock: document.querySelector('#sidebar-unlock'),
 };
 
 const SIDEBAR_STORAGE_KEY = 'glacialcast.sidebar.collapsed';
+/** Toggles the stream list. Named once so the title text cannot drift from it. */
+const SIDEBAR_SHORTCUT = '[';
 const KEY_STORE = 'glacialcast.keys.v1';
 const KEY_STORE_VERSION = 1;
 
@@ -66,7 +68,14 @@ const state = {
   streams: new Map(),
   /** One entry per visible tile. */
   tiles: [],
-  layout: 4,
+  layout: 1,
+  /**
+   * Whether the page is showing streams rather than asking for a key.
+   *
+   * Undefined until the first render so that render decides it, rather than a
+   * default here having to agree with one written in the markup.
+   */
+  watching: undefined,
 };
 
 /**
@@ -274,7 +283,9 @@ function setSidebarCollapsed(collapsed, { persist = true } = {}) {
   els.main.classList.toggle('sidebar-collapsed', collapsed);
   els.sidebar.inert = collapsed;
   els.sidebarToggle.setAttribute('aria-expanded', String(!collapsed));
-  els.sidebarToggle.title = collapsed ? 'Show the stream list' : 'Hide the stream list';
+  els.sidebarToggle.title = collapsed
+    ? `Show the stream list (${SIDEBAR_SHORTCUT})`
+    : `Hide the stream list (${SIDEBAR_SHORTCUT})`;
   if (!persist) return;
   try {
     globalThis.localStorage.setItem(SIDEBAR_STORAGE_KEY, collapsed ? '1' : '0');
@@ -294,8 +305,23 @@ function restoreSidebar() {
   setSidebarCollapsed(collapsed, { persist: false });
 }
 
-els.sidebarToggle.addEventListener('click', () => {
+function toggleSidebar() {
   setSidebarCollapsed(!els.main.classList.contains('sidebar-collapsed'));
+}
+
+els.sidebarToggle.addEventListener('click', toggleSidebar);
+
+// Getting the list out of the way is something a viewer does while watching,
+// with the pointer somewhere over a tile, so it is worth a key as well as a
+// trip to the header. Ignored while typing, so it cannot eat a viewing key.
+document.addEventListener('keydown', event => {
+  if (event.key !== SIDEBAR_SHORTCUT) return;
+  if (event.ctrlKey || event.metaKey || event.altKey) return;
+  const active = document.activeElement;
+  if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) return;
+  if (!state.watching) return;
+  event.preventDefault();
+  toggleSidebar();
 });
 
 function showError(element, error) {
@@ -324,34 +350,78 @@ function renderStreamList() {
     const item = document.createElement('li');
     item.draggable = true;
     item.dataset.streamId = streamId;
-    item.className = state.streams.get(streamId)?.active ? 'live' : 'offline';
+    const live = Boolean(state.streams.get(streamId)?.active);
+    item.className = live ? 'live' : 'offline';
 
     const title = document.createElement('span');
     title.className = 'stream-name';
     title.textContent = streamTitle(streamId);
     const hint = document.createElement('span');
     hint.className = 'stream-hint';
-    hint.textContent = state.streams.get(streamId)?.active ? 'live' : 'not publishing';
+    hint.textContent = live ? 'live' : 'not publishing';
 
-    const watch = document.createElement('button');
-    watch.type = 'button';
-    watch.textContent = 'Watch';
-    // Dragging is the primary gesture, but it is unavailable to keyboard and
-    // touch users, so every stream is also one click away from a free tile.
-    watch.addEventListener('click', () => assignToFirstFreeTile(streamId));
+    // The row itself is the control. Dragging is still the way to choose which
+    // tile, but it is unavailable to keyboard and touch users, so a plain click
+    // on the stream puts it in the first free one.
+    const pick = document.createElement('button');
+    pick.type = 'button';
+    pick.className = 'stream-pick';
+    pick.append(title, hint);
+    pick.addEventListener('click', () => assignToFirstFreeTile(streamId));
 
-    item.append(title, hint, watch);
+    item.append(pick);
     item.addEventListener('dragstart', event => {
       event.dataTransfer.setData('text/plain', streamId);
       event.dataTransfer.effectAllowed = 'copy';
     });
     els.streamList.append(item);
   }
-  els.emptyHint.hidden = known.length > 0;
   els.forgetAll.hidden = known.length === 0;
-  // Once something is unlocked the form is no longer the point of the panel,
-  // but it stays reachable for a second publisher's key.
-  els.unlockForm.classList.toggle('secondary', known.length > 0);
+  markOnScreen();
+  setWatching(known.length > 0);
+}
+
+/**
+ * Marks the streams that already have a tile.
+ *
+ * Kept apart from rendering the list so that attaching a tile does not rebuild
+ * the row whose button is still handling the click that caused it.
+ */
+function markOnScreen() {
+  for (const item of els.streamList.children) {
+    item.classList.toggle(
+      'on-screen',
+      state.tiles.some(tile => tile.streamId === item.dataset.streamId),
+    );
+  }
+}
+
+/**
+ * Switches the page between asking for a key and showing streams.
+ *
+ * These are different pages in everything but the URL: before a key opens
+ * anything the only useful act is entering one, and a grid of empty tiles
+ * offering to accept a drop is four invitations to do something impossible.
+ * The single unlock form moves between the two rather than being written twice,
+ * so there is one input to find, one set of listeners, and one error line
+ * wherever the viewer is looking.
+ */
+function setWatching(watching) {
+  // The first call settles which page this is, so it always runs even when the
+  // answer matches the default.
+  document.body.classList.remove('deciding');
+  if (state.watching === watching) return;
+  state.watching = watching;
+  document.body.classList.toggle('empty', !watching);
+  const slot = watching ? els.sidebarUnlock : els.welcomeUnlock;
+  const vacated = watching ? els.welcomeUnlock : els.sidebarUnlock;
+  slot.append(els.unlockForm);
+  slot.hidden = false;
+  vacated.hidden = true;
+  // The status travels with the form, because it is what just happened --
+  // "Unlocked 3 streams", or "Forgotten" on the way back. A stale error does
+  // not: it describes an attempt the viewer has since moved past.
+  showError(els.unlockError, null);
 }
 
 function setLayout(count) {
@@ -445,6 +515,7 @@ function attachTile(tile, streamId) {
   tile.title.textContent = streamTitle(streamId);
   tile.message.textContent = 'Preparing encrypted media…';
   mountPlayer(tile, streamId, key);
+  markOnScreen();
 }
 
 /**
@@ -486,8 +557,9 @@ function detachTile(tile) {
   tile.player = null;
   tile.streamId = null;
   tile.title.textContent = 'Empty';
-  tile.message.textContent = 'Drop a stream here';
+  tile.message.textContent = 'Pick a stream';
   tile.element.classList.remove('failed');
+  markOnScreen();
   const status = tile.element.querySelector('[data-role="status"]');
   const metrics = tile.element.querySelector('[data-role="metrics"]');
   if (status) status.textContent = '';
@@ -587,9 +659,6 @@ refreshStreams()
     await applyRememberedKeys();
     renderStreamList();
     showUnlockedStreams();
-    els.headline.textContent = state.keys.size > 0
-      ? 'Drag a stream into a tile'
-      : 'Enter the viewing key you were given';
   })
   .catch(error => showError(els.unlockError, error));
 

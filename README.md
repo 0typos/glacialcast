@@ -463,13 +463,21 @@ decryption locally.
 
 ## Watching
 
-`/` is the viewer: up to four streams at once. Pick a 1, 2, or 4 tile layout,
-drag a stream from the side panel into a tile — or press its **Watch** button,
-which does the same thing from a keyboard — and full-screen any tile on its
-own. Dropping a stream onto an occupied tile swaps the two, and shrinking the
-layout destroys the players it drops rather than leaving them decoding out of
-sight. The side panel collapses with the button beside the title, and stays
-collapsed until you open it again.
+`/` is the viewer: up to four streams at once. Until a key opens something the
+page is one card asking for it, because that is the only thing to do; once one
+does, the streams it opened go straight onto the screen and the page becomes
+the tiles.
+
+From there, pick a 1, 2, or 4 tile layout, click a stream in the panel to put it
+in the first free tile, or drag it onto the tile you want. Dropping a stream
+onto an occupied tile swaps the two, and shrinking the layout destroys the
+players it drops rather than leaving them decoding out of sight. Any tile
+full-screens on its own.
+
+The panel of streams is only needed when changing what is on screen, so it gets
+out of the way easily: the **Streams** button in the header collapses it, `[`
+does the same from the keyboard while watching, and the choice is remembered
+until you open it again.
 
 The operations dashboard — stream health, retention, admin controls — is at
 `/streams`. A single stream can still be deep-linked at `/dash/{stream_id}`.
