@@ -8,7 +8,7 @@ control_addr="${GLACIALCAST_VERIFY_CONTROL_ADDR:-127.0.0.1:18999}"
 ingest_addr="${GLACIALCAST_VERIFY_INGEST_ADDR:-127.0.0.1:19000}"
 offline_addr="${GLACIALCAST_VERIFY_OFFLINE_ADDR:-127.0.0.1:19001}"
 test_pattern="${GLACIALCAST_VERIFY_TEST_PATTERN:-motion}"
-idle_heartbeat_seconds="${GLACIALCAST_VERIFY_IDLE_HEARTBEAT_SECONDS:-10}"
+idle_heartbeat_seconds="${GLACIALCAST_VERIFY_IDLE_HEARTBEAT_SECONDS:-}"
 case "${test_pattern}" in
   static | typing | scroll | motion) ;;
   *)
@@ -16,9 +16,12 @@ case "${test_pattern}" in
     exit 2
     ;;
 esac
-if ! [[ "${idle_heartbeat_seconds}" =~ ^[0-9]+$ ]] \
-  || (( idle_heartbeat_seconds < 1 || idle_heartbeat_seconds > 300 )); then
-  echo "GLACIALCAST_VERIFY_IDLE_HEARTBEAT_SECONDS must be between 1 and 300" >&2
+# Unset means the publisher's own default, which is chosen to keep sample
+# durations under the second Firefox refuses to decode. The gate only overrides
+# it when a run wants to probe a specific cadence.
+if [[ -n "${idle_heartbeat_seconds}" ]] \
+  && ! [[ "${idle_heartbeat_seconds}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+  echo "GLACIALCAST_VERIFY_IDLE_HEARTBEAT_SECONDS must be a number of seconds" >&2
   exit 2
 fi
 origin="http://${control_addr}"
@@ -81,7 +84,7 @@ start_client() {
     --width 320 \
     --height 180 \
     --fps 2 \
-    --idle-heartbeat-seconds "${idle_heartbeat_seconds}" \
+    ${idle_heartbeat_seconds:+--idle-heartbeat-seconds "${idle_heartbeat_seconds}"} \
     --cursor-hz 30 \
     --segment-frames 2 \
     >>"${client_log}" 2>&1 &
