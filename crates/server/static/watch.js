@@ -630,6 +630,31 @@ function stripInviteKeyFromUrl() {
   globalThis.history.replaceState(null, '', `${pathname}${search}`);
 }
 
+/**
+ * Says why this browser cannot decrypt here, instead of offering a key field
+ * that cannot work.
+ *
+ * Deriving a key is the first thing that touches `crypto.subtle`, and browsers
+ * withhold it outside a secure context -- so on a plain `http://` address that
+ * is not localhost, typing a correct key produced `undefined is not an object
+ * (reading 'importKey')`. That is an accurate description of the third line of
+ * a key-derivation routine and no help at all to someone who just wants to
+ * know why the page will not play.
+ *
+ * Asked before the stream list, because nothing below it can succeed and the
+ * answer does not depend on what the relay holds.
+ */
+function refuseUnusablePlatform() {
+  const problem = Player.platformProblem();
+  if (!problem) return false;
+  document.body.classList.remove('deciding');
+  document.body.classList.add('empty');
+  const lead = document.querySelector('.welcome-lead');
+  if (lead) lead.textContent = problem;
+  els.unlockForm.hidden = true;
+  return true;
+}
+
 restoreSidebar();
 setLayout(state.layout);
 loadRememberedKeys();
@@ -638,6 +663,10 @@ loadRememberedKeys();
 // erased from the URL immediately, then used once the stream list is known.
 const invitedKey = inviteKeyFromUrl();
 if (invitedKey) stripInviteKeyFromUrl();
+
+// Nothing below this can work if the browser will not do the cryptography, and
+// the reason has nothing to do with the relay, so it is settled first.
+if (!refuseUnusablePlatform()) {
 
 // Streams are listed before anything is unlocked so the panel can say whether
 // the relay has anything to show at all, and so a key entered a moment later
@@ -679,3 +708,5 @@ setInterval(async () => {
     // A failed poll is retried by the next one.
   }
 }, STREAM_POLL_INTERVAL_MS);
+
+}
