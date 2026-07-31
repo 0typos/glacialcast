@@ -211,10 +211,11 @@ evidence. Reports are welcome; so is a failure.
   change.
 - **The browser must reach the relay over HTTPS or loopback.** Web Crypto and
   Encrypted Media Extensions are both unavailable on a plaintext non-loopback
-  origin, so a LAN deployment either uses loopback, a tunnel, or the Internet
-  profile with a real certificate. [`--trusted-lan`](#trusted-lan) removes the
-  publisher-side friction on a local network but cannot lift this: it is a
-  browser rule about secure contexts, not a relay setting.
+  origin. This is a browser rule about secure contexts, not a relay setting, so
+  it cannot be lifted — only satisfied. [`--trusted-lan`](#trusted-lan) satisfies
+  it by serving TLS itself with a generated certificate, which each browser
+  accepts once; a certificate from a CA the viewers already trust avoids even
+  that.
 
 ## Dependencies
 
@@ -329,8 +330,9 @@ On a local network you control, `--trusted-lan` is the whole relay setup:
 ```
 
 It binds both listeners to every interface (`0.0.0.0:8899` and `0.0.0.0:8900`),
-serves plaintext HTTP, and accepts publishers that present no ingest token. A
-publisher then needs only the relay's Noise public key:
+serves HTTPS with a certificate it generates itself, and accepts publishers that
+present no ingest token. A publisher then needs only the relay's Noise public
+key:
 
 ```sh
 ./target/release/glacialcast-client \
@@ -345,19 +347,42 @@ address given explicitly still wins over the defaults the flag carries, so
 `--trusted-lan --control-addr 127.0.0.1:8899` opens ingest to the network and
 leaves HTTP on loopback.
 
-**Viewing from another machine still needs HTTPS or a tunnel.** This is the one
-barrier the flag cannot remove. Encrypted playback needs Web Crypto and
-Encrypted Media Extensions, and browsers withhold both outside a secure context
-— which a plaintext address other than loopback is not. The relay says so at
-startup. Publishing is unaffected, because the publisher speaks Noise over TCP
-and is not a browser. To watch:
+### Why it serves HTTPS
 
-```sh
-ssh -N -L 8899:127.0.0.1:8899 relay-host   # then open http://127.0.0.1:8899
+Encrypted playback needs Web Crypto and Encrypted Media Extensions, and browsers
+withhold both outside a secure context — which a plain `http://` address that is
+not loopback is not. That is a browser rule about origins, so no relay setting
+can lift it; the only answers are a tunnel to the viewer's own loopback, or a
+real `https://` origin. `--trusted-lan` therefore serves TLS itself rather than
+needing a second process in front of it to do so.
+
+The certificate is generated on first start into `<data-dir>/tls`, kept with the
+key at mode `0600`, and reused afterwards so a browser that accepted it once is
+not asked again. It covers loopback, this host's name, and the address the host
+reaches the network by — the one a viewer on the LAN types. Add others with
+`--tls-name`.
+
+It signs for itself, so each browser stops on a warning the first time. The
+relay prints the fingerprint the browser will display, so accepting it can be a
+check rather than a habit:
+
+```text
+WARN serving HTTPS with a self-signed certificate; each browser shows a warning
+     once, and the fingerprint above is the one it will display
+     fingerprint=AE:92:F8:… valid_for=127.0.0.1, 192.168.1.20, ::1, relay, localhost
 ```
 
-or serve HTTPS with the [Internet profile](docs/internet-deployment.md), which
-is the supported way to reach the viewer from anywhere else.
+To skip the warning entirely, pass a certificate the viewers already trust —
+from an internal CA, or one made by `mkcert` and installed on their machines:
+
+```sh
+./target/release/glacialcast-server --trusted-lan \
+  --tls-cert /etc/glacialcast/cert.pem --tls-key /etc/glacialcast/key.pem
+```
+
+`--no-tls` serves plaintext instead, for a relay only ever reached through a
+tunnel or already behind something terminating TLS. Browsers reaching it over
+the network will not play, and it says so at startup.
 
 What `--trusted-lan` gives up: any host that can reach the ingest port may
 publish a stream, so a stream appearing in the list is no longer evidence of who

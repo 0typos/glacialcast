@@ -11,6 +11,7 @@
 mod dash_store;
 mod security;
 mod storage;
+mod tls;
 mod traffic;
 
 #[doc(hidden)]
@@ -120,6 +121,31 @@ struct Args {
     /// given explicitly still wins over the defaults above.
     #[arg(long, env = "GLACIALCAST_TRUSTED_LAN")]
     trusted_lan: bool,
+    /// PEM certificate chain to serve HTTPS with. Requires `--tls-key`.
+    ///
+    /// Supply one issued by a certificate authority the viewers already trust
+    /// and they see no warning. Without it, `--trusted-lan` generates a
+    /// self-signed pair instead.
+    #[arg(long, env = "GLACIALCAST_TLS_CERT", requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+    /// PEM private key for `--tls-cert`.
+    #[arg(long, env = "GLACIALCAST_TLS_KEY", requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+    /// Extra name or address a generated certificate should cover. Repeatable.
+    ///
+    /// Loopback, this host's name, and the address it reaches the network by
+    /// are covered already; this is for a DNS name they do not know about.
+    #[arg(long = "tls-name", value_name = "NAME")]
+    tls_names: Vec<String>,
+    /// Serves plaintext HTTP under `--trusted-lan` instead of generating a
+    /// certificate.
+    ///
+    /// Browsers withhold the cryptography encrypted playback needs on a plain
+    /// `http://` address that is not loopback, so viewers reaching this over
+    /// the network will not be able to play. For a relay that is only ever
+    /// reached through a tunnel, or fronted by something else terminating TLS.
+    #[arg(long, conflicts_with_all = ["tls_cert", "tls_key"])]
+    no_tls: bool,
     #[arg(long, env = "GLACIALCAST_DATA_DIR", default_value = "data")]
     data_dir: PathBuf,
     #[arg(long, env = "GLACIALCAST_INGEST_KEY_FILE")]
@@ -160,6 +186,12 @@ struct ListenerPlan {
     /// Whether a configured ingest token must clear the 32-byte floor that
     /// exists because an Internet-facing token is guessed at from anywhere.
     require_strong_ingest: bool,
+    /// Whether the HTTP listener terminates TLS itself.
+    ///
+    /// This is what makes a local-network deployment reachable by a browser at
+    /// all: encrypted playback needs a secure context, and a plain `http://`
+    /// address that is not loopback is not one.
+    serve_tls: bool,
 }
 
 /// Resolves the listener addresses and enforces the rules tying a deployment
@@ -206,7 +238,15 @@ fn plan_listeners(
     let ingest_addr = args
         .ingest_addr
         .unwrap_or_else(|| SocketAddr::from((host, DEFAULT_INGEST_PORT)));
-    let allow_insecure_http = args.allow_insecure_http || args.trusted_lan;
+    // A certificate, or a profile that generates one. Internet mode keeps its
+    // loopback listener behind a proxy that terminates TLS, so it never does
+    // this itself.
+    let serve_tls = !internet_mode
+        && (args.tls_cert.is_some()
+            || (args.trusted_lan && !args.no_tls && !args.allow_insecure_http));
+    // TLS answers the plaintext objection outright; the older flag remains the
+    // way to say "serve plaintext anyway".
+    let allow_insecure_http = serve_tls || args.allow_insecure_http || args.trusted_lan;
     if !control_addr.ip().is_loopback() && !allow_insecure_http {
         anyhow::bail!(
             "refusing a non-loopback HTTP listener; bind --control-addr to loopback behind an HTTPS reverse proxy, or pass --trusted-lan (or --allow-insecure-http) to serve a local network in plaintext"
@@ -227,6 +267,7 @@ fn plan_listeners(
         ingest_addr,
         require_strong_ingest: internet_mode
             || (!ingest_addr.ip().is_loopback() && !args.trusted_lan),
+        serve_tls,
     })
 }
 
@@ -666,6 +707,7 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
         control_addr,
         ingest_addr,
         require_strong_ingest,
+        serve_tls,
     } = plan_listeners(&args, internet_mode, config.ingest.require_token)?;
     if trust_forwarded_for && !internet_mode {
         anyhow::bail!("security.trust_forwarded_for requires an HTTPS public_origin");
@@ -888,38 +930,82 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
         warn!(
             control = %control_addr,
             ingest = %ingest_addr,
-            "serving a trusted LAN in plaintext; any host that can reach the ingest port may publish a stream, and stream contents stay end-to-end encrypted"
+            "serving a trusted LAN; any host that can reach the ingest port may publish a stream, and stream contents stay end-to-end encrypted"
         );
-        // The publisher side of this profile is complete, but the browser side
-        // is not, and the operator finds that out as a viewer that refuses to
-        // play rather than as anything the relay said. A plaintext non-loopback
-        // origin is not a secure context, so Web Crypto and Encrypted Media
-        // Extensions are both absent and the player stops at validatePlatform.
-        if !control_addr.ip().is_loopback() {
+        // Plaintext past loopback is now a choice rather than the only option,
+        // and it is one that stops browsers playing: a plain `http://` origin
+        // that is not loopback is not a secure context, so Web Crypto and
+        // Encrypted Media Extensions are both withheld.
+        if !serve_tls && !control_addr.ip().is_loopback() {
             warn!(
                 port = control_addr.port(),
                 "browsers reaching this relay at a plaintext address other than loopback cannot \
                  play: encrypted playback needs a secure context. Publishing works; for viewing, \
-                 forward this port over SSH to the viewer's own loopback, or serve HTTPS with the \
-                 Internet profile"
+                 drop --no-tls to serve HTTPS here, or forward this port over SSH to the viewer's \
+                 own loopback"
             );
         }
     }
+
+    let scheme = if serve_tls { "https" } else { "http" };
     info!(
         control = %control_addr,
         ingest = %ingest_addr,
+        scheme,
         ingest_server_key,
         "glacialcast server listening"
     );
-    let listener = TcpListener::bind(control_addr).await?;
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
-        wait_for_shutdown(&mut shutdown_rx).await;
-    })
-    .await?;
+
+    if serve_tls {
+        let material = tls::load_or_create(
+            &args.data_dir,
+            args.tls_cert.as_deref(),
+            args.tls_key.as_deref(),
+            control_addr,
+            &args.tls_names,
+        )?;
+        if material.generated {
+            // A certificate that signs for itself is not one any browser has a
+            // reason to trust, so the first visit stops on a warning. Saying so
+            // here, with the fingerprint the browser will show and the address
+            // the certificate is actually for, is the difference between an
+            // operator accepting a known certificate and clicking through an
+            // unknown one out of habit.
+            warn!(
+                fingerprint = %material.fingerprint,
+                valid_for = %material.names.join(", "),
+                "serving HTTPS with a self-signed certificate; each browser shows a warning once, \
+                 and the fingerprint above is the one it will display. Pass --tls-cert and \
+                 --tls-key to use a certificate your viewers already trust"
+            );
+        }
+        // Wrapped in axum's own tap adapter, which is the shape its blanket
+        // `Connected` implementation is written against: without it, connect
+        // info is only wired up for a plain `TcpListener`, and the handlers
+        // that log or rate-limit by peer address would not compile.
+        let listener = axum::serve::ListenerExt::tap_io(
+            tls::TlsListener::bind(control_addr, &material).await?,
+            |_| {},
+        );
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            wait_for_shutdown(&mut shutdown_rx).await;
+        })
+        .await?;
+    } else {
+        let listener = TcpListener::bind(control_addr).await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            wait_for_shutdown(&mut shutdown_rx).await;
+        })
+        .await?;
+    }
     let _ = shutdown_tx.send(true);
     Ok(())
 }
