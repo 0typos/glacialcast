@@ -859,7 +859,14 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 
 fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     for header_value in headers.get_all(header::COOKIE) {
-        let value = header_value.to_str().ok()?;
+        // Skip a header that is not text rather than abandoning the search.
+        // Browsers send cookies across several header lines, and `?` here gave
+        // up on all of them the moment one held a byte that is not UTF-8 -- so
+        // an unrelated cookie set by something else on the same host logged the
+        // viewer out, with no way to tell from the outside why.
+        let Ok(value) = header_value.to_str() else {
+            continue;
+        };
         for cookie in value.split(';') {
             let Some((cookie_name, cookie_value)) = cookie.trim().split_once('=') else {
                 continue;
@@ -1463,6 +1470,48 @@ mod tests {
         assert_eq!(client_ip(&headers, peer, true), forwarded);
         headers.insert("x-forwarded-for", "invalid, 203.0.113.8".parse().unwrap());
         assert_eq!(client_ip(&headers, peer, true), peer);
+    }
+
+    #[test]
+    fn an_unrelated_cookie_does_not_hide_the_session() {
+        let access = AccessControl::from_config(access_config(), false).unwrap();
+        let principal = access.authenticate_token(TOKEN).unwrap();
+        let (signer, path) = signer();
+        let (cookie, _) = signer.create_session(&principal).unwrap();
+
+        // Cookies arrive across several header lines, and anything else on the
+        // host can set one. A line that is not UTF-8 must not take the session
+        // with it: this used to abandon the whole search and log the viewer out.
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::COOKIE,
+            axum::http::HeaderValue::from_bytes(b"other=\xff\xfe").unwrap(),
+        );
+        headers.append(
+            header::COOKIE,
+            format!("{}={cookie}", signer.cookie_name())
+                .parse()
+                .unwrap(),
+        );
+        let request = signer
+            .authenticate(&headers, &access)
+            .expect("the session survives an unreadable cookie beside it");
+        assert_eq!(request.principal.name, "viewer-one");
+
+        // Order must not matter either.
+        let mut reversed = HeaderMap::new();
+        reversed.append(
+            header::COOKIE,
+            format!("{}={cookie}", signer.cookie_name())
+                .parse()
+                .unwrap(),
+        );
+        reversed.append(
+            header::COOKIE,
+            axum::http::HeaderValue::from_bytes(b"other=\xff\xfe").unwrap(),
+        );
+        assert!(signer.authenticate(&reversed, &access).is_some());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
