@@ -1,0 +1,46 @@
+# Dependency updates are proposed, never applied: every one still goes through
+# the same gates as any other change.
+#
+# `cargo deny` already refuses a crate with a known advisory, but only on the
+# days something runs it. This is what notices a fix exists before an advisory
+# does.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    # One pull request for the routine noise, separate ones for anything that
+    # can actually break a build. Reviewing forty patch bumps individually is
+    # how a major bump gets waved through in the middle of them.
+    groups:
+      patch-and-minor:
+        update-types:
+          - patch
+          - minor
+    commit-message:
+      prefix: build
+      include: scope
+
+  # Pinned by commit here, so an unpinned tag cannot move under a workflow.
+  # Dependabot understands that form and rewrites both the hash and the comment.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: ci
+      include: scope
+
+  # The fuzz targets carry their own lockfile and their own toolchain, so they
+  # drift separately from the workspace.
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: build
+      include: scope
