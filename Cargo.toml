@@ -22,6 +22,16 @@ aes = "0.8"
 anyhow = "1.0"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
+# HTTPS served by the relay itself, so a LAN deployment needs no second
+# process in front of it just to reach a secure context.
+#
+# Wired through tokio-rustls rather than a server wrapper crate: the obvious
+# wrapper pulls in rustls-pemfile, which is unmaintained (RUSTSEC-2025-0134)
+# with no upgrade, and rustls-pki-types parses the same PEM without it.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+rustls-pki-types = "1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "crypto", "ring"] }
 base64 = "0.22"
 bytes = "1.6"
 aes-gcm = "0.10"
