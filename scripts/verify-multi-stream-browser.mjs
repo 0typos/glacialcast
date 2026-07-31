@@ -205,6 +205,36 @@ try {
   }
   console.log('the shortcut toggles the panel, and is inert while typing a key');
 
+  // Leaving the page while a request is in flight must be silent.
+  //
+  // The reconcile pass and every object fetch go over plain HTTP, so closing
+  // the live socket does not stop them. Navigating away cancels them at the
+  // browser, and the player used to report that cancellation as a stream
+  // failure -- which is exactly what `NetworkError when attempting to fetch
+  // resource` in the onboarding gate was, arriving right after "Forget keys"
+  // because that step navigates.
+  //
+  // Removing a tile is deliberately not the trigger here: nothing cancels the
+  // request in that case, so it completes late and proves nothing. Requests are
+  // slowed rather than held open, so the reload after this still finishes.
+  await page.route('**/api/dash/streams/**', async route => {
+    await new Promise(resolve => setTimeout(resolve, 4_000));
+    await route.continue().catch(() => {});
+  });
+  await page.waitForTimeout(1_500);
+
+  const errorsBeforeTeardown = errors.length;
+  await page.goto(`${origin}/`, { waitUntil: 'domcontentloaded' });
+  await page.waitForTimeout(3_000);
+  await page.unroute('**/api/dash/streams/**');
+  await page.waitForTimeout(2_000);
+
+  const teardownErrors = errors.slice(errorsBeforeTeardown);
+  if (teardownErrors.length > 0) {
+    throw new Error(`leaving the page reported errors:\n${teardownErrors.join('\n')}`);
+  }
+  console.log('leaving the page with requests in flight reported nothing');
+
   if (errors.length > 0) {
     throw new Error(`browser reported errors:\n${errors.join('\n')}`);
   }
