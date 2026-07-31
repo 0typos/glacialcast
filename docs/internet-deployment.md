@@ -107,6 +107,11 @@ Keep TCP 8899 blocked from every non-loopback interface. The server refuses a
 non-loopback HTTP bind unless the operator supplies the explicitly unsafe
 `--allow-insecure-http` escape hatch.
 
+`--trusted-lan`, the local-network profile, implies that escape hatch and also
+waives the ingest token. It is refused outright whenever `security.public_origin`
+is set, so it cannot be combined with this profile: an Internet deployment
+cannot be talked into serving plaintext or into accepting untokened publishers.
+
 ## Publisher setup
 
 Print and record the persistent relay identity:

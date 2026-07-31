@@ -209,10 +209,12 @@ evidence. Reports are welcome; so is a failure.
 - **Pre-1.0 wire format.** `PROTOCOL_VERSION` has moved twice in recent work;
   publisher and relay must match, and retained objects do not survive a format
   change.
-- **The browser must reach the relay over HTTPS or loopback.** Encrypted Media
-  Extensions are unavailable on a plaintext non-loopback origin, so a LAN
-  deployment either uses loopback, a tunnel, or the Internet profile with a
-  real certificate.
+- **The browser must reach the relay over HTTPS or loopback.** Web Crypto and
+  Encrypted Media Extensions are both unavailable on a plaintext non-loopback
+  origin, so a LAN deployment either uses loopback, a tunnel, or the Internet
+  profile with a real certificate. [`--trusted-lan`](#trusted-lan) removes the
+  publisher-side friction on a local network but cannot lift this: it is a
+  browser rule about secure contexts, not a relay setting.
 
 ## Dependencies
 
@@ -317,6 +319,53 @@ would mean `/server.toml`.
 
 Configuration files containing credentials must be private regular files with
 mode `0600`. Unknown configuration keys are rejected.
+
+## Trusted LAN
+
+On a local network you control, `--trusted-lan` is the whole relay setup:
+
+```sh
+./target/release/glacialcast-server --trusted-lan --data-dir ./data
+```
+
+It binds both listeners to every interface (`0.0.0.0:8899` and `0.0.0.0:8900`),
+serves plaintext HTTP, and accepts publishers that present no ingest token. A
+publisher then needs only the relay's Noise public key:
+
+```sh
+./target/release/glacialcast-client \
+  --no-config \
+  --ingest-addr 192.168.1.20:8900 \
+  --ingest-server-key "$(./target/release/glacialcast-server --data-dir ./data --print-ingest-server-key)" \
+  --capture dash-wayland
+```
+
+No `server.toml`, no `client.toml`, and no shared secret between them. An
+address given explicitly still wins over the defaults the flag carries, so
+`--trusted-lan --control-addr 127.0.0.1:8899` opens ingest to the network and
+leaves HTTP on loopback.
+
+**Viewing from another machine still needs HTTPS or a tunnel.** This is the one
+barrier the flag cannot remove. Encrypted playback needs Web Crypto and
+Encrypted Media Extensions, and browsers withhold both outside a secure context
+— which a plaintext address other than loopback is not. The relay says so at
+startup. Publishing is unaffected, because the publisher speaks Noise over TCP
+and is not a browser. To watch:
+
+```sh
+ssh -N -L 8899:127.0.0.1:8899 relay-host   # then open http://127.0.0.1:8899
+```
+
+or serve HTTPS with the [Internet profile](docs/internet-deployment.md), which
+is the supported way to reach the viewer from anywhere else.
+
+What `--trusted-lan` gives up: any host that can reach the ingest port may
+publish a stream, so a stream appearing in the list is no longer evidence of who
+put it there. What it does not give up: stream contents stay end-to-end
+encrypted under the viewer key, so a listener on the segment without that key
+sees ciphertext, and publishers still pin the relay's identity with
+`--ingest-server-key`. It is refused together with `security.public_origin`,
+whose premises are the opposite.
 
 ## Internet deployment
 
