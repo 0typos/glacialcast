@@ -90,5 +90,13 @@ jobs:
         env:
           GLACIALCAST_PLAYWRIGHT_MODULE: /tmp/glacialcast-playwright/node_modules/playwright
         run: scripts/verify-viewer-onboarding.sh
+      - name: Verify the multi-stream viewer
+        # Also a synthetic capture, so it needs no Wayland session either. This
+        # is the only automated coverage of the landing page and of several
+        # players running at once, which is where page-global state in the
+        # player shows up; a single-stream gate passes either way.
+        env:
+          GLACIALCAST_PLAYWRIGHT_MODULE: /tmp/glacialcast-playwright/node_modules/playwright
+        run: scripts/verify-multi-stream.sh
       - name: Build and verify release archive
         run: scripts/verify-packaging.sh
