@@ -206,6 +206,12 @@ evidence. Reports are welcome; so is a failure.
   by bytes per stream, and history beyond that is gone.
 - **Packages are x86_64 only**, built against glibc 2.39. Older distributions
   are refused rather than sold a binary that cannot start.
+- **Firefox will not decode encrypted samples of a second or longer.** Chromium
+  plays the same bytes. The publisher's idle heartbeat therefore defaults to
+  0.5s, which bounds every sample below that; raising `--idle-heartbeat-seconds`
+  past a second cuts idle bandwidth further but limits playback to Chromium.
+  Measured against identical fragments with only durations rewritten: 0.95s
+  played, 1.0s stalled.
 - **Pre-1.0 wire format.** `PROTOCOL_VERSION` has moved twice in recent work;
   publisher and relay must match, and retained objects do not survive a format
   change.

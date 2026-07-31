@@ -192,8 +192,17 @@ struct Args {
     max_frame_height: u32,
     #[arg(long, value_parser = parse_update_rate, default_value = "5")]
     fps: f64,
-    #[arg(long, value_parser = parse_idle_heartbeat_seconds, default_value_t = 10)]
-    idle_heartbeat_seconds: u64,
+    /// Longest time an unchanged picture is held before being re-sent, in
+    /// seconds. Fractions are accepted.
+    ///
+    /// This bounds the duration of every published media sample, and staying
+    /// under one second is what keeps Firefox decoding: its MSE pipeline never
+    /// starts on encrypted samples of a second or longer. Measured against
+    /// identical fragments with only durations rewritten, 0.95s played and
+    /// 1.0s stalled, so the default keeps a wide margin. Raising this above a
+    /// second cuts idle bandwidth further but limits playback to Chromium.
+    #[arg(long, value_parser = parse_idle_heartbeat_seconds, default_value_t = 0.5)]
+    idle_heartbeat_seconds: f64,
     #[arg(long, default_value_t = 60)]
     cursor_hz: u64,
     #[arg(long, value_parser = parse_cursor_flush_ms, default_value_t = 25)]
@@ -1218,9 +1227,12 @@ async fn run_dash_connection(
     let cursor_flush_interval = Duration::from_millis(args.cursor_flush_ms.max(1));
     let mut last_cursor_flush = Instant::now();
     let mut media_index = 1u64;
-    let heartbeat_ticks = args
-        .idle_heartbeat_seconds
-        .saturating_mul(u64::from(MEDIA_TIMESCALE));
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the parser bounds the heartbeat to [0.2, 300] seconds"
+    )]
+    let heartbeat_ticks = (args.idle_heartbeat_seconds * f64::from(MEDIA_TIMESCALE)).round() as u64;
     let mut media_cadence = AdaptiveMediaCadence::new(u64::from(frame_duration), heartbeat_ticks);
     let mut pending_media: Option<PendingEncodedMedia> = None;
     let mut cursor_sequence = 0u64;
@@ -2576,13 +2588,13 @@ fn parse_cursor_flush_ms(value: &str) -> std::result::Result<u64, String> {
     Ok(milliseconds)
 }
 
-fn parse_idle_heartbeat_seconds(value: &str) -> std::result::Result<u64, String> {
+fn parse_idle_heartbeat_seconds(value: &str) -> std::result::Result<f64, String> {
     let seconds = value
         .trim()
-        .parse::<u64>()
+        .parse::<f64>()
         .map_err(|_| format!("invalid idle heartbeat {value:?}"))?;
-    if !(1..=300).contains(&seconds) {
-        return Err("idle heartbeat must be between 1 and 300 seconds".to_string());
+    if !seconds.is_finite() || !(0.2..=300.0).contains(&seconds) {
+        return Err("idle heartbeat must be between 0.2 and 300 seconds".to_string());
     }
     Ok(seconds)
 }
@@ -7534,10 +7546,15 @@ mod tests {
 
     #[test]
     fn idle_heartbeat_is_bounded() {
-        assert_eq!(parse_idle_heartbeat_seconds("1").unwrap(), 1);
-        assert_eq!(parse_idle_heartbeat_seconds("300").unwrap(), 300);
+        // Fractions matter: the default must sit under the one-second sample
+        // duration Firefox refuses to decode.
+        assert!((parse_idle_heartbeat_seconds("0.5").unwrap() - 0.5).abs() < f64::EPSILON);
+        assert!((parse_idle_heartbeat_seconds("1").unwrap() - 1.0).abs() < f64::EPSILON);
+        assert!((parse_idle_heartbeat_seconds("300").unwrap() - 300.0).abs() < f64::EPSILON);
+        assert!(parse_idle_heartbeat_seconds("0.1").is_err());
         assert!(parse_idle_heartbeat_seconds("0").is_err());
         assert!(parse_idle_heartbeat_seconds("301").is_err());
+        assert!(parse_idle_heartbeat_seconds("NaN").is_err());
     }
 
     #[test]
