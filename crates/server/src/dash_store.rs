@@ -474,12 +474,24 @@ impl DashStore {
         epoch_id: Uuid,
         kind: DashObjectKind,
     ) -> Result<Option<Vec<u8>>> {
-        let sequence = self
-            .list(stream_id)?
-            .into_iter()
-            .rev()
-            .find(|object| object.header.epoch_id == epoch_id && object.header.kind == kind)
-            .map(|object| object.header.sequence);
+        // Scanned under the lock for the one sequence wanted, rather than
+        // cloning every retained object first. This runs for each
+        // initialization and media request, so the copy it used to make was
+        // proportional to the whole retention window on every one of them.
+        let sequence = {
+            let Some(handle) = self.catalog(stream_id)? else {
+                return Ok(None);
+            };
+            let catalog = handle
+                .lock()
+                .map_err(|_| anyhow::anyhow!("DASH stream catalog mutex poisoned"))?;
+            catalog
+                .objects
+                .values()
+                .rev()
+                .find(|object| object.header.epoch_id == epoch_id && object.header.kind == kind)
+                .map(|object| object.header.sequence)
+        };
         match sequence {
             Some(sequence) => Ok(self.get(stream_id, sequence)?.map(|object| object.payload)),
             None => Ok(None),
@@ -500,11 +512,20 @@ impl DashStore {
             removed.extend(self.remove_group(catalog, group));
         }
 
-        while catalog.bytes > self.inner.retention_bytes {
-            let Some((oldest, _)) = oldest_retention_group(catalog) else {
-                break;
-            };
-            removed.extend(self.remove_group(catalog, oldest));
+        // Oldest-first, from one scan. Asking for the oldest group again on
+        // every pass rebuilt a map over every object in the stream each time,
+        // so evicting k groups out of n objects cost k*n -- and the moment
+        // eviction matters is the moment n is largest. The order cannot change
+        // underneath this: removing a group only takes groups away.
+        if catalog.bytes > self.inner.retention_bytes {
+            let mut by_age = retention_groups(catalog).into_iter().collect::<Vec<_>>();
+            by_age.sort_by_key(|(group, received_at_ms)| (*received_at_ms, *group));
+            for (group, _) in by_age {
+                if catalog.bytes <= self.inner.retention_bytes {
+                    break;
+                }
+                removed.extend(self.remove_group(catalog, group));
+            }
         }
         removed.extend(self.remove_orphaned_epoch_metadata(catalog));
         removed
@@ -1083,12 +1104,6 @@ fn retention_groups(catalog: &StreamCatalog) -> BTreeMap<(Uuid, u64), i64> {
             .or_insert(object.received_at_ms);
     }
     groups
-}
-
-fn oldest_retention_group(catalog: &StreamCatalog) -> Option<((Uuid, u64), i64)> {
-    retention_groups(catalog)
-        .into_iter()
-        .min_by_key(|(_, received_at_ms)| *received_at_ms)
 }
 
 fn object_relative_path(sequence: u64) -> PathBuf {
@@ -1680,10 +1695,13 @@ mod tests {
             );
         }
 
-        assert_eq!(
-            oldest_retention_group(&catalog),
-            Some(((oldest_epoch, 1), 10))
-        );
+        // Eviction takes groups oldest first, and now derives that order from
+        // one scan rather than re-deriving it per group. This asserts the
+        // ordering eviction actually uses, so it still guards the behaviour
+        // after the helper that used to compute it went away.
+        let mut by_age = retention_groups(&catalog).into_iter().collect::<Vec<_>>();
+        by_age.sort_by_key(|(group, received_at_ms)| (*received_at_ms, *group));
+        assert_eq!(by_age.first().copied(), Some(((oldest_epoch, 1), 10)));
     }
 
     #[test]
