@@ -107,6 +107,32 @@ function streamNotReadyError() {
   return error;
 }
 
+/**
+ * Why this browser cannot play an encrypted stream here, or `null` if it can.
+ *
+ * Module-level and returning rather than throwing, so the page can ask before
+ * it offers to do anything. The order matters: a plaintext origin that is not
+ * loopback is not a secure context, and browsers withhold Web Crypto there, so
+ * `crypto.subtle` is missing for a reason worth naming. Deriving a key touches
+ * `crypto.subtle` before any player exists, so checking only inside the player
+ * meant the first thing a viewer saw was `undefined is not an object (reading
+ * 'importKey')` -- true, and useless.
+ */
+function platformProblem() {
+  if (!globalThis.isSecureContext || !globalThis.crypto?.subtle) {
+    return 'This page must be reached over HTTPS, or at a loopback address, '
+      + 'before it can decrypt a stream. Browsers withhold the cryptography '
+      + 'this needs on a plain http:// address that is not localhost. Forward '
+      + 'the relay port over SSH to your own machine, or put HTTPS in front of '
+      + 'it.';
+  }
+  if (!globalThis.MediaSource) return 'Media Source Extensions are unavailable.';
+  if (!navigator.requestMediaKeySystemAccess) {
+    return 'Encrypted Media Extensions are unavailable.';
+  }
+  return null;
+}
+
 function createPlayer(root, options) {
   const streamId = options.streamId;
   const onStatus = options.onStatus || (() => {});
@@ -192,7 +218,8 @@ function createPlayer(root, options) {
 
   async function start(viewerKeyText) {
     setStatus('Loading stream metadata…');
-    validatePlatform();
+    const problem = platformProblem();
+    if (problem) throw new Error(problem);
     state.viewerKey = base64UrlToBytes(viewerKeyText, 32);
     const headers = await fetchHeaders();
     state.headers = headers;
@@ -300,17 +327,6 @@ function createPlayer(root, options) {
       epoch.globalEnd = planned.global_end;
     }
     return timeline;
-  }
-
-  function validatePlatform() {
-    if (!globalThis.isSecureContext) {
-      throw new Error('Encrypted playback requires HTTPS or a loopback origin.');
-    }
-    if (!globalThis.crypto?.subtle) throw new Error('Web Crypto is unavailable.');
-    if (!globalThis.MediaSource) throw new Error('Media Source Extensions are unavailable.');
-    if (!navigator.requestMediaKeySystemAccess) {
-      throw new Error('Encrypted Media Extensions are unavailable.');
-    }
   }
 
   async function fetchHeaders() {
@@ -1156,7 +1172,7 @@ async function verifyViewerKey(streamId, viewerKey) {
 }
 
 if (typeof globalThis !== 'undefined') {
-  globalThis.GlacialCastPlayer = { createPlayer, verifyViewerKey };
+  globalThis.GlacialCastPlayer = { createPlayer, verifyViewerKey, platformProblem };
 }
 
 function once(target, event) {
