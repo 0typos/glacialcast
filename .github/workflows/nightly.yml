@@ -32,7 +32,12 @@ jobs:
             libopenh264-dev \
             libpipewire-0.3-dev \
             libspa-0.2-dev \
-            libva-dev
+            libva-dev \
+            nasm
+      - name: Install OpenH264 2.6
+        # ubuntu-24.04 packages 2.4 under a different soname, which builds and
+        # then fails at runtime. See the script for why this is built.
+        run: sudo scripts/ci-install-openh264.sh
       - name: Run reliability soak
         env:
           GLACIALCAST_SOAK_SECONDS: "1800"
@@ -59,7 +64,12 @@ jobs:
             libopenh264-dev \
             libpipewire-0.3-dev \
             libspa-0.2-dev \
-            libva-dev
+            libva-dev \
+            nasm
+      - name: Install OpenH264 2.6
+        # ubuntu-24.04 packages 2.4 under a different soname, which builds and
+        # then fails at runtime. See the script for why this is built.
+        run: sudo scripts/ci-install-openh264.sh
       - name: Install browser test runtime
         run: |
           npm install --prefix /tmp/glacialcast-playwright playwright@1.59.1
