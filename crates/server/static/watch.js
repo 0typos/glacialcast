@@ -42,6 +42,31 @@ const SIDEBAR_STORAGE_KEY = 'glacialcast.sidebar.collapsed';
 const SIDEBAR_SHORTCUT = '[';
 const KEY_STORE = 'glacialcast.keys.v1';
 const KEY_STORE_VERSION = 1;
+/**
+ * Where the arrangement lives: which streams are on screen and in which tile,
+ * which are parked, which are hidden, and what this viewer calls them.
+ *
+ * Separate from the key store because it answers a different question and has a
+ * different lifetime. "Forget keys" gives up access; it does not mean the
+ * viewer has changed their mind about what to call their kitchen camera, and
+ * re-entering the key puts the arrangement back rather than starting over.
+ *
+ * Per-browser, like the keys, and never sent to the relay. A name typed here is
+ * this viewer's private label -- the relay is not told, and other viewers of
+ * the same stream see whatever the publisher called it.
+ */
+const PLACEMENT_STORE = 'glacialcast.streams.v1';
+const PLACEMENT_STORE_VERSION = 1;
+/** Longest custom name kept, so one pasted essay cannot fill the store. */
+const MAX_STREAM_NAME = 80;
+/**
+ * How many streams' arrangements to remember.
+ *
+ * A publisher that reconnects under a new identity leaves its old record
+ * behind, so on a long-lived relay this would otherwise only grow. The map
+ * keeps insertion order, so the oldest records are the ones dropped.
+ */
+const MAX_REMEMBERED_PLACEMENTS = 500;
 
 const MAX_TILES = 4;
 /** How long to wait before asking a not-yet-sending stream again. */
@@ -113,6 +138,16 @@ const state = {
   rejected: new Set(),
   /** Relay stream metadata by stream ID. */
   streams: new Map(),
+  /**
+   * This viewer's arrangement, by stream ID.
+   *
+   * Each record is `{ slot, hidden, name }`. `slot` is a tile number from 1 to
+   * MAX_TILES and puts the stream on screen there; null means parked -- in the
+   * list, ready to be added, not decoding. `hidden` takes it out of the list
+   * altogether, and clears any slot, because a stream cannot be both out of
+   * sight and on screen.
+   */
+  placements: new Map(),
   /** One entry per visible tile. */
   tiles: [],
   layout: 1,
@@ -180,6 +215,126 @@ function forgetRememberedKeys() {
   } catch {
     // Nothing stored means nothing to remove.
   }
+}
+
+/** What a stream with no remembered arrangement gets: listed, unnamed, parked. */
+const NO_PLACEMENT = Object.freeze({ slot: null, hidden: false, name: '' });
+
+function loadPlacements() {
+  try {
+    const raw = globalThis.localStorage.getItem(PLACEMENT_STORE);
+    if (!raw) return;
+    const stored = JSON.parse(raw);
+    if (stored?.version !== PLACEMENT_STORE_VERSION) return;
+    for (const [streamId, record] of Object.entries(stored.streams ?? {})) {
+      state.placements.set(streamId, sanitizePlacement(record));
+    }
+  } catch {
+    // A corrupt or unavailable store just means arranging again.
+  }
+}
+
+/**
+ * Reads one stored record without trusting it.
+ *
+ * Local storage is editable by hand and survives across versions, so a slot
+ * outside the grid or a name of unbounded length has to be treated as data
+ * rather than as something this page wrote.
+ */
+function sanitizePlacement(record) {
+  const hidden = record?.hidden === true;
+  const slot = Number(record?.slot);
+  const usable = !hidden && Number.isInteger(slot) && slot >= 1 && slot <= MAX_TILES;
+  return {
+    slot: usable ? slot : null,
+    hidden,
+    name: typeof record?.name === 'string' ? record.name.trim().slice(0, MAX_STREAM_NAME) : '',
+  };
+}
+
+function savePlacements() {
+  while (state.placements.size > MAX_REMEMBERED_PLACEMENTS) {
+    state.placements.delete(state.placements.keys().next().value);
+  }
+  try {
+    globalThis.localStorage.setItem(PLACEMENT_STORE, JSON.stringify({
+      version: PLACEMENT_STORE_VERSION,
+      streams: Object.fromEntries(state.placements),
+    }));
+  } catch {
+    // Without storage the arrangement still works for this page; it just has to
+    // be made again next time.
+  }
+}
+
+/**
+ * Reads a stream's arrangement, without creating one.
+ *
+ * Non-creating on purpose: this is called while rendering and while labelling
+ * tiles, and a read that quietly recorded every stream it was asked about would
+ * fill the store with streams the viewer never touched.
+ */
+function placementOf(streamId) {
+  return state.placements.get(streamId) ?? NO_PLACEMENT;
+}
+
+function updatePlacement(streamId, changes) {
+  const record = { ...placementOf(streamId), ...changes };
+  // A hidden stream cannot also be on screen, and this is the one place that
+  // has to hold, so it is enforced here rather than at each caller.
+  if (record.hidden) record.slot = null;
+  state.placements.set(streamId, record);
+  savePlacements();
+}
+
+function streamInSlot(slot) {
+  for (const [streamId, record] of state.placements) {
+    if (record.slot === slot && state.keys.has(streamId)) return streamId;
+  }
+  return null;
+}
+
+function firstFreeSlot() {
+  for (let slot = 1; slot <= MAX_TILES; slot += 1) {
+    if (!streamInSlot(slot)) return slot;
+  }
+  return null;
+}
+
+/** Puts `streamId` in `slot`, turning out whatever held it. */
+function assignSlot(streamId, slot) {
+  const displaced = streamInSlot(slot);
+  if (displaced && displaced !== streamId) updatePlacement(displaced, { slot: null });
+  updatePlacement(streamId, { slot, hidden: false });
+}
+
+/**
+ * Gives a stream nobody has arranged yet a place to be.
+ *
+ * A free tile if there is one, because a viewer who arrives holding keys and
+ * finds an empty grid has to put their own screens on it, and the obvious next
+ * action is always the same. Past the fourth it parks instead: a fifth screen
+ * turning up and displacing one being watched is the behaviour worth stopping,
+ * and it is exactly what "available, but not now" is for.
+ *
+ * Recorded either way, so the answer is only decided once. A stream parked by
+ * hand stays parked when it is seen again.
+ */
+function placeNewStreams(streamIds) {
+  let placed = 0;
+  for (const streamId of streamIds) {
+    if (state.placements.has(streamId)) continue;
+    const slot = firstFreeSlot();
+    state.placements.set(streamId, { ...NO_PLACEMENT, slot });
+    placed += 1;
+  }
+  if (placed > 0) savePlacements();
+  return placed;
+}
+
+/** What the publisher calls this stream. */
+function publishedTitle(streamId) {
+  return state.streams.get(streamId)?.display_name || streamId;
 }
 
 /**
@@ -435,53 +590,244 @@ async function refreshStreams() {
   renderStreamList();
 }
 
+/** What to call this stream here: the viewer's own name, or the publisher's. */
 function streamTitle(streamId) {
-  return state.streams.get(streamId)?.display_name || streamId;
+  return placementOf(streamId).name || publishedTitle(streamId);
 }
 
 function renderStreamList() {
   // Ordered by the relay's own ordering rather than by unlock order, so the
-  // panel reads the same way every time.
+  // panel reads the same way every time. Within "on screen" the tile number
+  // wins, because that is the order on the grid.
   const known = [...state.streams.keys()].filter(streamId => state.keys.has(streamId));
-  els.streamList.textContent = '';
+  placeNewStreams(known);
+
+  const onScreen = [];
+  const available = [];
+  const hidden = [];
   for (const streamId of known) {
-    const item = document.createElement('li');
-    item.draggable = true;
-    item.dataset.streamId = streamId;
-    const live = Boolean(state.streams.get(streamId)?.active);
-    item.className = live ? 'live' : 'offline';
+    const record = placementOf(streamId);
+    if (record.hidden) hidden.push(streamId);
+    else if (record.slot) onScreen.push(streamId);
+    else available.push(streamId);
+  }
+  onScreen.sort((left, right) => placementOf(left).slot - placementOf(right).slot);
 
-    const title = document.createElement('span');
-    title.className = 'stream-name';
-    title.textContent = streamTitle(streamId);
-    const hint = document.createElement('span');
-    hint.className = 'stream-hint';
-    // A stream nobody needed a key for is not end-to-end encrypted, and a
-    // viewer has no other way to tell one from the other once it is on screen.
-    hint.textContent = [
-      live ? 'live' : 'not publishing',
-      state.keys.get(streamId) === null ? 'not encrypted' : null,
-    ].filter(Boolean).join(' · ');
+  els.streamList.textContent = '';
+  renderStreamGroup('On screen', onScreen, 'screen');
+  renderStreamGroup('Available', available, 'available');
+  renderStreamGroup('Hidden', hidden, 'hidden');
 
-    // The row itself is the control. Dragging is still the way to choose which
-    // tile, but it is unavailable to keyboard and touch users, so a plain click
-    // on the stream puts it in the first free one.
-    const pick = document.createElement('button');
-    pick.type = 'button';
-    pick.className = 'stream-pick';
-    pick.append(title, hint);
-    pick.addEventListener('click', () => assignToFirstFreeTile(streamId));
+  els.forgetAll.hidden = known.length === 0;
+  markOnScreen();
+  setWatching(known.length > 0);
+}
 
-    item.append(pick);
+/**
+ * Renders one section of the panel.
+ *
+ * An empty section is not rendered at all: a heading over nothing reads as
+ * something having gone wrong, and on the common arrangement -- everything on
+ * screen, nothing parked or hidden -- the panel should look exactly as it did
+ * before any of this existed.
+ */
+function renderStreamGroup(title, streamIds, kind) {
+  if (streamIds.length === 0) return;
+  const group = document.createElement('section');
+  group.className = `stream-group stream-group-${kind}`;
+  const list = document.createElement('ul');
+  list.className = 'stream-list';
+  for (const streamId of streamIds) list.append(renderStreamRow(streamId, kind));
+
+  if (kind === 'hidden') {
+    // Folded away, because the point of hiding a stream is not to see it. Still
+    // present, and still counted, because a removal with no way back is a trap.
+    const details = document.createElement('details');
+    const summary = document.createElement('summary');
+    summary.textContent = `${title} (${streamIds.length})`;
+    details.append(summary, list);
+    group.append(details);
+  } else {
+    const heading = document.createElement('h3');
+    heading.textContent = title;
+    group.append(heading, list);
+  }
+  els.streamList.append(group);
+}
+
+function renderStreamRow(streamId, kind) {
+  const item = document.createElement('li');
+  item.dataset.streamId = streamId;
+  // Dragging is how a stream is put in a particular tile. A hidden one has no
+  // business being dropped anywhere until it is out of hiding.
+  item.draggable = kind !== 'hidden';
+  const record = placementOf(streamId);
+  const live = Boolean(state.streams.get(streamId)?.active);
+  item.className = live ? 'live' : 'offline';
+
+  // The whole row is the primary control, and it is deliberately the first
+  // button in the row: the obvious gesture is to click the thing you want to
+  // watch, and that is also what the browser gates click.
+  const pick = document.createElement('button');
+  pick.type = 'button';
+  pick.className = 'stream-pick';
+
+  if (record.slot) {
+    const slot = document.createElement('span');
+    slot.className = 'stream-slot';
+    slot.textContent = String(record.slot);
+    slot.title = `Tile ${record.slot}`;
+    pick.append(slot);
+  }
+
+  const label = document.createElement('span');
+  label.className = 'stream-label';
+  const name = document.createElement('span');
+  name.className = 'stream-name';
+  name.textContent = streamTitle(streamId);
+  label.append(name);
+  // What the publisher calls it, whenever that is not what is shown. Renaming
+  // is for the viewer's convenience and must not make a stream unidentifiable.
+  if (record.name) {
+    const published = document.createElement('span');
+    published.className = 'stream-published';
+    published.textContent = publishedTitle(streamId);
+    label.append(published);
+  }
+  pick.append(label);
+
+  const hint = document.createElement('span');
+  hint.className = 'stream-hint';
+  // A stream nobody needed a key for is not end-to-end encrypted, and a
+  // viewer has no other way to tell one from the other once it is on screen.
+  hint.textContent = [
+    live ? 'live' : 'not publishing',
+    state.keys.get(streamId) === null ? 'not encrypted' : null,
+  ].filter(Boolean).join(' · ');
+  pick.append(hint);
+
+  pick.title = kind === 'hidden'
+    ? 'Put this stream back in the list'
+    : 'Show this stream on screen';
+  pick.addEventListener('click', () => {
+    if (kind === 'hidden') {
+      updatePlacement(streamId, { hidden: false });
+      scheduleStreamList();
+      return;
+    }
+    assignToFirstFreeTile(streamId);
+  });
+  item.append(pick);
+
+  const actions = document.createElement('span');
+  actions.className = 'stream-actions';
+  actions.append(rowAction('✎', `Rename ${streamTitle(streamId)}`, () => beginRename(item, streamId)));
+  if (record.slot) {
+    actions.append(rowAction('−', 'Take off screen, keep in the list', () => {
+      takeOffScreen(streamId);
+      scheduleStreamList();
+    }));
+  }
+  if (kind !== 'hidden') {
+    actions.append(rowAction('✕', 'Hide this stream from the list', () => {
+      takeOffScreen(streamId);
+      updatePlacement(streamId, { hidden: true });
+      scheduleStreamList();
+    }));
+  }
+  item.append(actions);
+
+  if (item.draggable) {
     item.addEventListener('dragstart', event => {
       event.dataTransfer.setData('text/plain', streamId);
       event.dataTransfer.effectAllowed = 'copy';
     });
-    els.streamList.append(item);
   }
-  els.forgetAll.hidden = known.length === 0;
-  markOnScreen();
-  setWatching(known.length > 0);
+  return item;
+}
+
+function rowAction(glyph, title, onClick) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'stream-action';
+  button.title = title;
+  button.setAttribute('aria-label', title);
+  button.textContent = glyph;
+  button.addEventListener('click', onClick);
+  return button;
+}
+
+/** Stops decoding a stream and gives up its tile number, keeping it listed. */
+function takeOffScreen(streamId) {
+  const tile = state.tiles.find(candidate => candidate.streamId === streamId);
+  if (tile) detachTile(tile);
+  if (placementOf(streamId).slot) updatePlacement(streamId, { slot: null });
+}
+
+/**
+ * Rebuilds the panel once the current event has finished.
+ *
+ * Rendering moves a row between sections, which means destroying the element
+ * whose own button is still handling the click that asked for the move. The
+ * work is deferred by a turn so the handler returns to a live element, and so
+ * that several changes in one gesture render once.
+ */
+let streamListPending = false;
+function scheduleStreamList() {
+  if (streamListPending) return;
+  streamListPending = true;
+  setTimeout(() => {
+    streamListPending = false;
+    renderStreamList();
+  }, 0);
+}
+
+/**
+ * Swaps a row for a field to rename it in.
+ *
+ * The name is this viewer's alone: it is stored in this browser, never sent to
+ * the relay, and other people watching the same stream see whatever the
+ * publisher called it. Submitting an empty field, or the publisher's own name,
+ * clears the override rather than storing a duplicate of it -- so there is a
+ * way back that does not require remembering what the original was.
+ */
+function beginRename(item, streamId) {
+  if (item.querySelector('.stream-rename')) return;
+  const form = document.createElement('form');
+  form.className = 'stream-rename';
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.maxLength = MAX_STREAM_NAME;
+  input.value = streamTitle(streamId);
+  input.setAttribute('aria-label', `Name for ${publishedTitle(streamId)}`);
+  const save = document.createElement('button');
+  save.type = 'submit';
+  save.textContent = 'Save';
+  form.append(input, save);
+
+  form.addEventListener('submit', event => {
+    event.preventDefault();
+    const typed = input.value.trim();
+    updatePlacement(streamId, { name: typed === publishedTitle(streamId) ? '' : typed });
+    refreshTileTitles();
+    scheduleStreamList();
+  });
+  input.addEventListener('keydown', event => {
+    if (event.key !== 'Escape') return;
+    event.preventDefault();
+    scheduleStreamList();
+  });
+
+  item.append(form);
+  input.focus();
+  input.select();
+}
+
+/** Carries a rename through to the tiles already showing the stream. */
+function refreshTileTitles() {
+  for (const tile of state.tiles) {
+    if (tile.streamId) tile.title.textContent = streamTitle(tile.streamId);
+  }
 }
 
 /**
@@ -491,7 +837,7 @@ function renderStreamList() {
  * the row whose button is still handling the click that caused it.
  */
 function markOnScreen() {
-  for (const item of els.streamList.children) {
+  for (const item of els.streamList.querySelectorAll('li[data-stream-id]')) {
     item.classList.toggle(
       'on-screen',
       state.tiles.some(tile => tile.streamId === item.dataset.streamId),
@@ -536,14 +882,26 @@ function setLayout(count) {
 
   // Shrinking the layout destroys the players it drops, so their sockets and
   // decoders are released rather than left running behind a hidden tile.
+  let parked = false;
   while (state.tiles.length > count) {
     const tile = state.tiles.pop();
+    // A stream loses its number along with the tile that number referred to,
+    // and moves to the available list. Keeping a slot the grid no longer has
+    // would leave the panel promising a position that does not exist.
+    if (tile.streamId && placementOf(tile.streamId).slot) {
+      updatePlacement(tile.streamId, { slot: null });
+      parked = true;
+    }
     detachTile(tile);
     tile.element.remove();
   }
   while (state.tiles.length < count) {
     state.tiles.push(createTile());
   }
+  // Only when something moved. This also runs during startup, before the stream
+  // list has arrived, and rendering then would decide which of the two pages
+  // this is before anything is known.
+  if (parked) scheduleStreamList();
 }
 
 function createTile() {
@@ -571,7 +929,13 @@ function createTile() {
   });
 
   element.querySelector('[data-action="remove"]').addEventListener('click', () => {
-    detachTile(tile);
+    // Emptying a tile by hand is the viewer saying they do not want this on
+    // screen, so the stream gives up its number and moves to the available
+    // list. Every other way a tile is emptied -- reassignment, teardown,
+    // leaving the page -- deliberately leaves the arrangement alone.
+    if (tile.streamId) takeOffScreen(tile.streamId);
+    else detachTile(tile);
+    scheduleStreamList();
   });
   element.querySelector('[data-action="fullscreen"]').addEventListener('click', () => {
     if (document.fullscreenElement === element) document.exitFullscreen();
@@ -591,10 +955,15 @@ function assignToFirstFreeTile(streamId) {
     return;
   }
   if (state.tiles.length < MAX_TILES) {
-    setLayout(Math.min(MAX_TILES, state.tiles.length + 1));
+    // To the next layout the grid actually has, which is 1, 2, or 4. Growing by
+    // one produced a three-tile grid with no rule to lay it out, so the tiles
+    // fell into a single column that got narrower with every stream added.
+    setLayout(state.tiles.length < 2 ? 2 : MAX_TILES);
     attachTile(state.tiles.at(-1), streamId);
     return;
   }
+  // Every tile is taken. The first one is the one displaced, and its stream
+  // keeps its place in the list rather than disappearing from the panel.
   attachTile(state.tiles[0], streamId);
 }
 
@@ -620,7 +989,12 @@ function attachTile(tile, streamId) {
   tile.title.textContent = streamTitle(streamId);
   tile.message.textContent = key === null ? 'Preparing media…' : 'Preparing encrypted media…';
   mountPlayer(tile, streamId, key);
+  // The tile a stream landed in is its number from now on, whether it got there
+  // by click, by drag, or by being restored. Recorded here, at the one point
+  // every one of those paths goes through.
+  assignSlot(streamId, state.tiles.indexOf(tile) + 1);
   markOnScreen();
+  scheduleStreamList();
 }
 
 /**
@@ -721,27 +1095,43 @@ globalThis.GlacialCastWatch = {
   unlockedStreams: () => [...state.keys.keys()],
   /** Streams unlocked without a key, because they were published in the clear. */
   openStreams: () => [...state.keys].filter(([, key]) => key === null).map(([id]) => id),
+  /** This viewer's arrangement, so a gate can check what was remembered. */
+  placements: () => Object.fromEntries(state.placements),
+  /** The name shown for a stream, which may be one this viewer typed. */
+  titleOf: streamId => streamTitle(streamId),
 };
 
 /**
- * Fills the grid with whatever is already unlocked.
+ * Puts the numbered streams on screen, each in the tile its number names.
  *
- * Arriving at a viewer that holds your keys and shows an empty grid is a
- * chore: the obvious next action is always "put them on screen". The layout is
- * sized to what there is, so three screens land in a four-up grid and one lands
- * on its own rather than in a mostly empty one.
+ * Arriving at a viewer that holds your keys and shows an empty grid is a chore:
+ * the obvious next action is always "put them on screen". This does it, and
+ * does it the same way every time -- stream 1 in tile 1 -- so the grid a viewer
+ * arranged is the grid they come back to, across reloads and restarts.
+ *
+ * The layout only ever grows to fit. Shrinking it here would keep overriding a
+ * layout the viewer chose by hand, and this runs on every poll.
  */
 function showUnlockedStreams() {
-  const available = [...state.streams.keys()].filter(streamId => state.keys.has(streamId));
-  if (available.length === 0) return;
-  const fitted = available.length > 2 ? 4 : available.length;
-  if (fitted !== state.layout) setLayout(fitted);
-  for (const [index, streamId] of available.slice(0, state.tiles.length).entries()) {
+  const numbered = [...state.placements]
+    .filter(([streamId, record]) => record.slot
+      && state.keys.has(streamId)
+      && state.streams.has(streamId))
+    .sort((left, right) => left[1].slot - right[1].slot);
+  if (numbered.length === 0) return;
+
+  const highest = numbered.at(-1)[1].slot;
+  const fitted = highest > 2 ? 4 : highest;
+  if (fitted > state.layout) setLayout(fitted);
+
+  for (const [streamId, record] of numbered) {
+    const tile = state.tiles[record.slot - 1];
     // Reattaching a tile tears down a working player, so a stream already on
     // screen is left exactly where it is.
-    if (state.tiles.some(tile => tile.streamId === streamId)) continue;
-    if (state.tiles[index].streamId) continue;
-    attachTile(state.tiles[index], streamId);
+    if (!tile || tile.streamId === streamId) continue;
+    if (state.tiles.some(other => other.streamId === streamId)) continue;
+    if (tile.streamId) continue;
+    attachTile(tile, streamId);
   }
 }
 
@@ -817,6 +1207,9 @@ function explainEncryptedUnsupported() {
 }
 
 restoreSidebar();
+// Before the layout, because shrinking the grid parks what it drops and that
+// has to act on the arrangement being restored, not on an empty one.
+loadPlacements();
 setLayout(state.layout);
 loadRememberedKeys();
 

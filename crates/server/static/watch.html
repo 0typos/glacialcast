@@ -34,7 +34,11 @@
   <main>
     <aside id="sidebar" aria-labelledby="sidebar-title">
       <h2 id="sidebar-title">Streams</h2>
-      <ul id="stream-list" class="stream-list"></ul>
+      <!-- Holds one section per group -- on screen, available, hidden -- each
+           with its own list. A container rather than a list itself, so every
+           stream row is still a `#stream-list li[data-stream-id]` however the
+           groups are arranged. -->
+      <div id="stream-list" class="stream-groups"></div>
       <div id="sidebar-unlock" class="unlock-slot" hidden>
         <h3>Add another key</h3>
       </div>
