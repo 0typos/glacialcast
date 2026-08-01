@@ -124,6 +124,24 @@ pub struct EpochDescriptor {
     pub segment_frames: u16,
     /// RFC 3339 availability start time used by the live MPD.
     pub availability_start_time: String,
+    /// Whether this epoch's media and cursor payloads are encrypted.
+    ///
+    /// Defaults to `true` when absent, so a descriptor written before this
+    /// field existed still reads as the encrypted epoch it is, and retained
+    /// objects survive the upgrade.
+    ///
+    /// A `false` epoch has no viewer key, and therefore no key to derive an
+    /// authentication tag from either: its objects are unauthenticated, and
+    /// integrity rests on Noise for ingest and TLS to the browser rather than
+    /// end to end. Publishing one is refused unless the relay is serving a
+    /// trusted LAN.
+    #[serde(default = "encrypted_by_default")]
+    pub encrypted: bool,
+}
+
+/// Absent means encrypted: the only descriptors without the field predate it.
+fn encrypted_by_default() -> bool {
+    true
 }
 
 impl EpochDescriptor {
@@ -140,6 +158,10 @@ impl EpochDescriptor {
             || !self.codec.starts_with("avc1.")
             || self.codec.len() > 32
             || self.availability_start_time.len() > 64
+            // An unencrypted epoch has no key, so it has no key identifier to
+            // carry; requiring the epoch UUID there anyway keeps one shape for
+            // both modes and one thing for a reader to check.
+            || (!self.encrypted && self.key_id != *self.epoch_id.as_bytes())
         {
             return Err(DashError::InvalidEpochDescriptor);
         }
@@ -1341,6 +1363,37 @@ mod tests {
             source_width: batch.source_width,
             source_height: batch.source_height,
         }
+    }
+
+    #[test]
+    fn a_descriptor_without_the_flag_still_reads_as_encrypted() {
+        // Objects retained from before the field existed must keep working:
+        // absent means encrypted, because that is the only thing it could have
+        // been. Written as raw JSON rather than by round-tripping a struct,
+        // since the point is what an older publisher actually wrote.
+        let epoch = Uuid::new_v4();
+        let stream = Uuid::new_v4();
+        let legacy = serde_json::json!({
+            "format_version": DASH_FORMAT_VERSION,
+            "stream_id": stream,
+            "epoch_id": epoch,
+            "key_id": epoch.as_bytes(),
+            "width": 1920,
+            "height": 1080,
+            "codec": "avc1.42c028",
+            "timescale": MEDIA_TIMESCALE,
+            "segment_frames": 5,
+            "availability_start_time": "2026-01-01T00:00:00.000Z",
+        });
+        let parsed = EpochDescriptor::from_json(&serde_json::to_vec(&legacy).unwrap())
+            .expect("a descriptor predating the flag must still parse");
+        assert!(parsed.encrypted, "absent must mean encrypted");
+
+        // And the flag survives a round trip once it is written.
+        let mut plain = parsed.clone();
+        plain.encrypted = false;
+        let reparsed = EpochDescriptor::from_json(&plain.to_json().unwrap()).unwrap();
+        assert!(!reparsed.encrypted);
     }
 
     #[test]

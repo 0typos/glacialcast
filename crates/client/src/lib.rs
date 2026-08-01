@@ -1163,6 +1163,10 @@ async fn run_dash_connection(
         segment_frames: args.segment_frames(),
         availability_start_time: chrono::Utc::now()
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        // Every epoch this publisher writes today is encrypted. The flag exists
+        // so a viewer can tell before it has any key; the mode that sets it
+        // false is not wired up yet.
+        encrypted: true,
     };
     let epoch_started = Instant::now();
     send_new_dash_object(

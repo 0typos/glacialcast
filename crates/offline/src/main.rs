@@ -1979,6 +1979,7 @@ mod tests {
             timescale: MEDIA_TIMESCALE,
             segment_frames: 1,
             availability_start_time: "2026-01-01T00:00:00Z".to_string(),
+            encrypted: true,
         };
         let epoch = test_object(
             stream_id,
@@ -2020,6 +2021,7 @@ mod tests {
             timescale: MEDIA_TIMESCALE,
             segment_frames: 4,
             availability_start_time: "2026-01-01T00:00:00Z".to_string(),
+            encrypted: true,
         };
         store_object(
             &directory,
