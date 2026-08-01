@@ -206,6 +206,16 @@ evidence. Reports are welcome; so is a failure.
   by bytes per stream, and history beyond that is gone.
 - **Packages are x86_64 only**, built against glibc 2.39. Older distributions
   are refused rather than sold a binary that cannot start.
+- **iOS cannot play these streams in any browser.** Every iOS browser is
+  WebKit underneath, whatever its name. iPhones expose no `MediaSource` at all
+  (iOS 17.1 added ManagedMediaSource, which the viewer does not use), and
+  WebKit's Encrypted Media Extensions offer FairPlay only — never the ClearKey
+  scheme this viewer's end-to-end encryption is built on. The second wall
+  stands even where the first does not, so no setting or alternative iOS
+  browser helps; the viewer says so on the page rather than naming a missing
+  API. Viewing needs a desktop or Android browser. Publishing without
+  encryption would be the only route to iOS playback, and that mode does not
+  currently exist.
 - **Firefox will not decode encrypted samples of a second or longer.** Chromium
   plays the same bytes. The publisher's idle heartbeat therefore defaults to
   0.5s, which bounds every sample below that; raising `--idle-heartbeat-seconds`
