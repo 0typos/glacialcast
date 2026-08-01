@@ -448,6 +448,21 @@ async function unlockWithKey(typed) {
 function setStreamKey(streamId, key) {
   const changed = state.keys.has(streamId) && state.keys.get(streamId) !== key;
   state.keys.set(streamId, key);
+  // A key that verified against this stream's newest epoch has already answered
+  // the question `unlockOpenStreams` would ask: the epoch is encrypted, because
+  // an unencrypted one is opened by no key at all and `verifyViewerKey` says so.
+  //
+  // Recording it here matters for more than tidiness. Without it, every page
+  // load re-described every stream the remembered keys had just unlocked --
+  // two fetches each, in series, alongside a WebSocket per tile and against a
+  // browser's per-host connection limit. On a loaded machine that was enough to
+  // leave a navigation queued behind them.
+  if (key !== null) {
+    state.described.set(streamId, {
+      epochId: state.streams.get(streamId)?.last_epoch_id ?? null,
+      encrypted: true,
+    });
+  }
   if (changed) dropTilesFor(streamId);
 }
 
@@ -1190,6 +1205,8 @@ globalThis.GlacialCastWatch = {
   openStreams: () => [...state.keys].filter(([, key]) => key === null).map(([id]) => id),
   /** This viewer's arrangement, so a gate can check what was remembered. */
   placements: () => Object.fromEntries(state.placements),
+  /** What is known about each stream's encryption, and from which epoch. */
+  described: () => Object.fromEntries(state.described),
   /** The name shown for a stream, which may be one this viewer typed. */
   titleOf: streamId => streamTitle(streamId),
 };
