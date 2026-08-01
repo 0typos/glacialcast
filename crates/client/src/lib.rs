@@ -210,6 +210,19 @@ struct Args {
     /// second cuts idle bandwidth further but limits playback to Chromium.
     #[arg(long, value_parser = parse_idle_heartbeat_seconds, default_value_t = 0.5)]
     idle_heartbeat_seconds: f64,
+    /// Publishes without encryption, so no viewing key is needed to watch.
+    ///
+    /// The relay refuses these streams unless it is serving a trusted local
+    /// network, and every host that can reach it can then watch, and can inject
+    /// frames a viewer cannot tell from yours. Media and cursor data leave this
+    /// machine readable by the relay and by anything between.
+    ///
+    /// It exists because Apple's browsers cannot play encrypted streams at all:
+    /// WebKit offers only FairPlay, never the Clear Key scheme this uses, so an
+    /// iPhone or iPad has no way to decrypt one. Unencrypted is the only form
+    /// they can play.
+    #[arg(long)]
+    no_encryption: bool,
     #[arg(long, default_value_t = 60)]
     cursor_hz: u64,
     #[arg(long, value_parser = parse_cursor_flush_ms, default_value_t = 25)]
@@ -444,7 +457,7 @@ pub fn run() -> Result<()> {
         .clone()
         .unwrap_or_else(|| default_log_file(&identity.client_id));
     if detach {
-        print_sharing_summary(&identity, &daemon_socket, &log_file);
+        print_sharing_summary(&identity, &daemon_socket, &log_file, args.no_encryption);
     }
     if daemonize_if_requested(
         detach,
@@ -485,14 +498,21 @@ fn print_sharing_summary(
     identity: &ClientIdentity,
     daemon_socket: &std::path::Path,
     log_file: &std::path::Path,
+    unencrypted: bool,
 ) {
     println!("GlacialCast publisher \"{}\"", identity.display_name);
     if let Some(viewer_url) = &identity.viewer_url {
         println!("  viewer page  {viewer_url}");
     }
-    match identity.viewer_key_shareable.as_deref() {
-        Some(key) => println!("  viewer key   {key}"),
-        None => println!("  viewer key   (none configured; publishing will fail)"),
+    if unencrypted {
+        // Printing a key here would be worse than printing nothing: it reads as
+        // a secret protecting the stream, and this stream has none.
+        println!("  viewer key   (not used; this stream is published unencrypted)");
+    } else {
+        match identity.viewer_key_shareable.as_deref() {
+            Some(key) => println!("  viewer key   {key}"),
+            None => println!("  viewer key   (none configured; publishing will fail)"),
+        }
     }
     if let Some(path) = &identity.config_path {
         println!("  config       {}", path.display());
@@ -502,17 +522,26 @@ fn print_sharing_summary(
     }
     println!("  log file     {}", log_file.display());
     println!("  control      {}", daemon_socket.display());
-    if let Some(link) = invite_link(identity) {
+    if let Some(link) = invite_link(identity).filter(|_| !unencrypted) {
         println!();
         println!("Invitation link — opens and starts playing, with nothing to type:");
         println!("  {link}");
     }
     println!();
-    println!(
-        "Share the viewer key over a secure out-of-band channel. It is stable across\n\
-         restarts, and one key unlocks every screen this publisher casts; the relay\n\
-         cannot decrypt any of them."
-    );
+    if unencrypted {
+        println!(
+            "This stream is NOT encrypted. Anyone who can reach the relay can watch it,\n\
+             and anyone who can reach the relay's ingest port can inject frames a viewer\n\
+             cannot tell from yours. The relay can read the picture and the cursor. Use\n\
+             this only on a network you trust; the relay refuses it otherwise."
+        );
+    } else {
+        println!(
+            "Share the viewer key over a secure out-of-band channel. It is stable across\n\
+             restarts, and one key unlocks every screen this publisher casts; the relay\n\
+             cannot decrypt any of them."
+        );
+    }
 }
 
 /// Builds the one-click invitation link for this publisher's viewer key.
@@ -1129,6 +1158,9 @@ async fn run_dash_connection(
     let epoch_id = Uuid::new_v4();
     let keys = EpochKeys::derive(viewer_key, stream_id, epoch_id)
         .context("deriving encrypted DASH epoch keys")?;
+    // One place decides, and everything downstream reads it from the absence of
+    // a key rather than from a flag it could disagree with.
+    let epoch_keys = (!args.no_encryption).then_some(&keys);
     let encoder = EncoderActor::spawn(EncoderConfig {
         mode: args.dash_encoder,
         vaapi_device: args.vaapi_device.clone(),
@@ -1163,10 +1195,7 @@ async fn run_dash_connection(
         segment_frames: args.segment_frames(),
         availability_start_time: chrono::Utc::now()
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        // Every epoch this publisher writes today is encrypted. The flag exists
-        // so a viewer can tell before it has any key; the mode that sets it
-        // false is not wired up yet.
-        encrypted: true,
+        encrypted: epoch_keys.is_some(),
     };
     let epoch_started = Instant::now();
     send_new_dash_object(
@@ -1174,7 +1203,7 @@ async fn run_dash_connection(
         resend,
         next_dash_object(
             &mut sequence,
-            Some(&keys),
+            epoch_keys,
             DashObjectSpec {
                 stream_id,
                 epoch_id,
@@ -1197,7 +1226,7 @@ async fn run_dash_connection(
         resend,
         next_dash_object(
             &mut sequence,
-            Some(&keys),
+            epoch_keys,
             DashObjectSpec {
                 stream_id,
                 epoch_id,
@@ -1208,7 +1237,7 @@ async fn run_dash_connection(
                 duration: 0,
                 random_access: true,
                 mime: "video/mp4",
-                payload: build_init_segment(&avc_config, Some(keys.key_id))
+                payload: build_init_segment(&avc_config, epoch_keys.map(|keys| keys.key_id))
                     .context("building encrypted DASH initialization segment")?,
             },
         )?,
@@ -1216,7 +1245,7 @@ async fn run_dash_connection(
     .await?;
     let first_media = build_dash_media_object(
         &mut sequence,
-        Some(&keys),
+        epoch_keys,
         stream_id,
         epoch_id,
         0,
@@ -1348,7 +1377,7 @@ async fn run_dash_connection(
                         &mut socket,
                         resend,
                         &mut sequence,
-                        Some(&keys),
+                        epoch_keys,
                         stream_id,
                         epoch_id,
                         &mut media_index,
@@ -1362,7 +1391,7 @@ async fn run_dash_connection(
                     &mut socket,
                     resend,
                     &mut sequence,
-                    Some(&keys),
+                    epoch_keys,
                     stream_id,
                     epoch_id,
                     width,
@@ -1400,7 +1429,7 @@ async fn run_dash_connection(
                                 &mut socket,
                                 resend,
                                 &mut sequence,
-                                Some(&keys),
+                                epoch_keys,
                                 stream_id,
                                 epoch_id,
                                 width,
@@ -1438,7 +1467,7 @@ async fn run_dash_connection(
                         &mut socket,
                         resend,
                         &mut sequence,
-                        Some(&keys),
+                        epoch_keys,
                         stream_id,
                         epoch_id,
                         &mut media_index,
@@ -1459,7 +1488,7 @@ async fn run_dash_connection(
                         &mut socket,
                         resend,
                         &mut sequence,
-                        Some(&keys),
+                        epoch_keys,
                         stream_id,
                         epoch_id,
                         &mut media_index,
@@ -1502,7 +1531,7 @@ async fn run_dash_connection(
                     &mut socket,
                     resend,
                     &mut sequence,
-                    Some(&keys),
+                    epoch_keys,
                     stream_id,
                     epoch_id,
                     width,
@@ -1549,7 +1578,7 @@ async fn run_dash_connection(
                         &mut socket,
                         resend,
                         &mut sequence,
-                        Some(&keys),
+                        epoch_keys,
                         stream_id,
                         epoch_id,
                         width,
