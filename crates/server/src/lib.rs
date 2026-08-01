@@ -43,7 +43,6 @@ use axum::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
-use glacialcast_dash::EpochDescriptor;
 use glacialcast_protocol::{
     ClientMessage, ControlEvent, DashObject, DashObjectHeader, DashObjectKind, NOISE_KEY_LEN,
     NoiseKeypair, ServerMessage, StreamHello,
@@ -1495,6 +1494,7 @@ async fn list_streams(
         if let Some(summary) = dash_summaries.get(&stream.stream_id) {
             stream.retained_bytes = stream.retained_bytes.max(summary.bytes);
             stream.last_object_sequence = summary.last_sequence;
+            stream.last_epoch_id = summary.last_epoch_id;
         }
     }
     Ok(axum::Json(streams))
@@ -1959,10 +1959,19 @@ fn websocket_guard(state: &AppState, principal_name: &str) -> Result<ConnectionG
 /// can read the claim without any viewer key -- which is the whole point: an
 /// unencrypted epoch has no key, and the relay has never had one anyway.
 ///
-/// An epoch whose descriptor cannot be parsed is left alone. The relay treats
-/// object payloads as opaque everywhere else, and a descriptor it cannot read
-/// is not a claim to be unencrypted; refusing on a parse failure would make the
-/// relay reject objects it has no business interpreting.
+/// Only the claim is read, as leniently as JSON allows, and deliberately not
+/// through [`glacialcast_dash::EpochDescriptor::from_json`]. Requiring the whole
+/// descriptor to validate here was a bypass: a publisher could write
+/// `"encrypted": false`
+/// next to one field the relay's validation rejects but a viewer's does not,
+/// fail the strict parse, and be waved through -- while the viewer read the
+/// same claim from the same bytes and played the stream keyless. The policy
+/// needs the claim alone, so that nothing else in the payload can suppress it.
+///
+/// A payload that does not parse as a JSON object at all is left alone. It
+/// carries no readable claim for this check or for any viewer -- every viewer
+/// parses the descriptor with the same grammar before trusting anything in it,
+/// so what is stored is unplayable, not unencrypted.
 ///
 /// # Errors
 ///
@@ -1972,10 +1981,16 @@ fn refuse_unencrypted_epoch(object: &DashObject, allow_unencrypted: bool) -> Res
     if allow_unencrypted || object.header.kind != DashObjectKind::Epoch {
         return Ok(());
     }
-    let Ok(descriptor) = EpochDescriptor::from_json(&object.payload) else {
+    #[derive(serde::Deserialize)]
+    struct EncryptionClaim {
+        // An absent field means encrypted; only descriptors that predate the
+        // field lack it, mirroring the dash crate's default.
+        encrypted: Option<bool>,
+    }
+    let Ok(claim) = serde_json::from_slice::<EncryptionClaim>(&object.payload) else {
         return Ok(());
     };
-    if descriptor.encrypted {
+    if claim.encrypted != Some(false) {
         return Ok(());
     }
     anyhow::bail!(
@@ -2180,7 +2195,18 @@ async fn ingest_loop(
                         .await?;
                     continue;
                 }
-                refuse_unencrypted_epoch(&object, state.allow_unencrypted)?;
+                // Told, then dropped. The publisher cannot tell a policy
+                // refusal from a network fault by the disconnect alone, and
+                // reconnecting will never make this one succeed.
+                if let Err(refusal) = refuse_unencrypted_epoch(&object, state.allow_unencrypted) {
+                    socket
+                        .write(&ServerMessage::Refused {
+                            sequence: object.header.sequence,
+                            reason: refusal.to_string(),
+                        })
+                        .await?;
+                    return Err(refusal);
+                }
                 let is_new = object.header.sequence == expected_sequence;
                 let object_kind = object.header.kind;
                 let object_bytes = u64::from(object.header.payload_len);
@@ -2350,7 +2376,7 @@ mod tests {
         let stream_id = Uuid::new_v4();
         let epoch_id = Uuid::new_v4();
         let keys = EpochKeys::derive(&[9u8; 32], stream_id, epoch_id).unwrap();
-        let descriptor = EpochDescriptor {
+        let descriptor = glacialcast_dash::EpochDescriptor {
             format_version: 1,
             stream_id,
             epoch_id,
@@ -2402,10 +2428,10 @@ mod tests {
 
     #[test]
     fn an_unreadable_descriptor_is_not_treated_as_a_claim() {
-        // Payloads are opaque to the relay everywhere else. A descriptor it
-        // cannot parse is not a claim to be unencrypted, and refusing on a
-        // parse failure would have the relay rejecting objects it has no
-        // business interpreting.
+        // A payload that is not a JSON object carries no claim this check can
+        // read -- and none a viewer can read either, since every viewer parses
+        // the descriptor with the same grammar before trusting it. What gets
+        // stored is unplayable, not unencrypted.
         let mut object = epoch_object(true);
         object.payload = b"not json at all".to_vec();
         assert!(refuse_unencrypted_epoch(&object, false).is_ok());
@@ -2414,6 +2440,31 @@ mod tests {
         let mut media = epoch_object(false);
         media.header.kind = DashObjectKind::Media;
         assert!(refuse_unencrypted_epoch(&media, false).is_ok());
+    }
+
+    #[test]
+    fn an_invalid_descriptor_cannot_smuggle_an_unencrypted_claim() {
+        // The bypass this closes: "encrypted": false beside one field that
+        // fails the relay's full validation but not a viewer's. The strict
+        // parse failed, the old check waved the epoch through, and the viewer
+        // read the same claim from the same bytes and played it keyless. The
+        // claim must be honored no matter what surrounds it.
+        for payload in [
+            // segment_frames: 0 fails validate(); a viewer never checks it.
+            br#"{"format_version":1,"stream_id":"a3f1c1f2-0f6f-4e64-9d3e-3c1a5df31c11","epoch_id":"b4e2d2e3-1a7f-4f75-8e4f-4d2b6ea42d22","key_id":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"width":320,"height":180,"codec":"avc1.42c015","timescale":90000,"segment_frames":0,"availability_start_time":"","encrypted":false}"#.to_vec(),
+            // Not a descriptor at all, but unambiguously claiming to be clear.
+            br#"{"encrypted":false}"#.to_vec(),
+        ] {
+            let mut object = epoch_object(true);
+            object.payload = payload;
+            let error = refuse_unencrypted_epoch(&object, false)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("refusing an unencrypted epoch"), "{error}");
+            // A trusted-LAN relay still takes it; the gate is the policy, not
+            // the parse.
+            assert!(refuse_unencrypted_epoch(&object, true).is_ok());
+        }
     }
 
     #[test]
