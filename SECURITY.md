@@ -30,7 +30,16 @@ worth reporting against:
 - **The relay cannot read a stream.** Media is CENC-encrypted and cursor
   batches are AES-GCM sealed under a viewer key the relay never receives. Any
   path by which an operator of the relay recovers screen content or cursor
-  positions is in scope.
+  positions is in scope. This is the claim for a stream published normally; a
+  publisher that passed `--no-encryption` has deliberately given it up, and
+  that case is covered under "out of scope" below.
+- **Encryption cannot be stripped from a stream that has it.** A relay refuses
+  an unencrypted epoch unless started with `--trusted-lan`, which is itself
+  refused alongside `security.public_origin`. A viewer holding a key for a
+  stream refuses an epoch served in the clear on it, rather than playing
+  whatever arrives. Any path by which a hostile relay downgrades a stream a
+  viewer holds a key for — or by which an unencrypted epoch is accepted by a
+  relay that did not opt in — is in scope.
 - **Ingest is authenticated and pinned.** The publisher pins the relay's Noise
   NK public key. Any path by which an unpinned or substituted server accepts
   ingest, or by which an unauthenticated party publishes to a stream, is in
@@ -55,6 +64,17 @@ answering a publisher, a hostile publisher feeding a relay, or a malformed
 These are design limits, not bugs. They are documented so a report does not
 have to rediscover them:
 
+- **A stream published with `--no-encryption` is readable, by design.** The
+  media and cursor batches are plaintext to the relay, to anything that can
+  reach its HTTP surface, and to anything on the network path TLS does not
+  cover. Such objects also carry no authentication tag, because there is no key
+  to derive one from: a viewer can check an object against its own SHA-256 but
+  cannot tell who produced it. Integrity is hop-by-hop — Noise for ingest, TLS
+  to the browser — and not end to end. The mode exists because WebKit offers
+  FairPlay and never ClearKey, so an iPhone can play no other kind. Reports that
+  an unencrypted stream is readable are not findings; reports that one can be
+  published to a relay that did not opt in, or served to a viewer holding a key,
+  are.
 - **The viewer key unlocks everything the publisher casts.** One key covers
   every screen from one publisher, by design. Sharing it shares all of them.
 - **A key phrase carries 70 bits, not 256.** A viewing key is seven words from
@@ -64,10 +84,13 @@ have to rediscover them:
   actually transfer. Reports that the phrase space is smaller than 2^256 are not
   findings; a flaw in the derivation, the salt handling, or the word decoding
   very much is.
-- **An unlocked key lives in `sessionStorage` for the tab.** It is plaintext
-  there, readable by any script already running on the page. Script injection
-  into the viewer is in scope; the storage choice itself is not, since such a
-  script could equally read the key from memory.
+- **An unlocked key is stored in `localStorage`, on disk in the browser
+  profile.** It is plaintext there, readable by any script already running on
+  the page, and it survives a restart rather than ending with the tab. That is a
+  deliberate trade for entering the key once instead of on every reload;
+  **Forget keys** erases it and is the right thing to use on a shared machine.
+  Script injection into the viewer is in scope; the storage choice itself is
+  not, since such a script could equally read the key from memory.
 - **The relay learns metadata.** Stream existence, display names, object sizes,
   and timing are visible to it. Traffic analysis of a screen stream is not
   something this design defends against.

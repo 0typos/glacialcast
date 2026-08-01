@@ -2,7 +2,10 @@
 
 ## Product Contract
 
-GlacialCast is a low-bandwidth, end-to-end-encrypted Wayland screen viewer. It
+GlacialCast is a low-bandwidth, end-to-end-encrypted Wayland screen viewer --
+by default, and always on an Internet-facing relay; a publisher on a trusted
+LAN may opt out with `--no-encryption`, which exists because iPhones cannot
+decrypt these streams in any browser. It
 captures through the XDG Desktop Portal and PipeWire, publishes video at a very
 low frame rate, publishes cursor updates independently at a higher rate, keeps
 a bounded replay window, and can copy the same stream files to an offline

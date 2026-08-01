@@ -30,6 +30,9 @@ publish the relay's plaintext HTTP port.
   strong token.
 - CENC and cursor encryption remain end to end. TLS and relay authorization do
   not give the relay the viewer key.
+- Unencrypted publishing cannot reach this profile. A relay refuses an epoch
+  published in the clear unless started with `--trusted-lan`, and that flag is
+  refused alongside `security.public_origin`, so the two cannot be combined.
 
 The relay still observes stream timing, dimensions, object sizes, client IP
 addresses, and availability. GlacialCast does not attempt traffic-analysis

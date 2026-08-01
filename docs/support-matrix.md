@@ -27,6 +27,9 @@ scrambled pixels still produce valid encrypted objects.
 | Chromium on Linux | Same constrained CENC/fMP4 multi-epoch presentation and cursor behavior | Validated by the browser gates |
 | Portable offline viewer | Incremental `.gco` arrival, multi-epoch history, and live epoch transitions in both browsers | Validated by the synthetic and browser gates |
 | Internet HTTPS profile | Login, scoped authorization, Caddy TLS, secure session, playback in both browsers | Validated by the Internet browser gate |
+| Unencrypted publishing | Keyless self-unlock, plain cursor batches, decoded frame, refusal by a relay that did not opt in, refusal by a viewer holding a key | Validated by `scripts/verify-unencrypted.sh` in both browsers |
+| iPhone (ManagedMediaSource) | Unencrypted playback through `ManagedMediaSource` on iOS 17.1+ | **Unverified.** No engine a gate can launch exposes ManagedMediaSource, so only the decision in front of it is covered; the attachment itself has never run on a device |
+| Any iOS browser, encrypted | — | Impossible. WebKit's EME offers FairPlay and never ClearKey |
 
 ## Compositor matrix
 
