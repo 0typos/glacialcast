@@ -1959,19 +1959,10 @@ fn websocket_guard(state: &AppState, principal_name: &str) -> Result<ConnectionG
 /// can read the claim without any viewer key -- which is the whole point: an
 /// unencrypted epoch has no key, and the relay has never had one anyway.
 ///
-/// Only the claim is read, as leniently as JSON allows, and deliberately not
-/// through [`glacialcast_dash::EpochDescriptor::from_json`]. Requiring the whole
-/// descriptor to validate here was a bypass: a publisher could write
-/// `"encrypted": false`
-/// next to one field the relay's validation rejects but a viewer's does not,
-/// fail the strict parse, and be waved through -- while the viewer read the
-/// same claim from the same bytes and played the stream keyless. The policy
-/// needs the claim alone, so that nothing else in the payload can suppress it.
-///
-/// A payload that does not parse as a JSON object at all is left alone. It
-/// carries no readable claim for this check or for any viewer -- every viewer
-/// parses the descriptor with the same grammar before trusting anything in it,
-/// so what is stored is unplayable, not unencrypted.
+/// Only the claim is read, through [`glacialcast_dash::epoch_encryption_claim`],
+/// which lives beside the field so the lenient reader and the strict one cannot
+/// disagree about its name or its default. Requiring the whole descriptor to
+/// validate here was a bypass; that function documents why.
 ///
 /// # Errors
 ///
@@ -1981,16 +1972,7 @@ fn refuse_unencrypted_epoch(object: &DashObject, allow_unencrypted: bool) -> Res
     if allow_unencrypted || object.header.kind != DashObjectKind::Epoch {
         return Ok(());
     }
-    #[derive(serde::Deserialize)]
-    struct EncryptionClaim {
-        // An absent field means encrypted; only descriptors that predate the
-        // field lack it, mirroring the dash crate's default.
-        encrypted: Option<bool>,
-    }
-    let Ok(claim) = serde_json::from_slice::<EncryptionClaim>(&object.payload) else {
-        return Ok(());
-    };
-    if claim.encrypted != Some(false) {
+    if glacialcast_dash::epoch_encryption_claim(&object.payload) != Some(false) {
         return Ok(());
     }
     anyhow::bail!(

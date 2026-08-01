@@ -160,7 +160,10 @@ fn load_or_generate(
             .iter()
             .filter(|name| !stored.contains(*name))
             .collect();
-        if missing.is_empty() && !stored.is_empty() {
+        // An empty `stored` cannot pass this: `certificate_names` always yields
+        // at least loopback, so `missing` is non-empty whenever nothing was
+        // recorded. That is the upgrade path, and it needs no clause of its own.
+        if missing.is_empty() {
             let mut material = load_supplied(&cert_path, &key_path)?;
             material.generated = true;
             material.names = stored;

@@ -144,6 +144,36 @@ fn encrypted_by_default() -> bool {
     true
 }
 
+/// Reads only whether an epoch payload claims to be unencrypted.
+///
+/// Deliberately not [`EpochDescriptor::from_json`]. A relay enforcing an
+/// encrypted-only policy has to answer this question about payloads it would
+/// otherwise reject, because requiring the whole descriptor to validate first
+/// is a bypass: a publisher can write `"encrypted": false` beside one field the
+/// relay validates and a viewer does not, fail the strict parse, and be waved
+/// through -- while the viewer reads the same claim from the same bytes and
+/// plays the stream keyless.
+///
+/// Lives here, beside the field and its `encrypted_by_default`, so the lenient
+/// reader and the strict one cannot disagree about the field's name or its
+/// default. Written apart from them, a rename or a `serde` alias would compile,
+/// keep every test green, and silently turn the policy into a no-op.
+///
+/// Returns `None` when the payload is not a JSON object at all: it carries no
+/// claim this can read and none a viewer can read either, so what it describes
+/// is unplayable rather than unencrypted.
+#[must_use]
+pub fn epoch_encryption_claim(payload: &[u8]) -> Option<bool> {
+    #[derive(Deserialize)]
+    struct Claim {
+        #[serde(default = "encrypted_by_default")]
+        encrypted: bool,
+    }
+    serde_json::from_slice::<Claim>(payload)
+        .ok()
+        .map(|claim| claim.encrypted)
+}
+
 impl EpochDescriptor {
     /// Validates the descriptor against the supported GlacialCast profile.
     pub fn validate(&self) -> Result<()> {
@@ -1371,6 +1401,52 @@ fn xml_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_lenient_claim_agrees_with_the_strict_reader() {
+        // The relay's encrypted-only policy reads the claim without validating
+        // the rest of the descriptor. That is only safe while the two readers
+        // cannot disagree about the field or its default -- which is why the
+        // lenient one lives in this file, and why this test is here to fail if
+        // a rename, an alias, or a changed default separates them.
+        for encrypted in [true, false] {
+            let descriptor = EpochDescriptor {
+                format_version: DASH_FORMAT_VERSION,
+                stream_id: Uuid::from_u128(7),
+                epoch_id: Uuid::from_u128(9),
+                key_id: *Uuid::from_u128(9).as_bytes(),
+                width: 320,
+                height: 180,
+                codec: "avc1.42c015".to_string(),
+                timescale: MEDIA_TIMESCALE,
+                segment_frames: 2,
+                availability_start_time: "2026-01-01T00:00:00.000Z".to_string(),
+                encrypted,
+            };
+            let json = descriptor.to_json().unwrap();
+            assert_eq!(epoch_encryption_claim(&json), Some(encrypted));
+            assert_eq!(
+                EpochDescriptor::from_json(&json).unwrap().encrypted,
+                encrypted
+            );
+        }
+
+        // Absent means encrypted, in both readers.
+        let legacy = br#"{"format_version":1,"stream_id":"00000000-0000-0000-0000-000000000007","epoch_id":"00000000-0000-0000-0000-000000000009","key_id":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,9],"width":320,"height":180,"codec":"avc1.42c015","timescale":90000,"segment_frames":2,"availability_start_time":""}"#;
+        assert_eq!(epoch_encryption_claim(legacy), Some(true));
+        assert!(
+            EpochDescriptor::from_json(legacy).unwrap().encrypted,
+            "absent must read as encrypted"
+        );
+
+        // A claim the strict reader rejects is still honoured: that gap was the
+        // bypass. And bytes that are not a JSON object carry no claim at all.
+        assert_eq!(
+            epoch_encryption_claim(br#"{"encrypted":false,"segment_frames":0}"#),
+            Some(false)
+        );
+        assert_eq!(epoch_encryption_claim(b"not json"), None);
+    }
 
     fn fixture_config() -> AvcConfig {
         AvcConfig {

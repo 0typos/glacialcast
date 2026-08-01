@@ -79,6 +79,19 @@ wait_for_origin() {
 }
 wait_for_origin "${origin}"
 
+# Every failure below wants the same thing: say what was expected, show the log
+# that would explain it, and stop. Written out at each site it drifted -- the
+# tail length already differs between gates in this repo.
+fail_with_log() {
+  local message="$1"
+  shift
+  echo "${message}" >&2
+  for log in "$@"; do
+    sed -n '1,200p' "${log}" >&2
+  done
+  exit 1
+}
+
 RUST_LOG=glacialcast_client=info target/debug/glacialcast-client \
   --no-config \
   --ingest-addr "${ingest_addr}" \
@@ -113,10 +126,8 @@ for _ in $(seq 1 150); do
   sleep 0.2
 done
 if [[ -z "${stream_id}" ]]; then
-  echo "the publisher never registered a stream; server and client output follows" >&2
-  sed -n '1,200p' "${server_log}" >&2
-  sed -n '1,200p' "${client_log}" >&2
-  exit 1
+  fail_with_log "the publisher never registered a stream; server and client output follows" \
+    "${server_log}" "${client_log}"
 fi
 echo "publishing unencrypted stream ${stream_id}"
 
@@ -202,9 +213,8 @@ for _ in $(seq 1 100); do
   sleep 0.2
 done
 if (( refused == 0 )); then
-  echo "a relay without --trusted-lan accepted an unencrypted epoch" >&2
-  sed -n '1,200p' "${strict_server_log}" >&2
-  exit 1
+  fail_with_log "a relay without --trusted-lan accepted an unencrypted epoch" \
+    "${strict_server_log}"
 fi
 
 # The refusal has to reach the publisher, not just the relay's log. Dropping the
@@ -213,14 +223,10 @@ fi
 wait "${strict_client_pid}" 2>/dev/null || true
 strict_client_pid=""
 if ! grep -q "relay refused object" "${strict_client_log}"; then
-  echo "the publisher was never told why it was refused" >&2
-  sed -n '1,200p' "${strict_client_log}" >&2
-  exit 1
+  fail_with_log "the publisher was never told why it was refused" "${strict_client_log}"
 fi
 if ! grep -q "trusted-lan" "${strict_client_log}"; then
-  echo "the refusal reached the publisher without the reason" >&2
-  sed -n '1,200p' "${strict_client_log}" >&2
-  exit 1
+  fail_with_log "the refusal reached the publisher without the reason" "${strict_client_log}"
 fi
 retries="$(grep -c "DASH connection dropped" "${strict_client_log}" || true)"
 if [[ "${retries}" != "0" ]]; then

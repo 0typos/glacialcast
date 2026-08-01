@@ -109,6 +109,34 @@ function authenticationBytes(header) {
   );
 }
 
+/** How long a player may sit without a decoded frame before it says so. */
+const STALL_TIMEOUT_MS = 25_000;
+/**
+ * What a stalled player says.
+ *
+ * Deliberately about what was observed rather than why. This message once named
+ * Firefox, because at the time every stall was the same one: samples of a
+ * second or longer, which stall there and play in Chromium. The publisher now
+ * keeps samples under that, so a player reaching this is more likely to be
+ * something not yet seen than the cause that has been fixed -- and sending
+ * someone to a different browser for a reason that no longer applies wastes the
+ * one clue they have.
+ *
+ * Another browser is still worth trying, as a way to tell an engine-specific
+ * problem from a stream-specific one. It is offered as a diagnostic rather than
+ * as the answer.
+ *
+ * It lives with the player rather than with either page because both pages need
+ * it and neither owns it. Kept as two copies, the deep-link page had already
+ * drifted on its first day: it never cleared the message when a frame arrived
+ * late, which the multi-stream page did.
+ */
+const STALLED_MESSAGE =
+  'This stream is not starting. Media is arriving, but the browser has not '
+  + 'decoded a frame from it. Reloading often clears this. If it keeps '
+  + 'happening, opening the same stream in another browser will show whether '
+  + 'it is specific to this one.';
+
 /**
  * A stream the relay knows about that has nothing playable in it yet.
  *
@@ -215,6 +243,7 @@ function createPlayer(root, options) {
   let destroyed = false;
   let cursorFrame = null;
   let objectUrl = null;
+  let stallTimer = null;
   // Aborted when the player is destroyed, so a request still in flight ends
   // with the tile rather than outliving it. Closing the socket was never
   // enough: the reconcile pass fetches over plain HTTP, and a fetch left
@@ -289,6 +318,11 @@ function createPlayer(root, options) {
   els.video.addEventListener('progress', updateTimelineBounds);
   els.video.addEventListener('playing', () => {
     if (els.stageMessage) els.stageMessage.textContent = '';
+    // A slow start is not a permanent one. Telling the caller clears whatever
+    // it painted on the strength of the stall -- a tile's failure mark, say --
+    // so a player that recovers late is not left flagged for the session.
+    clearTimeout(stallTimer);
+    onStatus({ streamId, message: '', error: false });
   });
   els.video.addEventListener('error', () => {
     const detail = els.video.error?.message || `media error ${els.video.error?.code || 'unknown'}`;
@@ -306,7 +340,29 @@ function createPlayer(root, options) {
    * MediaSource carries the video -- so it is settled here, once, rather than
    * rediscovered at each step.
    */
+  /**
+   * Says something when this player never produces a picture.
+   *
+   * Starting can fail without ever rejecting: the media element waits for a
+   * frame that never arrives, and the promise chain simply does not settle.
+   * Nothing downstream of that runs, so a viewer is left with the "preparing"
+   * message for as long as the page stays open -- no error, no retry, nothing
+   * to act on. This does not diagnose the cause; it converts silence into a
+   * sentence, which is worth having whatever the cause turns out to be.
+   */
+  function armStallWatchdog() {
+    clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => {
+      stallTimer = null;
+      // readyState below HAVE_CURRENT_DATA means no frame was ever decoded.
+      if (destroyed || els.video.readyState >= 2) return;
+      if (els.stageMessage) els.stageMessage.textContent = STALLED_MESSAGE;
+      onStatus({ streamId, message: STALLED_MESSAGE, error: true });
+    }, STALL_TIMEOUT_MS);
+  }
+
   async function start(viewerKeyText) {
+    armStallWatchdog();
     setStatus('Loading stream metadata…');
     const encrypted = viewerKeyText !== null && viewerKeyText !== undefined;
     const problem = platformProblem({ encrypted });
@@ -1335,6 +1391,7 @@ function createPlayer(root, options) {
     destroy() {
       destroyed = true;
       teardown.abort();
+      clearTimeout(stallTimer);
       if (cursorFrame !== null) cancelAnimationFrame(cursorFrame);
       clearTimeout(state.liveReconnectTimer);
       clearInterval(state.liveReconcileTimer);

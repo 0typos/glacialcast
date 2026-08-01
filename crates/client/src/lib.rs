@@ -610,17 +610,10 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
     let viewer_key = if args.no_encryption {
         None
     } else {
-        Some(
-            identity
-                .viewer_key_b64
-                .as_deref()
-                .context(
-                    "encrypted DASH capture requires --viewer-key or viewer_key_b64 in client.toml",
-                )
-                .and_then(|key| {
-                    decode_key_b64(key).context("viewer key must be URL-safe base64 for 32 bytes")
-                })?,
-        )
+        let encoded = identity.viewer_key_b64.as_deref().context(
+            "encrypted DASH capture requires --viewer-key or viewer_key_b64 in client.toml",
+        )?;
+        Some(decode_key_b64(encoded).context("viewer key must be URL-safe base64 for 32 bytes")?)
     };
     identity.ingest_server_key.as_ref().context(
         "ingest server key is required; pass --ingest-server-key or set ingest_server_key in client.toml",
@@ -1081,12 +1074,31 @@ fn is_fatal_dash_error(err: &anyhow::Error) -> bool {
             || message.contains("segment-frames")
             || message.contains("does not fit MPEG-DASH")
             || message.contains("server rejected hello")
-            // A policy refusal is decided per object and will be decided the
-            // same way next time. Retrying it forever hides the reason behind
-            // a generic "connection dropped" and leaves the stream flapping.
-            || message.contains("relay refused object")
     })
+    // A policy refusal is decided per object and will be decided the same way
+    // next time. Retrying it forever hides the reason behind a generic
+    // "connection dropped" and leaves the stream flapping. Matched by type
+    // rather than by text: the entries above are messages from foreign
+    // libraries, where a substring is the only handle there is, but this one is
+    // ours -- and rewording it must not quietly restore the retry loop.
+    || err.chain().any(|cause| cause.is::<RelayRefused>())
 }
+
+/// Marks an error as the relay declining an object on policy.
+///
+/// Carries no detail of its own: the operator-facing sentence is the relay's,
+/// attached as context. This exists so the retry loop can recognise the
+/// refusal without matching on that sentence.
+#[derive(Debug)]
+struct RelayRefused;
+
+impl std::fmt::Display for RelayRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the relay refused this object")
+    }
+}
+
+impl std::error::Error for RelayRefused {}
 
 async fn run_dash_connection(
     args: &Args,
@@ -2250,7 +2262,8 @@ async fn wait_for_dash_ack(
                 // capacity, so every reconnect would produce the same refusal.
                 // Carrying the relay's own sentence out to the operator is the
                 // entire point of the message.
-                bail!("relay refused object {sequence}: {reason}");
+                return Err(anyhow::Error::new(RelayRefused)
+                    .context(format!("relay refused object {sequence}: {reason}")));
             }
             ServerMessage::Pong { .. } | ServerMessage::HelloAck { .. } => {}
         }
