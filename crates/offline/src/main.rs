@@ -1265,7 +1265,10 @@ async fn get_manifest(
     let mpd = build_mpd(&MpdConfig {
         stream_id,
         epoch_id: descriptor.epoch_id,
-        key_id: descriptor.key_id,
+        // Only when the epoch actually is protected: a manifest that
+        // advertises CENC over a plain avc1 track sends a conforming
+        // player looking for a key that will never be signalled.
+        key_id: descriptor.encrypted.then_some(descriptor.key_id),
         width: descriptor.width,
         height: descriptor.height,
         codec: &descriptor.codec,

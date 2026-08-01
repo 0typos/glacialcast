@@ -209,6 +209,13 @@ impl EpochDescriptor {
         if self.format_version != DASH_FORMAT_VERSION
             || self.stream_id.is_nil()
             || self.epoch_id.is_nil()
+            // Unconditional, for both modes. An unencrypted epoch has no key
+            // to identify, but it carries the same identifier anyway so there
+            // is one shape to read and one rule to check. This used to be
+            // restated below under `!self.encrypted`, where it was unreachable
+            // and read as though it were the check protecting that case --
+            // inviting a later relaxation here that would have removed the
+            // only real one.
             || self.key_id != *self.epoch_id.as_bytes()
             || self.width == 0
             || self.height == 0
@@ -217,10 +224,6 @@ impl EpochDescriptor {
             || !self.codec.starts_with("avc1.")
             || self.codec.len() > 32
             || self.availability_start_time.len() > 64
-            // An unencrypted epoch has no key, so it has no key identifier to
-            // carry; requiring the epoch UUID there anyway keeps one shape for
-            // both modes and one thing for a reader to check.
-            || (!self.encrypted && self.key_id != *self.epoch_id.as_bytes())
         {
             return Err(DashError::InvalidEpochDescriptor);
         }
@@ -1252,8 +1255,16 @@ pub struct MpdConfig<'a> {
     pub stream_id: Uuid,
     /// Epoch used in initialization and media URLs.
     pub epoch_id: Uuid,
-    /// CENC default key identifier advertised to EME.
-    pub key_id: [u8; 16],
+    /// CENC default key identifier advertised to EME, or `None` when the
+    /// presentation is not protected.
+    ///
+    /// Optional because the manifest must not claim protection the media does
+    /// not carry. `build_sample_entry` already refuses to emit `encv`/`sinf`
+    /// for an unencrypted epoch, and `build_fragment` omits the CENC auxiliary
+    /// boxes; a manifest advertising `mp4protection` over that track describes
+    /// something that does not exist, and a conforming player would wait for a
+    /// key it is never going to be signalled.
+    pub key_id: Option<[u8; 16]>,
     /// Encoded video width in pixels.
     pub width: u16,
     /// Encoded video height in pixels.
@@ -1295,6 +1306,15 @@ pub fn build_mpd(config: &MpdConfig<'_>) -> String {
     } else {
         format!(" presentationTimeOffset=\"{first_timestamp}\"")
     };
+    // Emitted only for a protected presentation, exactly as the sample entry
+    // and fragment builders gate their CENC boxes.
+    let content_protection = config.key_id.map_or_else(String::new, |key_id| {
+        format!(
+            "<ContentProtection schemeIdUri=\"urn:mpeg:dash:mp4protection:2011\" \
+             value=\"cenc\" cenc:default_KID=\"{}\"/>\n",
+            format_uuid(key_id)
+        )
+    });
     let mut xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" \
@@ -1304,8 +1324,7 @@ pub fn build_mpd(config: &MpdConfig<'_>) -> String {
          <Period id=\"{}\" start=\"PT0S\">\n\
          <AdaptationSet id=\"1\" contentType=\"video\" mimeType=\"video/mp4\" \
          segmentAlignment=\"true\" startWithSAP=\"1\">\n\
-         <ContentProtection schemeIdUri=\"urn:mpeg:dash:mp4protection:2011\" \
-         value=\"cenc\" cenc:default_KID=\"{}\"/>\n\
+         {}\
          <Representation id=\"video\" bandwidth=\"1000000\" codecs=\"{}\" \
          width=\"{}\" height=\"{}\">\n\
          <SegmentTemplate timescale=\"{}\" startNumber=\"{}\"{presentation_time_offset} \
@@ -1313,7 +1332,7 @@ pub fn build_mpd(config: &MpdConfig<'_>) -> String {
          media=\"epochs/{}/media/$Number$.m4s\">\n\
          <SegmentTimeline>\n",
         config.stream_id,
-        format_uuid(config.key_id),
+        content_protection,
         xml_escape(config.codec),
         config.width,
         config.height,
@@ -2019,13 +2038,46 @@ mod tests {
     }
 
     #[test]
+    fn an_unencrypted_mpd_claims_no_protection() {
+        // The fMP4 builders already refuse to describe protection an
+        // unencrypted epoch does not carry -- no `encv`, no `sinf`, no `tenc`,
+        // no `senc`. The manifest describing that same track advertised CENC
+        // regardless, which is a contradiction a conforming player resolves by
+        // waiting for a key that is never signalled. Nothing covered the
+        // unencrypted manifest, which is how it went unnoticed.
+        let epoch = Uuid::from_u128(0x2244);
+        let mpd = build_mpd(&MpdConfig {
+            stream_id: Uuid::from_u128(0x11),
+            epoch_id: epoch,
+            key_id: None,
+            width: 320,
+            height: 180,
+            codec: "avc1.42c015",
+            availability_start_time: "2026-01-01T00:00:00Z",
+            time_shift_buffer_depth_seconds: 60,
+            segments: &[SegmentTimelineEntry {
+                number: 1,
+                start: 0,
+                duration: u64::from(MEDIA_TIMESCALE),
+            }],
+            dynamic: true,
+        });
+        assert!(!mpd.contains("ContentProtection"), "{mpd}");
+        assert!(!mpd.contains("default_KID"), "{mpd}");
+        assert!(!mpd.contains("mp4protection"), "{mpd}");
+        // Everything else the presentation needs is still there.
+        assert!(mpd.contains(&format!("epochs/{epoch}/init.mp4")), "{mpd}");
+        assert!(mpd.contains("avc1.42c015"), "{mpd}");
+    }
+
+    #[test]
     fn mpd_declares_cenc_timeline_and_epoch_paths() {
         let stream = Uuid::from_u128(1);
         let epoch = Uuid::from_u128(2);
         let mpd = build_mpd(&MpdConfig {
             stream_id: stream,
             epoch_id: epoch,
-            key_id: *epoch.as_bytes(),
+            key_id: Some(*epoch.as_bytes()),
             width: 1280,
             height: 720,
             codec: "avc1.42c01f",
@@ -2067,7 +2119,7 @@ mod tests {
         let static_mpd = build_mpd(&MpdConfig {
             stream_id: stream,
             epoch_id: epoch,
-            key_id: *epoch.as_bytes(),
+            key_id: Some(*epoch.as_bytes()),
             width: 1280,
             height: 720,
             codec: "avc1.42c01f",
