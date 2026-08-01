@@ -70,9 +70,34 @@ const STALLED_MESSAGE =
   + 'decoded a frame from it. Reloading often clears this. If it keeps '
   + 'happening, opening the same stream in another browser will show whether '
   + 'it is specific to this one.';
+/**
+ * Why this browser cannot play an end-to-end encrypted stream, or `null`.
+ *
+ * Asked once, because it cannot change while the page is open. It is not a
+ * reason to refuse the page: a relay on a trusted LAN can publish in the clear,
+ * and those streams play here even where encrypted ones never will -- which is
+ * the whole of what an iPhone can do. So it is used to explain a key that
+ * cannot work, not to withhold everything.
+ */
+const ENCRYPTED_UNSUPPORTED = Player.platformProblem({ encrypted: true });
+
 const state = {
-  /** Unlocked viewer keys as URL-safe base64, by stream ID. */
+  /**
+   * Unlocked streams, by stream ID.
+   *
+   * The value is the viewer key as URL-safe base64, or `null` for a stream the
+   * publisher sent in the clear, which needs none. Membership is what says a
+   * stream is unlocked; the value only says how. So every test here asks `has`,
+   * never whether the value is truthy.
+   */
   keys: new Map(),
+  /**
+   * Streams already known to be encrypted, so the poll stops asking.
+   *
+   * Without this, every poll would re-fetch an epoch descriptor for every
+   * locked stream on the relay, forever.
+   */
+  encryptedStreams: new Set(),
   /** Secrets entered on this browser: key phrases, or raw viewer keys. */
   secrets: new Set(),
   /** Cache of derived keys as URL-safe base64, by publisher salt. */
@@ -178,6 +203,9 @@ function publishersByName() {
 async function unlockWithKey(typed) {
   const secret = typed.trim();
   if (!secret) throw new Error('Enter the viewing key you were given.');
+  // A correct key is no use in a browser that cannot decrypt, and finding that
+  // out after typing it is worse than being told before.
+  if (ENCRYPTED_UNSUPPORTED) throw new Error(ENCRYPTED_UNSUPPORTED);
   const publishers = publishersByName();
   if (publishers.size === 0) throw new Error('No streams are published yet.');
 
@@ -222,7 +250,7 @@ async function unlockWithKey(typed) {
  * reconnect, appears already unlocked rather than prompting again.
  */
 async function applyRememberedKeys() {
-  if (state.secrets.size === 0) return 0;
+  if (state.secrets.size === 0 || ENCRYPTED_UNSUPPORTED) return 0;
   let unlocked = 0;
   for (const streams of publishersByName().values()) {
     const locked = streams.filter(stream => !state.keys.has(stream.stream_id));
@@ -260,6 +288,38 @@ async function applyRememberedKeys() {
   return unlocked;
 }
 
+/**
+ * Opens the streams that need no key, because the publisher sent them in the
+ * clear to a trusted LAN.
+ *
+ * Runs after the remembered keys, deliberately. A relay that claimed a stream
+ * was published in the clear when the publisher encrypts it would otherwise get
+ * that stream opened keyless and be free to serve anything as its contents;
+ * trying the key first means a stream a key opens is held by that key, and the
+ * player refuses a clear epoch on it. So the relay's answer only ever decides
+ * streams no key of this viewer's opens anyway.
+ *
+ * The descriptor, not the stream listing, is what is asked -- see
+ * `describeStream`.
+ */
+async function unlockOpenStreams() {
+  let unlocked = 0;
+  for (const streamId of state.streams.keys()) {
+    if (state.keys.has(streamId) || state.encryptedStreams.has(streamId)) continue;
+    const { encrypted } = await Player.describeStream(streamId);
+    // Null means the stream has published nothing to tell from yet. Neither
+    // remembering nor unlocking it: the next poll asks again.
+    if (encrypted === null) continue;
+    if (encrypted) {
+      state.encryptedStreams.add(streamId);
+      continue;
+    }
+    state.keys.set(streamId, null);
+    unlocked += 1;
+  }
+  return unlocked;
+}
+
 els.unlockForm.addEventListener('submit', async event => {
   event.preventDefault();
   showError(els.unlockError, null);
@@ -284,11 +344,16 @@ els.unlockForm.addEventListener('submit', async event => {
   }
 });
 
-els.forgetAll.addEventListener('click', () => {
+els.forgetAll.addEventListener('click', async () => {
   for (const tile of state.tiles) detachTile(tile);
   forgetRememberedKeys();
   els.unlockStatus.textContent = 'Forgotten. Enter a key to watch again.';
   renderStreamList();
+  // A stream published in the clear was never opened by a key, so there is
+  // nothing about it to forget and it stays watchable. Re-opening those here
+  // rather than waiting for the next poll keeps them from vanishing for ten
+  // seconds and coming back on their own.
+  if (await unlockOpenStreams() > 0) renderStreamList();
 });
 
 for (const button of document.querySelectorAll('[data-layout]')) {
@@ -355,7 +420,18 @@ function showError(element, error) {
 async function refreshStreams() {
   const response = await fetch('/api/streams', { cache: 'no-store' });
   if (!response.ok) throw new Error('Unable to list streams.');
-  state.streams = new Map((await response.json()).map(stream => [stream.stream_id, stream]));
+  const streams = new Map((await response.json()).map(stream => [stream.stream_id, stream]));
+  // Whether a publisher encrypts is a startup choice, so it can only change
+  // across a restart -- and a restart is visible here as a stream going from
+  // not publishing to publishing. Forgetting the answer exactly then is what
+  // keeps a publisher that came back with --no-encryption from staying locked
+  // until the page is reloaded, without re-asking on every poll forever.
+  for (const [streamId, stream] of streams) {
+    if (stream.active && !state.streams.get(streamId)?.active) {
+      state.encryptedStreams.delete(streamId);
+    }
+  }
+  state.streams = streams;
   renderStreamList();
 }
 
@@ -380,7 +456,12 @@ function renderStreamList() {
     title.textContent = streamTitle(streamId);
     const hint = document.createElement('span');
     hint.className = 'stream-hint';
-    hint.textContent = live ? 'live' : 'not publishing';
+    // A stream nobody needed a key for is not end-to-end encrypted, and a
+    // viewer has no other way to tell one from the other once it is on screen.
+    hint.textContent = [
+      live ? 'live' : 'not publishing',
+      state.keys.get(streamId) === null ? 'not encrypted' : null,
+    ].filter(Boolean).join(' · ');
 
     // The row itself is the control. Dragging is still the way to choose which
     // tile, but it is unavailable to keyboard and touch users, so a plain click
@@ -518,11 +599,13 @@ function assignToFirstFreeTile(streamId) {
 }
 
 function attachTile(tile, streamId) {
-  const key = state.keys.get(streamId);
-  if (!key) {
+  // Membership is what says the stream is unlocked; the value is the key, and
+  // null is a real value meaning the stream was published in the clear.
+  if (!state.keys.has(streamId)) {
     tile.message.textContent = 'That stream is not unlocked in this tab.';
     return;
   }
+  const key = state.keys.get(streamId) ?? null;
   // Moving a stream that is already on screen swaps the two tiles rather than
   // decoding it twice.
   const occupied = state.tiles.find(other => other !== tile && other.streamId === streamId);
@@ -535,7 +618,7 @@ function attachTile(tile, streamId) {
 
   tile.streamId = streamId;
   tile.title.textContent = streamTitle(streamId);
-  tile.message.textContent = 'Preparing encrypted media…';
+  tile.message.textContent = key === null ? 'Preparing media…' : 'Preparing encrypted media…';
   mountPlayer(tile, streamId, key);
   markOnScreen();
 }
@@ -636,6 +719,8 @@ globalThis.GlacialCastWatch = {
   layout: () => state.layout,
   sidebarCollapsed: () => els.main.classList.contains('sidebar-collapsed'),
   unlockedStreams: () => [...state.keys.keys()],
+  /** Streams unlocked without a key, because they were published in the clear. */
+  openStreams: () => [...state.keys].filter(([, key]) => key === null).map(([id]) => id),
 };
 
 /**
@@ -687,8 +772,8 @@ function stripInviteKeyFromUrl() {
 }
 
 /**
- * Says why this browser cannot decrypt here, instead of offering a key field
- * that cannot work.
+ * Says why this browser can play nothing at all here, instead of offering a
+ * page that cannot work.
  *
  * Deriving a key is the first thing that touches `crypto.subtle`, and browsers
  * withhold it outside a secure context -- so on a plain `http://` address that
@@ -697,11 +782,17 @@ function stripInviteKeyFromUrl() {
  * a key-derivation routine and no help at all to someone who just wants to
  * know why the page will not play.
  *
+ * The question asked is deliberately the weaker one: what stops even a stream
+ * published in the clear. A browser that cannot decrypt but can still play is
+ * not refused, because on a trusted LAN there may be streams here for it --
+ * that is every iPhone. Its narrower problem is explained where a key is
+ * actually offered, by `explainEncryptedUnsupported`.
+ *
  * Asked before the stream list, because nothing below it can succeed and the
  * answer does not depend on what the relay holds.
  */
 function refuseUnusablePlatform() {
-  const problem = Player.platformProblem();
+  const problem = Player.platformProblem({ encrypted: false });
   if (!problem) return false;
   document.body.classList.remove('deciding');
   document.body.classList.add('empty');
@@ -709,6 +800,20 @@ function refuseUnusablePlatform() {
   if (lead) lead.textContent = problem;
   els.unlockForm.hidden = true;
   return true;
+}
+
+/**
+ * Replaces the invitation to type a key with the reason it would not work.
+ *
+ * A browser without ClearKey will never open an encrypted stream, so the field
+ * is taken away rather than left to disappoint. What remains is whatever the
+ * relay publishes in the clear, which unlocks itself.
+ */
+function explainEncryptedUnsupported() {
+  if (!ENCRYPTED_UNSUPPORTED) return;
+  els.unlockForm.hidden = true;
+  const lead = document.querySelector('.welcome-lead');
+  if (lead) lead.textContent = ENCRYPTED_UNSUPPORTED;
 }
 
 restoreSidebar();
@@ -723,6 +828,8 @@ if (invitedKey) stripInviteKeyFromUrl();
 // Nothing below this can work if the browser will not do the cryptography, and
 // the reason has nothing to do with the relay, so it is settled first.
 if (!refuseUnusablePlatform()) {
+
+explainEncryptedUnsupported();
 
 // Streams are listed before anything is unlocked so the panel can say whether
 // the relay has anything to show at all, and so a key entered a moment later
@@ -742,6 +849,7 @@ refreshStreams()
       }
     }
     await applyRememberedKeys();
+    await unlockOpenStreams();
     renderStreamList();
     showUnlockedStreams();
   })
@@ -756,7 +864,8 @@ refreshStreams()
 setInterval(async () => {
   try {
     await refreshStreams();
-    if (await applyRememberedKeys() > 0) {
+    const unlocked = await applyRememberedKeys() + await unlockOpenStreams();
+    if (unlocked > 0) {
       renderStreamList();
       showUnlockedStreams();
     }
