@@ -133,13 +133,39 @@ try {
   if (minimumEpochs > 1) {
     await page.evaluate(async () => {
       const video = document.querySelector('#video');
-      video.currentTime = video.buffered.start(0) + 0.01;
+      // What the element was doing either side of the seek.
+      //
+      // This deadline has expired on a runner more than once and said only
+      // that it expired. A seek that never completed, a readyState that never
+      // rose, and a buffer that does not cover the point being sought are
+      // three different faults with the same symptom, and there is no second
+      // chance to look at a nightly.
+      const snapshot = () => ({
+        readyState: video.readyState,
+        seeking: video.seeking,
+        paused: video.paused,
+        currentTime: Number(video.currentTime.toFixed(3)),
+        buffered: Array.from({ length: video.buffered.length }, (_, index) => [
+          Number(video.buffered.start(index).toFixed(3)),
+          Number(video.buffered.end(index).toFixed(3)),
+        ]),
+        error: video.error ? { code: video.error.code, message: video.error.message } : null,
+      });
+      const before = snapshot();
+      const target = video.buffered.start(0) + 0.01;
+      video.currentTime = target;
       if (video.paused) await video.play();
       if (typeof video.requestVideoFrameCallback === 'function') {
         await Promise.race([
           new Promise(resolve => video.requestVideoFrameCallback(resolve)),
           new Promise((_, reject) => {
-            setTimeout(() => reject(new Error('historical epoch did not paint')), 2_000);
+            setTimeout(
+              () => reject(new Error(
+                `historical epoch did not paint within 2s; sought to ${target.toFixed(3)}; `
+                + `before ${JSON.stringify(before)}; at timeout ${JSON.stringify(snapshot())}`,
+              )),
+              2_000,
+            );
           }),
         ]);
       } else {
@@ -182,18 +208,58 @@ try {
         };
     };
 
+    // What the overlay was seen doing, carried into any failure below.
+    //
+    // These three assertions used to fail with the symptom and nothing else --
+    // "did not hide and return" says the canvas never blanked, but not whether
+    // the cursor stopped arriving, the clock stopped advancing, or the frame
+    // loop stopped painting. Those want different fixes, and on a runner there
+    // is no second chance to look. So each reading is recorded alongside what
+    // the player thought it was showing at the time.
+    //
+    // `metrics()` reports the last frame the overlay drew rather than asking
+    // for a fresh decision, so polling it does not pull the overlay's own
+    // playback forward.
+    const player = globalThis.GlacialCastActivePlayer;
+    const cursorState = () => player?.metrics?.().cursor ?? null;
+    const observed = {
+      samples: 0,
+      blank: 0,
+      painted: 0,
+      blankRuns: 0,
+      startedAt: Date.now(),
+      atStart: cursorState(),
+      atEnd: null,
+    };
+    let wasBlank = null;
+    const observe = () => {
+      const current = bounds();
+      const isBlank = !current;
+      observed.samples += 1;
+      if (isBlank) observed.blank += 1;
+      else observed.painted += 1;
+      if (isBlank && wasBlank === false) observed.blankRuns += 1;
+      wasBlank = isBlank;
+      observed.atEnd = cursorState();
+      return current;
+    };
+    const fail = reason => {
+      observed.elapsedMs = Date.now() - observed.startedAt;
+      throw new Error(`${reason}; overlay observations ${JSON.stringify(observed)}`);
+    };
+
     const deadline = Date.now() + 3_000;
-    let first = bounds();
+    let first = observe();
     while (!first && Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 50));
-      first = bounds();
+      first = observe();
     }
-    if (!first) throw new Error('the independent cursor overlay did not paint');
+    if (!first) fail('the independent cursor overlay did not paint');
 
     let motion = null;
     while (Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 100));
-      const current = bounds();
+      const current = observe();
       if (
         current
         && (
@@ -210,18 +276,18 @@ try {
       }
     }
     if (!motion) {
-      throw new Error('the independent cursor overlay painted but did not move');
+      fail('the independent cursor overlay painted but did not move');
     }
 
     const visibilityDeadline = Date.now() + 4_000;
     let hidden = false;
     while (Date.now() < visibilityDeadline) {
       await new Promise(resolve => setTimeout(resolve, 50));
-      const current = bounds();
+      const current = observe();
       if (!current) hidden = true;
       else if (hidden) return { ...motion, hidAndReturned: true };
     }
-    throw new Error('the independent cursor overlay did not hide and return');
+    fail('the independent cursor overlay did not hide and return');
   });
   console.log(
     `cursor overlay painted ${cursorMotion.paintedPixels} pixels and moved `
