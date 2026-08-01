@@ -17,7 +17,7 @@ case "${test_pattern}" in
     ;;
 esac
 # Unset means the publisher's own default, which is chosen to keep sample
-# durations under the second Firefox refuses to decode. The gate only overrides
+# durations under the second at which samples stall in Firefox. The gate only overrides
 # it when a run wants to probe a specific cadence.
 if [[ -n "${idle_heartbeat_seconds}" ]] \
   && ! [[ "${idle_heartbeat_seconds}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
