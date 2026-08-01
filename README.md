@@ -221,7 +221,10 @@ evidence. Reports are welcome; so is a failure.
   0.5s, which bounds every sample below that; raising `--idle-heartbeat-seconds`
   past a second cuts idle bandwidth further but limits playback to Chromium.
   Measured against identical fragments with only durations rewritten: 0.95s
-  played, 1.0s stalled.
+  played, 1.0s stalled. The same limit applies to the frame period itself:
+  below roughly `--fps 1.25` every sample lasts that long regardless of the
+  heartbeat, so such streams play only in Chromium-family browsers, and the
+  publisher says so at startup.
 - **Pre-1.0 wire format.** `PROTOCOL_VERSION` has moved twice in recent work;
   publisher and relay must match, and retained objects do not survive a format
   change.
