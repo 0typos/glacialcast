@@ -1,0 +1,60 @@
+{
+  "description": "Adversarial epoch-descriptor payloads for the encryption claim. The relay (Rust) and the viewer (browser) do not share a JSON parser, and the claim decides whether media is authenticated at all, so both readers must agree on every vector here. Payloads are base64 so a vector can carry bytes that are not valid UTF-8 or that a JSON file could not hold literally.",
+  "vectors": [
+    {
+      "name": "plain encrypted",
+      "payload_base64": "eyJlbmNyeXB0ZWQiOnRydWV9",
+      "claim": "encrypted"
+    },
+    {
+      "name": "plain unencrypted",
+      "payload_base64": "eyJlbmNyeXB0ZWQiOmZhbHNlfQ==",
+      "claim": "unencrypted"
+    },
+    {
+      "name": "field absent means encrypted",
+      "payload_base64": "eyJmb3JtYXRfdmVyc2lvbiI6MX0=",
+      "claim": "encrypted"
+    },
+    {
+      "name": "leading byte-order mark before an unencrypted claim",
+      "payload_base64": "77u/eyJlbmNyeXB0ZWQiOmZhbHNlfQ==",
+      "claim": "unencrypted"
+    },
+    {
+      "name": "repeated key resolves last-wins to unencrypted",
+      "payload_base64": "eyJlbmNyeXB0ZWQiOnRydWUsImVuY3J5cHRlZCI6ZmFsc2V9",
+      "claim": "unencrypted"
+    },
+    {
+      "name": "repeated key resolves last-wins to encrypted",
+      "payload_base64": "eyJlbmNyeXB0ZWQiOmZhbHNlLCJlbmNyeXB0ZWQiOnRydWV9",
+      "claim": "encrypted"
+    },
+    {
+      "name": "unencrypted claim beside a field the strict reader rejects",
+      "payload_base64": "eyJlbmNyeXB0ZWQiOmZhbHNlLCJzZWdtZW50X2ZyYW1lcyI6MH0=",
+      "claim": "unencrypted"
+    },
+    {
+      "name": "non-boolean encrypted reads as encrypted",
+      "payload_base64": "eyJlbmNyeXB0ZWQiOiJmYWxzZSJ9",
+      "claim": "encrypted"
+    },
+    {
+      "name": "null encrypted reads as encrypted",
+      "payload_base64": "eyJlbmNyeXB0ZWQiOm51bGx9",
+      "claim": "encrypted"
+    },
+    {
+      "name": "not an object",
+      "payload_base64": "WzEsMiwzXQ==",
+      "claim": "unreadable"
+    },
+    {
+      "name": "not JSON at all",
+      "payload_base64": "bm90IGpzb24gYXQgYWxs",
+      "claim": "unreadable"
+    }
+  ]
+}

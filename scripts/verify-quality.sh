@@ -27,6 +27,7 @@ standard_checks() {
   run bash -n scripts/*.sh packaging/*.sh
   run node scripts/test-viewer-core.mjs
   run node scripts/test-viewer-key.mjs
+  run node scripts/test-epoch-claim.mjs
   run node scripts/generate-viewer-key-wordlist.mjs --check
   run node scripts/test-index-ui.mjs
   run node scripts/test-compare-frame.mjs
