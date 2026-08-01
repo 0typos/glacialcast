@@ -128,6 +128,9 @@ IFS=',' read -ra browser_list <<<"${browsers}"
 for browser in "${browser_list[@]}"; do
   node scripts/verify-multi-stream-browser.mjs \
     "${origin}" "${viewer_key}" ${stream_ids} "--browser=${browser}"
+  # Several streams under one key is also the fixture the arrangement needs:
+  # numbering only means something when there is more than one thing to number.
+  node scripts/verify-stream-arrangement.mjs "${origin}" "${viewer_key}" "${browser}"
 done
 
-echo "PASS: the multi-stream viewer decoded ${publishers} concurrent tiles in ${browsers}"
+echo "PASS: the multi-stream viewer decoded ${publishers} concurrent tiles in ${browsers}, and remembered how they were arranged"
