@@ -418,13 +418,28 @@ impl DashStore {
         Ok(summaries)
     }
 
+    /// Deletes a stream's catalog and its stored objects.
+    ///
+    /// The map lock is held across the whole deletion rather than only the
+    /// removal. Releasing it first let `catalog_or_create` insert a fresh
+    /// catalog for the same stream -- a different `Arc` from the one being
+    /// retired -- so a publisher's in-flight `store` recreated the directory,
+    /// the journal, and the catalog moments after they were deleted. The
+    /// residue had no stream record, so nothing in the API could see or reclaim
+    /// it. An administrative delete is issued precisely when a publisher is
+    /// still writing, which is the case that lost.
+    ///
+    /// Holding the map lock across `remove_dir_all` briefly blocks lookups for
+    /// every stream. That is the right trade for an admin-only operation that
+    /// must actually delete: the alternative is a delete that silently does
+    /// not. Lock order is unchanged -- map before catalog, as everywhere else.
     pub fn delete_stream(&self, stream_id: Uuid) -> Result<bool> {
-        let removed = self
+        let mut streams = self
             .inner
             .streams
             .write()
-            .map_err(|_| anyhow::anyhow!("DASH stream map lock poisoned"))?
-            .remove(&stream_id);
+            .map_err(|_| anyhow::anyhow!("DASH stream map lock poisoned"))?;
+        let removed = streams.remove(&stream_id);
         let _catalog_guard = match &removed {
             Some(handle) => Some(
                 handle
@@ -450,6 +465,13 @@ impl DashStore {
         let handles = self.catalogs()?;
         let mut removed_count = 0usize;
         for (stream_id, handle) in handles {
+            // The snapshot above can outlive a stream: a delete landing between
+            // it and this lock leaves a handle the map no longer holds, and
+            // persisting through it would call `create_dir_all` and rebuild the
+            // directory that was just removed. Skip anything no longer current.
+            if !self.is_current_catalog(stream_id, &handle)? {
+                continue;
+            }
             let mut catalog = handle
                 .lock()
                 .map_err(|_| anyhow::anyhow!("DASH stream catalog mutex poisoned"))?;
@@ -1052,6 +1074,24 @@ impl DashStore {
             .entry(stream_id)
             .or_insert_with(|| Arc::new(Mutex::new(StreamCatalog::default())))
             .clone())
+    }
+
+    /// Whether `handle` is still the catalog the map holds for `stream_id`.
+    ///
+    /// Compared by pointer, because a deleted-and-recreated stream has a
+    /// different `Arc` for the same id and the two must not be confused.
+    fn is_current_catalog(
+        &self,
+        stream_id: Uuid,
+        handle: &Arc<Mutex<StreamCatalog>>,
+    ) -> Result<bool> {
+        Ok(self
+            .inner
+            .streams
+            .read()
+            .map_err(|_| anyhow::anyhow!("DASH stream map lock poisoned"))?
+            .get(&stream_id)
+            .is_some_and(|current| Arc::ptr_eq(current, handle)))
     }
 
     fn catalogs(&self) -> Result<Vec<(Uuid, Arc<Mutex<StreamCatalog>>)>> {

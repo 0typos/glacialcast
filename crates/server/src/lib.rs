@@ -1489,7 +1489,7 @@ async fn list_streams(
         })
         .map(|record| record.stream)
         .collect();
-    let dash_summaries = state.dash_store.summaries()?;
+    let dash_summaries = dash_read(&state, DashStore::summaries).await?;
     for stream in &mut streams {
         if let Some(summary) = dash_summaries.get(&stream.stream_id) {
             stream.retained_bytes = stream.retained_bytes.max(summary.bytes);
@@ -1525,6 +1525,32 @@ async fn delete_stream(
     }
 }
 
+/// Runs a `DashStore` read off the async runtime.
+///
+/// The store is synchronous: every read takes a per-stream `std::sync::Mutex`
+/// and most then read a file. The ingest path was moved off the runtime for
+/// exactly this reason -- storing an object holds that same mutex across
+/// several fsyncs -- but the read handlers were left behind, so a viewer's
+/// request could park a runtime worker on a lock held by a publisher's flush.
+///
+/// Parking a worker is not yielding. With the default worker count of one per
+/// core, a couple of such requests on a small relay stall every task on the
+/// runtime, including the `tokio::time::timeout` that is supposed to bound the
+/// request and the timer that drives retention. The in-flight semaphore does
+/// not help: its permit is held by a blocked thread rather than a suspended
+/// task.
+async fn dash_read<T, F>(state: &AppState, read: F) -> Result<T, AppError>
+where
+    F: FnOnce(&DashStore) -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let store = state.dash_store.clone();
+    let value = tokio::task::spawn_blocking(move || read(&store))
+        .await
+        .context("joining the DASH read task")??;
+    Ok(value)
+}
+
 async fn dash_manifest(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1532,9 +1558,8 @@ async fn dash_manifest(
 ) -> Result<Response, AppError> {
     let identity = request_identity(&state, &headers)?;
     authorize_stream(&state, &identity.principal, stream_id)?;
-    let manifest = state
-        .dash_store
-        .manifest(stream_id, true)?
+    let manifest = dash_read(&state, move |store| store.manifest(stream_id, true))
+        .await?
         .ok_or(AppError::NotFound)?;
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -1553,9 +1578,8 @@ async fn list_dash_objects(
     let identity = request_identity(&state, &headers)?;
     authorize_stream(&state, &identity.principal, stream_id)?;
     Ok(Json(
-        state
-            .dash_store
-            .list(stream_id)?
+        dash_read(&state, move |store| store.list(stream_id))
+            .await?
             .into_iter()
             .filter(|object| {
                 query
@@ -1579,9 +1603,8 @@ async fn get_dash_object(
 ) -> Result<Response, AppError> {
     let identity = request_identity(&state, &headers)?;
     authorize_stream(&state, &identity.principal, stream_id)?;
-    let object = state
-        .dash_store
-        .get(stream_id, sequence)?
+    let object = dash_read(&state, move |store| store.get(stream_id, sequence))
+        .await?
         .ok_or(AppError::NotFound)?;
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -1601,10 +1624,11 @@ async fn get_dash_initialization(
 ) -> Result<Response, AppError> {
     let identity = request_identity(&state, &headers)?;
     authorize_stream(&state, &identity.principal, stream_id)?;
-    let initialization = state
-        .dash_store
-        .initialization(stream_id, epoch_id)?
-        .ok_or(AppError::NotFound)?;
+    let initialization = dash_read(&state, move |store| {
+        store.initialization(stream_id, epoch_id)
+    })
+    .await?
+    .ok_or(AppError::NotFound)?;
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "video/mp4")
@@ -1628,10 +1652,11 @@ async fn get_dash_segment(
         .ok_or_else(|| anyhow::anyhow!("DASH segment path must end in .m4s"))?
         .parse::<u64>()
         .context("parsing DASH segment number")?;
-    let segment = state
-        .dash_store
-        .media_segment(stream_id, epoch_id, segment_number)?
-        .ok_or(AppError::NotFound)?;
+    let segment = dash_read(&state, move |store| {
+        store.media_segment(stream_id, epoch_id, segment_number)
+    })
+    .await?
+    .ok_or(AppError::NotFound)?;
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "video/iso.segment")
@@ -1719,7 +1744,19 @@ async fn control_socket(
     let mut rx = state.events.subscribe();
     let (mut sender, mut receiver) = socket.split();
     let send_task = tokio::spawn(async move {
-        while let Ok(event) = rx.recv().await {
+        loop {
+            // `Lagged` is not the end of the stream. A receiver that fell
+            // behind the channel is repositioned to the oldest retained value
+            // and is fully usable; treating it as an error ended this task
+            // while the socket stayed open, so the dashboard silently stopped
+            // receiving events, never saw a close, never reconnected, and held
+            // its connection slot until the client went away. The live-header
+            // socket a few lines above has always done this correctly.
+            let event = match rx.recv().await {
+                Ok(event) => event,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
             let allowed = state
                 .store
                 .client_id_for_stream(event.stream_id)
