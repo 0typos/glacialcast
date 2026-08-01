@@ -98,5 +98,14 @@ jobs:
         env:
           GLACIALCAST_PLAYWRIGHT_MODULE: /tmp/glacialcast-playwright/node_modules/playwright
         run: scripts/verify-multi-stream.sh
+      - name: Verify the unencrypted publishing mode
+        # The one path no other gate can reach: every other browser gate starts
+        # by typing a viewing key, and this mode exists because there is nothing
+        # to type. Firefox only here, because that is what this job installs;
+        # nightly runs the same gate against both engines.
+        env:
+          GLACIALCAST_PLAYWRIGHT_MODULE: /tmp/glacialcast-playwright/node_modules/playwright
+          GLACIALCAST_VERIFY_BROWSERS: firefox
+        run: scripts/verify-unencrypted.sh
       - name: Build and verify release archive
         run: scripts/verify-packaging.sh
