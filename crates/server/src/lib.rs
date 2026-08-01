@@ -1647,21 +1647,27 @@ async fn list_dash_objects(
     headers: HeaderMap,
     Path(stream_id): Path<Uuid>,
     Query(query): Query<DashObjectListQuery>,
-) -> Result<Json<Vec<DashObjectHeader>>, AppError> {
+) -> Result<Response, AppError> {
     let identity = request_identity(&state, &headers)?;
     authorize_stream(&state, &identity.principal, stream_id)?;
-    Ok(Json(
-        dash_read(&state, move |store| store.list(stream_id))
-            .await?
-            .into_iter()
-            .filter(|object| {
-                query
-                    .after_sequence
-                    .is_none_or(|sequence| object.header.sequence > sequence)
-            })
-            .map(|object| object.header)
-            .collect(),
-    ))
+    let after = query.after_sequence;
+    let page = dash_read(&state, move |store| store.list_page(stream_id, after)).await?;
+    // The retained bounds ride in headers rather than the body, because the
+    // body is an array that several consumers already parse and the bounds are
+    // the one thing a partial page cannot convey. A viewer needs them to know
+    // which sequences were evicted while it was not looking.
+    let mut response = Json(page.headers).into_response();
+    for (name, value) in [
+        ("x-glacialcast-retained-first", page.retained_first),
+        ("x-glacialcast-retained-last", page.retained_last),
+    ] {
+        if let Some(sequence) = value
+            && let Ok(header) = axum::http::HeaderValue::from_str(&sequence.to_string())
+        {
+            response.headers_mut().insert(name, header);
+        }
+    }
+    Ok(response)
 }
 
 #[derive(Debug, Default, Deserialize)]

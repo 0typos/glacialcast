@@ -17,6 +17,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs::{File, OpenOptions},
     io::{Read, Write},
+    ops::Bound,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
@@ -80,6 +81,16 @@ struct StreamCatalog {
     bytes: u64,
     last_sequence: Option<u64>,
     journal_entries: usize,
+}
+
+/// One page of object headers, and the retained range it was taken from.
+#[derive(Debug, Clone, Default)]
+pub struct DashListPage {
+    pub headers: Vec<DashObjectHeader>,
+    /// Oldest sequence still retained, or `None` when the stream is empty.
+    pub retained_first: Option<u64>,
+    /// Newest sequence still retained, or `None` when the stream is empty.
+    pub retained_last: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -258,6 +269,37 @@ impl DashStore {
             }
         }
         Ok(stored)
+    }
+
+    /// Headers after `after_sequence`, with the retained range they came from.
+    ///
+    /// A live viewer reconciles every fifteen seconds, and reconciling against
+    /// the whole catalog made that cost grow with retained history rather than
+    /// with new work: measured at 576 KB after one minute of publishing and
+    /// still climbing, against a media payload of roughly 2.5 KB/s. The range
+    /// scan means the response carries what the viewer does not have yet.
+    ///
+    /// The bounds come back because they are the one thing the viewer needed
+    /// the full list for -- knowing which sequences have been evicted, so it
+    /// can forget them and trim its buffered history. They are cheap here
+    /// (`BTreeMap` ends) and impossible to derive from a partial page.
+    pub fn list_page(&self, stream_id: Uuid, after_sequence: Option<u64>) -> Result<DashListPage> {
+        let Some(handle) = self.catalog(stream_id)? else {
+            return Ok(DashListPage::default());
+        };
+        let catalog = handle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("DASH stream catalog mutex poisoned"))?;
+        let lower = after_sequence.map_or(Bound::Unbounded, Bound::Excluded);
+        Ok(DashListPage {
+            headers: catalog
+                .objects
+                .range((lower, Bound::Unbounded))
+                .map(|(_, object)| object.header.clone())
+                .collect(),
+            retained_first: catalog.objects.keys().next().copied(),
+            retained_last: catalog.objects.keys().next_back().copied(),
+        })
     }
 
     pub fn list(&self, stream_id: Uuid) -> Result<Vec<StoredDashObject>> {
