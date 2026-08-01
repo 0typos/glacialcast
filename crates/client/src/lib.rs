@@ -1,4 +1,4 @@
-//! GlacialCast Wayland capture and encrypted DASH publisher.
+//! GlacialCast Wayland capture and DASH publisher.
 //!
 //! The client captures a portal/PipeWire or deterministic test source, samples
 //! video at a deliberately low cadence, and processes cursor metadata on an
@@ -596,13 +596,26 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
         "stream credentials ready"
     );
 
-    let viewer_key = identity
-        .viewer_key_b64
-        .as_deref()
-        .context("encrypted DASH capture requires --viewer-key or viewer_key_b64 in client.toml")
-        .and_then(|key| {
-            decode_key_b64(key).context("viewer key must be URL-safe base64 for 32 bytes")
-        })?;
+    // A stream published in the clear has no viewer key, so requiring one was a
+    // contradiction: `--no-encryption --no-viewer-key` printed a summary saying
+    // the key was not used, daemonized looking healthy, and then died here --
+    // in the child's log, where nobody was looking. The flag decides; a key
+    // that happens to be configured is simply left unused.
+    let viewer_key = if args.no_encryption {
+        None
+    } else {
+        Some(
+            identity
+                .viewer_key_b64
+                .as_deref()
+                .context(
+                    "encrypted DASH capture requires --viewer-key or viewer_key_b64 in client.toml",
+                )
+                .and_then(|key| {
+                    decode_key_b64(key).context("viewer key must be URL-safe base64 for 32 bytes")
+                })?,
+        )
+    };
     identity.ingest_server_key.as_ref().context(
         "ingest server key is required; pass --ingest-server-key or set ingest_server_key in client.toml",
     )?;
@@ -696,7 +709,7 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
                             client: &identity,
                             label: label.as_deref(),
                         },
-                        &viewer_key,
+                        viewer_key.as_ref(),
                         capture.as_mut(),
                         &mut resend,
                         shutdown_rx,
@@ -983,7 +996,7 @@ async fn sleep_or_shutdown(duration: Duration, shutdown_rx: &mut watch::Receiver
 async fn run_dash_client(
     args: &Args,
     identity: StreamIdentity<'_>,
-    viewer_key: &[u8; 32],
+    viewer_key: Option<&[u8; 32]>,
     capture: &mut dyn Capture,
     resend: &mut DashResendBuffer,
     shutdown_rx: watch::Receiver<bool>,
@@ -1032,7 +1045,7 @@ async fn run_dash_client(
             Ok(()) => return Ok(()),
             Err(err) => {
                 if is_fatal_capture_error(&err) || is_fatal_dash_error(&err) {
-                    return Err(err.context("fatal encrypted DASH publisher error"));
+                    return Err(err.context("fatal DASH publisher error"));
                 }
                 if connection_started.elapsed() >= Duration::from_secs(60) {
                     retry_delay = Duration::from_secs(1);
@@ -1062,13 +1075,17 @@ fn is_fatal_dash_error(err: &anyhow::Error) -> bool {
             || message.contains("segment-frames")
             || message.contains("does not fit MPEG-DASH")
             || message.contains("server rejected hello")
+            // A policy refusal is decided per object and will be decided the
+            // same way next time. Retrying it forever hides the reason behind
+            // a generic "connection dropped" and leaves the stream flapping.
+            || message.contains("relay refused object")
     })
 }
 
 async fn run_dash_connection(
     args: &Args,
     identity: StreamIdentity<'_>,
-    viewer_key: &[u8; 32],
+    viewer_key: Option<&[u8; 32]>,
     source: &CaptureSource,
     capture: &mut dyn Capture,
     resend: &mut DashResendBuffer,
@@ -1158,11 +1175,17 @@ async fn run_dash_connection(
     let frame_duration = ((f64::from(MEDIA_TIMESCALE) / args.fps).round() as u64)
         .clamp(1, u64::from(u32::MAX)) as u32;
     let epoch_id = Uuid::new_v4();
-    let keys = EpochKeys::derive(viewer_key, stream_id, epoch_id)
-        .context("deriving encrypted DASH epoch keys")?;
     // One place decides, and everything downstream reads it from the absence of
-    // a key rather than from a flag it could disagree with.
-    let epoch_keys = (!args.no_encryption).then_some(&keys);
+    // a key rather than from a flag it could disagree with. There may be no key
+    // to derive from at all: an unencrypted publisher is not required to have
+    // one configured.
+    let keys = viewer_key
+        .map(|key| {
+            EpochKeys::derive(key, stream_id, epoch_id)
+                .context("deriving encrypted DASH epoch keys")
+        })
+        .transpose()?;
+    let epoch_keys = keys.as_ref();
     let encoder = EncoderActor::spawn(EncoderConfig {
         mode: args.dash_encoder,
         vaapi_device: args.vaapi_device.clone(),
@@ -1189,7 +1212,11 @@ async fn run_dash_connection(
         format_version: DASH_FORMAT_VERSION,
         stream_id,
         epoch_id,
-        key_id: keys.key_id,
+        // Always the epoch's own bytes, which is what EpochKeys derives it from
+        // and what the descriptor's validation requires. An unencrypted epoch
+        // has no key to identify, and carries the same shape rather than a
+        // second one for readers to handle.
+        key_id: *epoch_id.as_bytes(),
         width: u16::try_from(width).context("video width does not fit MPEG-DASH metadata")?,
         height: u16::try_from(height).context("video height does not fit MPEG-DASH metadata")?,
         codec,
@@ -1240,7 +1267,7 @@ async fn run_dash_connection(
                 random_access: true,
                 mime: "video/mp4",
                 payload: build_init_segment(&avc_config, epoch_keys.map(|keys| keys.key_id))
-                    .context("building encrypted DASH initialization segment")?,
+                    .context("building the DASH initialization segment")?,
             },
         )?,
     )
@@ -1403,7 +1430,7 @@ async fn run_dash_connection(
                     args.segment_frames(),
                     &mut pending_cursor_events,
                 ).await?;
-                info!(%stream_id, "shutdown requested; closing encrypted DASH stream");
+                info!(%stream_id, "shutdown requested; closing DASH stream");
                 return Ok(());
             }
             _ = frame_tick.tick() => {
@@ -1909,7 +1936,7 @@ async fn publish_encoded_media(
         duration,
         keyframe = encoded.keyframe,
         bytes,
-        "sent encrypted DASH media fragment"
+        "sent DASH media fragment"
     );
     *media_index = media_index.saturating_add(1);
     Ok(())
@@ -1941,7 +1968,7 @@ fn build_dash_media_object(
             iv,
         },
     )
-    .context("building encrypted DASH media fragment")?;
+    .context("building the DASH media fragment")?;
     let segment_frames = u64::from(segment_frames);
     next_dash_object(
         sequence,
@@ -2211,6 +2238,13 @@ async fn wait_for_dash_ack(
             ServerMessage::Backpressure { pause_ms, reason } => {
                 warn!(pause_ms, %reason, "server requested DASH publisher backpressure");
                 tokio::time::sleep(Duration::from_millis(pause_ms)).await;
+            }
+            ServerMessage::Refused { sequence, reason } => {
+                // The relay has declined this object on policy, not on
+                // capacity, so every reconnect would produce the same refusal.
+                // Carrying the relay's own sentence out to the operator is the
+                // entire point of the message.
+                bail!("relay refused object {sequence}: {reason}");
             }
             ServerMessage::Pong { .. } | ServerMessage::HelloAck { .. } => {}
         }
@@ -7435,7 +7469,7 @@ mod tests {
                     client: &identity,
                     label: None,
                 },
-                &[7u8; 32],
+                Some(&[7u8; 32]),
                 &mut capture,
                 &mut resend,
                 shutdown_rx,
