@@ -586,7 +586,9 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
     let serve_control = args.daemon_child || args.daemon_socket.is_some();
     info!(
         client_id = %identity.client_id,
-        e2e_encrypted = identity.viewer_key_b64.is_some(),
+        // The identity holds a viewer key whether or not this run uses one, so
+        // the flag is what says whether anything is encrypted end to end.
+        e2e_encrypted = identity.viewer_key_b64.is_some() && !args.no_encryption,
         config = identity
             .config_path
             .as_ref()
@@ -1265,7 +1267,8 @@ async fn run_dash_connection(
         bitrate = args.video_bitrate,
         encoder = encoder.backend_name(),
         bytes = first_bytes,
-        "encrypted MPEG-DASH publisher started"
+        encrypted = epoch_keys.is_some(),
+        "MPEG-DASH publisher started"
     );
 
     let frame_interval = Duration::from_secs_f64(1.0 / args.fps);
