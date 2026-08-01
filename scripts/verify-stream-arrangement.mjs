@@ -20,6 +20,23 @@ if (!origin || !viewerKey || !['firefox', 'chromium'].includes(browserName)) {
 }
 
 const WAIT_MS = 45_000;
+/**
+ * How many times a reload may be attempted before the run fails.
+ *
+ * Reloading the viewer with tiles decoding intermittently wedges Firefox on a
+ * contended machine: the navigation commits and `domcontentloaded` never
+ * arrives. Investigated at length and it is not this page's doing -- the relay
+ * answers HTTP 200 throughout, no request is outstanding, and removing the
+ * viewer's unload teardown entirely changes nothing. `page.evaluate` hangs too,
+ * so the browser's main thread is wedged rather than waiting on us. The same
+ * hang hits verify-multi-stream-browser.mjs, which predates this file.
+ *
+ * One retry, because a viewer whose reload wedges presses the key again, and
+ * this gate is about whether the arrangement survives a reload rather than
+ * about how Firefox behaves when starved. Two failures in a row still fail the
+ * run, and the retry is logged so the rate stays visible.
+ */
+const RELOAD_ATTEMPTS = 2;
 const browserType = browserName === 'firefox' ? firefox : chromium;
 const executablePath = browserName === 'firefox'
   ? process.env.GLACIALCAST_FIREFOX_EXECUTABLE
@@ -76,20 +93,39 @@ const untilOnScreen = streamId => until(
  * before failing. The answer is in the message rather than in someone's head
  * the next time this goes red on a runner and not on a desk.
  */
-async function reload() {
+async function describeRelay() {
   try {
-    await page.reload({ waitUntil: 'domcontentloaded', timeout: WAIT_MS });
+    const probe = await fetch(`${origin}/api/streams`, { cache: 'no-store' });
+    return `HTTP ${probe.status} with ${(await probe.json()).length} streams`;
   } catch (error) {
-    let relay = 'unreachable';
-    try {
-      const probe = await fetch(`${origin}/api/streams`, { cache: 'no-store' });
-      relay = `HTTP ${probe.status} with ${(await probe.json()).length} streams`;
-    } catch (probeError) {
-      relay = `unreachable: ${probeError.message}`;
-    }
-    throw new Error(`${error.message}\n  the relay, asked from outside the browser: ${relay}`);
+    return `unreachable: ${error.message}`;
   }
-  await until(() => globalThis.GlacialCastWatch?.unlockedStreams().length > 0);
+}
+
+async function reload() {
+  for (let attempt = 1; attempt <= RELOAD_ATTEMPTS; attempt += 1) {
+    try {
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: WAIT_MS });
+      await until(() => globalThis.GlacialCastWatch?.unlockedStreams().length > 0);
+      return;
+    } catch (error) {
+      const relay = await describeRelay();
+      if (attempt < RELOAD_ATTEMPTS) {
+        // Deliberately loud. If this line starts appearing on first load, or
+        // on both attempts, the assumption behind the retry is wrong and the
+        // count in the logs is the evidence that says so.
+        console.log(
+          `  warn reload did not reach domcontentloaded in ${WAIT_MS}ms; `
+          + `retrying once. relay from outside the browser: ${relay}`,
+        );
+        continue;
+      }
+      throw new Error(
+        `${error.message}\n  relay from outside the browser: ${relay}`
+        + `\n  this was attempt ${attempt} of ${RELOAD_ATTEMPTS}`,
+      );
+    }
+  }
 }
 
 try {

@@ -157,6 +157,24 @@ try {
 
   // Collapsing must survive a reload, and must not disturb what is playing:
   // the panel is a control surface, not part of the stream.
+  // Reloading with tiles decoding intermittently wedges Firefox on a contended
+  // machine: the navigation commits and `domcontentloaded` never arrives. It is
+  // not this page's doing -- the relay answers throughout, nothing is in
+  // flight, and removing the viewer's unload teardown changes nothing; even
+  // `page.evaluate` hangs, so the main thread is wedged rather than waiting on
+  // us. One retry, because that is what a viewer does, and this gate is about
+  // whether the key survives a reload rather than about Firefox under
+  // starvation. A second failure still fails the run, and the retry is logged
+  // so the rate stays visible.
+  const reloadOnce = async () => {
+    try {
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 });
+    } catch (error) {
+      console.log(`  warn reload did not reach domcontentloaded; retrying once (${error.message.split('\n')[0]})`);
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 });
+    }
+  };
+
   const playingBefore = await page.evaluate(
     () => globalThis.GlacialCastWatch.tiles()[0]?.metrics?.appendedMedia ?? 0,
   );
@@ -168,7 +186,7 @@ try {
     { timeout: 60_000 },
   );
 
-  await page.reload({ waitUntil: 'domcontentloaded' });
+  await reloadOnce();
   await page.waitForFunction(() => globalThis.GlacialCastWatch?.sidebarCollapsed?.() === true, null, {
     timeout: 15_000,
   });
