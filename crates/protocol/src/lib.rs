@@ -620,6 +620,20 @@ pub enum ServerMessage {
         /// Relay Unix timestamp in milliseconds.
         now_ms: i64,
     },
+    /// Refuses a published object for a reason retrying will not change.
+    ///
+    /// [`Self::HelloAck`] can only speak at handshake time, so a policy that is
+    /// decided per object -- an epoch published in the clear to a relay that
+    /// does not take them -- had no way to say so. The connection simply
+    /// dropped, which a publisher cannot tell from a network fault, so it
+    /// reconnected forever while the one sentence that would fix it stayed in
+    /// the relay's log.
+    Refused {
+        /// Object sequence that was refused.
+        sequence: u64,
+        /// Bounded human-readable reason, meant for the publisher's operator.
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -659,6 +673,16 @@ pub struct PublicStream {
     pub last_object_sequence: Option<u64>,
     /// Approximate bytes retained for this stream.
     pub retained_bytes: u64,
+    /// Newest retained capture epoch, when the relay holds one.
+    ///
+    /// Whether a stream is encrypted is decided per epoch, so this is what lets
+    /// a viewer notice the answer may have changed without refetching a
+    /// descriptor for every stream on every poll. Guessing it from publisher
+    /// lifecycle instead -- watching for a stream to go inactive and back --
+    /// misses a restart that completes between two polls, and misses an abrupt
+    /// disconnect where the relay never observes the gap at all.
+    #[serde(default)]
+    pub last_epoch_id: Option<Uuid>,
 }
 
 /// Returns the current Unix timestamp in milliseconds.
