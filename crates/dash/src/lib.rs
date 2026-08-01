@@ -775,7 +775,7 @@ pub struct Subsample {
 }
 
 /// Builds an AVC/CENC fragmented-MP4 initialization segment.
-pub fn build_encrypted_init_segment(config: &AvcConfig, key_id: [u8; 16]) -> Result<Vec<u8>> {
+pub fn build_init_segment(config: &AvcConfig, key_id: Option<[u8; 16]>) -> Result<Vec<u8>> {
     // Both bounds matter. `avcC` gives each parameter set a 16-bit length, so a
     // longer one would be written with a truncated prefix and the segment would
     // describe a different set of bytes than it carries -- silently, and only
@@ -829,7 +829,7 @@ pub fn build_encrypted_init_segment(config: &AvcConfig, key_id: [u8; 16]) -> Res
     Ok(output)
 }
 
-fn build_track(config: &AvcConfig, key_id: [u8; 16]) -> Vec<u8> {
+fn build_track(config: &AvcConfig, key_id: Option<[u8; 16]>) -> Vec<u8> {
     mp4_box(*b"trak", |trak| {
         trak.extend(full_box(*b"tkhd", 0, 0x000007, |out| {
             put_u32(out, 0);
@@ -877,11 +877,11 @@ fn build_track(config: &AvcConfig, key_id: [u8; 16]) -> Vec<u8> {
     })
 }
 
-fn build_sample_table(config: &AvcConfig, key_id: [u8; 16]) -> Vec<u8> {
+fn build_sample_table(config: &AvcConfig, key_id: Option<[u8; 16]>) -> Vec<u8> {
     mp4_box(*b"stbl", |stbl| {
         stbl.extend(full_box(*b"stsd", 0, 0, |out| {
             put_u32(out, 1);
-            out.extend(build_encrypted_sample_entry(config, key_id));
+            out.extend(build_sample_entry(config, key_id));
         }));
         stbl.extend(full_box(*b"stts", 0, 0, |out| put_u32(out, 0)));
         stbl.extend(full_box(*b"stsc", 0, 0, |out| put_u32(out, 0)));
@@ -903,8 +903,12 @@ fn build_sample_table(config: &AvcConfig, key_id: [u8; 16]) -> Vec<u8> {
     clippy::cast_possible_truncation,
     reason = "parameter-set lengths are bounded to u16 by the caller, per the invariant above"
 )]
-fn build_encrypted_sample_entry(config: &AvcConfig, key_id: [u8; 16]) -> Vec<u8> {
-    mp4_box(*b"encv", |entry| {
+fn build_sample_entry(config: &AvcConfig, key_id: Option<[u8; 16]>) -> Vec<u8> {
+    // A protected track declares `encv` and carries the scheme in `sinf`; an
+    // unprotected one is plain `avc1` with neither. Emitting `encv` without a
+    // scheme, or `avc1` with one, describes a track that is not what it says.
+    let kind = if key_id.is_some() { *b"encv" } else { *b"avc1" };
+    mp4_box(kind, |entry| {
         entry.extend_from_slice(&[0; 6]);
         put_u16(entry, 1);
         entry.extend_from_slice(&[0; 16]);
@@ -932,22 +936,24 @@ fn build_encrypted_sample_entry(config: &AvcConfig, key_id: [u8; 16]) -> Vec<u8>
             avcc.extend_from_slice(&config.pps);
         }));
 
-        entry.extend(mp4_box(*b"sinf", |sinf| {
-            sinf.extend(mp4_box(*b"frma", |out| out.extend_from_slice(b"avc1")));
-            sinf.extend(full_box(*b"schm", 0, 0, |out| {
-                out.extend_from_slice(b"cenc");
-                put_u32(out, 0x0001_0000);
-            }));
-            sinf.extend(mp4_box(*b"schi", |schi| {
-                schi.extend(full_box(*b"tenc", 0, 0, |out| {
-                    out.push(0);
-                    out.push(0);
-                    out.push(1);
-                    out.push(16);
-                    out.extend_from_slice(&key_id);
+        if let Some(key_id) = key_id {
+            entry.extend(mp4_box(*b"sinf", |sinf| {
+                sinf.extend(mp4_box(*b"frma", |out| out.extend_from_slice(b"avc1")));
+                sinf.extend(full_box(*b"schm", 0, 0, |out| {
+                    out.extend_from_slice(b"cenc");
+                    put_u32(out, 0x0001_0000);
+                }));
+                sinf.extend(mp4_box(*b"schi", |schi| {
+                    schi.extend(full_box(*b"tenc", 0, 0, |out| {
+                        out.push(0);
+                        out.push(0);
+                        out.push(1);
+                        out.push(16);
+                        out.extend_from_slice(&key_id);
+                    }));
                 }));
             }));
-        }));
+        }
     })
 }
 
@@ -957,24 +963,30 @@ fn build_encrypted_sample_entry(config: &AvcConfig, key_id: [u8; 16]) -> Vec<u8>
     reason = "sample lengths are bounded by MAX_MEDIA_PAYLOAD, and the saiz and \
               senc fields by the AuxiliaryInfoTooLarge check below"
 )]
-pub fn build_encrypted_fragment(
-    cenc_key: &[u8; 16],
+pub fn build_fragment(
+    cenc_key: Option<&[u8; 16]>,
     input: FragmentInput<'_>,
 ) -> Result<MediaFragment> {
     if input.annex_b.len() > MAX_MEDIA_PAYLOAD {
         return Err(DashError::MediaTooLarge);
     }
     let (mut sample, ranges) = annex_b_to_avcc(input.annex_b)?;
-    let mut cipher = Aes128Ctr::new(cenc_key.into(), (&input.iv).into());
+    // Without a key the sample stays as it is and describes no subsamples, so
+    // the protection boxes below are omitted rather than written empty: a
+    // `saiz`/`saio`/`senc` trio saying nothing is protected is a claim about
+    // encryption that an unencrypted fragment should not be making.
     let mut subsamples = Vec::with_capacity(ranges.len());
-    for range in ranges {
-        let clear_bytes = 5u16;
-        let encrypted_len = range.end.saturating_sub(range.start);
-        cipher.apply_keystream(&mut sample[range]);
-        subsamples.push(Subsample {
-            clear_bytes,
-            encrypted_bytes: encrypted_len as u32,
-        });
+    if let Some(cenc_key) = cenc_key {
+        let mut cipher = Aes128Ctr::new(cenc_key.into(), (&input.iv).into());
+        for range in ranges {
+            let clear_bytes = 5u16;
+            let encrypted_len = range.end.saturating_sub(range.start);
+            cipher.apply_keystream(&mut sample[range]);
+            subsamples.push(Subsample {
+                clear_bytes,
+                encrypted_bytes: encrypted_len as u32,
+            });
+        }
     }
 
     let auxiliary_size = 16usize
@@ -1009,27 +1021,33 @@ pub fn build_encrypted_fragment(
                     },
                 );
             }));
-            traf.extend(full_box(*b"saiz", 0, 0, |out| {
-                out.push(auxiliary_size as u8);
-                put_u32(out, 1);
-            }));
-            traf.extend(full_box(*b"saio", 0, 0, |out| {
-                put_u32(out, 1);
-                put_u32(out, 0);
-            }));
-            traf.extend(full_box(*b"senc", 0, 0x000002, |out| {
-                put_u32(out, 1);
-                out.extend_from_slice(&input.iv);
-                put_u16(out, subsamples.len() as u16);
-                for subsample in &subsamples {
-                    put_u16(out, subsample.clear_bytes);
-                    put_u32(out, subsample.encrypted_bytes);
-                }
-            }));
+            if cenc_key.is_some() {
+                traf.extend(full_box(*b"saiz", 0, 0, |out| {
+                    out.push(auxiliary_size as u8);
+                    put_u32(out, 1);
+                }));
+                traf.extend(full_box(*b"saio", 0, 0, |out| {
+                    put_u32(out, 1);
+                    put_u32(out, 0);
+                }));
+                traf.extend(full_box(*b"senc", 0, 0x000002, |out| {
+                    put_u32(out, 1);
+                    out.extend_from_slice(&input.iv);
+                    put_u16(out, subsamples.len() as u16);
+                    for subsample in &subsamples {
+                        put_u16(out, subsample.clear_bytes);
+                        put_u32(out, subsample.encrypted_bytes);
+                    }
+                }));
+            }
         }));
     });
 
-    patch_fragment_offsets(&mut moof)?;
+    if cenc_key.is_some() {
+        patch_fragment_offsets(&mut moof)?;
+    } else {
+        patch_data_offset(&mut moof)?;
+    }
     let mdat = mp4_box(*b"mdat", |out| out.extend_from_slice(&sample));
     let mut bytes = Vec::with_capacity(moof.len() + mdat.len());
     bytes.extend_from_slice(&moof);
@@ -1042,10 +1060,22 @@ pub fn build_encrypted_fragment(
     })
 }
 
-fn patch_fragment_offsets(moof: &mut [u8]) -> Result<()> {
+/// Points `trun` at the sample data, which every fragment needs.
+///
+/// The offset is relative to the start of the `moof`, which is what
+/// `default-base-is-moof` in `tfhd` selects, and the `mdat` payload begins
+/// eight bytes past its end.
+fn patch_data_offset(moof: &mut [u8]) -> Result<()> {
     let trun = find_box(moof, *b"trun").ok_or(DashError::EmptyAccessUnit)?;
     let data_offset = i32::try_from(moof.len() + 8).map_err(|_| DashError::MediaTooLarge)?;
     moof[trun + 16..trun + 20].copy_from_slice(&data_offset.to_be_bytes());
+    Ok(())
+}
+
+/// Points `trun` at the sample data and `saio` at the per-sample encryption
+/// information, for a protected fragment.
+fn patch_fragment_offsets(moof: &mut [u8]) -> Result<()> {
+    patch_data_offset(moof)?;
 
     let saio = find_box(moof, *b"saio").ok_or(DashError::EmptyAccessUnit)?;
     let senc = find_box(moof, *b"senc").ok_or(DashError::EmptyAccessUnit)?;
@@ -1363,6 +1393,75 @@ mod tests {
             source_width: batch.source_width,
             source_height: batch.source_height,
         }
+    }
+
+    #[test]
+    fn an_unencrypted_fragment_carries_no_protection_and_no_ciphertext() {
+        let access_unit: &[u8] = &[
+            0, 0, 0, 1, 0x65, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 1, 0x06, 9, 10, 11,
+        ];
+        let input = || FragmentInput {
+            sequence: 1,
+            decode_time: 0,
+            duration: 90_000,
+            keyframe: true,
+            annex_b: access_unit,
+            iv: [5u8; 16],
+        };
+        let plain = build_fragment(None, input()).unwrap();
+        let sealed = build_fragment(Some(&[4u8; 16]), input()).unwrap();
+
+        // No key means no claim about encryption: the boxes that describe
+        // per-sample protection must be absent, not present and empty.
+        for box_kind in [b"saiz", b"saio", b"senc"] {
+            assert!(
+                find_box(&plain.bytes, *box_kind).is_none(),
+                "unencrypted fragment must not carry {}",
+                std::str::from_utf8(box_kind).unwrap()
+            );
+            assert!(
+                find_box(&sealed.bytes, *box_kind).is_some(),
+                "encrypted fragment must still carry {}",
+                std::str::from_utf8(box_kind).unwrap()
+            );
+        }
+        assert!(plain.subsamples.is_empty());
+
+        // The payload really is in the clear: the NAL body survives verbatim,
+        // where the encrypted build leaves it changed.
+        assert!(
+            plain
+                .encrypted_sample
+                .windows(8)
+                .any(|w| w == [1, 2, 3, 4, 5, 6, 7, 8]),
+            "unencrypted sample must contain the original NAL body"
+        );
+        assert!(
+            !sealed
+                .encrypted_sample
+                .windows(8)
+                .any(|w| w == [1, 2, 3, 4, 5, 6, 7, 8]),
+            "encrypted sample must not"
+        );
+        // Both still point trun at the sample data.
+        assert!(find_box(&plain.bytes, *b"trun").is_some());
+    }
+
+    #[test]
+    fn an_unencrypted_init_segment_declares_a_plain_avc_track() {
+        let plain = build_init_segment(&fixture_config(), None).unwrap();
+        let sealed = build_init_segment(&fixture_config(), Some([3u8; 16])).unwrap();
+        // `encv` plus `sinf` is the protected shape; `avc1` with neither is the
+        // plain one. A track that says `encv` and carries no scheme, or says
+        // `avc1` and carries one, describes something it is not.
+        assert!(find_box(&plain, *b"avc1").is_some());
+        assert!(find_box(&plain, *b"encv").is_none());
+        assert!(find_box(&plain, *b"sinf").is_none());
+        assert!(find_box(&plain, *b"tenc").is_none());
+        assert!(find_box(&sealed, *b"encv").is_some());
+        assert!(find_box(&sealed, *b"sinf").is_some());
+        // The decoder configuration is the same either way.
+        assert!(find_box(&plain, *b"avcC").is_some());
     }
 
     #[test]
@@ -1696,7 +1795,7 @@ mod tests {
 
     #[test]
     fn init_segment_declares_avc_and_common_encryption() {
-        let init = build_encrypted_init_segment(&fixture_config(), [3u8; 16]).unwrap();
+        let init = build_init_segment(&fixture_config(), Some([3u8; 16])).unwrap();
 
         for marker in [
             b"ftyp", b"moov", b"encv", b"avcC", b"sinf", b"cenc", b"tenc",
@@ -1718,8 +1817,8 @@ mod tests {
         let access_unit = [
             0, 0, 0, 1, 0x65, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 1, 0x06, 9, 10, 11,
         ];
-        let fragment = build_encrypted_fragment(
-            &[4u8; 16],
+        let fragment = build_fragment(
+            Some(&[4u8; 16]),
             FragmentInput {
                 sequence: 1,
                 decode_time: 0,
@@ -1841,8 +1940,8 @@ mod tests {
             ),
         ];
         for (name, annex_b) in cases {
-            let fragment = build_encrypted_fragment(
-                &key,
+            let fragment = build_fragment(
+                Some(&key),
                 FragmentInput {
                     sequence: 1,
                     decode_time: 0,

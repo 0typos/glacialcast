@@ -19,8 +19,8 @@ use futures_util::StreamExt;
 use glacialcast_dash::{
     CursorBatch as DashCursorBatch, CursorBitmap as DashCursorBitmap,
     CursorContext as DashCursorContext, CursorEvent as DashCursorEvent, DASH_FORMAT_VERSION,
-    EpochDescriptor, EpochKeys, FragmentInput, MEDIA_TIMESCALE, build_encrypted_fragment,
-    build_encrypted_init_segment, encrypt_cursor_batch,
+    EpochDescriptor, EpochKeys, FragmentInput, MEDIA_TIMESCALE, build_fragment, build_init_segment,
+    encrypt_cursor_batch,
 };
 use glacialcast_protocol::{
     CaptureSource, ClientMessage, DashObject, DashObjectKind, NewDashObject, NoiseSocket,
@@ -1208,7 +1208,7 @@ async fn run_dash_connection(
                 duration: 0,
                 random_access: true,
                 mime: "video/mp4",
-                payload: build_encrypted_init_segment(&avc_config, keys.key_id)
+                payload: build_init_segment(&avc_config, Some(keys.key_id))
                     .context("building encrypted DASH initialization segment")?,
             },
         )?,
@@ -1892,8 +1892,8 @@ fn build_dash_media_object(
 ) -> Result<DashObject> {
     let mut iv = [0u8; 16];
     OsRng.fill_bytes(&mut iv);
-    let fragment = build_encrypted_fragment(
-        &keys.cenc_key,
+    let fragment = build_fragment(
+        Some(&keys.cenc_key),
         FragmentInput {
             sequence: u32::try_from(media_index.saturating_add(1))
                 .context("DASH epoch has too many media fragments")?,

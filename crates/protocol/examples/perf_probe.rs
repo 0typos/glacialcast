@@ -1,6 +1,6 @@
 use glacialcast_dash::{
     CursorBatch, CursorBitmap, CursorContext, CursorEvent, EpochKeys, FragmentInput,
-    build_encrypted_fragment, decrypt_cursor_batch, encrypt_cursor_batch,
+    build_fragment, decrypt_cursor_batch, encrypt_cursor_batch,
 };
 use glacialcast_protocol::{DashObject, DashObjectKind, NewDashObject};
 use std::{
@@ -83,8 +83,8 @@ fn fragment_probe(keys: &EpochKeys) -> f64 {
     }
     let iterations = 500;
     let elapsed = measure(iterations, || {
-        let fragment = build_encrypted_fragment(
-            &keys.cenc_key,
+        let fragment = build_fragment(
+            Some(&keys.cenc_key),
             FragmentInput {
                 sequence: 1,
                 decode_time: 0,
