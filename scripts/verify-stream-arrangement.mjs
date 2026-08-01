@@ -204,6 +204,44 @@ try {
   );
   check(true, 'and went back on screen from there');
 
+  // Growing the grid must fill the hole it opens. Two tiles up, both taken,
+  // clicking a third jumps the layout to four -- adding two tiles at once --
+  // and the stream belongs in the first of them. Reaching for the last tile
+  // instead left tile 3 empty and wrote that hole into the arrangement, where
+  // it was faithfully restored on every reload.
+  await page.locator('[data-layout="2"]').click();
+  // Both tiles taken is the precondition: growing only happens when there is no
+  // free tile to use.
+  await page.waitForFunction(
+    () => {
+      const grid = globalThis.GlacialCastWatch.tiles();
+      return grid.length === 2 && grid.every(tile => tile.streamId);
+    },
+    null,
+    { timeout: WAIT_MS },
+  );
+  const parked = await rowIds('available');
+  if (parked.length === 0) failures.push('expected a parked stream after shrinking to two tiles');
+  else {
+    await page.locator(`li[data-stream-id="${parked[0]}"] .stream-pick`).click();
+    await page.waitForFunction(
+      streamId => globalThis.GlacialCastWatch.tiles().some(tile => tile.streamId === streamId),
+      parked[0],
+      { timeout: WAIT_MS },
+    );
+    const grown = await tiles();
+    const slots = await placements();
+    check(
+      grown.length === 4 && grown[2].streamId === parked[0],
+      `growing to four put the stream in tile 3 (landed in ${
+        grown.findIndex(tile => tile.streamId === parked[0]) + 1})`,
+    );
+    check(
+      slots[parked[0]]?.slot === 3,
+      `and recorded it as tile 3 (recorded ${slots[parked[0]]?.slot})`,
+    );
+  }
+
   check(errors.length === 0, `no page errors (${JSON.stringify(errors)})`);
 } finally {
   await browser.close();

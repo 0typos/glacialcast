@@ -84,6 +84,7 @@ RUST_LOG=glacialcast_client=info target/debug/glacialcast-client \
   --ingest-addr "${ingest_addr}" \
   "--ingest-server-key=${ingest_server_key}" \
   --no-encryption \
+  --no-viewer-key \
   --foreground \
   --client-id unencrypted-e2e \
   --display-name "Unencrypted E2E" \
@@ -119,6 +120,10 @@ if [[ -z "${stream_id}" ]]; then
 fi
 echo "publishing unencrypted stream ${stream_id}"
 
+# --no-viewer-key on both publishers on purpose: an unencrypted stream has no
+# viewer key, and requiring one anyway made this exact combination print a
+# healthy summary and then die in the daemon log without publishing anything.
+#
 # The descriptor is what the viewer reads to decide there is no key, so it is
 # checked here directly rather than only through a browser.
 epoch_sequence=""
@@ -174,6 +179,7 @@ RUST_LOG=glacialcast_client=info target/debug/glacialcast-client \
   --ingest-addr "${strict_ingest_addr}" \
   "--ingest-server-key=${strict_ingest_server_key}" \
   --no-encryption \
+  --no-viewer-key \
   --foreground \
   --client-id unencrypted-refused \
   --display-name "Unencrypted Refused" \
@@ -200,6 +206,28 @@ if (( refused == 0 )); then
   sed -n '1,200p' "${strict_server_log}" >&2
   exit 1
 fi
+
+# The refusal has to reach the publisher, not just the relay's log. Dropping the
+# connection alone is indistinguishable from a network fault, so the publisher
+# used to reconnect forever while the one actionable sentence stayed here.
+wait "${strict_client_pid}" 2>/dev/null || true
+strict_client_pid=""
+if ! grep -q "relay refused object" "${strict_client_log}"; then
+  echo "the publisher was never told why it was refused" >&2
+  sed -n '1,200p' "${strict_client_log}" >&2
+  exit 1
+fi
+if ! grep -q "trusted-lan" "${strict_client_log}"; then
+  echo "the refusal reached the publisher without the reason" >&2
+  sed -n '1,200p' "${strict_client_log}" >&2
+  exit 1
+fi
+retries="$(grep -c "DASH connection dropped" "${strict_client_log}" || true)"
+if [[ "${retries}" != "0" ]]; then
+  echo "the publisher retried a refusal ${retries} times instead of stopping" >&2
+  exit 1
+fi
+echo "the publisher was told why, and stopped instead of retrying"
 # Refusing has to mean refusing, not logging and storing anyway. The stream is
 # registered by the Hello that precedes the epoch, so it is the objects behind
 # it that must be absent -- and it is this relay's own stream that is asked
