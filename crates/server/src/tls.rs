@@ -118,6 +118,20 @@ fn load_supplied(cert_path: &Path, key_path: &Path) -> Result<TlsMaterial> {
     })
 }
 
+/// Reuses a generated certificate only while it still covers what is wanted.
+///
+/// The names are recorded beside the pair when it is written, because they
+/// cannot be recovered from the PEM without parsing the certificate's SANs. Two
+/// things went wrong without them. The startup warning printed an empty
+/// `valid_for` on every restart after the first -- losing exactly the address
+/// list the warning exists to convey. And an operator who added `--tls-name`,
+/// or whose LAN address changed, silently kept the old certificate: nothing
+/// compared what was asked for against what was stored, so the browser reported
+/// a name mismatch and the only way out was deleting the directory by hand.
+///
+/// A stored pair that covers every wanted name is kept, so restarting does not
+/// ask viewers to accept a new certificate. Anything else is regenerated, which
+/// does -- once, and for a reason the operator can act on.
 fn load_or_generate(
     dir: &Path,
     control_addr: SocketAddr,
@@ -125,6 +139,9 @@ fn load_or_generate(
 ) -> Result<TlsMaterial> {
     let cert_path = dir.join("cert.pem");
     let key_path = dir.join("key.pem");
+    let names_path = dir.join("names");
+    let wanted = certificate_names(control_addr, extra_names);
+
     if cert_path.exists() && key_path.exists() {
         let key_mode = fs::metadata(&key_path)
             .with_context(|| format!("reading {}", key_path.display()))?
@@ -138,26 +155,61 @@ fn load_or_generate(
                 key_mode
             );
         }
-        let mut material = load_supplied(&cert_path, &key_path)?;
-        material.generated = true;
-        return Ok(material);
+        let stored = read_names(&names_path);
+        let missing: Vec<&String> = wanted
+            .iter()
+            .filter(|name| !stored.contains(*name))
+            .collect();
+        if missing.is_empty() && !stored.is_empty() {
+            let mut material = load_supplied(&cert_path, &key_path)?;
+            material.generated = true;
+            material.names = stored;
+            return Ok(material);
+        }
+        warn!(
+            path = %cert_path.display(),
+            missing = ?missing,
+            "regenerating the relay certificate: the stored one does not cover every \
+             address this relay answers to, so viewers will be asked to accept it once more"
+        );
     }
 
-    let names = certificate_names(control_addr, extra_names);
-    let (cert_pem, key_pem) = generate(&names)?;
+    let (cert_pem, key_pem) = generate(&wanted)?;
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
         .with_context(|| format!("securing {}", dir.display()))?;
     write_private(&key_path, key_pem.as_bytes())?;
     fs::write(&cert_path, &cert_pem).with_context(|| format!("writing {}", cert_path.display()))?;
+    // Last, so a crash between the two leaves a pair with no name list rather
+    // than a name list describing a certificate that was never written. The
+    // first is regenerated on the next start; the second would be trusted.
+    fs::write(&names_path, wanted.join("\n"))
+        .with_context(|| format!("writing {}", names_path.display()))?;
     let fingerprint = fingerprint(&cert_pem).unwrap_or_else(|| "unavailable".to_string());
     Ok(TlsMaterial {
         cert_pem,
         key_pem,
         fingerprint,
-        names,
+        names: wanted,
         generated: true,
     })
+}
+
+/// The names a stored generated certificate was issued for.
+///
+/// An unreadable or absent list reads as "nothing known", which forces a
+/// regeneration rather than a guess -- including for a pair written by a
+/// version that did not keep this file.
+fn read_names(path: &Path) -> Vec<String> {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// The names a generated certificate should answer to.
@@ -409,6 +461,10 @@ mod tests {
         let second = load_or_create(&dir, None, None, addr, &[]).unwrap();
         assert_eq!(first.cert_pem, second.cert_pem);
         assert_eq!(first.fingerprint, second.fingerprint);
+        // And it still knows what it answers to. The startup warning prints
+        // this list, and reuse used to empty it.
+        assert_eq!(first.names, second.names);
+        assert!(second.names.iter().any(|name| name == "localhost"));
 
         let key = dir.join("tls/key.pem");
         let mode = fs::metadata(&key).unwrap().permissions().mode() & 0o777;
@@ -430,6 +486,48 @@ mod tests {
         // A wildcard bind names no address of its own, so it must not add one.
         let wildcard = certificate_names("0.0.0.0:8899".parse().unwrap(), &[]);
         assert!(!wildcard.iter().any(|name| name == "0.0.0.0"));
+    }
+
+    #[test]
+    fn a_newly_wanted_name_regenerates_the_certificate() {
+        // The reuse path used to keep the stored pair no matter what was asked
+        // for, so adding --tls-name changed nothing and the browser reported a
+        // name mismatch with no way out but deleting the directory.
+        let dir = scratch_dir();
+        let addr: SocketAddr = "0.0.0.0:8899".parse().unwrap();
+        let first = load_or_create(&dir, None, None, addr, &[]).unwrap();
+
+        let renamed =
+            load_or_create(&dir, None, None, addr, &["cast.example".to_string()]).unwrap();
+        assert_ne!(first.fingerprint, renamed.fingerprint);
+        assert!(renamed.names.iter().any(|name| name == "cast.example"));
+
+        // Asking for the same set again reuses it: regenerating is the cost of
+        // a changed answer, not of every restart.
+        let again = load_or_create(&dir, None, None, addr, &["cast.example".to_string()]).unwrap();
+        assert_eq!(renamed.fingerprint, again.fingerprint);
+
+        // Dropping a name keeps the certificate, which still covers what is
+        // wanted. A transiently missing address must not churn the pair.
+        let fewer = load_or_create(&dir, None, None, addr, &[]).unwrap();
+        assert_eq!(renamed.fingerprint, fewer.fingerprint);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_pair_with_no_recorded_names_is_regenerated() {
+        // What an upgrade finds: a certificate written before the name list
+        // existed. Keeping it would mean serving a certificate nobody can say
+        // anything about, so it is replaced once.
+        let dir = scratch_dir();
+        let addr: SocketAddr = "0.0.0.0:8899".parse().unwrap();
+        let first = load_or_create(&dir, None, None, addr, &[]).unwrap();
+        fs::remove_file(dir.join("tls/names")).unwrap();
+
+        let second = load_or_create(&dir, None, None, addr, &[]).unwrap();
+        assert_ne!(first.fingerprint, second.fingerprint);
+        assert!(!second.names.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
