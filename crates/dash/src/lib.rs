@@ -144,6 +144,21 @@ fn encrypted_by_default() -> bool {
     true
 }
 
+/// What an epoch payload claims about its own encryption.
+///
+/// Three states, not two, because "the relay cannot read this" is a different
+/// answer from "this says it is encrypted" and must not be treated as one. A
+/// policy that silently accepts what it cannot read is not a policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncryptionClaim {
+    /// The payload claims encryption, or predates the field and so defaults to it.
+    Encrypted,
+    /// The payload explicitly claims to be published in the clear.
+    Unencrypted,
+    /// No claim could be read. Nothing may be inferred from this.
+    Unreadable,
+}
+
 /// Reads only whether an epoch payload claims to be unencrypted.
 ///
 /// Deliberately not [`EpochDescriptor::from_json`]. A relay enforcing an
@@ -159,19 +174,33 @@ fn encrypted_by_default() -> bool {
 /// default. Written apart from them, a rename or a `serde` alias would compile,
 /// keep every test green, and silently turn the policy into a no-op.
 ///
-/// Returns `None` when the payload is not a JSON object at all: it carries no
-/// claim this can read and none a viewer can read either, so what it describes
-/// is unplayable rather than unencrypted.
+/// # Matching the reader that actually plays the stream
+///
+/// The viewer reads these bytes with `TextDecoder` and `JSON.parse`, and the
+/// only thing that matters here is agreeing with it. A first attempt used
+/// `serde_json::from_slice`, which is stricter in ways that were themselves a
+/// bypass: it rejects a leading byte-order mark and a repeated key, where the
+/// browser accepts both and takes the last value. Three bytes of BOM in front
+/// of an otherwise ordinary descriptor were enough to make the relay see no
+/// claim, store the epoch, and let the viewer play it with no key and no
+/// authentication.
+///
+/// So this strips a BOM, decodes lossily as `TextDecoder` does, and parses to a
+/// `Value` so that a repeated key resolves last-wins the way `JSON.parse` does.
+/// A field that is present but not a boolean reads as encrypted, because the
+/// viewer's test is `descriptor.encrypted !== false`.
 #[must_use]
-pub fn epoch_encryption_claim(payload: &[u8]) -> Option<bool> {
-    #[derive(Deserialize)]
-    struct Claim {
-        #[serde(default = "encrypted_by_default")]
-        encrypted: bool,
+pub fn epoch_encryption_claim(payload: &[u8]) -> EncryptionClaim {
+    let text = String::from_utf8_lossy(payload);
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let Ok(serde_json::Value::Object(fields)) = serde_json::from_str::<serde_json::Value>(text)
+    else {
+        return EncryptionClaim::Unreadable;
+    };
+    match fields.get("encrypted") {
+        Some(serde_json::Value::Bool(false)) => EncryptionClaim::Unencrypted,
+        _ => EncryptionClaim::Encrypted,
     }
-    serde_json::from_slice::<Claim>(payload)
-        .ok()
-        .map(|claim| claim.encrypted)
 }
 
 impl EpochDescriptor {
@@ -1406,9 +1435,7 @@ mod tests {
     fn the_lenient_claim_agrees_with_the_strict_reader() {
         // The relay's encrypted-only policy reads the claim without validating
         // the rest of the descriptor. That is only safe while the two readers
-        // cannot disagree about the field or its default -- which is why the
-        // lenient one lives in this file, and why this test is here to fail if
-        // a rename, an alias, or a changed default separates them.
+        // cannot disagree about the field or its default.
         for encrypted in [true, false] {
             let descriptor = EpochDescriptor {
                 format_version: DASH_FORMAT_VERSION,
@@ -1424,28 +1451,73 @@ mod tests {
                 encrypted,
             };
             let json = descriptor.to_json().unwrap();
-            assert_eq!(epoch_encryption_claim(&json), Some(encrypted));
+            let expected = if encrypted {
+                EncryptionClaim::Encrypted
+            } else {
+                EncryptionClaim::Unencrypted
+            };
+            assert_eq!(epoch_encryption_claim(&json), expected);
             assert_eq!(
                 EpochDescriptor::from_json(&json).unwrap().encrypted,
                 encrypted
             );
         }
+    }
 
-        // Absent means encrypted, in both readers.
-        let legacy = br#"{"format_version":1,"stream_id":"00000000-0000-0000-0000-000000000007","epoch_id":"00000000-0000-0000-0000-000000000009","key_id":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,9],"width":320,"height":180,"codec":"avc1.42c015","timescale":90000,"segment_frames":2,"availability_start_time":""}"#;
-        assert_eq!(epoch_encryption_claim(legacy), Some(true));
-        assert!(
-            EpochDescriptor::from_json(legacy).unwrap().encrypted,
-            "absent must read as encrypted"
-        );
+    #[test]
+    fn the_claim_reader_matches_the_browser_on_every_shared_vector() {
+        // The invariant is a cross-implementation one: the relay decides policy
+        // from these bytes and the browser decides whether to demand a key from
+        // the same bytes, using a different JSON parser. Comparing two Rust
+        // readers -- which is all the previous test did -- cannot see a
+        // disagreement between the two programs that actually matter, and did
+        // not: a leading byte-order mark made `serde_json` report no claim
+        // while `TextDecoder` plus `JSON.parse` read it as unencrypted, so a
+        // relay serving encrypted-only stored a plaintext epoch and the viewer
+        // played it with no key and no authentication.
+        //
+        // scripts/test-epoch-claim.mjs drives the browser's reader over the
+        // same file. Neither side may be changed alone.
+        let raw = include_str!("../../../test-vectors/epoch-claim-vectors.json");
+        let file: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let vectors = file["vectors"].as_array().unwrap();
+        assert!(vectors.len() >= 10, "vector file looks truncated");
+        for vector in vectors {
+            let name = vector["name"].as_str().unwrap();
+            let payload = base64_decode(vector["payload_base64"].as_str().unwrap());
+            let expected = match vector["claim"].as_str().unwrap() {
+                "encrypted" => EncryptionClaim::Encrypted,
+                "unencrypted" => EncryptionClaim::Unencrypted,
+                "unreadable" => EncryptionClaim::Unreadable,
+                other => panic!("unknown claim {other} in vector {name}"),
+            };
+            assert_eq!(epoch_encryption_claim(&payload), expected, "vector: {name}");
+        }
+    }
 
-        // A claim the strict reader rejects is still honoured: that gap was the
-        // bypass. And bytes that are not a JSON object carry no claim at all.
-        assert_eq!(
-            epoch_encryption_claim(br#"{"encrypted":false,"segment_frames":0}"#),
-            Some(false)
-        );
-        assert_eq!(epoch_encryption_claim(b"not json"), None);
+    /// Minimal standard-alphabet base64, so the vector file can carry bytes
+    /// that are not valid UTF-8 without this crate taking a dependency.
+    fn base64_decode(text: &str) -> Vec<u8> {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = Vec::new();
+        let mut acc = 0u32;
+        let mut bits = 0u32;
+        for byte in text.bytes().filter(|b| *b != b'=') {
+            let index = TABLE
+                .iter()
+                .position(|c| *c == byte)
+                .unwrap_or_else(|| panic!("invalid base64 byte {byte}"));
+            let value = u32::try_from(index).expect("alphabet index is below 64");
+            acc = (acc << 6) | value;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                let octet = (acc >> bits) & 0xff;
+                out.push(u8::try_from(octet).expect("masked to a single octet"));
+            }
+        }
+        out
     }
 
     fn fixture_config() -> AvcConfig {

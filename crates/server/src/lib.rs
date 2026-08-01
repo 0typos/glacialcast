@@ -1964,6 +1964,11 @@ fn websocket_guard(state: &AppState, principal_name: &str) -> Result<ConnectionG
 /// disagree about its name or its default. Requiring the whole descriptor to
 /// validate here was a bypass; that function documents why.
 ///
+/// A payload whose claim cannot be read is refused rather than stored. The
+/// relay and the browser do not share a JSON parser, so "I cannot read this"
+/// says nothing about whether the viewer can -- and the viewer is the one that
+/// decides whether to demand a key.
+///
 /// # Errors
 ///
 /// Returns an error when the epoch declares itself unencrypted and this relay
@@ -1972,13 +1977,22 @@ fn refuse_unencrypted_epoch(object: &DashObject, allow_unencrypted: bool) -> Res
     if allow_unencrypted || object.header.kind != DashObjectKind::Epoch {
         return Ok(());
     }
-    if glacialcast_dash::epoch_encryption_claim(&object.payload) != Some(false) {
-        return Ok(());
+    match glacialcast_dash::epoch_encryption_claim(&object.payload) {
+        glacialcast_dash::EncryptionClaim::Encrypted => Ok(()),
+        glacialcast_dash::EncryptionClaim::Unencrypted => anyhow::bail!(
+            "refusing an unencrypted epoch: this relay serves streams end-to-end encrypted. \
+             Start it with --trusted-lan to accept publishers that send in the clear"
+        ),
+        // Refused rather than stored. An epoch descriptor this cannot read is
+        // one it cannot make a policy decision about, and a viewer may well
+        // read it perfectly well -- the two parsers are not the same program.
+        // Accepting what it cannot read is how the previous version of this
+        // check was bypassed with three bytes of byte-order mark.
+        glacialcast_dash::EncryptionClaim::Unreadable => anyhow::bail!(
+            "refusing an epoch whose descriptor could not be read: this relay serves streams \
+             end-to-end encrypted and cannot confirm that this one is"
+        ),
     }
-    anyhow::bail!(
-        "refusing an unencrypted epoch: this relay serves streams end-to-end encrypted. \
-         Start it with --trusted-lan to accept publishers that send in the clear"
-    )
 }
 
 async fn run_ingest(
@@ -2409,19 +2423,51 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_descriptor_is_not_treated_as_a_claim() {
-        // A payload that is not a JSON object carries no claim this check can
-        // read -- and none a viewer can read either, since every viewer parses
-        // the descriptor with the same grammar before trusting it. What gets
-        // stored is unplayable, not unencrypted.
+    fn an_unreadable_descriptor_is_refused_rather_than_stored() {
+        // This used to be accepted, on the reasoning that a payload the relay
+        // cannot parse is one no viewer can parse either. That reasoning was
+        // wrong, and the bypass it opened is the reason this test now asserts
+        // the opposite: the relay and the browser do not share a JSON parser,
+        // so "I cannot read this" says nothing about what the viewer will read.
         let mut object = epoch_object(true);
         object.payload = b"not json at all".to_vec();
-        assert!(refuse_unencrypted_epoch(&object, false).is_ok());
+        let error = refuse_unencrypted_epoch(&object, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("could not be read"), "{error}");
+        // A relay serving a trusted LAN still takes it: the gate is the policy.
+        assert!(refuse_unencrypted_epoch(&object, true).is_ok());
 
         // A non-epoch object is never inspected, whatever it carries.
         let mut media = epoch_object(false);
         media.header.kind = DashObjectKind::Media;
         assert!(refuse_unencrypted_epoch(&media, false).is_ok());
+    }
+
+    #[test]
+    fn a_browser_readable_claim_cannot_hide_behind_a_stricter_rust_parser() {
+        // The shipped bypass. `serde_json` rejects a leading byte-order mark
+        // and a repeated key; `TextDecoder` plus `JSON.parse` accept both and
+        // take the last value. Three bytes in front of an ordinary descriptor
+        // made the relay see no claim, store the epoch, and let the viewer play
+        // it with no key and no authentication.
+        let bom = {
+            let mut payload = vec![0xEF, 0xBB, 0xBF];
+            payload.extend_from_slice(br#"{"encrypted":false}"#);
+            payload
+        };
+        let repeated = br#"{"encrypted":true,"encrypted":false}"#.to_vec();
+        for payload in [bom, repeated] {
+            let mut object = epoch_object(true);
+            object.payload = payload;
+            let error = refuse_unencrypted_epoch(&object, false)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("refusing an unencrypted epoch"),
+                "a claim the browser reads as unencrypted was not refused: {error}"
+            );
+        }
     }
 
     #[test]
