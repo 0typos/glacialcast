@@ -146,7 +146,14 @@ fn getrandom(buffer: &mut [u8]) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     };
     if filled != buffer.len() {
-        return Err(std::io::Error::last_os_error());
+        // Not a syscall failure, so `errno` belongs to whatever failed last on
+        // this thread -- frequently nothing, which reported key generation
+        // failing with "Success". The refusal is the point; the message has to
+        // survive being read by whoever hits it.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "getrandom returned a partial fill",
+        ));
     }
     Ok(())
 }

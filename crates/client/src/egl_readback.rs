@@ -482,7 +482,11 @@ unsafe fn compile_shader(gl: &ScaleEntrypoints, stage: u32, source: &str) -> Res
 
 /// Collects a driver info log into a lossy `String`.
 fn info_log(capacity: i32, fill: impl FnOnce(i32, *mut i32, *mut c_char)) -> String {
-    let mut buffer = vec![0i8; capacity as usize];
+    // `c_char`, not `i8`. They are the same type on x86_64 and different on
+    // aarch64, where `c_char` is unsigned -- so hard-coding `i8` here compiled
+    // on the development machine and failed to compile at all on a target
+    // deny.toml lists and build-packages.sh ships as arm64.
+    let mut buffer = vec![0 as c_char; capacity as usize];
     let mut written = 0;
     fill(capacity, &raw mut written, buffer.as_mut_ptr());
     let length = written.clamp(0, capacity - 1) as usize;
@@ -1059,8 +1063,28 @@ impl EglReadback {
 
 impl Drop for EglReadback {
     fn drop(&mut self) {
-        // SAFETY: every name was created by this context, which is still
-        // current on this thread because the type cannot cross threads.
+        // Bind the context before deleting anything it owns, rather than
+        // assuming it is still bound.
+        //
+        // SAFETY: `self.display` and `self.context` were created by `new` and
+        // have not been destroyed -- this is the only place that destroys them,
+        // and it runs once. `PhantomData<*const ()>` makes the type `!Send`, so
+        // this runs on the thread that created the context, which is where EGL
+        // requires it to be made current. The old comment claimed the context
+        // was *already* current on the strength of `!Send`, which does not
+        // follow: current-ness is per-thread mutable state that any other EGL
+        // user on this thread could have changed. Making it current here is
+        // what actually establishes that the names below belong to it.
+        unsafe {
+            (self.entrypoints.egl_make_current)(
+                self.display,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                self.context,
+            );
+        }
+        // SAFETY: as above, with `self.context` now current on this thread, so
+        // every framebuffer and texture name below is one it created.
         unsafe {
             (self.entrypoints.gl_bind_framebuffer)(GL_FRAMEBUFFER, 0);
             (self.entrypoints.gl_delete_framebuffers)(1, &self.framebuffer);
