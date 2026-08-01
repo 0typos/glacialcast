@@ -55,8 +55,32 @@ const rowIds = group => page.evaluate(
   `.stream-group-${group} li[data-stream-id]`,
 );
 
+/**
+ * Reloads, and says who was at fault if it does not come back.
+ *
+ * Reloading here is unusually hostile: it lands immediately after three players
+ * have been torn down, so their sockets may still be closing while the
+ * navigation asks for another one. A stall then looks the same from Playwright
+ * whether the browser is queuing the request behind connections that have not
+ * closed or the relay has stopped answering -- and those want opposite fixes.
+ *
+ * So a timed-out reload asks the relay directly, from outside the browser,
+ * before failing. The answer is in the message rather than in someone's head
+ * the next time this goes red on a runner and not on a desk.
+ */
 async function reload() {
-  await page.reload({ waitUntil: 'domcontentloaded' });
+  try {
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: WAIT_MS });
+  } catch (error) {
+    let relay = 'unreachable';
+    try {
+      const probe = await fetch(`${origin}/api/streams`, { cache: 'no-store' });
+      relay = `HTTP ${probe.status} with ${(await probe.json()).length} streams`;
+    } catch (probeError) {
+      relay = `unreachable: ${probeError.message}`;
+    }
+    throw new Error(`${error.message}\n  the relay, asked from outside the browser: ${relay}`);
+  }
   await page.waitForFunction(
     () => globalThis.GlacialCastWatch?.unlockedStreams().length > 0,
     null,
@@ -77,6 +101,22 @@ try {
     () => globalThis.GlacialCastWatch.tiles().filter(tile => tile.streamId).length >= 3,
     null,
     { timeout: WAIT_MS },
+  );
+
+  // A key that verified against a stream has already established that the
+  // stream is encrypted, so nothing should go back and ask the relay again.
+  // When this was not recorded, every load re-described every unlocked stream
+  // -- two fetches each, in series, competing with a WebSocket per tile for the
+  // browser's per-host connections, which was enough to leave a reload queued
+  // behind them on a loaded machine.
+  const described = await page.evaluate(() => globalThis.GlacialCastWatch.described());
+  const unlockedIds = await page.evaluate(
+    () => globalThis.GlacialCastWatch.unlockedStreams(),
+  );
+  check(
+    unlockedIds.every(streamId => described[streamId]?.encrypted === true),
+    `unlocking recorded each stream as encrypted without asking again (${
+      JSON.stringify(described)})`,
   );
 
   // Newly seen streams take the free tiles, which is what the viewer did before
