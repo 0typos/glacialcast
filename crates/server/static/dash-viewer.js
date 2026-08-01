@@ -29,11 +29,36 @@ const decoder = new TextDecoder();
  * `returnValue`, so it does not raise a "leave site?" prompt.
  */
 let pageUnloading = false;
+/**
+ * How long a page is treated as leaving before the flag is given back.
+ *
+ * Latching it forever was wrong in both directions. A navigation can be
+ * abandoned -- the viewer presses Escape, the target refuses, the response
+ * turns out to be a download -- and `beforeunload` has already fired, so the
+ * page stays open with every future failure silenced: no tile message, no
+ * console line, for the rest of the session. A page restored from the back-
+ * forward cache is the same story with a longer gap.
+ *
+ * The flag only has to outlive the rejections that a teardown produces, which
+ * arrive within milliseconds of it. A second is far longer than that and far
+ * shorter than a viewer noticing a page has gone quiet.
+ */
+const UNLOAD_QUIET_MS = 1_000;
+let unloadTimer = null;
 for (const event of ['beforeunload', 'pagehide']) {
   globalThis.addEventListener?.(event, () => {
     pageUnloading = true;
+    clearTimeout(unloadTimer);
+    unloadTimer = setTimeout(() => {
+      pageUnloading = false;
+    }, UNLOAD_QUIET_MS);
   });
 }
+// A page that came back never left. Anything it reports from here is real.
+globalThis.addEventListener?.('pageshow', () => {
+  clearTimeout(unloadTimer);
+  pageUnloading = false;
+});
 
 /**
  * Mounts one DASH player inside `root`.
@@ -215,6 +240,8 @@ function createPlayer(root, options) {
   const state = {
     descriptor: null,
     viewerKey: null,
+    /** The start in flight, so a second one joins it instead of racing it. */
+    starting: null,
     // Which flavour of MediaSource this stream is playing through, settled once
     // `start` knows whether the stream is encrypted.
     mediaSourceClass: null,
@@ -1250,14 +1277,36 @@ function createPlayer(root, options) {
 
   return {
     streamId,
+    /**
+     * Starts playback, at most once at a time.
+     *
+     * Two starts overlapping is not hypothetical: the deep-link page begins one
+     * itself as soon as it learns the stream needs no key, and the viewer can
+     * submit the unlock form before that has finished. Nothing inside `start`
+     * was reentrant -- the second overwrote `state.viewerKey` while the first
+     * was still deriving from it, and built a second MediaSource over the
+     * element the first was appending to, leaving a blank player or an error
+     * about an epoch the other start had already accepted.
+     *
+     * The first start wins and the second joins it, rather than the second
+     * cancelling the first: they are asking for the same stream, and whichever
+     * key is right is the one the running attempt is already using or is about
+     * to fail on.
+     */
     start(viewerKeyText) {
-      return start(viewerKeyText).catch(error => {
-        // A start interrupted by teardown is the same non-event as an
-        // interrupted reconcile, and the caller's retry path already ignores a
-        // tile it has moved on from.
-        reportUnlessTornDown(error);
-        throw error;
-      });
+      if (state.starting) return state.starting;
+      state.starting = start(viewerKeyText)
+        .catch(error => {
+          // A start interrupted by teardown is the same non-event as an
+          // interrupted reconcile, and the caller's retry path already ignores
+          // a tile it has moved on from.
+          reportUnlessTornDown(error);
+          throw error;
+        })
+        .finally(() => {
+          state.starting = null;
+        });
+      return state.starting;
     },
     metrics() {
       const newest = state.cursorEvents.at(-1) || null;
