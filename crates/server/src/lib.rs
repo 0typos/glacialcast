@@ -43,9 +43,10 @@ use axum::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
+use glacialcast_dash::EpochDescriptor;
 use glacialcast_protocol::{
-    ClientMessage, ControlEvent, DashObjectHeader, NOISE_KEY_LEN, NoiseKeypair, ServerMessage,
-    StreamHello,
+    ClientMessage, ControlEvent, DashObject, DashObjectHeader, DashObjectKind, NOISE_KEY_LEN,
+    NoiseKeypair, ServerMessage, StreamHello,
     config_path::{self, ConfigSource},
     daemon::{
         daemonize_if_requested, install_signal_handlers, manager_command, serve_control_socket,
@@ -297,6 +298,12 @@ struct AppState {
     traffic: TrafficMetrics,
     retention_bytes_per_stream: u64,
     retention_seconds: u64,
+    /// Whether this relay accepts epochs published without encryption.
+    ///
+    /// Enforced here rather than trusted to the publisher: a publisher that
+    /// wants to send in the clear is exactly the one that cannot be relied on
+    /// to refuse itself.
+    allow_unencrypted: bool,
     active_ingests: Arc<AsyncMutex<HashMap<Uuid, Uuid>>>,
     ingest_private_key: [u8; NOISE_KEY_LEN],
 }
@@ -803,6 +810,10 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
         traffic: TrafficMetrics::default(),
         retention_bytes_per_stream: args.retention_bytes_per_stream,
         retention_seconds: args.retention_seconds,
+        // Only a relay explicitly serving a trusted local network takes them,
+        // and never one with a public origin: Internet mode is refused
+        // alongside --trusted-lan already, so this cannot both be set.
+        allow_unencrypted: args.trusted_lan && !internet_mode,
         active_ingests: Arc::new(AsyncMutex::new(HashMap::new())),
         ingest_private_key: ingest_key.private,
     };
@@ -1940,6 +1951,37 @@ fn websocket_guard(state: &AppState, principal_name: &str) -> Result<ConnectionG
     ))
 }
 
+/// Refuses an epoch published without encryption unless this relay takes them.
+///
+/// The descriptor is plaintext JSON carried in the epoch object, so the relay
+/// can read the claim without any viewer key -- which is the whole point: an
+/// unencrypted epoch has no key, and the relay has never had one anyway.
+///
+/// An epoch whose descriptor cannot be parsed is left alone. The relay treats
+/// object payloads as opaque everywhere else, and a descriptor it cannot read
+/// is not a claim to be unencrypted; refusing on a parse failure would make the
+/// relay reject objects it has no business interpreting.
+///
+/// # Errors
+///
+/// Returns an error when the epoch declares itself unencrypted and this relay
+/// is not serving a trusted local network.
+fn refuse_unencrypted_epoch(object: &DashObject, allow_unencrypted: bool) -> Result<()> {
+    if allow_unencrypted || object.header.kind != DashObjectKind::Epoch {
+        return Ok(());
+    }
+    let Ok(descriptor) = EpochDescriptor::from_json(&object.payload) else {
+        return Ok(());
+    };
+    if descriptor.encrypted {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing an unencrypted epoch: this relay serves streams end-to-end encrypted. \
+         Start it with --trusted-lan to accept publishers that send in the clear"
+    )
+}
+
 async fn run_ingest(
     addr: SocketAddr,
     state: AppState,
@@ -2136,6 +2178,7 @@ async fn ingest_loop(
                         .await?;
                     continue;
                 }
+                refuse_unencrypted_epoch(&object, state.allow_unencrypted)?;
                 let is_new = object.header.sequence == expected_sequence;
                 let object_kind = object.header.kind;
                 let object_bytes = u64::from(object.header.payload_len);
@@ -2298,6 +2341,77 @@ mod tests {
         let mut argv = vec!["glacialcast-server"];
         argv.extend_from_slice(flags);
         Args::parse_from(argv)
+    }
+
+    fn epoch_object(encrypted: bool) -> DashObject {
+        use glacialcast_dash::{EpochKeys, MEDIA_TIMESCALE};
+        let stream_id = Uuid::new_v4();
+        let epoch_id = Uuid::new_v4();
+        let keys = EpochKeys::derive(&[9u8; 32], stream_id, epoch_id).unwrap();
+        let descriptor = EpochDescriptor {
+            format_version: 1,
+            stream_id,
+            epoch_id,
+            key_id: *epoch_id.as_bytes(),
+            width: 1920,
+            height: 1080,
+            codec: "avc1.42c028".to_string(),
+            timescale: MEDIA_TIMESCALE,
+            segment_frames: 5,
+            availability_start_time: "2026-01-01T00:00:00.000Z".to_string(),
+            encrypted,
+        };
+        DashObject::authenticated(
+            glacialcast_protocol::NewDashObject {
+                stream_id,
+                epoch_id,
+                kind: DashObjectKind::Epoch,
+                sequence: 1,
+                segment_number: 0,
+                chunk_index: 0,
+                timestamp: 0,
+                duration: 0,
+                random_access: true,
+                mime: "application/vnd.glacialcast.epoch+json",
+                payload: descriptor.to_json().unwrap(),
+            },
+            &keys,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_publisher_cannot_send_in_the_clear_to_an_encrypted_relay() {
+        // The publisher declares this, so the relay has to be the one that
+        // refuses: a publisher choosing to send in the clear is exactly the one
+        // that will not refuse itself.
+        let error = refuse_unencrypted_epoch(&epoch_object(false), false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("refusing an unencrypted epoch"), "{error}");
+        assert!(error.contains("--trusted-lan"), "{error}");
+
+        // A relay serving a trusted LAN takes it.
+        assert!(refuse_unencrypted_epoch(&epoch_object(false), true).is_ok());
+        // And an encrypted epoch is accepted either way.
+        assert!(refuse_unencrypted_epoch(&epoch_object(true), false).is_ok());
+        assert!(refuse_unencrypted_epoch(&epoch_object(true), true).is_ok());
+    }
+
+    #[test]
+    fn an_unreadable_descriptor_is_not_treated_as_a_claim() {
+        // Payloads are opaque to the relay everywhere else. A descriptor it
+        // cannot parse is not a claim to be unencrypted, and refusing on a
+        // parse failure would have the relay rejecting objects it has no
+        // business interpreting.
+        let mut object = epoch_object(true);
+        object.payload = b"not json at all".to_vec();
+        assert!(refuse_unencrypted_epoch(&object, false).is_ok());
+
+        // A non-epoch object is never inspected, whatever it carries.
+        let mut media = epoch_object(false);
+        media.header.kind = DashObjectKind::Media;
+        assert!(refuse_unencrypted_epoch(&media, false).is_ok());
     }
 
     #[test]
