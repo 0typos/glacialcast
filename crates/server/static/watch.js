@@ -117,12 +117,23 @@ const state = {
    */
   keys: new Map(),
   /**
-   * Streams already known to be encrypted, so the poll stops asking.
+   * The epoch each stream's encryption was last read from, by stream ID.
    *
-   * Without this, every poll would re-fetch an epoch descriptor for every
-   * locked stream on the relay, forever.
+   * Whether a stream is encrypted is a property of its epoch, so the answer
+   * only goes stale when the epoch does. Holding the epoch it was read from
+   * turns "should I ask again?" into comparing two values from the relay's own
+   * listing, rather than watching a stream go inactive and back and hoping a
+   * publisher restart lands between two polls.
+   *
+   * A stream with no epoch yet maps to null, which never equals the epoch that
+   * eventually arrives, so it is re-asked until there is something to read.
+   *
+   * Each value is `{ epochId, encrypted }`. The mode is kept alongside because
+   * the remembered keys are applied first and must not claim a stream already
+   * known to need none -- doing so would take it back from the keyless unlock
+   * on every poll, forever.
    */
-  encryptedStreams: new Set(),
+  described: new Map(),
   /** Secrets entered on this browser: key phrases, or raw viewer keys. */
   secrets: new Set(),
   /** Cache of derived keys as URL-safe base64, by publisher salt. */
@@ -210,6 +221,10 @@ function forgetRememberedKeys() {
   state.derived.clear();
   state.keys.clear();
   state.rejected.clear();
+  // Clearing the keys also clears the keyless unlocks, which were never keys at
+  // all. Forgetting what has been described re-asks for each stream once, which
+  // is what puts the streams that need no key straight back.
+  state.described.clear();
   try {
     globalThis.localStorage.removeItem(KEY_STORE);
   } catch {
@@ -226,8 +241,19 @@ function loadPlacements() {
     if (!raw) return;
     const stored = JSON.parse(raw);
     if (stored?.version !== PLACEMENT_STORE_VERSION) return;
+    const taken = new Set();
     for (const [streamId, record] of Object.entries(stored.streams ?? {})) {
-      state.placements.set(streamId, sanitizePlacement(record));
+      const placement = sanitizePlacement(record);
+      // One tile, one stream. A store written by a version that could hand the
+      // same number out twice would otherwise keep doing it: whichever stream
+      // was restored first took the tile and the other stayed listed as on
+      // screen while never appearing. The later record is the one parked, so
+      // the arrangement loses a position rather than a stream.
+      if (placement.slot !== null) {
+        if (taken.has(placement.slot)) placement.slot = null;
+        else taken.add(placement.slot);
+      }
+      state.placements.set(streamId, placement);
     }
   } catch {
     // A corrupt or unavailable store just means arranging again.
@@ -287,9 +313,19 @@ function updatePlacement(streamId, changes) {
   savePlacements();
 }
 
+/**
+ * The stream holding a tile number, whether or not it is unlocked right now.
+ *
+ * Deliberately not filtered by which streams have keys. A remembered stream
+ * that is momentarily locked -- after "Forget keys", before a key is re-entered
+ * -- still owns its number, and treating that number as free handed it to a
+ * second stream without going through the displacement below. Both then held
+ * it, the panel showed two rows badged with the same tile, and only one of them
+ * was ever rendered.
+ */
 function streamInSlot(slot) {
   for (const [streamId, record] of state.placements) {
-    if (record.slot === slot && state.keys.has(streamId)) return streamId;
+    if (record.slot === slot) return streamId;
   }
   return null;
 }
@@ -379,7 +415,7 @@ async function unlockWithKey(typed) {
     if (!await Player.verifyViewerKey(streams[0].stream_id, bytes)) continue;
 
     const encoded = ViewerKey.bytesToBase64Url(bytes);
-    for (const stream of streams) state.keys.set(stream.stream_id, encoded);
+    for (const stream of streams) setStreamKey(stream.stream_id, encoded);
     state.derived.set(streams[0].viewer_key_salt, encoded);
     unlocked += streams.length;
   }
@@ -398,6 +434,24 @@ async function unlockWithKey(typed) {
 }
 
 /**
+ * Records the key a stream is unlocked with, remounting it if it changed.
+ *
+ * A player is handed its key once, at start, and derives every epoch key from
+ * it for the life of the tile. So a stream already on screen under one key --
+ * an old one, or the provisional acceptance a stream with no epoch yet gets --
+ * went on using it after a new key arrived, failing every object against a key
+ * the viewer had already replaced. Nothing put that right short of a reload.
+ *
+ * Detaching is enough to fix it: the tile keeps its number, so the restore that
+ * follows puts the stream back with the key now recorded here.
+ */
+function setStreamKey(streamId, key) {
+  const changed = state.keys.has(streamId) && state.keys.get(streamId) !== key;
+  state.keys.set(streamId, key);
+  if (changed) dropTilesFor(streamId);
+}
+
+/**
  * Opens everything the remembered secrets can open, without asking.
  *
  * Runs on load and again whenever the stream list changes, so a screen the
@@ -408,7 +462,10 @@ async function applyRememberedKeys() {
   if (state.secrets.size === 0 || ENCRYPTED_UNSUPPORTED) return 0;
   let unlocked = 0;
   for (const streams of publishersByName().values()) {
-    const locked = streams.filter(stream => !state.keys.has(stream.stream_id));
+    // A stream already known to need no key is not locked, it is open. Trying a
+    // key against it would take it back from the keyless unlock every poll.
+    const locked = streams.filter(stream => !state.keys.has(stream.stream_id)
+      && state.described.get(stream.stream_id)?.encrypted !== false);
     if (locked.length === 0) continue;
     const salt = streams[0].viewer_key_salt;
     if (state.rejected.has(salt)) continue;
@@ -431,7 +488,7 @@ async function applyRememberedKeys() {
     for (const bytes of candidates) {
       if (!await Player.verifyViewerKey(streams[0].stream_id, bytes)) continue;
       const encoded = ViewerKey.bytesToBase64Url(bytes);
-      for (const stream of locked) state.keys.set(stream.stream_id, encoded);
+      for (const stream of locked) setStreamKey(stream.stream_id, encoded);
       state.derived.set(salt, encoded);
       unlocked += locked.length;
       opened = true;
@@ -455,24 +512,59 @@ async function applyRememberedKeys() {
  * streams no key of this viewer's opens anyway.
  *
  * The descriptor, not the stream listing, is what is asked -- see
- * `describeStream`.
+ * `describeStream`. The listing is trusted for one thing only: which epoch is
+ * current, so this can tell when the answer is worth asking for again.
  */
 async function unlockOpenStreams() {
   let unlocked = 0;
-  for (const streamId of state.streams.keys()) {
-    if (state.keys.has(streamId) || state.encryptedStreams.has(streamId)) continue;
+  for (const [streamId, stream] of state.streams) {
+    const epochId = stream.last_epoch_id ?? null;
+    if (state.described.get(streamId)?.epochId === epochId) continue;
+    // A new epoch is a new answer to every question about this publisher,
+    // including one whose key was tried and did not fit. Without this, a
+    // publisher that went from clear to encrypted would stay in `rejected`
+    // from the attempt made while it had no key at all.
+    state.rejected.delete(stream.viewer_key_salt);
     const { encrypted } = await Player.describeStream(streamId);
-    // Null means the stream has published nothing to tell from yet. Neither
-    // remembering nor unlocking it: the next poll asks again.
+    // Null means the stream has published nothing to tell from yet. Nothing is
+    // remembered and nothing is unlocked: the next poll asks again.
     if (encrypted === null) continue;
+    state.described.set(streamId, { epochId, encrypted });
     if (encrypted) {
-      state.encryptedStreams.add(streamId);
+      // A stream that was open and is now encrypted has to give up its keyless
+      // unlock, or every tile showing it fails forever against a key of null
+      // with no retry -- the refusal is deliberate, so it is not retryable.
+      if (state.keys.get(streamId) === null) {
+        state.keys.delete(streamId);
+        dropTilesFor(streamId);
+      }
       continue;
     }
+    // And the reverse: a key held for a stream now published in the clear
+    // refuses every epoch. Dropping it lets the keyless unlock below take over.
+    if (state.keys.get(streamId)) {
+      state.keys.delete(streamId);
+      dropTilesFor(streamId);
+    }
+    if (state.keys.has(streamId)) continue;
     state.keys.set(streamId, null);
     unlocked += 1;
   }
   return unlocked;
+}
+
+/**
+ * Tears down whatever is showing a stream, without disturbing its arrangement.
+ *
+ * For when the stream itself changed underneath a running player -- a publisher
+ * that restarted into the other encryption mode. The tile keeps its number, so
+ * the stream is re-attached under the new mode by the same restore that puts
+ * everything else back.
+ */
+function dropTilesFor(streamId) {
+  for (const tile of state.tiles) {
+    if (tile.streamId === streamId) detachTile(tile);
+  }
 }
 
 els.unlockForm.addEventListener('submit', async event => {
@@ -507,8 +599,13 @@ els.forgetAll.addEventListener('click', async () => {
   // A stream published in the clear was never opened by a key, so there is
   // nothing about it to forget and it stays watchable. Re-opening those here
   // rather than waiting for the next poll keeps them from vanishing for ten
-  // seconds and coming back on their own.
-  if (await unlockOpenStreams() > 0) renderStreamList();
+  // seconds and coming back on their own -- and they go back on screen, not
+  // merely back in the list, because the tiles were just emptied above and
+  // their numbers still say where they belong.
+  if (await unlockOpenStreams() > 0) {
+    renderStreamList();
+    showUnlockedStreams();
+  }
 });
 
 for (const button of document.querySelectorAll('[data-layout]')) {
@@ -575,18 +672,9 @@ function showError(element, error) {
 async function refreshStreams() {
   const response = await fetch('/api/streams', { cache: 'no-store' });
   if (!response.ok) throw new Error('Unable to list streams.');
-  const streams = new Map((await response.json()).map(stream => [stream.stream_id, stream]));
-  // Whether a publisher encrypts is a startup choice, so it can only change
-  // across a restart -- and a restart is visible here as a stream going from
-  // not publishing to publishing. Forgetting the answer exactly then is what
-  // keeps a publisher that came back with --no-encryption from staying locked
-  // until the page is reloaded, without re-asking on every poll forever.
-  for (const [streamId, stream] of streams) {
-    if (stream.active && !state.streams.get(streamId)?.active) {
-      state.encryptedStreams.delete(streamId);
-    }
-  }
-  state.streams = streams;
+  state.streams = new Map(
+    (await response.json()).map(stream => [stream.stream_id, stream]),
+  );
   renderStreamList();
 }
 
@@ -959,7 +1047,12 @@ function assignToFirstFreeTile(streamId) {
     // one produced a three-tile grid with no rule to lay it out, so the tiles
     // fell into a single column that got narrower with every stream added.
     setLayout(state.tiles.length < 2 ? 2 : MAX_TILES);
-    attachTile(state.tiles.at(-1), streamId);
+    // The first free tile, not the last one. Growing from two adds two tiles at
+    // once, so reaching for the end skipped tile 3 -- and since a tile is also
+    // a number, that hole was written to the arrangement and faithfully
+    // restored on every reload.
+    const grown = state.tiles.find(tile => !tile.streamId) ?? state.tiles.at(-1);
+    attachTile(grown, streamId);
     return;
   }
   // Every tile is taken. The first one is the one displaced, and its stream

@@ -1089,20 +1089,33 @@ fn portable_paths(root: &FsPath) -> Result<Vec<PathBuf>> {
 async fn list_streams(
     State(state): State<OfflineState>,
 ) -> Result<Json<Vec<serde_json::Value>>, OfflineError> {
-    let streams = load_all(&state)
-        .await?
-        .into_iter()
+    let objects = load_all(&state).await?;
+    let streams = objects
+        .iter()
         .map(|object| object.header.stream_id)
         .collect::<BTreeSet<_>>();
     Ok(Json(
         streams
             .into_iter()
             .map(|stream_id| {
+                // The newest epoch in the mirror. A viewer reads this to decide
+                // whether what it knows about a stream's encryption is still
+                // current, so a mirror that omitted it would look to the viewer
+                // like a stream that had never published one.
+                let last_epoch_id = objects
+                    .iter()
+                    .filter(|object| {
+                        object.header.stream_id == stream_id
+                            && object.header.kind == DashObjectKind::Epoch
+                    })
+                    .max_by_key(|object| object.header.sequence)
+                    .map(|object| object.header.epoch_id);
                 serde_json::json!({
                     "stream_id": stream_id,
                     "display_name": stream_id.to_string(),
                     "active": false,
                     "viewer_key_salt": serde_json::Value::Null,
+                    "last_epoch_id": last_epoch_id,
                 })
             })
             .collect(),
