@@ -87,6 +87,13 @@ pub struct DashSummary {
     pub bytes: u64,
     pub last_sequence: Option<u64>,
     pub last_timestamp: Option<u64>,
+    /// Epoch of the newest retained epoch object, if any.
+    ///
+    /// Published so a viewer can tell one capture epoch from the next without
+    /// fetching a descriptor per stream per poll. Whether a stream is encrypted
+    /// is a property of its epoch, so this is what says when that answer might
+    /// have changed.
+    pub last_epoch_id: Option<Uuid>,
 }
 
 impl DashStore {
@@ -411,6 +418,12 @@ impl DashStore {
                         .filter(|object| object.header.kind == DashObjectKind::Media)
                         .map(|object| object.header.timestamp)
                         .max(),
+                    last_epoch_id: catalog
+                        .objects
+                        .values()
+                        .filter(|object| object.header.kind == DashObjectKind::Epoch)
+                        .max_by_key(|object| object.header.sequence)
+                        .map(|object| object.header.epoch_id),
                 },
             );
         }
@@ -2273,6 +2286,7 @@ mod tests {
                 bytes: 3,
                 last_sequence: Some(1),
                 last_timestamp: Some(0),
+                last_epoch_id: None,
             }
         );
         assert!(store.delete_stream(stream_id).unwrap());

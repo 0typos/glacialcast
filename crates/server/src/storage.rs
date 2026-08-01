@@ -251,6 +251,9 @@ impl Store {
                     },
                     active: active != 0,
                     last_seen_at_ms: last_seen,
+                    // Filled in from the DASH store when the listing is built;
+                    // the stream catalog does not track objects.
+                    last_epoch_id: None,
                     last_object_sequence: None,
                     retained_bytes: 0,
                 },
