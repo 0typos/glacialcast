@@ -1089,33 +1089,34 @@ fn portable_paths(root: &FsPath) -> Result<Vec<PathBuf>> {
 async fn list_streams(
     State(state): State<OfflineState>,
 ) -> Result<Json<Vec<serde_json::Value>>, OfflineError> {
-    let objects = load_all(&state).await?;
-    let streams = objects
-        .iter()
-        .map(|object| object.header.stream_id)
-        .collect::<BTreeSet<_>>();
+    // One pass for both answers. Asking each stream for its newest epoch
+    // separately reread every loaded object once per stream, which on a mirror
+    // holding thousands of `.gco` files is the whole catalog squared.
+    let mut streams: BTreeMap<Uuid, Option<(u64, Uuid)>> = BTreeMap::new();
+    for object in load_all(&state).await? {
+        let header = &object.header;
+        let newest = streams.entry(header.stream_id).or_default();
+        if header.kind == DashObjectKind::Epoch
+            && newest.is_none_or(|(sequence, _)| header.sequence >= sequence)
+        {
+            *newest = Some((header.sequence, header.epoch_id));
+        }
+    }
     Ok(Json(
         streams
             .into_iter()
-            .map(|stream_id| {
-                // The newest epoch in the mirror. A viewer reads this to decide
-                // whether what it knows about a stream's encryption is still
-                // current, so a mirror that omitted it would look to the viewer
-                // like a stream that had never published one.
-                let last_epoch_id = objects
-                    .iter()
-                    .filter(|object| {
-                        object.header.stream_id == stream_id
-                            && object.header.kind == DashObjectKind::Epoch
-                    })
-                    .max_by_key(|object| object.header.sequence)
-                    .map(|object| object.header.epoch_id);
+            .map(|(stream_id, newest)| {
+                // The mirror answers `/api/streams` in the relay's shape, field
+                // for field, so the same viewer code can read either. Nothing
+                // this binary serves reads `last_epoch_id` today -- it serves
+                // the single-stream page, not the multi-stream one -- but a
+                // shape that quietly differs is how the two drift apart.
                 serde_json::json!({
                     "stream_id": stream_id,
                     "display_name": stream_id.to_string(),
                     "active": false,
                     "viewer_key_salt": serde_json::Value::Null,
-                    "last_epoch_id": last_epoch_id,
+                    "last_epoch_id": newest.map(|(_, epoch_id)| epoch_id),
                 })
             })
             .collect(),

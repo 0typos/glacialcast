@@ -86,7 +86,6 @@ struct StreamCatalog {
 pub struct DashSummary {
     pub bytes: u64,
     pub last_sequence: Option<u64>,
-    pub last_timestamp: Option<u64>,
     /// Epoch of the newest retained epoch object, if any.
     ///
     /// Published so a viewer can tell one capture epoch from the next without
@@ -412,18 +411,7 @@ impl DashStore {
                 DashSummary {
                     bytes: catalog.bytes,
                     last_sequence: catalog.last_sequence,
-                    last_timestamp: catalog
-                        .objects
-                        .values()
-                        .filter(|object| object.header.kind == DashObjectKind::Media)
-                        .map(|object| object.header.timestamp)
-                        .max(),
-                    last_epoch_id: catalog
-                        .objects
-                        .values()
-                        .filter(|object| object.header.kind == DashObjectKind::Epoch)
-                        .max_by_key(|object| object.header.sequence)
-                        .map(|object| object.header.epoch_id),
+                    last_epoch_id: newest_epoch(&catalog).map(|object| object.header.epoch_id),
                 },
             );
         }
@@ -573,12 +561,7 @@ impl DashStore {
             })
             .map(|object| object.header.epoch_id)
             .collect::<BTreeSet<_>>();
-        let newest_epoch = catalog
-            .objects
-            .values()
-            .rev()
-            .find(|object| object.header.kind == DashObjectKind::Epoch)
-            .map(|object| object.header.epoch_id);
+        let newest_epoch = newest_epoch(catalog).map(|object| object.header.epoch_id);
         let sequences = catalog
             .objects
             .iter()
@@ -1145,6 +1128,21 @@ fn object_temp_filename(filename: &str) -> bool {
     sequence.len() == 20
         && sequence.bytes().all(|byte| byte.is_ascii_digit())
         && Uuid::parse_str(identifier).is_ok()
+}
+
+/// The newest retained epoch object of a stream, if it has one.
+///
+/// "Newest" means highest sequence, and `objects` is keyed by sequence, so a
+/// reverse scan stops at the first match. Named because three places wanted it
+/// and each had written the rule out differently -- one as a reverse find, one
+/// as a filter with `max_by_key` -- which is three places to visit when what
+/// counts as the current epoch changes.
+fn newest_epoch(catalog: &StreamCatalog) -> Option<&StoredDashObject> {
+    catalog
+        .objects
+        .values()
+        .rev()
+        .find(|object| object.header.kind == DashObjectKind::Epoch)
 }
 
 fn validate_media_progression(catalog: &StreamCatalog, candidate: &DashObjectHeader) -> Result<()> {
@@ -2285,7 +2283,6 @@ mod tests {
             DashSummary {
                 bytes: 3,
                 last_sequence: Some(1),
-                last_timestamp: Some(0),
                 last_epoch_id: None,
             }
         );

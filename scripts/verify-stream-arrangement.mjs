@@ -54,6 +54,14 @@ const rowIds = group => page.evaluate(
   selector => [...document.querySelectorAll(selector)].map(row => row.dataset.streamId),
   `.stream-group-${group} li[data-stream-id]`,
 );
+/** Waits for a page predicate on the gate's own clock, not Playwright's default. */
+const until = (predicate, arg = null) =>
+  page.waitForFunction(predicate, arg, { timeout: WAIT_MS });
+/** The condition asked for four times over: is this stream decoding in a tile? */
+const untilOnScreen = streamId => until(
+  id => globalThis.GlacialCastWatch.tiles().some(tile => tile.streamId === id),
+  streamId,
+);
 
 /**
  * Reloads, and says who was at fault if it does not come back.
@@ -81,27 +89,15 @@ async function reload() {
     }
     throw new Error(`${error.message}\n  the relay, asked from outside the browser: ${relay}`);
   }
-  await page.waitForFunction(
-    () => globalThis.GlacialCastWatch?.unlockedStreams().length > 0,
-    null,
-    { timeout: WAIT_MS },
-  );
+  await until(() => globalThis.GlacialCastWatch?.unlockedStreams().length > 0);
 }
 
 try {
   await page.goto(`${origin}/watch`, { waitUntil: 'domcontentloaded' });
   await page.locator('#viewing-key').fill(viewerKey);
   await page.locator('#unlock button[type="submit"]').click();
-  await page.waitForFunction(
-    () => globalThis.GlacialCastWatch.unlockedStreams().length >= 3,
-    null,
-    { timeout: WAIT_MS },
-  );
-  await page.waitForFunction(
-    () => globalThis.GlacialCastWatch.tiles().filter(tile => tile.streamId).length >= 3,
-    null,
-    { timeout: WAIT_MS },
-  );
+  await until(() => globalThis.GlacialCastWatch.unlockedStreams().length >= 3);
+  await until(() => globalThis.GlacialCastWatch.tiles().filter(tile => tile.streamId).length >= 3);
 
   // A key that verified against a stream has already established that the
   // stream is encrypted, so nothing should go back and ask the relay again.
@@ -132,14 +128,10 @@ try {
 
   // (3) The arrangement has to come back on its own, in the same tiles.
   await reload();
-  await page.waitForFunction(
-    expected => {
-      const restored = globalThis.GlacialCastWatch.tiles().map(tile => tile.streamId);
-      return expected.every((streamId, index) => !streamId || restored[index] === streamId);
-    },
-    initial.map(tile => tile.streamId),
-    { timeout: WAIT_MS },
-  );
+  await until(expected => {
+    const restored = globalThis.GlacialCastWatch.tiles().map(tile => tile.streamId);
+    return expected.every((streamId, index) => !streamId || restored[index] === streamId);
+  }, initial.map(tile => tile.streamId));
   console.log('  ok   every stream came back in its own tile after a reload');
 
   const [first, second, third] = initial.map(tile => tile.streamId);
@@ -152,11 +144,7 @@ try {
   await page.locator(`li[data-stream-id="${first}"] .stream-action`).first().click();
   await page.locator(`li[data-stream-id="${first}"] .stream-rename input`).fill('Kitchen Door');
   await page.locator(`li[data-stream-id="${first}"] .stream-rename button`).click();
-  await page.waitForFunction(
-    streamId => globalThis.GlacialCastWatch.titleOf(streamId) === 'Kitchen Door',
-    first,
-    { timeout: WAIT_MS },
-  );
+  await until(streamId => globalThis.GlacialCastWatch.titleOf(streamId) === 'Kitchen Door', first);
   const renamedTile = (await tiles()).find(tile => tile.streamId === first);
   check(renamedTile !== undefined, 'renaming did not disturb the tile it was playing in');
   const subtitle = await page.evaluate(
@@ -172,10 +160,9 @@ try {
 
   // (2) Parking: off screen, still listed, ready to be put back.
   await page.locator(`li[data-stream-id="${second}"] .stream-action[aria-label^="Take off"]`).click();
-  await page.waitForFunction(
+  await until(
     streamId => !globalThis.GlacialCastWatch.tiles().some(tile => tile.streamId === streamId),
     second,
-    { timeout: WAIT_MS },
   );
   check((await rowIds('available')).includes(second), 'a parked stream moved to the available list');
   check(
@@ -185,11 +172,7 @@ try {
 
   // (1) Hiding: out of the list entirely, and reversible.
   await page.locator(`li[data-stream-id="${third}"] .stream-action[aria-label^="Hide"]`).click();
-  await page.waitForFunction(
-    streamId => globalThis.GlacialCastWatch.placements()[streamId]?.hidden === true,
-    third,
-    { timeout: WAIT_MS },
-  );
+  await until(streamId => globalThis.GlacialCastWatch.placements()[streamId]?.hidden === true, third);
   check(
     !(await rowIds('screen')).includes(third) && !(await rowIds('available')).includes(third),
     'a hidden stream left both visible lists',
@@ -205,11 +188,7 @@ try {
   // Restoring the grid happens after the keys have opened anything, so waiting
   // on the unlock alone would read the tiles before they had been filled and
   // call an empty grid a pass.
-  await page.waitForFunction(
-    streamId => globalThis.GlacialCastWatch.tiles().some(tile => tile.streamId === streamId),
-    first,
-    { timeout: WAIT_MS },
-  );
+  await untilOnScreen(first);
   const remembered = await placements();
   check(
     await page.evaluate(streamId => globalThis.GlacialCastWatch.titleOf(streamId), first) === 'Kitchen Door',
@@ -230,18 +209,10 @@ try {
   // Putting one back has to work, or hiding is a one-way door.
   await page.locator('.stream-group-hidden summary').click();
   await page.locator(`li[data-stream-id="${third}"] .stream-pick`).click();
-  await page.waitForFunction(
-    streamId => globalThis.GlacialCastWatch.placements()[streamId]?.hidden === false,
-    third,
-    { timeout: WAIT_MS },
-  );
+  await until(streamId => globalThis.GlacialCastWatch.placements()[streamId]?.hidden === false, third);
   check((await rowIds('available')).includes(third), 'an unhidden stream returned to the list');
   await page.locator(`li[data-stream-id="${third}"] .stream-pick`).click();
-  await page.waitForFunction(
-    streamId => globalThis.GlacialCastWatch.tiles().some(tile => tile.streamId === streamId),
-    third,
-    { timeout: WAIT_MS },
-  );
+  await untilOnScreen(third);
   check(true, 'and went back on screen from there');
 
   // Growing the grid must fill the hole it opens. Two tiles up, both taken,
@@ -252,23 +223,15 @@ try {
   await page.locator('[data-layout="2"]').click();
   // Both tiles taken is the precondition: growing only happens when there is no
   // free tile to use.
-  await page.waitForFunction(
-    () => {
-      const grid = globalThis.GlacialCastWatch.tiles();
-      return grid.length === 2 && grid.every(tile => tile.streamId);
-    },
-    null,
-    { timeout: WAIT_MS },
-  );
+  await until(() => {
+    const grid = globalThis.GlacialCastWatch.tiles();
+    return grid.length === 2 && grid.every(tile => tile.streamId);
+  });
   const parked = await rowIds('available');
   if (parked.length === 0) failures.push('expected a parked stream after shrinking to two tiles');
   else {
     await page.locator(`li[data-stream-id="${parked[0]}"] .stream-pick`).click();
-    await page.waitForFunction(
-      streamId => globalThis.GlacialCastWatch.tiles().some(tile => tile.streamId === streamId),
-      parked[0],
-      { timeout: WAIT_MS },
-    );
+    await untilOnScreen(parked[0]);
     const grown = await tiles();
     const slots = await placements();
     check(

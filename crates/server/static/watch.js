@@ -73,28 +73,6 @@ const MAX_TILES = 4;
 const STREAM_RETRY_INTERVAL_MS = 3_000;
 /** How often to look for screens the publisher added after this page loaded. */
 const STREAM_POLL_INTERVAL_MS = 10_000;
-/** How long a tile may sit without a decoded frame before it says so. */
-const STREAM_STALL_TIMEOUT_MS = 25_000;
-/**
- * What a stalled tile says.
- *
- * Deliberately about what was observed rather than why. This message once named
- * Firefox, because at the time every stall was the same one: samples of a
- * second or longer, which Firefox will not decode and Chromium will. The
- * publisher now keeps samples under that, so a tile reaching this is more
- * likely to be something not yet seen than the cause that has been fixed --
- * and sending someone to a different browser for a reason that no longer
- * applies wastes the one clue they have.
- *
- * Another browser is still worth trying, as a way to tell an engine-specific
- * problem from a stream-specific one. It is offered as a diagnostic rather than
- * as the answer.
- */
-const STALLED_MESSAGE =
-  'This stream is not starting. Media is arriving, but the browser has not '
-  + 'decoded a frame from it. Reloading often clears this. If it keeps '
-  + 'happening, opening the same stream in another browser will show whether '
-  + 'it is specific to this one.';
 /**
  * Why this browser cannot play an end-to-end encrypted stream, or `null`.
  *
@@ -534,17 +512,23 @@ async function unlockOpenStreams() {
   let unlocked = 0;
   for (const [streamId, stream] of state.streams) {
     const epochId = stream.last_epoch_id ?? null;
-    if (state.described.get(streamId)?.epochId === epochId) continue;
-    // A new epoch is a new answer to every question about this publisher,
-    // including one whose key was tried and did not fit. Without this, a
-    // publisher that went from clear to encrypted would stay in `rejected`
-    // from the attempt made while it had no key at all.
-    state.rejected.delete(stream.viewer_key_salt);
+    const seen = state.described.get(streamId);
+    if (seen && seen.epochId === epochId) continue;
+    // A *changed* epoch is a new answer to every question about this publisher,
+    // including one whose key was tried and did not fit -- without this, a
+    // publisher that went from clear to encrypted would stay in `rejected` from
+    // the attempt made while it had no key at all. First sight is not a change,
+    // and clearing then would defeat the rejection cache on every poll: each
+    // retry costs 600,000 PBKDF2 iterations per remembered secret.
+    if (seen) state.rejected.delete(stream.viewer_key_salt);
     const { encrypted } = await Player.describeStream(streamId);
-    // Null means the stream has published nothing to tell from yet. Nothing is
-    // remembered and nothing is unlocked: the next poll asks again.
-    if (encrypted === null) continue;
+    // The answer is recorded even when it is "nothing published yet", so this
+    // settles instead of re-describing every stream on every poll for as long
+    // as one sits idle. The epoch it was recorded against is null then, and the
+    // real epoch will differ from it, so the question is asked again exactly
+    // once something can answer it.
     state.described.set(streamId, { epochId, encrypted });
+    if (encrypted === null) continue;
     if (encrypted) {
       // A stream that was open and is now encrypted has to give up its keyless
       // unlock, or every tile showing it fails forever against a key of null
@@ -577,9 +561,9 @@ async function unlockOpenStreams() {
  * everything else back.
  */
 function dropTilesFor(streamId) {
-  for (const tile of state.tiles) {
-    if (tile.streamId === streamId) detachTile(tile);
-  }
+  // At most one: attachTile moves a stream rather than letting it occupy two.
+  const tile = state.tiles.find(candidate => candidate.streamId === streamId);
+  if (tile) detachTile(tile);
 }
 
 els.unlockForm.addEventListener('submit', async event => {
@@ -862,8 +846,7 @@ function rowAction(glyph, title, onClick) {
 
 /** Stops decoding a stream and gives up its tile number, keeping it listed. */
 function takeOffScreen(streamId) {
-  const tile = state.tiles.find(candidate => candidate.streamId === streamId);
-  if (tile) detachTile(tile);
+  dropTilesFor(streamId);
   if (placementOf(streamId).slot) updatePlacement(streamId, { slot: null });
 }
 
@@ -1066,8 +1049,7 @@ function assignToFirstFreeTile(streamId) {
     // once, so reaching for the end skipped tile 3 -- and since a tile is also
     // a number, that hole was written to the arrangement and faithfully
     // restored on every reload.
-    const grown = state.tiles.find(tile => !tile.streamId) ?? state.tiles.at(-1);
-    attachTile(grown, streamId);
+    attachTile(state.tiles.find(tile => !tile.streamId), streamId);
     return;
   }
   // Every tile is taken. The first one is the one displaced, and its stream
@@ -1122,7 +1104,6 @@ function mountPlayer(tile, streamId, key) {
       tile.element.classList.toggle('failed', Boolean(update.error));
     },
   });
-  watchForFirstFrame(tile, streamId);
   tile.player.start(key).catch(error => {
     // A tile reassigned or emptied while the start was in flight has already
     // been torn down, and must not be revived here.
@@ -1138,42 +1119,9 @@ function mountPlayer(tile, streamId, key) {
   });
 }
 
-/**
- * Says something when a tile never produces a picture.
- *
- * Starting a player can fail without ever rejecting: the media element waits
- * for a frame that never arrives, and the promise chain simply does not settle.
- * Nothing downstream of that runs, so the tile kept its "Preparing encrypted
- * media" message for as long as the page stayed open -- no error, no retry, and
- * nothing to act on.
- *
- * This does not diagnose the cause. It converts silence into a sentence, which
- * is worth having whatever the cause turns out to be.
- */
-function watchForFirstFrame(tile, streamId) {
-  clearTimeout(tile.stallTimer);
-  tile.stallTimer = setTimeout(() => {
-    tile.stallTimer = null;
-    if (tile.streamId !== streamId) return;
-    const video = tile.element.querySelector('[data-role="video"]');
-    // readyState below HAVE_CURRENT_DATA means no frame was ever decoded.
-    if (video && video.readyState >= 2) return;
-    tile.element.classList.add('failed');
-    tile.message.textContent = STALLED_MESSAGE;
-    // A slow start is not a permanent one. If a frame does arrive later the
-    // player clears the message itself, so the mark has to go with it rather
-    // than leaving a tile flagged for the rest of the session.
-    video?.addEventListener('playing', () => {
-      tile.element.classList.remove('failed');
-    }, { once: true });
-  }, STREAM_STALL_TIMEOUT_MS);
-}
-
 function detachTile(tile) {
   clearTimeout(tile.retryTimer);
   tile.retryTimer = null;
-  clearTimeout(tile.stallTimer);
-  tile.stallTimer = null;
   tile.player?.destroy();
   tile.player = null;
   tile.streamId = null;
