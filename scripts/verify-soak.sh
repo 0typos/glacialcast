@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# An endurance check that stops the moment it has an answer.
+#
+# The full duration is only ever spent on success. Every check in the sampling
+# loop below throws where it stands: either process having exited, a readiness
+# or listing response that is not OK, or no durable sequence progress for
+# GLACIALCAST_SOAK_MAX_STALL_SECONDS. Measured on the nightly, where the run is
+# half an hour: a passing job takes 32m16s, and the two that caught the
+# OpenH264 soname fault -- the publisher loading a library it could not use --
+# took 1m54s each, most of which was compilation.
+#
+# Worth knowing before reaching for a shorter duration. What the length buys is
+# the eviction path: retention here is 60 seconds, so a 30-second run never
+# evicts anything at all, while a half-hour run cycles it about thirty times.
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 
