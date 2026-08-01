@@ -215,4 +215,44 @@ if (totalPerMinute > Number(maxTotalText)) {
 }
 NODE
 
+# The viewer's own traffic, which the ceilings above cannot see: they count
+# publisher-to-relay object bytes, recorded on the ingest path only.
+#
+# A live tile reconciles its header list every fifteen seconds. Requesting the
+# whole catalog each time made that grow with retained history rather than with
+# new work -- measured at 576 KB one minute into a stream and still climbing,
+# against a media payload of roughly 2.5 KB/s. This asserts an incremental
+# request stays a small fraction of the full listing, which is what keeps a
+# long-lived viewer from costing far more than the stream it is watching.
+bandwidth_stream_id="$(
+  curl -fsS "${origin}/api/streams" 2>/dev/null \
+    | grep -oP '"stream_id":"\K[0-9a-f-]+' | head -1 || true
+)"
+if [[ -z "${bandwidth_stream_id}" ]]; then
+  echo "no stream to measure viewer reconcile traffic against" >&2
+  exit 1
+fi
+full_listing="$(
+  curl -fsS "${origin}/api/dash/streams/${bandwidth_stream_id}/objects" 2>/dev/null || true
+)"
+high_water="$(
+  grep -o '"sequence":[0-9]*' <<<"${full_listing}" | cut -d: -f2 | sort -n | tail -1 || true
+)"
+full_bytes="${#full_listing}"
+if [[ -z "${high_water}" ]] || (( full_bytes < 10000 )); then
+  echo "the full listing is too small for this comparison to mean anything: ${full_bytes} B" >&2
+  exit 1
+fi
+incremental_bytes="$(
+  curl -fsS -o /dev/null -w '%{size_download}' \
+    "${origin}/api/dash/streams/${bandwidth_stream_id}/objects?after_sequence=${high_water}" \
+    2>/dev/null || echo "${full_bytes}"
+)"
+if (( incremental_bytes * 10 > full_bytes )); then
+  echo "a viewer reconcile costs ${incremental_bytes} B against a ${full_bytes} B full listing;" >&2
+  echo "it should be proportional to new work, not to retained history" >&2
+  exit 1
+fi
+echo "viewer reconcile ${incremental_bytes} B against a ${full_bytes} B full listing"
+
 echo "PASS: ${profile} application traffic stayed within media=${max_media_per_minute} cursor=${max_cursor_per_minute} total=${max_total_per_minute} bytes/minute"

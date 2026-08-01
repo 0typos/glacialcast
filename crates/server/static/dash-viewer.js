@@ -369,8 +369,7 @@ function createPlayer(root, options) {
     if (problem) throw new Error(problem);
     state.viewerKey = encrypted ? base64UrlToBytes(viewerKeyText, 32) : null;
     state.mediaSourceClass = mediaSourceConstructor(encrypted);
-    const headers = await fetchHeaders();
-    state.headers = headers;
+    const headers = mergeHeaders(await fetchHeaders());
     await loadEpochDescriptors(headers);
     const timeline = installInitialEpochTimeline(headers);
     if (timeline.length === 0) {
@@ -529,15 +528,50 @@ function createPlayer(root, options) {
     return timeline;
   }
 
-  async function fetchHeaders() {
-    const response = await fetch(`/api/dash/streams/${streamId}/objects`, {
+  /**
+   * Object headers, optionally only those newer than `afterSequence`.
+   *
+   * The reconcile below runs every fifteen seconds for as long as a tile is
+   * open, and asking for the whole catalog every time made that cost grow with
+   * retained history instead of with new work -- measured at 576 KB one minute
+   * into a stream and still climbing, against a media payload of about 2.5 KB
+   * a second. Asking only for what this player has not seen keeps it flat.
+   *
+   * The retained bounds come back in headers because a partial page cannot
+   * show which sequences have been evicted, and that is what the caller needs
+   * in order to forget them.
+   */
+  async function fetchHeaders(afterSequence = null) {
+    const query = afterSequence === null ? '' : `?after_sequence=${afterSequence}`;
+    const response = await fetch(`/api/dash/streams/${streamId}/objects${query}`, {
       cache: 'no-store',
       signal: teardown.signal,
     });
     if (!response.ok) throw new Error(await response.text() || 'Unable to list DASH objects.');
     const headers = await response.json();
     headers.sort((left, right) => left.sequence - right.sequence);
-    return headers;
+    const bound = name => {
+      const value = Number(response.headers.get(name));
+      return Number.isSafeInteger(value) && value > 0 ? value : null;
+    };
+    return {
+      headers,
+      retainedFirst: bound('x-glacialcast-retained-first'),
+      retainedLast: bound('x-glacialcast-retained-last'),
+    };
+  }
+
+  /**
+   * Merges a page of headers into what this player already holds, and drops
+   * anything the relay has since evicted.
+   */
+  function mergeHeaders(page) {
+    const known = new Map(state.headers.map(header => [header.sequence, header]));
+    for (const header of page.headers) known.set(header.sequence, header);
+    state.headers = [...known.values()]
+      .filter(header => page.retainedFirst === null || header.sequence >= page.retainedFirst)
+      .sort((left, right) => left.sequence - right.sequence);
+    return state.headers;
   }
 
   async function fetchObject(sequence) {
@@ -1031,8 +1065,11 @@ function createPlayer(root, options) {
   }
 
   async function reconcileLiveHeaders() {
-    const headers = await fetchHeaders();
-    state.headers = headers;
+    // Only what is newer than the newest header already held. Everything older
+    // either arrived over the live socket or was fetched on the initial load.
+    const highWater = state.headers.at(-1)?.sequence ?? null;
+    const page = await fetchHeaders(highWater);
+    const headers = mergeHeaders(page);
     for (const header of headers.filter(header => header.kind === 'Epoch')) {
       // Same reasoning as the initial load: an epoch this key cannot open is
       // skipped, not fatal, so retained history from a rotated key does not
@@ -1063,13 +1100,13 @@ function createPlayer(root, options) {
       refreshStreamLabel();
     }
 
-    const retainedSequences = new Set(headers.map(header => header.sequence));
-    const listedHighWater = headers.at(-1)?.sequence || 0;
-    state.seenSequences = new Set(
-      [...state.seenSequences].filter(
-        sequence => retainedSequences.has(sequence) || sequence > listedHighWater
-      )
-    );
+    // Forget sequences the relay has evicted. The retained floor says which
+    // those are without the response having to carry every surviving header.
+    if (page.retainedFirst !== null) {
+      state.seenSequences = new Set(
+        [...state.seenSequences].filter(sequence => sequence >= page.retainedFirst),
+      );
+    }
 
     const firstRandomAccess = headers.find(
       header => header.kind === 'Media' && header.random_access
