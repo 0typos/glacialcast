@@ -55,8 +55,17 @@ const KEY_STORE_VERSION = 1;
  * this viewer's private label -- the relay is not told, and other viewers of
  * the same stream see whatever the publisher called it.
  */
-const PLACEMENT_STORE = 'glacialcast.streams.v1';
-const PLACEMENT_STORE_VERSION = 1;
+const PLACEMENT_STORE = 'glacialcast.streams.v2';
+const PLACEMENT_STORE_VERSION = 2;
+/**
+ * The v1 store, read once and migrated.
+ *
+ * v1 gave each stream a `slot` field, which let two streams claim one tile --
+ * a state the grid cannot show and the loader had to repair on every read.
+ * v2 stores the grid itself, so the conflict is unrepresentable rather than
+ * corrected. The old key is removed once the migrated arrangement is written.
+ */
+const LEGACY_PLACEMENT_STORE = 'glacialcast.streams.v1';
 /** Longest custom name kept, so one pasted essay cannot fill the store. */
 const MAX_STREAM_NAME = 80;
 /**
@@ -128,13 +137,26 @@ const state = {
   /** Relay stream metadata by stream ID. */
   streams: new Map(),
   /**
-   * This viewer's arrangement, by stream ID.
+   * Which stream is in which tile: index 0 is tile 1, `null` is empty.
    *
-   * Each record is `{ slot, hidden, name }`. `slot` is a tile number from 1 to
-   * MAX_TILES and puts the stream on screen there; null means parked -- in the
-   * list, ready to be added, not decoding. `hidden` takes it out of the list
-   * altogether, and clears any slot, because a stream cannot be both out of
-   * sight and on screen.
+   * The grid itself, rather than a tile number stored on each stream. Both can
+   * express "stream A is in tile 2"; only this one is unable to express "A and
+   * B are both in tile 2". That state used to be reachable, was invisible in
+   * the panel except as two rows badged with the same number, and had to be
+   * repaired every time the store was read.
+   *
+   * Everything about a tile number is now a question about this array, so
+   * "which tile is this stream in" is an `indexOf` rather than a field that
+   * some other record could contradict.
+   */
+  grid: new Array(MAX_TILES).fill(null),
+  /**
+   * What this viewer has decided about each stream, by stream ID.
+   *
+   * `{ hidden, name }`. Where a stream sits is `grid` above; this is only what
+   * it is called and whether it is listed at all. `hidden` takes a stream out
+   * of the list, and clearing its tile is part of hiding it, because a stream
+   * cannot be both out of sight and on screen.
    */
   placements: new Map(),
   /** One entry per visible tile. */
@@ -210,59 +232,92 @@ function forgetRememberedKeys() {
   }
 }
 
-/** What a stream with no remembered arrangement gets: listed, unnamed, parked. */
-const NO_PLACEMENT = Object.freeze({ slot: null, hidden: false, name: '' });
+/** What a stream with no remembered arrangement gets: listed and unnamed. */
+const NO_PLACEMENT = Object.freeze({ hidden: false, name: '' });
 
 function loadPlacements() {
   try {
     const raw = globalThis.localStorage.getItem(PLACEMENT_STORE);
-    if (!raw) return;
-    const stored = JSON.parse(raw);
-    if (stored?.version !== PLACEMENT_STORE_VERSION) return;
-    const taken = new Set();
-    for (const [streamId, record] of Object.entries(stored.streams ?? {})) {
-      const placement = sanitizePlacement(record);
-      // One tile, one stream. A store written by a version that could hand the
-      // same number out twice would otherwise keep doing it: whichever stream
-      // was restored first took the tile and the other stayed listed as on
-      // screen while never appearing. The later record is the one parked, so
-      // the arrangement loses a position rather than a stream.
-      if (placement.slot !== null) {
-        if (taken.has(placement.slot)) placement.slot = null;
-        else taken.add(placement.slot);
-      }
-      state.placements.set(streamId, placement);
+    if (raw) {
+      const stored = JSON.parse(raw);
+      if (stored?.version !== PLACEMENT_STORE_VERSION) return;
+      adoptPlacements(stored.grid, stored.streams);
+      return;
     }
+    const legacy = globalThis.localStorage.getItem(LEGACY_PLACEMENT_STORE);
+    if (!legacy) return;
+    const stored = JSON.parse(legacy);
+    if (stored?.version !== 1) return;
+    adoptPlacements(...gridFromSlots(stored.streams));
+    savePlacements();
+    globalThis.localStorage.removeItem(LEGACY_PLACEMENT_STORE);
   } catch {
     // A corrupt or unavailable store just means arranging again.
   }
 }
 
 /**
- * Reads one stored record without trusting it.
+ * Turns v1's per-stream `slot` fields into a grid.
  *
- * Local storage is editable by hand and survives across versions, so a slot
- * outside the grid or a name of unbounded length has to be treated as data
- * rather than as something this page wrote.
+ * First record wins a contested tile, which is what v1's repair pass did on
+ * every read; the loser is parked rather than dropped, so an arrangement loses
+ * a position and never a stream.
  */
-function sanitizePlacement(record) {
-  const hidden = record?.hidden === true;
-  const slot = Number(record?.slot);
-  const usable = !hidden && Number.isInteger(slot) && slot >= 1 && slot <= MAX_TILES;
-  return {
-    slot: usable ? slot : null,
-    hidden,
-    name: typeof record?.name === 'string' ? record.name.trim().slice(0, MAX_STREAM_NAME) : '',
-  };
+function gridFromSlots(streams) {
+  const grid = new Array(MAX_TILES).fill(null);
+  const records = {};
+  for (const [streamId, record] of Object.entries(streams ?? {})) {
+    records[streamId] = record;
+    const slot = Number(record?.slot);
+    if (
+      record?.hidden !== true
+      && Number.isInteger(slot)
+      && slot >= 1
+      && slot <= MAX_TILES
+      && grid[slot - 1] === null
+    ) {
+      grid[slot - 1] = streamId;
+    }
+  }
+  return [grid, records];
+}
+
+/**
+ * Takes a stored arrangement, without trusting it.
+ *
+ * Local storage is editable by hand and survives across versions, so a grid of
+ * the wrong length, a stream in two tiles at once, or a name of unbounded
+ * length are all things to read defensively rather than things this page wrote.
+ */
+function adoptPlacements(grid, streams) {
+  for (const [streamId, record] of Object.entries(streams ?? {})) {
+    state.placements.set(streamId, {
+      hidden: record?.hidden === true,
+      name: typeof record?.name === 'string' ? record.name.trim().slice(0, MAX_STREAM_NAME) : '',
+    });
+  }
+  if (!Array.isArray(grid)) return;
+  for (const [index, streamId] of grid.slice(0, MAX_TILES).entries()) {
+    // A stream can hold one tile. Later mentions of one already placed are
+    // dropped rather than duplicated -- and a hidden stream holds none.
+    if (typeof streamId !== 'string') continue;
+    if (state.grid.includes(streamId)) continue;
+    if (placementOf(streamId).hidden) continue;
+    state.grid[index] = streamId;
+  }
 }
 
 function savePlacements() {
-  while (state.placements.size > MAX_REMEMBERED_PLACEMENTS) {
-    state.placements.delete(state.placements.keys().next().value);
+  // A stream on screen is never the one forgotten, however long ago it was
+  // first seen: the grid would then point at a record that no longer exists.
+  for (const streamId of state.placements.keys()) {
+    if (state.placements.size <= MAX_REMEMBERED_PLACEMENTS) break;
+    if (!state.grid.includes(streamId)) state.placements.delete(streamId);
   }
   try {
     globalThis.localStorage.setItem(PLACEMENT_STORE, JSON.stringify({
       version: PLACEMENT_STORE_VERSION,
+      grid: state.grid,
       streams: Object.fromEntries(state.placements),
     }));
   } catch {
@@ -272,7 +327,7 @@ function savePlacements() {
 }
 
 /**
- * Reads a stream's arrangement, without creating one.
+ * Reads what this viewer decided about a stream, without creating a record.
  *
  * Non-creating on purpose: this is called while rendering and while labelling
  * tiles, and a read that quietly recorded every stream it was asked about would
@@ -283,12 +338,17 @@ function placementOf(streamId) {
 }
 
 function updatePlacement(streamId, changes) {
-  const record = { ...placementOf(streamId), ...changes };
-  // A hidden stream cannot also be on screen, and this is the one place that
-  // has to hold, so it is enforced here rather than at each caller.
-  if (record.hidden) record.slot = null;
-  state.placements.set(streamId, record);
+  state.placements.set(streamId, { ...placementOf(streamId), ...changes });
+  // Hiding a stream takes it off the grid. This is the one place that has to
+  // hold, so it is enforced here rather than at each caller.
+  if (changes.hidden) clearSlot(streamId);
   savePlacements();
+}
+
+/** The tile a stream is in, from 1, or null when it is not on the grid. */
+function slotOf(streamId) {
+  const index = state.grid.indexOf(streamId);
+  return index < 0 ? null : index + 1;
 }
 
 /**
@@ -296,30 +356,35 @@ function updatePlacement(streamId, changes) {
  *
  * Deliberately not filtered by which streams have keys. A remembered stream
  * that is momentarily locked -- after "Forget keys", before a key is re-entered
- * -- still owns its number, and treating that number as free handed it to a
- * second stream without going through the displacement below. Both then held
- * it, the panel showed two rows badged with the same tile, and only one of them
- * was ever rendered.
+ * -- still owns its tile, and treating that tile as free would hand it to a
+ * second stream.
  */
 function streamInSlot(slot) {
-  for (const [streamId, record] of state.placements) {
-    if (record.slot === slot) return streamId;
-  }
-  return null;
+  return state.grid[slot - 1] ?? null;
 }
 
 function firstFreeSlot() {
-  for (let slot = 1; slot <= MAX_TILES; slot += 1) {
-    if (!streamInSlot(slot)) return slot;
-  }
-  return null;
+  const index = state.grid.indexOf(null);
+  return index < 0 ? null : index + 1;
 }
 
 /** Puts `streamId` in `slot`, turning out whatever held it. */
 function assignSlot(streamId, slot) {
-  const displaced = streamInSlot(slot);
-  if (displaced && displaced !== streamId) updatePlacement(displaced, { slot: null });
-  updatePlacement(streamId, { slot, hidden: false });
+  clearSlot(streamId);
+  state.grid[slot - 1] = streamId;
+  state.placements.set(streamId, { ...placementOf(streamId), hidden: false });
+  savePlacements();
+}
+
+/**
+ * Takes a stream off the grid, wherever it was.
+ *
+ * Mutates without storing, so a caller that is also changing something else
+ * writes once rather than twice for one action.
+ */
+function clearSlot(streamId) {
+  const index = state.grid.indexOf(streamId);
+  if (index >= 0) state.grid[index] = null;
 }
 
 /**
@@ -338,8 +403,9 @@ function placeNewStreams(streamIds) {
   let placed = 0;
   for (const streamId of streamIds) {
     if (state.placements.has(streamId)) continue;
+    state.placements.set(streamId, { ...NO_PLACEMENT });
     const slot = firstFreeSlot();
-    state.placements.set(streamId, { ...NO_PLACEMENT, slot });
+    if (slot !== null) state.grid[slot - 1] = streamId;
     placed += 1;
   }
   if (placed > 0) savePlacements();
@@ -695,10 +761,10 @@ function renderStreamList() {
   for (const streamId of known) {
     const record = placementOf(streamId);
     if (record.hidden) hidden.push(streamId);
-    else if (record.slot) onScreen.push(streamId);
+    else if (slotOf(streamId)) onScreen.push(streamId);
     else available.push(streamId);
   }
-  onScreen.sort((left, right) => placementOf(left).slot - placementOf(right).slot);
+  onScreen.sort((left, right) => slotOf(left) - slotOf(right));
 
   els.streamList.textContent = '';
   renderStreamGroup('On screen', onScreen, 'screen');
@@ -759,11 +825,12 @@ function renderStreamRow(streamId, kind) {
   pick.type = 'button';
   pick.className = 'stream-pick';
 
-  if (record.slot) {
+  const tileNumber = slotOf(streamId);
+  if (tileNumber) {
     const slot = document.createElement('span');
     slot.className = 'stream-slot';
-    slot.textContent = String(record.slot);
-    slot.title = `Tile ${record.slot}`;
+    slot.textContent = String(tileNumber);
+    slot.title = `Tile ${tileNumber}`;
     pick.append(slot);
   }
 
@@ -809,7 +876,7 @@ function renderStreamRow(streamId, kind) {
   const actions = document.createElement('span');
   actions.className = 'stream-actions';
   actions.append(rowAction('✎', `Rename ${streamTitle(streamId)}`, () => beginRename(item, streamId)));
-  if (record.slot) {
+  if (tileNumber) {
     actions.append(rowAction('−', 'Take off screen, keep in the list', () => {
       takeOffScreen(streamId);
       scheduleStreamList();
@@ -847,7 +914,8 @@ function rowAction(glyph, title, onClick) {
 /** Stops decoding a stream and gives up its tile number, keeping it listed. */
 function takeOffScreen(streamId) {
   dropTilesFor(streamId);
-  if (placementOf(streamId).slot) updatePlacement(streamId, { slot: null });
+  clearSlot(streamId);
+  savePlacements();
 }
 
 /**
@@ -974,8 +1042,9 @@ function setLayout(count) {
     // A stream loses its number along with the tile that number referred to,
     // and moves to the available list. Keeping a slot the grid no longer has
     // would leave the panel promising a position that does not exist.
-    if (tile.streamId && placementOf(tile.streamId).slot) {
-      updatePlacement(tile.streamId, { slot: null });
+    if (tile.streamId && slotOf(tile.streamId)) {
+      clearSlot(tile.streamId);
+      savePlacements();
       parked = true;
     }
     detachTile(tile);
@@ -1151,8 +1220,21 @@ globalThis.GlacialCastWatch = {
   unlockedStreams: () => [...state.keys.keys()],
   /** Streams unlocked without a key, because they were published in the clear. */
   openStreams: () => [...state.keys].filter(([, key]) => key === null).map(([id]) => id),
-  /** This viewer's arrangement, so a gate can check what was remembered. */
-  placements: () => Object.fromEntries(state.placements),
+  /**
+   * This viewer's arrangement, so a gate can check what was remembered.
+   *
+   * `slot` is composed from the grid rather than stored, which is the whole
+   * point of the change that introduced it: there is one place a tile number
+   * can come from, so no record can disagree with the grid about it.
+   */
+  placements: () => Object.fromEntries(
+    [...state.placements].map(([streamId, record]) => [
+      streamId,
+      { ...record, slot: slotOf(streamId) },
+    ]),
+  ),
+  /** The tiles themselves, in order: stream ID or null. */
+  grid: () => [...state.grid],
   /** What is known about each stream's encryption, and from which epoch. */
   described: () => Object.fromEntries(state.described),
   /** The name shown for a stream, which may be one this viewer typed. */
@@ -1171,19 +1253,21 @@ globalThis.GlacialCastWatch = {
  * layout the viewer chose by hand, and this runs on every poll.
  */
 function showUnlockedStreams() {
-  const numbered = [...state.placements]
-    .filter(([streamId, record]) => record.slot
+  // The grid is already in tile order, so this needs no sort and the last
+  // occupied index is the layout to fit.
+  const numbered = state.grid
+    .map((streamId, index) => ({ streamId, slot: index + 1 }))
+    .filter(({ streamId }) => streamId
       && state.keys.has(streamId)
-      && state.streams.has(streamId))
-    .sort((left, right) => left[1].slot - right[1].slot);
+      && state.streams.has(streamId));
   if (numbered.length === 0) return;
 
-  const highest = numbered.at(-1)[1].slot;
+  const highest = numbered.at(-1).slot;
   const fitted = highest > 2 ? 4 : highest;
   if (fitted > state.layout) setLayout(fitted);
 
-  for (const [streamId, record] of numbered) {
-    const tile = state.tiles[record.slot - 1];
+  for (const { streamId, slot } of numbered) {
+    const tile = state.tiles[slot - 1];
     // Reattaching a tile tears down a working player, so a stream already on
     // screen is left exactly where it is.
     if (!tile || tile.streamId === streamId) continue;
