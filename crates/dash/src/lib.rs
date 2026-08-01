@@ -1498,6 +1498,8 @@ mod tests {
     /// Minimal standard-alphabet base64, so the vector file can carry bytes
     /// that are not valid UTF-8 without this crate taking a dependency.
     fn base64_decode(text: &str) -> Vec<u8> {
+        use std::ops::{BitAnd, BitOr, Shl, Shr};
+
         const TABLE: &[u8; 64] =
             b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = Vec::new();
@@ -1509,11 +1511,11 @@ mod tests {
                 .position(|c| *c == byte)
                 .unwrap_or_else(|| panic!("invalid base64 byte {byte}"));
             let value = u32::try_from(index).expect("alphabet index is below 64");
-            acc = (acc << 6) | value;
+            acc = acc.shl(6u32).bitor(value);
             bits += 6;
             if bits >= 8 {
                 bits -= 8;
-                let octet = (acc >> bits) & 0xff;
+                let octet = acc.shr(bits).bitand(0xffu32);
                 out.push(u8::try_from(octet).expect("masked to a single octet"));
             }
         }
