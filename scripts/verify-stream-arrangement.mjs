@@ -293,6 +293,27 @@ try {
     `the arrangement was rewritten in the new shape (${JSON.stringify(migrated.current)})`,
   );
 
+  // A stored grid naming a stream it has no record for is not something this
+  // page writes -- it is hand-edited or corrupt storage. Taking it anyway put a
+  // stream on the grid that the placement pass still considered new, so the
+  // relay announcing it handed the same stream a second tile: the exact state
+  // the grid is supposed to make unrepresentable.
+  await page.evaluate(streamId => {
+    globalThis.localStorage.setItem('glacialcast.streams.v2', JSON.stringify({
+      version: 2,
+      grid: [streamId, null, null, null],
+      streams: {},
+    }));
+  }, alpha);
+  await reload();
+  await untilOnScreen(alpha);
+  const repaired = await page.evaluate(() => globalThis.GlacialCastWatch.grid());
+  const occupied = repaired.filter(Boolean);
+  check(
+    new Set(occupied).size === occupied.length,
+    `a grid entry with no record did not earn a second tile (${JSON.stringify(repaired)})`,
+  );
+
   check(errors.length === 0, `no page errors (${JSON.stringify(errors)})`);
 } finally {
   await browser.close();
