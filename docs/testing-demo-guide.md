@@ -171,6 +171,22 @@ GLACIALCAST_VERIFY_OFFLINE_BROWSERS=firefox,chromium \
 scripts/verify-dash-e2e.sh
 ```
 
+Test the publishing mode that has no key, which no other browser gate can reach
+— every one of them starts by typing one:
+
+```sh
+GLACIALCAST_VERIFY_BROWSERS=firefox,chromium \
+scripts/verify-unencrypted.sh
+```
+
+It publishes with `--no-encryption --no-viewer-key`, checks the stream unlocks
+itself and decodes a frame without a key existing anywhere in the run, and
+checks both fences: a relay without `--trusted-lan` refusing the epoch and
+telling the publisher why, and a viewer holding a key refusing a stream served
+in the clear. What it cannot check is the iPhone path — no engine it can launch
+exposes `ManagedMediaSource` — so it covers the decision in front of that branch
+and says so.
+
 Then test the Internet boundary. Docker must be running and able to obtain the
 official `caddy:2` image:
 

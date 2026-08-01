@@ -82,8 +82,9 @@ contains bootstrap access and ingest credentials. The E2EE viewer key remains
 publisher/viewer state and is not recoverable from the relay backup.
 
 Test restoration on a non-production host when the retained history matters.
-Protect backups as credentials even though media payloads remain end-to-end
-encrypted.
+Protect backups as credentials even though media payloads are normally
+end-to-end encrypted -- and unconditionally, if any publisher on the relay used
+`--no-encryption`, since those payloads are stored in the clear.
 
 ## Upgrade
 

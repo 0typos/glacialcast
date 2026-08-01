@@ -5,6 +5,12 @@ with bounded history. It captures a selected monitor or window through the XDG
 Desktop Portal and PipeWire, sends H.264 video at a few frames per second, and
 renders cursor updates as an independent, much higher-rate overlay.
 
+End-to-end encryption is the default and the only thing an Internet-facing
+relay will accept. A publisher on a trusted LAN can turn it off with
+[`--no-encryption`](#publishing-without-encryption), which exists because
+iPhones cannot decrypt these streams in any browser. What that gives up is set
+out there and in `SECURITY.md`.
+
 The current pre-1.0 implementation provides:
 
 - native portal and PipeWire capture without GStreamer;
@@ -14,12 +20,17 @@ The current pre-1.0 implementation provides:
 - authenticated cursor batches at up to 60 updates per second, on a timeline
   independent of the video;
 - a durable relay bounded by both object age and bytes per stream;
-- a dependency-free Firefox/Chromium viewer using MSE and EME Clear Key; and
+- a dependency-free Firefox/Chromium viewer using MSE and EME Clear Key, whose
+  grid remembers which stream belongs in which tile, and what you call it;
+- an opt-out for trusted LANs that publishes in the clear, for devices that
+  cannot decrypt at all; and
 - portable `.gco` object files and a self-contained offline viewer.
 
 The relay does not receive the viewer key and cannot decrypt media or cursor
-contents. The capture client pins the relay's Noise public key, so ingest
-credentials and objects are encrypted to the intended server. The current HTTP
+contents — unless the publisher chose to send in the clear, which only a
+`--trusted-lan` relay accepts. The capture client pins the relay's Noise public
+key either way, so ingest credentials and objects are encrypted to the intended
+server in transit. The current HTTP
 viewer supports a fail-closed Internet profile with HTTPS proxying, signed
 viewer sessions, publisher-scoped authorization, admin controls, CSRF and
 origin enforcement, request/connection limits, and operational probes.
@@ -206,25 +217,36 @@ evidence. Reports are welcome; so is a failure.
   by bytes per stream, and history beyond that is gone.
 - **Packages are x86_64 only**, built against glibc 2.39. Older distributions
   are refused rather than sold a binary that cannot start.
-- **iOS cannot play these streams in any browser.** Every iOS browser is
-  WebKit underneath, whatever its name. iPhones expose no `MediaSource` at all
-  (iOS 17.1 added ManagedMediaSource, which the viewer does not use), and
-  WebKit's Encrypted Media Extensions offer FairPlay only — never the ClearKey
-  scheme this viewer's end-to-end encryption is built on. The second wall
-  stands even where the first does not, so no setting or alternative iOS
-  browser helps; the viewer says so on the page rather than naming a missing
-  API. Viewing needs a desktop or Android browser. Publishing without
-  encryption would be the only route to iOS playback, and that mode does not
-  currently exist.
-- **Firefox will not decode encrypted samples of a second or longer.** Chromium
-  plays the same bytes. The publisher's idle heartbeat therefore defaults to
-  0.5s, which bounds every sample below that; raising `--idle-heartbeat-seconds`
-  past a second cuts idle bandwidth further but limits playback to Chromium.
-  Measured against identical fragments with only durations rewritten: 0.95s
-  played, 1.0s stalled. The same limit applies to the frame period itself:
-  below roughly `--fps 1.25` every sample lasts that long regardless of the
-  heartbeat, so such streams play only in Chromium-family browsers, and the
-  publisher says so at startup.
+- **iOS cannot play an encrypted stream in any browser.** Every iOS browser is
+  WebKit underneath, whatever its name, and WebKit's Encrypted Media Extensions
+  offer FairPlay only — never the ClearKey scheme this viewer's end-to-end
+  encryption is built on. No setting or alternative iOS browser helps; the
+  viewer says so on the page rather than naming a missing API. The only route
+  to an iPhone is [`--no-encryption`](#publishing-without-encryption), which
+  plays through ManagedMediaSource (iOS 17.1+) and gives up end-to-end
+  encryption to do it. **That path has never been run on a real device**: no
+  browser engine a CI runner can launch exposes ManagedMediaSource, so it is
+  written and reasoned about but unverified. Encrypted viewing needs a desktop
+  or Android browser.
+- **Samples of a second or longer stall in Firefox here.** Chromium plays the
+  same bytes. The publisher's idle heartbeat therefore defaults to 0.5s, which
+  bounds every sample below that; raising `--idle-heartbeat-seconds` past a
+  second cuts idle bandwidth further but limits playback to Chromium. The same
+  applies to the frame period itself: below roughly `--fps 1.25` every sample
+  lasts that long regardless of the heartbeat, so the publisher warns at
+  startup.
+
+  The cause is not established, and the wording above is deliberately narrower
+  than it used to be. Duration is necessary but not sufficient: a standalone
+  page with its own MediaSource and ClearKey session, fed the identical
+  fragments with only `trun` durations and `tfdt` rewritten, plays both the
+  0.5s and the 1.0s variant in Firefox at 640x360 and at 1920x1080. The same
+  fragments appended from inside this viewer's own page still stall at 1.0s and
+  play at 0.5s. So something about the page context is part of the trigger —
+  the leading suspect is the viewer's own concurrent MediaSource and EME
+  instances. **No upstream bug has been filed**, because no standalone
+  reproduction exists to file. The 0.5s default is validated by outcome, not by
+  a diagnosis.
 - **Pre-1.0 wire format.** `PROTOCOL_VERSION` has moved twice in recent work;
   publisher and relay must match, and retained objects do not survive a format
   change.
@@ -234,7 +256,10 @@ evidence. Reports are welcome; so is a failure.
   it cannot be lifted — only satisfied. [`--trusted-lan`](#trusted-lan) satisfies
   it by serving TLS itself with a generated certificate, which each browser
   accepts once; a certificate from a CA the viewers already trust avoids even
-  that.
+  that. Publishing without encryption does not exempt a viewer from this: every
+  object carries a SHA-256 the viewer checks before decoding, and
+  `crypto.subtle` is withheld outside a secure context along with everything
+  else.
 
 ## Dependencies
 
@@ -381,6 +406,17 @@ not asked again. It covers loopback, this host's name, and the address the host
 reaches the network by — the one a viewer on the LAN types. Add others with
 `--tls-name`.
 
+The names it was issued for are recorded beside it, and a start that wants a
+name the stored certificate does not cover regenerates the pair rather than
+serving one that will not match. So adding `--tls-name`, or moving the host to
+an address it has not been issued for, costs one more browser warning and then
+works; it used to silently keep the old certificate and leave the browser
+reporting a name mismatch with no way out but deleting the directory by hand.
+Dropping a name keeps the certificate, so an address that is momentarily
+unavailable does not churn it. **A relay upgrading from before this was
+recorded regenerates once on first start**, because a stored pair with no name
+list cannot be shown to cover anything; viewers accept it again that one time.
+
 It signs for itself, so each browser stops on a warning the first time. The
 relay prints the fingerprint the browser will display, so accepting it can be a
 check rather than a habit:
@@ -405,11 +441,56 @@ the network will not play, and it says so at startup.
 
 What `--trusted-lan` gives up: any host that can reach the ingest port may
 publish a stream, so a stream appearing in the list is no longer evidence of who
-put it there. What it does not give up: stream contents stay end-to-end
-encrypted under the viewer key, so a listener on the segment without that key
-sees ciphertext, and publishers still pin the relay's identity with
-`--ingest-server-key`. It is refused together with `security.public_origin`,
-whose premises are the opposite.
+put it there. It is also the only mode that accepts a publisher sending in the
+clear — an encrypted-only relay refuses such an epoch outright, and says why.
+Publishers still pin the relay's identity with `--ingest-server-key` either way.
+It is refused together with `security.public_origin`, whose premises are the
+opposite, so plaintext media cannot structurally reach the Internet profile.
+
+Streams published normally stay end-to-end encrypted under the viewer key on a
+`--trusted-lan` relay exactly as anywhere else; a listener on the segment
+without that key sees ciphertext. What changes is that the relay will now also
+accept a publisher that opted out.
+
+## Publishing without encryption
+
+`--no-encryption` publishes a stream in the clear. It exists for one reason: an
+iPhone cannot decrypt these streams in any browser, because WebKit offers
+FairPlay and never ClearKey. Unencrypted media played through
+ManagedMediaSource is the only path onto the device.
+
+```sh
+glacialcast-client --no-encryption --no-viewer-key \
+  --ingest-addr relay.lan:8900 \
+  --ingest-server-key "$(…)" \
+  --capture dash-wayland
+```
+
+There is no viewing key, so there is nothing to share and nothing to type: the
+stream unlocks itself in the viewer and is labelled `not encrypted` in the
+stream list and on its tile.
+
+**What it gives up, plainly.** The media and the cursor batches are readable by
+the relay, by anything that can reach the relay's HTTP surface, and by anything
+on the network path that TLS does not cover. The objects also carry no
+authentication tag — there is no key to derive one from — so a viewer can tell
+that an object matches its own SHA-256 but cannot tell who produced it. What
+remains is Noise for ingest, with the relay's identity pinned, and TLS from the
+relay to the browser. Integrity is hop-by-hop; it is not end to end.
+
+**What stops it spreading.** A relay refuses an unencrypted epoch unless it was
+started with `--trusted-lan`, and `--trusted-lan` is itself refused alongside
+`security.public_origin`, so plaintext media cannot reach an Internet-profile
+relay by configuration mistake. A refused publisher is told why and stops,
+rather than reconnecting into a loop. And a viewer that holds a key for a stream
+**refuses** an epoch served in the clear on it: a relay that could strip the
+encryption from a stream you have a key for is exactly what the key is there to
+catch.
+
+Mixing modes on one relay is fine. Encryption is decided per capture epoch, so a
+publisher that restarts into the other mode is picked up without a reload, and
+retained history from the previous mode is skipped rather than breaking
+playback.
 
 ## Internet deployment
 
@@ -517,6 +598,32 @@ in the first free tile, or drag it onto the tile you want. Dropping a stream
 onto an occupied tile swaps the two, and shrinking the layout destroys the
 players it drops rather than leaving them decoding out of sight. Any tile
 full-screens on its own.
+
+### Arranging what you watch
+
+A stream on screen carries the number of the tile it is in, and that number is
+what the grid is rebuilt from: stream 1 lands in tile 1 on every reload, every
+new tab, and after a browser restart. The panel groups streams by what they are
+doing:
+
+- **On screen** — numbered, decoding, in the tile the number names.
+- **Available** — listed and ready, not decoding. Where a stream goes when you
+  empty its tile, and where a fifth screen starts rather than displacing
+  something you are watching. Click it to put it back on screen.
+- **Hidden** — out of the list. Folded away behind a disclosure rather than
+  forgotten, so a removal is always reversible.
+
+The **✎** button on a row renames a stream. The name is yours alone: it is
+stored in this browser, never sent to the relay, and other people watching the
+same stream see whatever the publisher called it. The publisher's own name stays
+visible underneath, so renaming can never leave you unable to tell which screen
+you are looking at. Clearing the field puts the original name back.
+
+All of it lives in `localStorage` beside the keys, so it is per-browser — you
+arrange your laptop and your desktop separately. **Forget keys** does not touch
+it: giving up access is not the same as changing your mind about what to call
+your kitchen camera, and re-entering the key restores the arrangement rather
+than starting over.
 
 The panel of streams is only needed when changing what is on screen, so it gets
 out of the way easily: the **Streams** button in the header collapses it, `[`
@@ -878,8 +985,17 @@ retention, and key-leak assertions. Run the browser command separately when
 Docker and Playwright are available.
 
 `scripts/verify-dash-e2e.sh` exercises an authenticated encrypted test stream
-against a temporary relay and portable offline viewer. The recovery gate
-crashes and restarts an authenticated relay under an active publisher. The
+against a temporary relay and portable offline viewer.
+`scripts/verify-unencrypted.sh` covers the path no other browser gate can reach,
+because every one of them begins by typing a viewing key: it publishes with
+`--no-encryption --no-viewer-key`, checks that the stream unlocks and decodes a
+frame with no key anywhere in the run, and checks both fences — a relay without
+`--trusted-lan` refusing the epoch and telling the publisher why, and a viewer
+holding a key refusing a stream served in the clear.
+`scripts/verify-multi-stream.sh` also drives the viewer's arrangement — tile
+numbering, parking, hiding, renaming — through a reload, which is the only thing
+that proves any of it was actually stored. The recovery gate crashes and
+restarts an authenticated relay under an active publisher. The
 Internet gate exercises session and bearer authentication, authorization,
 origin and CSRF enforcement, throttling, security headers, protected mirroring,
 monitoring, and fail-closed configuration. The Internet browser gate places
