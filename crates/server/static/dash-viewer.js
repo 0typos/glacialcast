@@ -126,7 +126,20 @@ function platformProblem() {
       + 'the relay port over SSH to your own machine, or put HTTPS in front of '
       + 'it.';
   }
-  if (!globalThis.MediaSource) return 'Media Source Extensions are unavailable.';
+  if (!globalThis.MediaSource) {
+    // Every iOS browser is WebKit underneath, whatever its name. iPhones
+    // expose no MediaSource at all (ManagedMediaSource arrived in iOS 17.1 and
+    // this viewer does not use it), and WebKit's EME offers FairPlay only,
+    // never ClearKey -- so even past the media API, the decryption this needs
+    // is not on offer. Say that plainly: naming a missing API reads as if a
+    // setting could supply it, and on iOS none can.
+    if ('ManagedMediaSource' in globalThis || /iPhone|iPod|iPad/.test(navigator.userAgent)) {
+      return 'iPhone and iPad browsers cannot play these encrypted streams: '
+        + 'iOS offers neither the media API nor the ClearKey decryption they '
+        + 'need, in any browser. Use a desktop or Android browser instead.';
+    }
+    return 'Media Source Extensions are unavailable.';
+  }
   if (!navigator.requestMediaKeySystemAccess) {
     return 'Encrypted Media Extensions are unavailable.';
   }
@@ -452,8 +465,19 @@ function createPlayer(root, options) {
       access = await navigator.requestMediaKeySystemAccess('org.w3.clearkey', configuration);
     } catch (error) {
       for (const capability of capabilities) delete capability.encryptionScheme;
+      // Safari passes the capability check -- requestMediaKeySystemAccess
+      // exists for FairPlay -- and then refuses ClearKey here, on iPad and on
+      // macOS alike. That refusal deserves a sentence, not a bare
+      // NotSupportedError.
       access = await navigator.requestMediaKeySystemAccess('org.w3.clearkey', configuration)
-        .catch(() => { throw error; });
+        .catch(() => {
+          throw new Error(
+            'This browser does not offer ClearKey decryption, which these '
+            + 'end-to-end encrypted streams need. Safari, and every browser '
+            + 'on iOS, offers only FairPlay; use Firefox or a Chromium '
+            + `browser instead. (${error.message || error})`,
+          );
+        });
     }
     state.mediaKeys = await access.createMediaKeys();
     await els.video.setMediaKeys(state.mediaKeys);
