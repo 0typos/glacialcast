@@ -203,11 +203,17 @@ struct Args {
     /// seconds. Fractions are accepted.
     ///
     /// This bounds the duration of every published media sample, and staying
-    /// under one second is what keeps Firefox decoding: its MSE pipeline never
-    /// starts on encrypted samples of a second or longer. Measured against
-    /// identical fragments with only durations rewritten, 0.95s played and
-    /// 1.0s stalled, so the default keeps a wide margin. Raising this above a
-    /// second cuts idle bandwidth further but limits playback to Chromium.
+    /// under one second is what keeps Firefox decoding: samples of a second or
+    /// longer stall in the viewer there, where Chromium plays the same bytes.
+    /// Measured against identical fragments with only durations rewritten,
+    /// 0.95s played and 1.0s stalled, so the default keeps a wide margin.
+    /// Raising this above a second cuts idle bandwidth further but limits
+    /// playback to Chromium.
+    ///
+    /// The cause is not established. The same fragments play at both durations
+    /// in a standalone page, so the duration is necessary but not sufficient
+    /// and something about the viewer's page context is part of it. The default
+    /// is validated by outcome rather than by a diagnosis.
     #[arg(long, value_parser = parse_idle_heartbeat_seconds, default_value_t = 0.5)]
     idle_heartbeat_seconds: f64,
     /// Publishes without encryption, so no viewing key is needed to watch.
@@ -633,7 +639,7 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
     if update_rate_outlasts_firefox(args.fps) {
         // The idle heartbeat bounds coalesced samples, but nothing can shorten
         // the frame period itself: at this rate every sample approaches or
-        // exceeds the roughly one-second duration Firefox refuses to decode
+        // exceeds the roughly one-second duration that stalls in Firefox
         // (measured: 0.95s plays, 1.0s stalls). Warn rather than refuse --
         // capture validation and Chromium-only deployments legitimately run
         // this slow -- but say it here, at startup, not as a stalled tile.
@@ -2660,7 +2666,7 @@ fn load_client_config(path: &PathBuf) -> Result<ClientConfig> {
     toml::from_str(&raw).with_context(|| format!("parsing client config {}", path.display()))
 }
 
-/// Whether the frame period alone reaches the sample duration Firefox refuses.
+/// Whether the frame period alone reaches the sample duration that stalls Firefox.
 ///
 /// The cliff sits at roughly one second (0.95s plays, 1.0s stalls, and the
 /// boundary drifts between runs), so this warns from 0.8s nominal -- capture
@@ -7661,7 +7667,7 @@ mod tests {
     #[test]
     fn idle_heartbeat_is_bounded() {
         // Fractions matter: the default must sit under the one-second sample
-        // duration Firefox refuses to decode.
+        // duration that stalls in Firefox.
         assert!((parse_idle_heartbeat_seconds("0.5").unwrap() - 0.5).abs() < f64::EPSILON);
         assert!((parse_idle_heartbeat_seconds("1").unwrap() - 1.0).abs() < f64::EPSILON);
         assert!((parse_idle_heartbeat_seconds("300").unwrap() - 300.0).abs() < f64::EPSILON);
