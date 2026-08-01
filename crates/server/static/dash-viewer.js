@@ -36,7 +36,7 @@ for (const event of ['beforeunload', 'pagehide']) {
 }
 
 /**
- * Mounts one encrypted DASH player inside `root`.
+ * Mounts one DASH player inside `root`.
  *
  * Elements are found by `data-role` within `root`, so several players can run
  * on one page. Every element except the stage, video, and cursor layer is
@@ -108,7 +108,35 @@ function streamNotReadyError() {
 }
 
 /**
- * Why this browser cannot play an encrypted stream here, or `null` if it can.
+ * The MediaSource flavour to play a stream of this kind with, or `null`.
+ *
+ * Ordinary `MediaSource` wherever it exists, which is every desktop browser,
+ * Android, and iPad. `ManagedMediaSource` is taken only where there is no
+ * ordinary one at all -- that is, on iPhones -- so no platform that already
+ * works changes path. It cannot carry an encrypted stream in any case: it
+ * arrived with iOS 17.1, and WebKit's Encrypted Media Extensions offer
+ * FairPlay and never ClearKey, so an iPhone can play a stream published in the
+ * clear and no other kind.
+ */
+function mediaSourceConstructor(encrypted) {
+  if (globalThis.MediaSource) return globalThis.MediaSource;
+  if (!encrypted && globalThis.ManagedMediaSource) return globalThis.ManagedMediaSource;
+  return null;
+}
+
+function isAppleMobile() {
+  return 'ManagedMediaSource' in globalThis
+    || /iPhone|iPod|iPad/.test(globalThis.navigator?.userAgent ?? '');
+}
+
+/**
+ * Why this browser cannot play a stream of this kind here, or `null` if it can.
+ *
+ * `encrypted` says which kind is being asked about, because the answer differs.
+ * An end-to-end encrypted stream needs Encrypted Media Extensions and ClearKey
+ * inside them; a stream a publisher sent in the clear to a trusted LAN needs
+ * neither. That difference is the whole reason an iPhone can play the second
+ * kind and can never play the first.
  *
  * Module-level and returning rather than throwing, so the page can ask before
  * it offers to do anything. The order matters: a plaintext origin that is not
@@ -117,30 +145,40 @@ function streamNotReadyError() {
  * `crypto.subtle` before any player exists, so checking only inside the player
  * meant the first thing a viewer saw was `undefined is not an object (reading
  * 'importKey')` -- true, and useless.
+ *
+ * A secure context is required of both kinds, not only the encrypted one. Every
+ * object carries a SHA-256 of its payload and the viewer checks it, which is
+ * what catches a truncated or corrupted fragment before it reaches the decoder,
+ * and `crypto.subtle.digest` is withheld outside a secure context along with
+ * everything else. The relay can serve its own HTTPS, so this costs a flag
+ * rather than a second server.
  */
-function platformProblem() {
+function platformProblem(options = {}) {
+  const encrypted = options.encrypted !== false;
   if (!globalThis.isSecureContext || !globalThis.crypto?.subtle) {
     return 'This page must be reached over HTTPS, or at a loopback address, '
-      + 'before it can decrypt a stream. Browsers withhold the cryptography '
-      + 'this needs on a plain http:// address that is not localhost. Forward '
-      + 'the relay port over SSH to your own machine, or put HTTPS in front of '
-      + 'it.';
+      + 'before it can play a stream. Browsers withhold the cryptography this '
+      + 'needs to check what it receives on a plain http:// address that is '
+      + 'not localhost. Start the relay with --tls-cert, or forward its port '
+      + 'over SSH to your own machine.';
   }
-  if (!globalThis.MediaSource) {
-    // Every iOS browser is WebKit underneath, whatever its name. iPhones
-    // expose no MediaSource at all (ManagedMediaSource arrived in iOS 17.1 and
-    // this viewer does not use it), and WebKit's EME offers FairPlay only,
-    // never ClearKey -- so even past the media API, the decryption this needs
-    // is not on offer. Say that plainly: naming a missing API reads as if a
-    // setting could supply it, and on iOS none can.
-    if ('ManagedMediaSource' in globalThis || /iPhone|iPod|iPad/.test(navigator.userAgent)) {
-      return 'iPhone and iPad browsers cannot play these encrypted streams: '
-        + 'iOS offers neither the media API nor the ClearKey decryption they '
-        + 'need, in any browser. Use a desktop or Android browser instead.';
+  if (!mediaSourceConstructor(encrypted)) {
+    // Every iOS browser is WebKit underneath, whatever its name, so "use
+    // Chrome" is not advice that helps there. Say what is actually missing.
+    if (isAppleMobile()) {
+      return encrypted
+        ? 'iPhone and iPad browsers cannot play an end-to-end encrypted '
+          + 'stream: WebKit offers FairPlay decryption and never the ClearKey '
+          + 'these use, in any browser on the device. A publisher on a trusted '
+          + 'LAN can send in the clear with --no-encryption, which does play '
+          + 'here; otherwise use a desktop or Android browser.'
+        : 'This iPhone is running a version of iOS too old to play a stream '
+          + 'this way. The media API it needs, ManagedMediaSource, arrived in '
+          + 'iOS 17.1.';
     }
     return 'Media Source Extensions are unavailable.';
   }
-  if (!navigator.requestMediaKeySystemAccess) {
+  if (encrypted && !globalThis.navigator?.requestMediaKeySystemAccess) {
     return 'Encrypted Media Extensions are unavailable.';
   }
   return null;
@@ -177,6 +215,9 @@ function createPlayer(root, options) {
   const state = {
     descriptor: null,
     viewerKey: null,
+    // Which flavour of MediaSource this stream is playing through, settled once
+    // `start` knows whether the stream is encrypted.
+    mediaSourceClass: null,
     epochs: new Map(),
     epochOrder: [],
     headers: [],
@@ -196,7 +237,7 @@ function createPlayer(root, options) {
     liveReconcileTimer: null,
     live: true,
     appendedMedia: 0,
-    decryptedCursorBatches: 0,
+    cursorBatches: 0,
     cursorClock: ViewerCore.createCursorClock(),
     lastRenderedCursor: undefined,
     lastRenderedBitmap: undefined,
@@ -229,11 +270,22 @@ function createPlayer(root, options) {
 
   cursorFrame = requestAnimationFrame(renderCursor);
 
+  /**
+   * Starts playback, with `viewerKeyText` or with `null` for a stream the
+   * publisher sent in the clear.
+   *
+   * Which of those it is decides almost everything below -- whether keys are
+   * derived, whether Encrypted Media Extensions are touched at all, and which
+   * MediaSource carries the video -- so it is settled here, once, rather than
+   * rediscovered at each step.
+   */
   async function start(viewerKeyText) {
     setStatus('Loading stream metadata…');
-    const problem = platformProblem();
+    const encrypted = viewerKeyText !== null && viewerKeyText !== undefined;
+    const problem = platformProblem({ encrypted });
     if (problem) throw new Error(problem);
-    state.viewerKey = base64UrlToBytes(viewerKeyText, 32);
+    state.viewerKey = encrypted ? base64UrlToBytes(viewerKeyText, 32) : null;
+    state.mediaSourceClass = mediaSourceConstructor(encrypted);
     const headers = await fetchHeaders();
     state.headers = headers;
     await loadEpochDescriptors(headers);
@@ -245,9 +297,12 @@ function createPlayer(root, options) {
     const descriptor = state.descriptor;
     if (els.streamLabel) els.streamLabel.textContent = `${streamId} · ${descriptor.width}×${descriptor.height} · ${descriptor.codec}`;
 
-    await initializeKeySystem();
-    for (const epochId of state.epochOrder) {
-      await installEpochKey(state.epochs.get(epochId));
+    ensureContentTypesSupported();
+    if (encrypted) {
+      await initializeKeySystem();
+      for (const epochId of state.epochOrder) {
+        await installEpochKey(state.epochs.get(epochId));
+      }
     }
     await initializeMediaSource(timeline);
 
@@ -256,7 +311,9 @@ function createPlayer(root, options) {
     // Live first: replaying history can take a while on a long retention
     // window, and nothing about it should delay or endanger the live cursor.
     connectLive();
-    setStatus('Live encrypted DASH playback ready.');
+    setStatus(encrypted
+      ? 'Live encrypted DASH playback ready.'
+      : 'Live DASH playback ready. This stream is not encrypted.');
     updateMetrics();
     await loadHistoricalCursors(headers);
     updateMetrics();
@@ -267,12 +324,13 @@ function createPlayer(root, options) {
     if (epochHeaders.length === 0) {
       throw streamNotReadyError();
     }
-    // An epoch this key cannot open is skipped rather than fatal. Retained
+    // An epoch this viewer cannot open is skipped rather than fatal. Retained
     // history can outlive a viewer key — rotating one leaves the relay holding
     // objects encrypted to the old key for the rest of the retention window —
     // and a viewer holding the current key must still be able to watch the
     // current stream. Failing the whole load would make a rotated key look
-    // broken until the old history aged out.
+    // broken until the old history aged out. A publisher that switched between
+    // encrypted and clear leaves the same kind of unopenable history behind.
     const failures = [];
     for (const header of epochHeaders) {
       try {
@@ -282,21 +340,47 @@ function createPlayer(root, options) {
       }
     }
     if (state.epochOrder.length === 0) {
-      throw failures[0] ?? new Error('No stream epoch could be authenticated with this key.');
+      throw failures[0] ?? new Error('No stream epoch could be opened.');
     }
     if (failures.length > 0) {
-      console.info(
-        `Skipped ${failures.length} epoch(s) this viewer key does not open.`,
-      );
+      console.info(`Skipped ${failures.length} epoch(s) this viewer cannot open.`);
     }
   }
 
+  /**
+   * Loads and opens one epoch descriptor.
+   *
+   * The order here is forced by what the descriptor is for. An epoch published
+   * without a viewer key has no key to derive an authentication tag from, so
+   * its objects carry none -- and whether to expect one is a question only the
+   * descriptor answers. So the payload is read before it is authenticated.
+   *
+   * Nothing the parse produces is trusted before that check. The JSON
+   * contributes exactly one boolean, which chooses between "verify the tag" and
+   * "there is no tag"; every other field is validated and stored only after the
+   * chosen verification has passed. A relay that flips the boolean on a stream
+   * this viewer holds a key for is caught by `requireMatchingEncryption` before
+   * even that much, and one that flips it the other way fails the tag check.
+   * The payload's own SHA-256 is checked first either way, so the parser never
+   * sees bytes that do not match the header describing them.
+   */
   async function loadEpochDescriptor(header) {
     if (state.epochs.has(header.epoch_id)) return state.epochs.get(header.epoch_id);
-    const keys = await deriveEpochKeys(state.viewerKey, streamId, header.epoch_id);
+    const payload = await fetchObject(header.sequence);
+    await verifyObjectIntegrity(header, payload);
+    const descriptor = JSON.parse(decoder.decode(payload));
+    // Absent means encrypted: the only descriptors without the field predate it.
+    const encrypted = descriptor.encrypted !== false;
+    requireMatchingEncryption(encrypted, header);
+    const keys = encrypted
+      ? await deriveEpochKeys(state.viewerKey, streamId, header.epoch_id)
+      : null;
+    await authenticateObject(header, payload, keys);
+    validateDescriptor(descriptor, header);
     const epoch = {
-      descriptor: null,
+      descriptor,
       keys,
+      encrypted,
       mediaStart: null,
       mediaEnd: null,
       offset: null,
@@ -307,19 +391,39 @@ function createPlayer(root, options) {
     };
     state.epochs.set(header.epoch_id, epoch);
     state.epochOrder.push(header.epoch_id);
-    try {
-      const payload = await fetchObject(header.sequence);
-      await verifyObject(header, payload);
-      const descriptor = JSON.parse(decoder.decode(payload));
-      validateDescriptor(descriptor, header);
-      epoch.descriptor = descriptor;
-      state.seenSequences.add(header.sequence);
-      return epoch;
-    } catch (error) {
-      state.epochs.delete(header.epoch_id);
-      state.epochOrder = state.epochOrder.filter(epochId => epochId !== header.epoch_id);
-      throw error;
+    state.seenSequences.add(header.sequence);
+    return epoch;
+  }
+
+  /**
+   * Refuses an epoch whose encryption does not match what this viewer started
+   * with.
+   *
+   * Both directions matter, and the second one is the point. Holding a viewer
+   * key and being handed an epoch published in the clear is a relay stripping
+   * the encryption from a stream -- serving whatever bytes it likes, with no
+   * tag to fail, to a viewer who believes the key is protecting them. Detecting
+   * exactly that is what the key is for, so the epoch is refused rather than
+   * played with a note. The other direction is only a viewer without the key it
+   * needs, which is worth saying plainly.
+   *
+   * Refusing is per-epoch, not per-stream: a publisher that changed modes
+   * leaves retained history of the other kind, and that history must not stop
+   * the current epoch from playing.
+   */
+  function requireMatchingEncryption(encrypted, header) {
+    if (encrypted === (state.viewerKey !== null)) return;
+    if (encrypted) {
+      throw new Error(
+        `Epoch ${header.epoch_id} is end-to-end encrypted and needs a viewing key.`,
+      );
     }
+    throw new Error(
+      `Epoch ${header.epoch_id} was published without encryption, but this `
+      + 'viewer holds a key for the stream. Refusing it: a relay that can strip '
+      + 'the encryption from a stream you hold a key for is what the key is '
+      + 'there to catch.',
+    );
   }
 
   function installInitialEpochTimeline(headers) {
@@ -398,15 +502,21 @@ function createPlayer(root, options) {
     };
   }
 
-  async function verifyObject(header, payload) {
+  /**
+   * Checks that a payload is the one its header describes.
+   *
+   * Everything an object claims about itself that needs no key: the format, the
+   * stream, the length, and the payload hash. An epoch published without a
+   * viewer key has only this, which catches a truncated or corrupted object but
+   * makes no claim about who produced it.
+   */
+  async function verifyObjectIntegrity(header, payload) {
     if (header.format_version !== FORMAT_VERSION) {
       throw new Error(`Unsupported DASH object version ${header.format_version}.`);
     }
     if (header.stream_id !== streamId) {
       throw new Error(`Object ${header.sequence} belongs to a different stream.`);
     }
-    const epoch = state.epochs.get(header.epoch_id);
-    if (!epoch) throw new Error(`Object ${header.sequence} belongs to an unknown stream epoch.`);
     if (payload.byteLength !== header.payload_len) {
       throw new Error(`Object ${header.sequence} has an invalid payload length.`);
     }
@@ -414,14 +524,32 @@ function createPlayer(root, options) {
     if (!equalBytes(digest, new Uint8Array(header.payload_sha256))) {
       throw new Error(`Object ${header.sequence} failed its SHA-256 check.`);
     }
+  }
+
+  /**
+   * Verifies the keyed claim about who produced an object.
+   *
+   * `keys` is null for an epoch published in the clear, which carries no tag to
+   * check. That is the whole of the difference between the two modes: integrity
+   * is checked either way, and only this end-to-end claim is given up.
+   */
+  async function authenticateObject(header, payload, keys) {
+    if (!keys) return;
     const authenticated = concatBytes(authenticationBytes(header), payload);
     const valid = await crypto.subtle.verify(
       'HMAC',
-      epoch.keys.authenticationKey,
+      keys.authenticationKey,
       new Uint8Array(header.authentication_tag),
       authenticated,
     );
     if (!valid) throw new Error(`Object ${header.sequence} failed authentication.`);
+  }
+
+  async function verifyObject(header, payload) {
+    await verifyObjectIntegrity(header, payload);
+    const epoch = state.epochs.get(header.epoch_id);
+    if (!epoch) throw new Error(`Object ${header.sequence} belongs to an unknown stream epoch.`);
+    await authenticateObject(header, payload, epoch.keys);
   }
 
   function validateDescriptor(descriptor, header) {
@@ -438,16 +566,29 @@ function createPlayer(root, options) {
     }
   }
 
-  async function initializeKeySystem() {
-    const contentTypes = [...new Set(state.epochOrder.map(epochId => {
-      const descriptor = state.epochs.get(epochId).descriptor;
-      return contentTypeForDescriptor(descriptor);
-    }))];
-    for (const contentType of contentTypes) {
-      if (!MediaSource.isTypeSupported(contentType)) {
+  function playableContentTypes() {
+    return [...new Set(state.epochOrder.map(
+      epochId => contentTypeForDescriptor(state.epochs.get(epochId).descriptor),
+    ))];
+  }
+
+  /**
+   * Rejects a codec the browser will not decode, before a MediaSource exists.
+   *
+   * Asked of whichever MediaSource this stream is playing through, because
+   * ManagedMediaSource answers for itself and an iPhone has no other one to
+   * ask.
+   */
+  function ensureContentTypesSupported() {
+    for (const contentType of playableContentTypes()) {
+      if (!state.mediaSourceClass.isTypeSupported(contentType)) {
         throw new Error(`This browser cannot play ${contentType}.`);
       }
     }
+  }
+
+  async function initializeKeySystem() {
+    const contentTypes = playableContentTypes();
     const capabilities = contentTypes.map(contentType => ({
       contentType,
       robustness: '',
@@ -484,6 +625,9 @@ function createPlayer(root, options) {
   }
 
   async function installEpochKey(epoch) {
+    // An epoch published in the clear has no key to install, and on the
+    // platforms that mode exists for there is no key system to install it into.
+    if (!epoch.keys) return;
     const epochId = epoch.descriptor.epoch_id;
     if (state.keyEpochs.has(epochId)) return;
     if (!state.mediaKeys) throw new Error('The Clear Key system is not initialized.');
@@ -520,10 +664,27 @@ function createPlayer(root, options) {
   }
 
   async function initializeMediaSource(timeline) {
-    const mediaSource = new MediaSource();
+    const mediaSource = new state.mediaSourceClass();
     state.mediaSource = mediaSource;
-    objectUrl = URL.createObjectURL(mediaSource);
-    els.video.src = objectUrl;
+    if (state.mediaSourceClass === globalThis.ManagedMediaSource) {
+      // ManagedMediaSource attaches through srcObject, not an object URL, and
+      // refuses an element that could hand playback to an AirPlay receiver.
+      //
+      // It also differs from an ordinary MediaSource in when it opens: it is
+      // managed, so it stays closed until the element actually wants data
+      // rather than opening as soon as something is attached to it. Nothing
+      // below asks for data, so waiting for `sourceopen` on a paused element
+      // waits forever. Starting playback is what makes the browser ask. The
+      // element is muted and playsinline, so this is allowed without a gesture;
+      // if a browser blocks it anyway the Live button is the way back, exactly
+      // as it is for the ordinary path.
+      els.video.disableRemotePlayback = true;
+      els.video.srcObject = mediaSource;
+      els.video.play().catch(() => {});
+    } else {
+      objectUrl = URL.createObjectURL(mediaSource);
+      els.video.src = objectUrl;
+    }
     await once(mediaSource, 'sourceopen');
     const firstEpoch = state.epochs.get(timeline[0].epoch_id);
     const contentType = contentTypeForDescriptor(firstEpoch.descriptor);
@@ -651,14 +812,11 @@ function createPlayer(root, options) {
     }
     const payload = await fetchObject(header.sequence);
     await verifyObject(header, payload);
-    const encrypted = ViewerCore.parseEncryptedCursorPayload(payload);
-    const plaintext = await crypto.subtle.decrypt({
-      name: 'AES-GCM',
-      iv: encrypted.nonce,
-      additionalData: cursorAad(header, epoch.descriptor),
-      tagLength: 128,
-    }, epoch.keys.cursorKey, encrypted.ciphertext);
-    const batch = ViewerCore.parseCursorBatch(new Uint8Array(plaintext), {
+    // An epoch with no key carries the encoded batch directly, with none of the
+    // GCE1 envelope around it. The batch inside is the same either way, and so
+    // is the validation it goes through.
+    const encoded = epoch.keys ? await decryptCursorPayload(header, epoch, payload) : payload;
+    const batch = ViewerCore.parseCursorBatch(encoded, {
       sourceWidth: epoch.descriptor.width,
       sourceHeight: epoch.descriptor.height,
       startTimestamp: header.timestamp,
@@ -673,6 +831,17 @@ function createPlayer(root, options) {
     return batch;
   }
 
+  async function decryptCursorPayload(header, epoch, payload) {
+    const encrypted = ViewerCore.parseEncryptedCursorPayload(payload);
+    const plaintext = await crypto.subtle.decrypt({
+      name: 'AES-GCM',
+      iv: encrypted.nonce,
+      additionalData: cursorAad(header, epoch.descriptor),
+      tagLength: 128,
+    }, epoch.keys.cursorKey, encrypted.ciphertext);
+    return new Uint8Array(plaintext);
+  }
+
   function commitCursorObject(header, batch) {
     if (state.seenSequences.has(header.sequence)) return;
     for (const event of batch.events) {
@@ -680,7 +849,7 @@ function createPlayer(root, options) {
     }
     state.cursorEvents = ViewerCore.mergeSortedCursorEvents(state.cursorEvents, batch.events);
     state.seenSequences.add(header.sequence);
-    state.decryptedCursorBatches += 1;
+    state.cursorBatches += 1;
     updateMetrics();
   }
 
@@ -1101,6 +1270,7 @@ function createPlayer(root, options) {
         cursorEvents: state.cursorEvents.length,
         epochs: state.epochOrder.length,
         live: state.live,
+        encrypted: state.viewerKey !== null,
         // Cursor selection state, which is otherwise invisible from outside
         // and is where overlay problems actually live.
         cursor: {
@@ -1131,6 +1301,10 @@ function createPlayer(root, options) {
       if (els.video) {
         els.video.pause();
         els.video.removeAttribute('src');
+        // The ManagedMediaSource path attaches here instead of through src, so
+        // clearing only the attribute would leave the source attached to a
+        // tile that is going away.
+        els.video.srcObject = null;
         els.video.load();
       }
       if (objectUrl) URL.revokeObjectURL(objectUrl);
@@ -1138,6 +1312,53 @@ function createPlayer(root, options) {
       state.cursorEvents = [];
     },
   };
+}
+
+/**
+ * Fetches the newest epoch descriptor of `streamId`, or null if it has none.
+ *
+ * The two questions a page asks before it builds a tile -- is this stream
+ * encrypted, and does this key open it -- are both answered by the same
+ * object, so they share the two fetches it takes to get it.
+ */
+async function latestEpochObject(streamId) {
+  const response = await fetch(`/api/dash/streams/${streamId}/objects`, { cache: 'no-store' });
+  if (!response.ok) return null;
+  const headers = await response.json();
+  const header = headers
+    .filter(candidate => candidate.kind === 'Epoch')
+    .sort((left, right) => right.sequence - left.sequence)[0];
+  if (!header) return null;
+  const payloadResponse = await fetch(
+    `/api/dash/streams/${streamId}/objects/${header.sequence}`,
+  );
+  if (!payloadResponse.ok) return null;
+  return { header, payload: new Uint8Array(await payloadResponse.arrayBuffer()) };
+}
+
+/**
+ * Whether `streamId` is published encrypted: true, false, or null when nothing
+ * has been published yet to tell from.
+ *
+ * Read from the epoch descriptor rather than from the stream listing, because
+ * the descriptor is what the publisher wrote and the listing is what the relay
+ * says. A relay that answers this dishonestly gains nothing: claiming a stream
+ * is in the clear only makes the page skip a key prompt, and the player then
+ * refuses every encrypted epoch and says so, while claiming a clear stream is
+ * encrypted only produces a key prompt that nothing satisfies. The player, not
+ * this, is where the decision is enforced.
+ */
+async function describeStream(streamId) {
+  try {
+    const object = await latestEpochObject(streamId);
+    if (!object) return { encrypted: null };
+    const descriptor = JSON.parse(new TextDecoder().decode(object.payload));
+    // Absent means encrypted: the only descriptors without the field predate it.
+    return { encrypted: descriptor.encrypted !== false };
+  } catch {
+    // A stream whose descriptor cannot be read is not one to guess about.
+    return { encrypted: null };
+  }
 }
 
 /**
@@ -1150,21 +1371,20 @@ function createPlayer(root, options) {
  * epoch descriptor's HMAC. That costs a single small fetch.
  */
 async function verifyViewerKey(streamId, viewerKey) {
-  const response = await fetch(`/api/dash/streams/${streamId}/objects`, { cache: 'no-store' });
-  if (!response.ok) return false;
-  const headers = await response.json();
-  const epoch = headers
-    .filter(header => header.kind === 'Epoch')
-    .sort((left, right) => right.sequence - left.sequence)[0];
+  const object = await latestEpochObject(streamId);
   // A stream that has not published an epoch yet cannot confirm or deny the
   // key. Treat that as "no reason to reject" rather than as a wrong key.
-  if (!epoch) return true;
+  if (!object) return true;
+  const { header: epoch, payload } = object;
 
-  const payloadResponse = await fetch(
-    `/api/dash/streams/${streamId}/objects/${epoch.sequence}`,
-  );
-  if (!payloadResponse.ok) return false;
-  const payload = new Uint8Array(await payloadResponse.arrayBuffer());
+  // A stream published in the clear is not opened by any key, however good the
+  // key is. Saying so here is what keeps a viewer who holds a key for some
+  // other publisher from claiming this stream and then refusing to play it.
+  try {
+    if (JSON.parse(new TextDecoder().decode(payload)).encrypted === false) return false;
+  } catch {
+    // Not readable as a descriptor; let the authentication below answer.
+  }
 
   const saltInput = concatBytes(
     new TextEncoder().encode('glacialcast epoch key salt'),
@@ -1196,7 +1416,12 @@ async function verifyViewerKey(streamId, viewerKey) {
 }
 
 if (typeof globalThis !== 'undefined') {
-  globalThis.GlacialCastPlayer = { createPlayer, verifyViewerKey, platformProblem };
+  globalThis.GlacialCastPlayer = {
+    createPlayer,
+    verifyViewerKey,
+    describeStream,
+    platformProblem,
+  };
 }
 
 function once(target, event) {

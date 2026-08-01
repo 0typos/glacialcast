@@ -35,6 +35,28 @@ async function streamSalt() {
   }
 }
 
+/**
+ * Starts straight away when the stream needs no key.
+ *
+ * A publisher on a trusted LAN can send in the clear, and asking such a stream
+ * for a viewing key would be asking for something that does not exist. The
+ * player is the authority on this -- it refuses an epoch whose encryption does
+ * not match what it started with -- so an unhelpful answer here costs a visible
+ * failure, not a silent one.
+ */
+describeOpenStream();
+
+async function describeOpenStream() {
+  try {
+    const { encrypted } = await Player.describeStream(streamId);
+    if (encrypted !== false) return;
+    unlockForm.hidden = true;
+    await player.start(null);
+  } catch {
+    // The unlock form is still there; the player renders its own failures.
+  }
+}
+
 unlockForm.addEventListener('submit', async event => {
   event.preventDefault();
   // Accepts either a key phrase or a raw viewer key, so a link shared with a
