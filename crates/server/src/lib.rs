@@ -941,19 +941,21 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
         warn!(
             control = %control_addr,
             ingest = %ingest_addr,
-            "serving a trusted LAN; any host that can reach the ingest port may publish a stream, and stream contents stay end-to-end encrypted"
+            "serving a trusted LAN; any host that can reach the ingest port may publish a stream, and a publisher may send in the clear with --no-encryption"
         );
         // Plaintext past loopback is now a choice rather than the only option,
         // and it is one that stops browsers playing: a plain `http://` origin
         // that is not loopback is not a secure context, so Web Crypto and
-        // Encrypted Media Extensions are both withheld.
+        // Encrypted Media Extensions are both withheld. Publishing in the clear
+        // does not exempt a viewer from this. Every object carries a SHA-256 the
+        // viewer checks, and `crypto.subtle` is withheld along with the rest.
         if !serve_tls && !control_addr.ip().is_loopback() {
             warn!(
                 port = control_addr.port(),
                 "browsers reaching this relay at a plaintext address other than loopback cannot \
-                 play: encrypted playback needs a secure context. Publishing works; for viewing, \
-                 drop --no-tls to serve HTTPS here, or forward this port over SSH to the viewer's \
-                 own loopback"
+                 play: playback needs a secure context, whether or not the stream is encrypted. \
+                 Publishing works; for viewing, drop --no-tls to serve HTTPS here, or forward this \
+                 port over SSH to the viewer's own loopback"
             );
         }
     }
