@@ -23,7 +23,10 @@ standard_checks() {
     -D warnings \
     -D clippy::undocumented_unsafe_blocks
   run env "RUSTDOCFLAGS=-D warnings -D missing-docs" cargo doc --workspace --no-deps
-  run cargo deny -L error check
+  # Without `-L error` the warn-level diagnostics are printed too. Duplicate
+  # versions are only a warning here, and silently dropping them meant the gate
+  # reported "ok" while the graph grew forks nobody saw.
+  run cargo deny check
   run bash -n scripts/*.sh packaging/*.sh
   run node scripts/test-viewer-core.mjs
   run node scripts/test-viewer-key.mjs

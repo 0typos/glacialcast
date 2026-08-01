@@ -7,6 +7,13 @@ all-features = true
 
 [advisories]
 ignore = []
+# Both pass today; stated so they cannot start passing by default change.
+yanked = "deny"
+unmaintained = "all"
+# NOTE: `cros-libva` is patched to a path in the workspace manifest, so it has
+# no registry source and this check cannot see it. See
+# vendor/cros-libva/GLACIALCAST-PATCHES.md -- it is checked by hand against
+# rustsec.org during dependency review.
 
 [licenses]
 allow = [
