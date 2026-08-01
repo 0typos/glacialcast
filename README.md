@@ -625,6 +625,14 @@ it: giving up access is not the same as changing your mind about what to call
 your kitchen camera, and re-entering the key restores the arrangement rather
 than starting over.
 
+What is stored is the grid itself — four slots, each naming a stream or empty —
+rather than a tile number written on each stream. The two can say the same
+thing, but only the grid is incapable of saying that two streams are in one
+tile, which is a state nothing could display and the viewer used to repair
+silently on every load. An arrangement saved by an earlier version is migrated
+on first read; if it did contain that conflict, the first stream keeps the tile
+and the other is parked.
+
 The panel of streams is only needed when changing what is on screen, so it gets
 out of the way easily: the **Streams** button in the header collapses it, `[`
 does the same from the keyboard while watching, and the choice is remembered

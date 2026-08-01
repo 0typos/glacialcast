@@ -245,6 +245,54 @@ try {
     );
   }
 
+  // A viewer upgrading from the version that stored a tile number on each
+  // stream must keep their arrangement, and must arrive at a grid that cannot
+  // hold the conflict the old shape allowed. The fixture below is a v1 store
+  // with two streams claiming tile 1 -- exactly what the old loader had to
+  // repair on every read.
+  const [alpha, beta, gamma] = initial.map(tile => tile.streamId);
+  await page.evaluate(([one, two, three]) => {
+    globalThis.localStorage.removeItem('glacialcast.streams.v2');
+    globalThis.localStorage.setItem('glacialcast.streams.v1', JSON.stringify({
+      version: 1,
+      streams: {
+        [one]: { slot: 1, hidden: false, name: 'Upgraded' },
+        [two]: { slot: 1, hidden: false, name: '' },
+        [three]: { slot: 2, hidden: true, name: '' },
+      },
+    }));
+  }, [alpha, beta, gamma]);
+  await reload();
+  await untilOnScreen(alpha);
+
+  const migrated = await page.evaluate(() => ({
+    grid: globalThis.GlacialCastWatch.grid(),
+    placements: globalThis.GlacialCastWatch.placements(),
+    legacy: globalThis.localStorage.getItem('glacialcast.streams.v1'),
+    current: JSON.parse(globalThis.localStorage.getItem('glacialcast.streams.v2') ?? 'null'),
+  }));
+  check(
+    migrated.grid[0] === alpha,
+    `the contested tile went to the first record (${JSON.stringify(migrated.grid)})`,
+  );
+  check(
+    migrated.placements[beta]?.slot === null,
+    'the stream that lost the contest was parked, not dropped',
+  );
+  check(
+    migrated.placements[gamma]?.hidden === true && migrated.grid.includes(gamma) === false,
+    'a hidden stream came through hidden and off the grid',
+  );
+  check(
+    await page.evaluate(streamId => globalThis.GlacialCastWatch.titleOf(streamId), alpha) === 'Upgraded',
+    'the name carried across the upgrade',
+  );
+  check(migrated.legacy === null, 'the v1 store was removed once migrated');
+  check(
+    migrated.current?.version === 2 && Array.isArray(migrated.current.grid),
+    `the arrangement was rewritten in the new shape (${JSON.stringify(migrated.current)})`,
+  );
+
   check(errors.length === 0, `no page errors (${JSON.stringify(errors)})`);
 } finally {
   await browser.close();
