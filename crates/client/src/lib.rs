@@ -190,6 +190,13 @@ struct Args {
     max_frame_width: u32,
     #[arg(long, default_value_t = 1440)]
     max_frame_height: u32,
+    /// Captured updates per second, between 0.5 and 15.
+    ///
+    /// Below about 1.25 the frame period itself reaches the roughly one-second
+    /// sample duration Firefox will not decode, so such a stream plays only in
+    /// Chromium-family browsers. The publisher warns at startup rather than
+    /// refusing, because low rates remain valid for capture validation and for
+    /// deployments that never involve Firefox.
     #[arg(long, value_parser = parse_update_rate, default_value = "5")]
     fps: f64,
     /// Longest time an unchanged picture is held before being re-sent, in
@@ -579,6 +586,20 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
         });
     }
 
+    if update_rate_outlasts_firefox(args.fps) {
+        // The idle heartbeat bounds coalesced samples, but nothing can shorten
+        // the frame period itself: at this rate every sample approaches or
+        // exceeds the roughly one-second duration Firefox refuses to decode
+        // (measured: 0.95s plays, 1.0s stalls). Warn rather than refuse --
+        // capture validation and Chromium-only deployments legitimately run
+        // this slow -- but say it here, at startup, not as a stalled tile.
+        warn!(
+            fps = args.fps,
+            "at this update rate every media sample lasts close to a second or more, \
+             which Firefox will not decode; viewers there will see a stalled tile. \
+             Use --fps 1.25 or higher if Firefox playback matters"
+        );
+    }
     let targets = resolve_publish_targets(&args, &identity).await?;
     info!(
         streams = targets.len(),
@@ -2560,6 +2581,15 @@ fn load_client_config(path: &PathBuf) -> Result<ClientConfig> {
     file.read_to_string(&mut raw)
         .with_context(|| format!("reading client config {}", path.display()))?;
     toml::from_str(&raw).with_context(|| format!("parsing client config {}", path.display()))
+}
+
+/// Whether the frame period alone reaches the sample duration Firefox refuses.
+///
+/// The cliff sits at roughly one second (0.95s plays, 1.0s stalls, and the
+/// boundary drifts between runs), so this warns from 0.8s nominal -- capture
+/// jitter stretches real inter-frame gaps past the nominal period.
+fn update_rate_outlasts_firefox(fps: f64) -> bool {
+    fps.recip() > 0.8
 }
 
 fn parse_update_rate(value: &str) -> std::result::Result<f64, String> {
@@ -7539,6 +7569,13 @@ mod tests {
     #[test]
     fn fractional_update_rate_accepts_half_to_fifteen() {
         assert_eq!(parse_update_rate("0.5").unwrap(), 0.5);
+        // Low rates stay allowed for capture validation, but the frame period
+        // they imply is one Firefox cannot decode, and the warning keys off
+        // this predicate.
+        assert!(update_rate_outlasts_firefox(0.5));
+        assert!(update_rate_outlasts_firefox(1.0));
+        assert!(!update_rate_outlasts_firefox(1.3));
+        assert!(!update_rate_outlasts_firefox(5.0));
         assert_eq!(parse_update_rate("15").unwrap(), 15.0);
         assert!(parse_update_rate("0.25").is_err());
         assert!(parse_update_rate("16").is_err());
