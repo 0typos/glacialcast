@@ -393,6 +393,34 @@ pub fn encrypt_cursor_batch(
     Ok(EncryptedCursorBatch { nonce, ciphertext })
 }
 
+/// Encodes and validates a cursor batch without encrypting it.
+///
+/// For an epoch published without a viewer key, where there is no cursor key to
+/// encrypt with. The same validation runs, so a batch that would be rejected
+/// encrypted is rejected here too; only the sealing is missing.
+///
+/// # Errors
+///
+/// Returns an error when the batch or its context fails validation.
+pub fn encode_plain_cursor_batch(context: CursorContext, batch: &CursorBatch) -> Result<Vec<u8>> {
+    validate_cursor_batch(batch)?;
+    validate_cursor_context(batch, context)?;
+    encode_cursor_batch(batch)
+}
+
+/// Decodes and validates a cursor batch that was published unencrypted.
+///
+/// # Errors
+///
+/// Returns an error when the bytes are malformed or fail validation against
+/// `context`.
+pub fn decode_plain_cursor_batch(context: CursorContext, bytes: &[u8]) -> Result<CursorBatch> {
+    let batch = decode_cursor_batch(bytes)?;
+    validate_cursor_batch(&batch)?;
+    validate_cursor_context(&batch, context)?;
+    Ok(batch)
+}
+
 /// Authenticates, decrypts, decodes, and validates a cursor batch.
 pub fn decrypt_cursor_batch(
     keys: &EpochKeys,

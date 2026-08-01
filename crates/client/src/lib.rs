@@ -20,7 +20,7 @@ use glacialcast_dash::{
     CursorBatch as DashCursorBatch, CursorBitmap as DashCursorBitmap,
     CursorContext as DashCursorContext, CursorEvent as DashCursorEvent, DASH_FORMAT_VERSION,
     EpochDescriptor, EpochKeys, FragmentInput, MEDIA_TIMESCALE, build_fragment, build_init_segment,
-    encrypt_cursor_batch,
+    encode_plain_cursor_batch, encrypt_cursor_batch,
 };
 use glacialcast_protocol::{
     CaptureSource, ClientMessage, DashObject, DashObjectKind, NewDashObject, NoiseSocket,
@@ -1174,7 +1174,7 @@ async fn run_dash_connection(
         resend,
         next_dash_object(
             &mut sequence,
-            &keys,
+            Some(&keys),
             DashObjectSpec {
                 stream_id,
                 epoch_id,
@@ -1197,7 +1197,7 @@ async fn run_dash_connection(
         resend,
         next_dash_object(
             &mut sequence,
-            &keys,
+            Some(&keys),
             DashObjectSpec {
                 stream_id,
                 epoch_id,
@@ -1216,7 +1216,7 @@ async fn run_dash_connection(
     .await?;
     let first_media = build_dash_media_object(
         &mut sequence,
-        &keys,
+        Some(&keys),
         stream_id,
         epoch_id,
         0,
@@ -1348,7 +1348,7 @@ async fn run_dash_connection(
                         &mut socket,
                         resend,
                         &mut sequence,
-                        &keys,
+                        Some(&keys),
                         stream_id,
                         epoch_id,
                         &mut media_index,
@@ -1362,7 +1362,7 @@ async fn run_dash_connection(
                     &mut socket,
                     resend,
                     &mut sequence,
-                    &keys,
+                    Some(&keys),
                     stream_id,
                     epoch_id,
                     width,
@@ -1400,7 +1400,7 @@ async fn run_dash_connection(
                                 &mut socket,
                                 resend,
                                 &mut sequence,
-                                &keys,
+                                Some(&keys),
                                 stream_id,
                                 epoch_id,
                                 width,
@@ -1438,7 +1438,7 @@ async fn run_dash_connection(
                         &mut socket,
                         resend,
                         &mut sequence,
-                        &keys,
+                        Some(&keys),
                         stream_id,
                         epoch_id,
                         &mut media_index,
@@ -1459,7 +1459,7 @@ async fn run_dash_connection(
                         &mut socket,
                         resend,
                         &mut sequence,
-                        &keys,
+                        Some(&keys),
                         stream_id,
                         epoch_id,
                         &mut media_index,
@@ -1502,7 +1502,7 @@ async fn run_dash_connection(
                     &mut socket,
                     resend,
                     &mut sequence,
-                    &keys,
+                    Some(&keys),
                     stream_id,
                     epoch_id,
                     width,
@@ -1549,7 +1549,7 @@ async fn run_dash_connection(
                         &mut socket,
                         resend,
                         &mut sequence,
-                        &keys,
+                        Some(&keys),
                         stream_id,
                         epoch_id,
                         width,
@@ -1674,29 +1674,34 @@ fn frame_changed(
     }
 }
 
+/// Builds the next object in sequence, authenticated when the epoch has a key.
+///
+/// `keys` is `None` for an epoch published without encryption: there is no
+/// viewer key, so there is nothing to authenticate with. The payload hash is
+/// still written and still checked on the way out.
 fn next_dash_object(
     sequence: &mut u64,
-    keys: &EpochKeys,
+    keys: Option<&EpochKeys>,
     spec: DashObjectSpec<'_>,
 ) -> Result<DashObject> {
     *sequence = sequence.checked_add(1).context("DASH sequence exhausted")?;
-    DashObject::authenticated(
-        NewDashObject {
-            stream_id: spec.stream_id,
-            epoch_id: spec.epoch_id,
-            kind: spec.kind,
-            sequence: *sequence,
-            segment_number: spec.segment_number,
-            chunk_index: spec.chunk_index,
-            timestamp: spec.timestamp,
-            duration: spec.duration,
-            random_access: spec.random_access,
-            mime: spec.mime,
-            payload: spec.payload,
-        },
-        keys,
-    )
-    .context("authenticating DASH object")
+    let input = NewDashObject {
+        stream_id: spec.stream_id,
+        epoch_id: spec.epoch_id,
+        kind: spec.kind,
+        sequence: *sequence,
+        segment_number: spec.segment_number,
+        chunk_index: spec.chunk_index,
+        timestamp: spec.timestamp,
+        duration: spec.duration,
+        random_access: spec.random_access,
+        mime: spec.mime,
+        payload: spec.payload,
+    };
+    match keys {
+        Some(keys) => DashObject::authenticated(input, keys).context("authenticating DASH object"),
+        None => DashObject::unauthenticated(input).context("building unauthenticated DASH object"),
+    }
 }
 
 /// Runs the H.264 encoder on a thread of its own.
@@ -1841,7 +1846,7 @@ async fn publish_encoded_media(
     socket: &mut NoiseSocket<TcpStream>,
     resend: &mut DashResendBuffer,
     sequence: &mut u64,
-    keys: &EpochKeys,
+    keys: Option<&EpochKeys>,
     stream_id: Uuid,
     epoch_id: Uuid,
     media_index: &mut u64,
@@ -1881,7 +1886,7 @@ async fn publish_encoded_media(
 #[allow(clippy::too_many_arguments)]
 fn build_dash_media_object(
     sequence: &mut u64,
-    keys: &EpochKeys,
+    keys: Option<&EpochKeys>,
     stream_id: Uuid,
     epoch_id: Uuid,
     media_index: u64,
@@ -1893,7 +1898,7 @@ fn build_dash_media_object(
     let mut iv = [0u8; 16];
     OsRng.fill_bytes(&mut iv);
     let fragment = build_fragment(
-        Some(&keys.cenc_key),
+        keys.map(|keys| &keys.cenc_key),
         FragmentInput {
             sequence: u32::try_from(media_index.saturating_add(1))
                 .context("DASH epoch has too many media fragments")?,
@@ -2066,7 +2071,7 @@ async fn flush_dash_cursor_batch(
     socket: &mut NoiseSocket<TcpStream>,
     resend: &mut DashResendBuffer,
     sequence: &mut u64,
-    keys: &EpochKeys,
+    keys: Option<&EpochKeys>,
     stream_id: Uuid,
     epoch_id: Uuid,
     width: u32,
@@ -2088,19 +2093,23 @@ async fn flush_dash_cursor_batch(
         source_height: height,
         events: std::mem::take(events),
     };
-    let encrypted = encrypt_cursor_batch(
-        keys,
-        DashCursorContext {
-            stream_id,
-            epoch_id,
-            sequence: next_sequence,
-            start_timestamp,
-            source_width: width,
-            source_height: height,
-        },
-        &batch,
-    )
-    .context("encrypting cursor batch")?;
+    let context = DashCursorContext {
+        stream_id,
+        epoch_id,
+        sequence: next_sequence,
+        start_timestamp,
+        source_width: width,
+        source_height: height,
+    };
+    // Same validation either way; an epoch with no key simply has nothing to
+    // seal the batch with, so it carries the encoded form directly.
+    let payload = match keys {
+        Some(keys) => encrypt_cursor_batch(keys, context, &batch)
+            .context("encrypting cursor batch")?
+            .to_bytes()
+            .context("serializing encrypted cursor batch")?,
+        None => encode_plain_cursor_batch(context, &batch).context("encoding cursor batch")?,
+    };
     let segment_duration = u64::from(frame_duration).saturating_mul(u64::from(segment_frames));
     let object = next_dash_object(
         sequence,
@@ -2115,9 +2124,7 @@ async fn flush_dash_cursor_batch(
             duration: end_timestamp.saturating_sub(start_timestamp).max(1),
             random_access: true,
             mime: "application/vnd.glacialcast.cursor",
-            payload: encrypted
-                .to_bytes()
-                .context("serializing encrypted cursor batch")?,
+            payload,
         },
     )?;
     send_new_dash_object(socket, resend, object).await
