@@ -375,6 +375,46 @@ impl DashObject {
         Ok(object)
     }
 
+    /// Builds an object with no authentication tag, for an epoch with no key.
+    ///
+    /// An unencrypted epoch has no viewer key, so it has nothing to derive an
+    /// authentication key from and the tag is left zero. The payload hash is
+    /// still computed and still checked by [`Self::validate`], so accidental
+    /// corruption is caught; what is given up is the keyed claim about who
+    /// produced the bytes. Integrity for such a stream rests on Noise for
+    /// ingest and TLS to the browser instead of end to end.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the payload is too large or the object fails
+    /// [`Self::validate`].
+    pub fn unauthenticated(input: NewDashObject<'_>) -> Result<Self> {
+        let payload_len =
+            u32::try_from(input.payload.len()).map_err(|_| ProtocolError::DashPayloadTooLarge)?;
+        let payload_sha256: [u8; 32] = Sha256::digest(&input.payload).into();
+        let object = Self {
+            header: DashObjectHeader {
+                format_version: DASH_FORMAT_VERSION,
+                stream_id: input.stream_id,
+                epoch_id: input.epoch_id,
+                kind: input.kind,
+                sequence: input.sequence,
+                segment_number: input.segment_number,
+                chunk_index: input.chunk_index,
+                timestamp: input.timestamp,
+                duration: input.duration,
+                random_access: input.random_access,
+                mime: input.mime.to_string(),
+                payload_len,
+                payload_sha256,
+                authentication_tag: [0; 32],
+            },
+            payload: input.payload,
+        };
+        object.validate()?;
+        Ok(object)
+    }
+
     /// Validates public metadata, kind-specific invariants, length, and hash.
     ///
     /// This does not verify [`DashObjectHeader::authentication_tag`]; call
@@ -1081,6 +1121,38 @@ mod tests {
         )
         .unwrap();
         (object, keys)
+    }
+
+    #[test]
+    fn an_unauthenticated_object_still_catches_corruption() {
+        // No viewer key means no keyed claim about who produced the bytes, but
+        // the payload hash is still written and still checked -- so accidental
+        // corruption is caught even where tampering is not.
+        let stream_id = Uuid::new_v4();
+        let epoch_id = Uuid::new_v4();
+        let build = |payload: Vec<u8>| NewDashObject {
+            stream_id,
+            epoch_id,
+            kind: DashObjectKind::Epoch,
+            sequence: 1,
+            segment_number: 0,
+            chunk_index: 0,
+            timestamp: 0,
+            duration: 0,
+            random_access: true,
+            mime: "application/vnd.glacialcast.epoch+json",
+            payload,
+        };
+        let object = DashObject::unauthenticated(build(b"{}".to_vec())).unwrap();
+        assert_eq!(object.header.authentication_tag, [0; 32]);
+        assert!(object.validate().is_ok());
+
+        let mut corrupted = object.clone();
+        corrupted.payload = b"{ }".to_vec();
+        assert!(
+            corrupted.validate().is_err(),
+            "a changed payload must fail the hash check"
+        );
     }
 
     #[test]
