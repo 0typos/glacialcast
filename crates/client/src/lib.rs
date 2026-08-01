@@ -3747,13 +3747,20 @@ fn pipewire_cursor_bitmap(
     if meta.data.is_null()
         || bitmap_offset < cursor_meta_size
         || bitmap_offset.checked_add(bitmap_meta_size)? > meta_size
+        // The offset is written by the producing compositor, so it is no more
+        // trusted than the sizes and strides checked around it. A reference
+        // must be aligned as well as in bounds, and every other field here is
+        // already treated as hostile; this one was not.
+        || !bitmap_offset.is_multiple_of(std::mem::align_of::<spa::sys::spa_meta_bitmap>())
     {
         return None;
     }
 
     // SAFETY: `meta.data` is callback-owned PipeWire storage of `meta_size`
-    // bytes. The bitmap header and every strided pixel row are checked to lie
-    // within that allocation before a reference or slice is formed.
+    // bytes, and PipeWire aligns it. The bitmap header and every strided pixel
+    // row are checked to lie within that allocation, and `bitmap_offset` is
+    // checked to be a multiple of the header's alignment, before a reference or
+    // slice is formed.
     unsafe {
         let meta_base = meta.data.cast::<u8>();
         let bitmap = &*(meta_base
