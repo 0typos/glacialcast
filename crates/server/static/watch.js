@@ -242,6 +242,10 @@ function loadPlacements() {
       const stored = JSON.parse(raw);
       if (stored?.version !== PLACEMENT_STORE_VERSION) return;
       adoptPlacements(stored.grid, stored.streams);
+      // Once this key exists it is the only one read, so anything left under
+      // the old one is unreachable. Removing it here rather than only on the
+      // migration path stops it sitting in storage forever.
+      globalThis.localStorage.removeItem(LEGACY_PLACEMENT_STORE);
       return;
     }
     const legacy = globalThis.localStorage.getItem(LEGACY_PLACEMENT_STORE);
@@ -249,8 +253,12 @@ function loadPlacements() {
     const stored = JSON.parse(legacy);
     if (stored?.version !== 1) return;
     adoptPlacements(...gridFromSlots(stored.streams));
-    savePlacements();
-    globalThis.localStorage.removeItem(LEGACY_PLACEMENT_STORE);
+    // Only once the migrated arrangement is actually on disk. Storage can
+    // refuse a write -- over quota, or private browsing -- and deleting the
+    // original on the strength of a write that did not happen would lose the
+    // viewer's tiles, hidden flags, and names outright. A failed write used to
+    // be harmless: the store stayed put and was read again next time.
+    if (savePlacements()) globalThis.localStorage.removeItem(LEGACY_PLACEMENT_STORE);
   } catch {
     // A corrupt or unavailable store just means arranging again.
   }
@@ -302,6 +310,13 @@ function adoptPlacements(grid, streams) {
     // dropped rather than duplicated -- and a hidden stream holds none.
     if (typeof streamId !== 'string') continue;
     if (state.grid.includes(streamId)) continue;
+    // A tile naming a stream with no record of its own is not a placement this
+    // page wrote. Taking it anyway put a stream on the grid that
+    // `placeNewStreams` still considered new, so the relay announcing it handed
+    // the same stream a second tile -- the very state the grid exists to make
+    // unrepresentable. It is left off; the stream is placed normally when it
+    // arrives.
+    if (!state.placements.has(streamId)) continue;
     if (placementOf(streamId).hidden) continue;
     state.grid[index] = streamId;
   }
@@ -320,9 +335,12 @@ function savePlacements() {
       grid: state.grid,
       streams: Object.fromEntries(state.placements),
     }));
+    return true;
   } catch {
     // Without storage the arrangement still works for this page; it just has to
-    // be made again next time.
+    // be made again next time. Reported rather than swallowed, because the
+    // migration deletes the old store on the strength of this.
+    return false;
   }
 }
 
@@ -349,18 +367,6 @@ function updatePlacement(streamId, changes) {
 function slotOf(streamId) {
   const index = state.grid.indexOf(streamId);
   return index < 0 ? null : index + 1;
-}
-
-/**
- * The stream holding a tile number, whether or not it is unlocked right now.
- *
- * Deliberately not filtered by which streams have keys. A remembered stream
- * that is momentarily locked -- after "Forget keys", before a key is re-entered
- * -- still owns its tile, and treating that tile as free would hand it to a
- * second stream.
- */
-function streamInSlot(slot) {
-  return state.grid[slot - 1] ?? null;
 }
 
 function firstFreeSlot() {
