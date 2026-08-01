@@ -950,6 +950,22 @@ impl FixedWindowLimiter {
         })
     }
 
+    /// Whether `key` still has budget, without spending any.
+    ///
+    /// For a caller that must reject before doing the work but has not yet
+    /// decided whether the attempt counts -- a bearer credential is charged
+    /// only when it turns out to be wrong, so a legitimate client running at
+    /// any rate is never limited by it.
+    pub fn peek(&self, key: impl Into<String>) -> bool {
+        let now = Instant::now();
+        let Ok(state) = self.inner.lock() else {
+            return false;
+        };
+        state.entries.get(&key.into()).is_none_or(|entry| {
+            now.duration_since(entry.started) >= self.window || entry.count < self.limit
+        })
+    }
+
     pub fn check(&self, key: impl Into<String>) -> bool {
         let now = Instant::now();
         let Ok(mut state) = self.inner.lock() else {

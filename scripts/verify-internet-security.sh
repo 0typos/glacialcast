@@ -463,4 +463,29 @@ if target/debug/glacialcast-server \
 fi
 grep -Fq "refusing a non-loopback HTTP listener" "${work_dir}/public-http.log"
 
+# A wrong bearer credential must face the same limiter as a wrong login.
+#
+# Every route other than /api/auth/login reaches request_identity, which
+# returns early on an Authorization header, so a guesser who used a bearer
+# token instead of the login form met no limiter, no counter, and no delay --
+# orders of magnitude more attempts per minute than the login path allows, and
+# invisible to the failure metric operators are told to alert on.
+bearer_codes=""
+for attempt in $(seq 1 6); do
+  bearer_codes="${bearer_codes} $(
+    curl -s -o /dev/null -w '%{http_code}' \
+      -H "Authorization: Bearer wrong-bearer-guess-${attempt}" \
+      "${local_origin}/api/streams" || true
+  )"
+done
+if ! grep -q "429" <<<"${bearer_codes}"; then
+  echo "a wrong bearer credential was never rate limited: ${bearer_codes}" >&2
+  exit 1
+fi
+if ! grep -q "401" <<<"${bearer_codes}"; then
+  echo "a wrong bearer credential was not rejected before limiting: ${bearer_codes}" >&2
+  exit 1
+fi
+echo "a wrong bearer credential is rejected and then rate limited:${bearer_codes}"
+
 echo "PASS: Internet profile enforced authentication, managed enrollment/revocation, publisher authorization, CSRF/origin policy, login throttling, secure cookies, security headers, private configuration, monitoring, and fail-closed binds"

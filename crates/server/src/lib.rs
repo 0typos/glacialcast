@@ -861,6 +861,11 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
         }
     });
 
+    let login_guard = LoginGuard {
+        limiter: state.login_limiter.clone(),
+        global: state.global_login_limiter.clone(),
+        trust_forwarded_for: state.trust_forwarded_for,
+    };
     let app = Router::new()
         // Watching is what this server is for, so the multi-stream view is the
         // landing page and the operations dashboard lives one click away.
@@ -923,6 +928,7 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
         .layer(middleware::from_fn(move |request, next| {
             let http_slots = http_slots.clone();
             let metrics = metrics.clone();
+            let login_guard = login_guard.clone();
             async move {
                 bounded_http_request(
                     request,
@@ -931,6 +937,7 @@ async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
                     limits.http_timeout_seconds,
                     http_slots,
                     metrics,
+                    login_guard,
                 )
                 .await
             }
@@ -1044,6 +1051,33 @@ fn validate_limits(limits: &LimitsConfig) -> Result<()> {
     Ok(())
 }
 
+/// What the middleware needs to hold a failed bearer credential to the same
+/// account as a failed login.
+#[derive(Clone)]
+struct LoginGuard {
+    limiter: FixedWindowLimiter,
+    global: FixedWindowLimiter,
+    trust_forwarded_for: bool,
+}
+
+/// Bounds an HTTP request, and charges a failed bearer credential to the login
+/// limiter.
+///
+/// `POST /api/auth/login` is rate limited per address, counted, and delayed on
+/// failure. Every other route reaches `request_identity`, which returns early
+/// on an `Authorization: Bearer` header and consults none of that -- so the
+/// same credential could be guessed through any authenticated route at the
+/// speed of the in-flight semaphore rather than ten attempts a minute, and
+/// without incrementing the counter operators are told to alert on.
+///
+/// The check belongs here because this is the only layer that sees both the
+/// credential presented and whether it was accepted, so only a *rejected*
+/// credential is charged and a legitimate client is never limited by its own
+/// traffic however fast it runs. It can still be refused once someone sharing
+/// its address has spent the budget -- the same property `/api/auth/login`
+/// already has, and the price of limiting per address at all. The ingest
+/// listener limits per peer before its handshake; this gives the HTTP surface
+/// the same shape.
 async fn bounded_http_request(
     request: axum::extract::Request,
     next: middleware::Next,
@@ -1051,8 +1085,38 @@ async fn bounded_http_request(
     timeout_seconds: u64,
     slots: Arc<Semaphore>,
     metrics: Arc<ServerMetrics>,
+    login: LoginGuard,
 ) -> Response {
     metrics.http_requests.fetch_add(1, Ordering::Relaxed);
+    let bearer_ip = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| {
+            value
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("bearer ")
+        })
+        .map(|_| {
+            let peer = request
+                .extensions()
+                .get::<ConnectInfo<SocketAddr>>()
+                .map_or_else(|| std::net::IpAddr::from([0, 0, 0, 0]), |info| info.0.ip());
+            client_ip(request.headers(), peer, login.trust_forwarded_for)
+        });
+    // A guesser who has already spent the budget is refused before the handler
+    // runs, so the credential is never compared again.
+    if let Some(ip) = bearer_ip
+        && !login.limiter.peek(ip.to_string())
+    {
+        metrics.login_rate_limited.fetch_add(1, Ordering::Relaxed);
+        warn!(remote_ip = %ip, "bearer credential rate limited");
+        return security_headers(
+            (StatusCode::TOO_MANY_REQUESTS, "too many requests").into_response(),
+            hsts,
+        );
+    }
     let Ok(_permit) = slots.try_acquire_owned() else {
         metrics.http_overloaded.fetch_add(1, Ordering::Relaxed);
         return security_headers(
@@ -1073,6 +1137,15 @@ async fn bounded_http_request(
                 (StatusCode::GATEWAY_TIMEOUT, "request timed out").into_response()
             }
         };
+    if let Some(ip) = bearer_ip
+        && response.status() == StatusCode::UNAUTHORIZED
+    {
+        login.limiter.check(ip.to_string());
+        login.global.check("global");
+        metrics.login_failures.fetch_add(1, Ordering::Relaxed);
+        warn!(remote_ip = %ip, "bearer credential rejected");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
     security_headers(response, hsts)
 }
 
