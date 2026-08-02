@@ -219,15 +219,23 @@ impl DashStore {
             .insert(stored.header.sequence, stored.clone());
         next_catalog.last_sequence = Some(stored.header.sequence);
 
+        let before_eviction = next_catalog.objects.len();
         let evicted = self.enforce_retention(&mut next_catalog, stored.received_at_ms);
-        let mut removed_sequences = catalog
-            .objects
-            .keys()
-            .filter(|sequence| !next_catalog.objects.contains_key(sequence))
-            .copied()
-            .collect::<Vec<_>>();
-        if !next_catalog.objects.contains_key(&stored.header.sequence) {
-            removed_sequences.push(stored.header.sequence);
+        // Derived from what the eviction actually did rather than by diffing
+        // the two catalogs, which walked every retained key on every store.
+        let mut removed_sequences = Vec::new();
+        if next_catalog.objects.len() != before_eviction
+            || !next_catalog.objects.contains_key(&stored.header.sequence)
+        {
+            removed_sequences = catalog
+                .objects
+                .keys()
+                .filter(|sequence| !next_catalog.objects.contains_key(sequence))
+                .copied()
+                .collect();
+            if !next_catalog.objects.contains_key(&stored.header.sequence) {
+                removed_sequences.push(stored.header.sequence);
+            }
         }
         let persistence = self.append_catalog_transaction(
             stream_id,
@@ -570,6 +578,22 @@ impl DashStore {
         let cutoff_ms = now_ms.saturating_sub(
             i64::try_from(self.inner.retention_age.as_millis()).unwrap_or(i64::MAX),
         );
+        // Nothing can be evicted unless the oldest object has expired or the
+        // stream is over its byte budget, and both are answerable without
+        // touching the catalog: sequences are assigned in arrival order, so the
+        // first entry is the oldest. Skipping here avoids two full scans per
+        // stored object for as long as the retention window is filling, which
+        // is most of a stream's life.
+        let oldest_expired = catalog
+            .objects
+            .values()
+            .next()
+            .is_some_and(|object| object.received_at_ms < cutoff_ms);
+        if !oldest_expired && catalog.bytes <= self.inner.retention_bytes {
+            // No eviction means no epoch can have just lost its last timeline
+            // object, so there is no new orphan to collect either.
+            return Vec::new();
+        }
         let expired = retention_groups(catalog)
             .into_iter()
             .filter(|(_, received_at)| *received_at < cutoff_ms)
