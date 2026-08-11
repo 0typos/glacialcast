@@ -329,7 +329,7 @@ pub(super) async fn run_native_client(
                 NewNativeObject {
                     sequence,
                     timestamp,
-                    duration: 0,
+                    duration: 1,
                     kind: NativeObjectKind::Epoch,
                     random_access: true,
                     codec: Some(CodecId::H264AnnexB),

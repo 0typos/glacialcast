@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use glacialcast_protocol::{
     NoiseKeypair, NoiseSocket, PROTOCOL_VERSION,
-    credential::{CredentialRole, NativeCredential},
+    credential::{CredentialRequest, CredentialRole, NativeCredential},
     envelope::KeyEnvelope,
     identity::{IdentityPublic, IdentitySecret, load_or_create_identity},
     initiator_handshake_xx, load_or_create_noise_keypair,
@@ -71,6 +71,13 @@ enum AdminCommand {
     Revoke { viewer: String },
     /// List approved and revoked viewer identities.
     Viewers,
+    /// Create a publisher request for an offline relay-access CA.
+    CredentialRequest {
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, default_value = "gcpub")]
+        subject: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -113,7 +120,13 @@ pub(super) fn is_admin_command() -> bool {
     std::env::args().skip(1).any(|argument| {
         matches!(
             argument.as_str(),
-            "requests" | "approve" | "approve-all" | "deny" | "revoke" | "viewers"
+            "requests"
+                | "approve"
+                | "approve-all"
+                | "deny"
+                | "revoke"
+                | "viewers"
+                | "credential-request"
         )
     })
 }
@@ -147,7 +160,12 @@ pub(super) fn run() -> Result<()> {
 async fn execute(profile: Profile, policy: ViewerPolicy, command: AdminCommand) -> Result<()> {
     let state_path = profile.state_dir.join("publisher-state.bin");
     let mut state = load_state(&state_path)?;
-    if !matches!(command, AdminCommand::Viewers | AdminCommand::Revoke { .. }) {
+    if !matches!(
+        command,
+        AdminCommand::Viewers
+            | AdminCommand::Revoke { .. }
+            | AdminCommand::CredentialRequest { .. }
+    ) {
         refresh_requests(&profile, &mut state, policy).await?;
     }
     match command {
@@ -190,6 +208,19 @@ async fn execute(profile: Profile, policy: ViewerPolicy, command: AdminCommand) 
             for viewer in &state.revoked {
                 println!("revoked  {}", hex(viewer));
             }
+        }
+        AdminCommand::CredentialRequest { output, subject } => {
+            let now = glacialcast_protocol::now_ms();
+            let request = CredentialRequest::new(
+                &profile.identity,
+                subject,
+                CredentialRole::Publisher,
+                profile.noise.public,
+                now,
+                now.saturating_add(PAIR_LIFETIME_MS),
+            )?;
+            glacialcast_protocol::private_state::create_private(&output, &request.encode()?)?;
+            println!("wrote publisher credential request {}", output.display());
         }
     }
     save_state(&state_path, &state)

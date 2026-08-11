@@ -7,7 +7,7 @@ use clap::Parser;
 use eframe::egui;
 use glacialcast_protocol::{
     NoiseKeypair, NoiseSocket, PROTOCOL_VERSION,
-    credential::{CredentialRole, NativeCredential},
+    credential::{CredentialRequest, CredentialRole, NativeCredential},
     identity::{IdentityPublic, IdentitySecret, load_or_create_identity},
     initiator_handshake_xx, load_or_create_noise_keypair,
     native::{CodecId, LiveSequenceGuard, NativeObjectKind},
@@ -47,6 +47,15 @@ struct Args {
     /// Forget this relay's learned key and exit.
     #[arg(long)]
     forget_relay: bool,
+    /// Verify the relay, print its catalog, and exit without opening a window.
+    #[arg(long)]
+    headless: bool,
+    /// Write a viewer request for an offline relay-access CA and exit.
+    #[arg(long)]
+    credential_request: Option<PathBuf>,
+    /// Subject label placed in `--credential-request`.
+    #[arg(long, default_value = "gcview")]
+    credential_subject: String,
 }
 
 #[derive(Clone)]
@@ -330,6 +339,20 @@ pub fn run() -> Result<()> {
         .or(invite_pin);
     let identity = Arc::new(load_or_create_identity(&state_dir.join("identity.key"))?);
     let noise = load_or_create_noise_keypair(&state_dir.join("noise.key"))?;
+    if let Some(output) = &args.credential_request {
+        let now = glacialcast_protocol::now_ms();
+        let request = CredentialRequest::new(
+            &identity,
+            args.credential_subject,
+            CredentialRole::Viewer,
+            noise.public,
+            now,
+            now.saturating_add(24 * 60 * 60 * 1_000),
+        )?;
+        glacialcast_protocol::private_state::create_private(output, &request.encode()?)?;
+        println!("wrote viewer credential request {}", output.display());
+        return Ok(());
+    }
     let credential = args
         .credential
         .as_deref()
@@ -343,6 +366,10 @@ pub fn run() -> Result<()> {
         credential,
         explicit_pin,
     };
+    if args.headless {
+        let runtime = Runtime::new()?;
+        return runtime.block_on(headless_catalog(&profile));
+    }
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     std::thread::Builder::new()
@@ -360,6 +387,32 @@ pub fn run() -> Result<()> {
         Box::new(move |_| Ok(Box::new(ViewerApp::new(event_rx, command_tx)))),
     )
     .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
+async fn headless_catalog(profile: &ConnectionProfile) -> Result<()> {
+    let mut socket = connect(profile).await?;
+    socket.write(&ViewerMessage::Catalog).await?;
+    match socket.read::<RelayViewerMessage>().await? {
+        RelayViewerMessage::Catalog(catalog) => {
+            for entry in catalog {
+                println!(
+                    "{}\t{}\t{}",
+                    entry.descriptor.body.stream_id,
+                    if entry.publisher_online {
+                        "live"
+                    } else {
+                        "offline"
+                    },
+                    entry.descriptor.body.name
+                );
+            }
+            Ok(())
+        }
+        RelayViewerMessage::Error(error) => {
+            anyhow::bail!("catalog rejected: {:?}: {}", error.code, error.detail)
+        }
+        _ => anyhow::bail!("unexpected catalog response"),
+    }
 }
 
 async fn command_worker(

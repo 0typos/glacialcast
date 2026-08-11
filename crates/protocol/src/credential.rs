@@ -370,6 +370,32 @@ pub struct CredentialRequestBody {
 }
 
 impl CredentialRequest {
+    /// Encodes this proof-of-possession request canonically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when serialization fails.
+    pub fn encode(&self) -> Result<Vec<u8>, CredentialError> {
+        postcard::to_stdvec(self).map_err(CredentialError::from)
+    }
+
+    /// Decodes a canonical request and rejects trailing bytes.
+    ///
+    /// Freshness is checked separately by [`Self::verify`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed, trailing, or non-canonical input.
+    pub fn decode(bytes: &[u8]) -> Result<Self, CredentialError> {
+        let (request, remainder) = postcard::take_from_bytes::<Self>(bytes)?;
+        if !remainder.is_empty() || request.encode()? != bytes {
+            return Err(CredentialError::InvalidMetadata(
+                "trailing or non-canonical credential request",
+            ));
+        }
+        Ok(request)
+    }
+
     /// Creates and signs a native credential request.
     ///
     /// # Errors
