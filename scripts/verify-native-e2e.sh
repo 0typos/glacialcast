@@ -30,6 +30,11 @@ PY
 cargo build -p gcrelay -p gcpub -p gcview
 cargo test -p gcrelay native_service::tests::pairing_request_offer_confirmation_and_decision_queue_while_offline
 
+mkdir -p "${work_dir}/publisher-state/glacialcast"
+printf '%s\n' '[viewers]' 'policy = "open"' \
+  >"${work_dir}/publisher-state/glacialcast/config.toml"
+chmod 600 "${work_dir}/publisher-state/glacialcast/config.toml"
+
 target/debug/gcrelay \
   --no-config \
   --publisher-addr "127.0.0.1:${publisher_port}" \
@@ -46,7 +51,7 @@ for _ in $(seq 1 100); do
   sleep 0.05
 done
 
-target/debug/gcpub \
+XDG_STATE_HOME="${work_dir}/publisher-state" target/debug/gcpub \
   --foreground \
   --no-config \
   --ingest-addr "127.0.0.1:${publisher_port}" \
@@ -65,13 +70,22 @@ for _ in $(seq 1 200); do
       --state-dir "${work_dir}/viewer" --headless >"${work_dir}/catalog" 2>/dev/null \
       && grep -q $'live\tNative E2E' "${work_dir}/catalog"; then
     kill -0 "${publisher_pid}"
-    echo "PASS: native relay and publisher processes expose a live authenticated catalog; the protocol E2E test decrypted retained media"
-    exit 0
+    stream_id="$(awk -F '\t' '$2 == "live" && $3 == "Native E2E" { print $1; exit }' "${work_dir}/catalog")"
+    if target/debug/gcview "127.0.0.1:${viewer_port}" \
+      --state-dir "${work_dir}/viewer" --verify-stream "${stream_id}" \
+      >"${work_dir}/verified" 2>"${work_dir}/viewer.log"; then
+      grep -q $'verified\t' "${work_dir}/verified"
+      grep -q 'rotated-group=' "${work_dir}/verified"
+      echo "PASS: real publisher, relay, and viewer paired per stream, decrypted, decoded, and survived key rotation"
+      exit 0
+    fi
+    break
   fi
   sleep 0.05
 done
 
 cat "${work_dir}/relay.log" >&2
 cat "${work_dir}/publisher.log" >&2
+[[ ! -f "${work_dir}/viewer.log" ]] || cat "${work_dir}/viewer.log" >&2
 echo "native process smoke test timed out" >&2
 exit 1

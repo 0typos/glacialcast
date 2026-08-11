@@ -47,6 +47,10 @@ contents:
     dst: /usr/share/doc/gcpub/client.toml.example
     file_info:
       mode: 0644
+  - src: ./packaging/publisher.toml.example
+    dst: /usr/share/doc/gcpub/publisher.toml.example
+    file_info:
+      mode: 0644
 
 scripts:
   postinstall: ./packaging/scripts/client-postinstall.sh

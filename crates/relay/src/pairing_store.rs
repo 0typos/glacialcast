@@ -671,6 +671,7 @@ mod tests {
         let request = PairRequest::new(
             &viewer,
             publisher.public().unwrap(),
+            uuid::Uuid::from_u128(1),
             "viewer".into(),
             1_000,
             1_000 + DAY_MS,
@@ -738,6 +739,7 @@ mod tests {
         let request = PairRequest::new(
             &viewer,
             publisher.public().unwrap(),
+            uuid::Uuid::from_u128(1),
             "viewer".into(),
             1_000,
             2_000,
@@ -753,6 +755,7 @@ mod tests {
         let valid = PairRequest::new(
             &viewer,
             publisher.public().unwrap(),
+            uuid::Uuid::from_u128(1),
             "viewer".into(),
             3_000,
             3_000 + DAY_MS,

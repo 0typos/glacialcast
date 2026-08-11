@@ -44,9 +44,10 @@ target/release/gcpub --relay relay.example:8900 approve REQUEST_PREFIX
 target/release/gcpub --relay relay.example:8900 approve-all
 ```
 
-Approval is permanent for that viewer identity and applies to every stream from
-the publisher. `gcpub revoke VIEWER_PREFIX` removes it immediately; an active
-publisher rotates the group key and forces a new IDR before publishing more.
+Approval is permanent for that viewer identity on the requested stream only.
+`gcpub revoke VIEWER_PREFIX --stream STREAM_UUID` removes that grant
+immediately; an active publisher rotates the group key and forces a new IDR
+before publishing more.
 
 The viewer exposes **History**, a retained-range slider, **Go**, and **Live**.
 Newly approved viewers receive retained key envelopes newest-first, so older
@@ -65,7 +66,8 @@ private group-key history used to authorize a new viewer. Defaults are 100 MiB
 and 24 hours.
 
 Viewer approval policy lives in the publisher state directory as private
-`config.toml`:
+`config.toml`; see `packaging/publisher.toml.example`. The running publisher
+reloads this policy and its revocation list while it polls for requests:
 
 ```toml
 [viewers]

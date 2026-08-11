@@ -1420,7 +1420,7 @@ dependencies = [
 
 [[package]]
 name = "gcpub"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1449,7 +1449,7 @@ dependencies = [
 
 [[package]]
 name = "gcrelay"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1468,7 +1468,7 @@ dependencies = [
 
 [[package]]
 name = "gcview"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1563,7 +1563,7 @@ dependencies = [
 
 [[package]]
 name = "glacialcast-protocol"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1588,7 +1588,7 @@ dependencies = [
 
 [[package]]
 name = "glacialcast-stream"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "aes",
  "aes-gcm",

@@ -22,9 +22,11 @@ use glacialcast_protocol::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, path::PathBuf};
-use tokio::net::TcpStream;
+use tokio::{net::TcpStream, sync::watch};
+use tracing::{info, warn};
+use uuid::Uuid;
 
-const STATE_VERSION: u16 = 1;
+const STATE_VERSION: u16 = 2;
 const MAX_STATE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
 const PAIR_LIFETIME_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -74,7 +76,12 @@ enum AdminCommand {
     /// Reject one request by ID or unique prefix.
     Deny { request: String },
     /// Permanently revoke a viewer by identity ID or unique prefix.
-    Revoke { viewer: String },
+    Revoke {
+        viewer: String,
+        /// Stream whose grant is permanently revoked.
+        #[arg(long)]
+        stream: Uuid,
+    },
     /// List approved and revoked viewer identities.
     Viewers,
     /// Create a publisher request for an offline relay-access CA.
@@ -98,8 +105,20 @@ struct PendingPairing {
 pub(super) struct PublisherState {
     version: u16,
     pending: Vec<PendingPairing>,
-    pub(super) approved: Vec<IdentityPublic>,
-    revoked: Vec<[u8; 32]>,
+    approved: Vec<StreamGrant>,
+    revoked: Vec<RevokedGrant>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct StreamGrant {
+    stream_id: Uuid,
+    viewer: IdentityPublic,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct RevokedGrant {
+    stream_id: Uuid,
+    viewer_id: [u8; 32],
 }
 
 impl Default for PublisherState {
@@ -185,6 +204,87 @@ pub(super) fn run() -> Result<()> {
     runtime.block_on(execute(profile, policy, args.command))
 }
 
+pub(super) async fn run_live_approvals(
+    relay: String,
+    state_dir: PathBuf,
+    credential_path: Option<PathBuf>,
+    pin: Option<[u8; 32]>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let identity = match load_or_create_identity(&state_dir.join("native-identity.key")) {
+        Ok(identity) => identity,
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "viewer approval worker could not load publisher identity");
+            return;
+        }
+    };
+    let noise = match load_or_create_noise_keypair(&state_dir.join("native-noise.key")) {
+        Ok(noise) => noise,
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "viewer approval worker could not load Noise identity");
+            return;
+        }
+    };
+    let credential = match credential_path
+        .as_deref()
+        .map(|path| NativeCredential::decode(&read_private(path, MAX_CREDENTIAL_BYTES)?))
+        .transpose()
+    {
+        Ok(credential) => credential,
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "viewer approval worker could not load relay credential");
+            return;
+        }
+    };
+    let profile = Profile {
+        relay: normalize_relay(&relay),
+        state_dir: state_dir.clone(),
+        identity,
+        noise,
+        credential,
+        pin,
+    };
+    let state_path = state_dir.join("publisher-state.bin");
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        let result = async {
+            let config = load_config(None, &state_dir)?;
+            let policy = load_policy(config.viewers.policy, config.viewers)?;
+            let mut state = load_state(&state_path)?;
+            let pending_before = state.pending.len();
+            let grants_before = state.approved.len();
+            refresh_requests(&profile, &mut state, &policy).await?;
+            save_state(&state_path, &state)?;
+            if state.pending.len() > pending_before {
+                info!(
+                    new_requests = state.pending.len() - pending_before,
+                    "viewer approval requests are waiting; run `gcpub requests`"
+                );
+            }
+            if state.approved.len() > grants_before {
+                info!(
+                    new_grants = state.approved.len() - grants_before,
+                    "viewer access approved by publisher policy"
+                );
+            }
+            Result::<()>::Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            warn!(error = %format!("{error:#}"), "viewer approval synchronization failed; retrying");
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+            changed = shutdown.changed() => {
+                let _ = changed;
+                return;
+            }
+        }
+    }
+}
+
 async fn execute(profile: Profile, policy: ApprovalPolicy, command: AdminCommand) -> Result<()> {
     let state_path = profile.state_dir.join("publisher-state.bin");
     let mut state = load_state(&state_path)?;
@@ -216,25 +316,30 @@ async fn execute(profile: Profile, policy: ApprovalPolicy, command: AdminCommand
         AdminCommand::Deny { request } => {
             decide(&profile, &mut state, &request, false).await?;
         }
-        AdminCommand::Revoke { viewer } => {
-            let index = unique_identity(&state.approved, &viewer)?;
+        AdminCommand::Revoke { viewer, stream } => {
+            let index = unique_grant(&state.approved, stream, &viewer)?;
             let removed = state.approved.remove(index);
-            let viewer_id = removed.id()?;
-            if !state.revoked.contains(&viewer_id) {
-                state.revoked.push(viewer_id);
+            let viewer_id = removed.viewer.id()?;
+            let revoked = RevokedGrant {
+                stream_id: stream,
+                viewer_id,
+            };
+            if !state.revoked.contains(&revoked) {
+                state.revoked.push(revoked);
                 state.revoked.sort_unstable();
             }
             println!(
-                "revoked {}; active publication must rotate its group immediately",
-                hex(&viewer_id)
+                "revoked {} from {}; active publication must rotate its group immediately",
+                hex(&viewer_id),
+                stream
             );
         }
         AdminCommand::Viewers => {
-            for viewer in &state.approved {
-                println!("approved {}", hex(&viewer.id()?));
+            for grant in &state.approved {
+                println!("approved {} {}", grant.stream_id, hex(&grant.viewer.id()?));
             }
-            for viewer in &state.revoked {
-                println!("revoked  {}", hex(viewer));
+            for grant in &state.revoked {
+                println!("revoked  {} {}", grant.stream_id, hex(&grant.viewer_id));
             }
         }
         AdminCommand::CredentialRequest { output, subject } => {
@@ -282,11 +387,14 @@ async fn refresh_requests(
             _ => anyhow::bail!("unexpected publisher inbox response"),
         }
     }
-    let revoked: BTreeSet<[u8; 32]> = state.revoked.iter().copied().collect();
+    let revoked: BTreeSet<RevokedGrant> = state.revoked.iter().copied().collect();
     for (request, source_addr) in requests {
         request.verify(glacialcast_protocol::now_ms(), PAIR_LIFETIME_MS)?;
         let request_id = request.id()?;
-        if revoked.contains(&request.body.viewer.id()?) {
+        if revoked.contains(&RevokedGrant {
+            stream_id: request.body.stream_id,
+            viewer_id: request.body.viewer.id()?,
+        }) {
             continue;
         }
         if state
@@ -322,6 +430,23 @@ async fn refresh_requests(
             ViewerPolicy::Required => None,
         };
         if let Some(reason) = policy_reason {
+            if let Err(error) = publish_history_envelopes_on_socket(
+                &mut socket,
+                &profile.state_dir,
+                request.body.stream_id,
+                &profile.identity,
+                &request.body.viewer,
+            )
+            .await
+            {
+                warn!(
+                    stream = %request.body.stream_id,
+                    viewer = %hex(&request.body.viewer.id()?),
+                    error = %format!("{error:#}"),
+                    "retained keys could not be delivered; automatic approval will retry"
+                );
+                continue;
+            }
             let decision = PublisherDecision::approve_by_policy(
                 &profile.identity,
                 &request,
@@ -332,7 +457,7 @@ async fn refresh_requests(
                 .write(&PublisherMessage::PairDecision(decision))
                 .await?;
             expect_pairing_ack(&mut socket, request_id).await?;
-            add_approved(state, request.body.viewer)?;
+            add_approved(state, request.body.stream_id, request.body.viewer)?;
             continue;
         }
         let now = glacialcast_protocol::now_ms();
@@ -444,9 +569,23 @@ async fn decide(
         .await?;
     expect_pairing_ack(&mut socket, request_id).await?;
     if approve {
-        add_approved(state, pending.request.body.viewer)?;
-        println!("approved {}", hex(&pending.request.body.viewer.id()?));
-        if let Err(error) = publish_history_envelopes(profile, &pending.request.body.viewer).await {
+        add_approved(
+            state,
+            pending.request.body.stream_id,
+            pending.request.body.viewer,
+        )?;
+        println!(
+            "approved {} for {}",
+            hex(&pending.request.body.viewer.id()?),
+            pending.request.body.stream_id
+        );
+        if let Err(error) = publish_history_envelopes(
+            profile,
+            pending.request.body.stream_id,
+            &pending.request.body.viewer,
+        )
+        .await
+        {
             eprintln!(
                 "history authorization will retry during publication; immediate attempt failed: {error:#}"
             );
@@ -458,17 +597,47 @@ async fn decide(
     Ok(())
 }
 
-async fn publish_history_envelopes(profile: &Profile, viewer: &IdentityPublic) -> Result<()> {
+async fn publish_history_envelopes(
+    profile: &Profile,
+    stream_id: Uuid,
+    viewer: &IdentityPublic,
+) -> Result<()> {
     let groups =
         super::native_publish::load_key_history(&profile.state_dir.join("key-history.bin"))?;
+    let (mut socket, _) = connect(profile).await?;
+    publish_history_groups(&mut socket, &profile.identity, viewer, stream_id, &groups).await
+}
+
+async fn publish_history_envelopes_on_socket(
+    socket: &mut NoiseSocket<TcpStream>,
+    state_dir: &std::path::Path,
+    stream_id: Uuid,
+    publisher: &IdentitySecret,
+    viewer: &IdentityPublic,
+) -> Result<()> {
+    let groups = super::native_publish::load_key_history(&state_dir.join("key-history.bin"))?;
+    publish_history_groups(socket, publisher, viewer, stream_id, &groups).await
+}
+
+async fn publish_history_groups(
+    socket: &mut NoiseSocket<TcpStream>,
+    publisher: &IdentitySecret,
+    viewer: &IdentityPublic,
+    stream_id: Uuid,
+    groups: &[super::native_publish::RetainedGroupKey],
+) -> Result<()> {
+    let groups: Vec<_> = groups
+        .iter()
+        .rev()
+        .filter(|group| group.stream_id == stream_id)
+        .collect();
     if groups.is_empty() {
         return Ok(());
     }
-    let (mut socket, _) = connect(profile).await?;
-    for group in groups.iter().rev() {
+    for group in groups {
         socket
             .write(&PublisherMessage::KeyEnvelope(KeyEnvelope::seal(
-                &profile.identity,
+                publisher,
                 viewer,
                 group.stream_id,
                 group.epoch_id,
@@ -492,20 +661,27 @@ async fn publish_history_envelopes(profile: &Profile, viewer: &IdentityPublic) -
     }
 }
 
-fn add_approved(state: &mut PublisherState, viewer: IdentityPublic) -> Result<()> {
+fn add_approved(state: &mut PublisherState, stream_id: Uuid, viewer: IdentityPublic) -> Result<()> {
     let id = viewer.id()?;
-    if state.revoked.binary_search(&id).is_ok() {
-        anyhow::bail!("viewer is permanently revoked");
+    if state
+        .revoked
+        .binary_search(&RevokedGrant {
+            stream_id,
+            viewer_id: id,
+        })
+        .is_ok()
+    {
+        anyhow::bail!("viewer is permanently revoked for this stream");
     }
     if !state
         .approved
         .iter()
-        .any(|approved| approved.id().ok() == Some(id))
+        .any(|grant| grant.stream_id == stream_id && grant.viewer.id().ok() == Some(id))
     {
-        state.approved.push(viewer);
+        state.approved.push(StreamGrant { stream_id, viewer });
         state
             .approved
-            .sort_by_key(|approved| approved.id().unwrap_or([0; 32]));
+            .sort_by_key(|grant| (grant.stream_id, grant.viewer.id().unwrap_or([0; 32])));
     }
     Ok(())
 }
@@ -516,7 +692,7 @@ fn print_requests(state: &PublisherState) -> Result<()> {
     }
     for pending in &state.pending {
         println!(
-            "{}  {:<10}  {:<20}  {}  {}",
+            "{}  {:<10}  {:<20}  {}  {}  {}",
             &hex(&pending.request.id()?)[..12],
             if pending.confirmation.is_some() {
                 "confirmed"
@@ -524,6 +700,7 @@ fn print_requests(state: &PublisherState) -> Result<()> {
                 "waiting"
             },
             pending.request.body.device_label,
+            pending.request.body.stream_id,
             pending.source_addr,
             authentication_string(&pending.request, &pending.offer)?,
         );
@@ -617,16 +794,41 @@ fn unique_request(pending: &[PendingPairing], prefix: &str) -> Result<usize> {
     )
 }
 
-fn unique_identity(identities: &[IdentityPublic], prefix: &str) -> Result<usize> {
-    unique_index(
-        identities.iter().map(|identity| {
-            identity
+fn unique_grant(grants: &[StreamGrant], stream_id: Uuid, prefix: &str) -> Result<usize> {
+    if prefix.is_empty() || !prefix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("ID prefix must be hexadecimal");
+    }
+    let prefix = prefix.to_ascii_lowercase();
+    let matches: Vec<usize> = grants
+        .iter()
+        .enumerate()
+        .filter(|(_, grant)| grant.stream_id == stream_id)
+        .filter_map(|(index, grant)| {
+            grant
+                .viewer
                 .id()
-                .map(|id| hex(&id))
-                .map_err(anyhow::Error::from)
-        }),
-        prefix,
-    )
+                .ok()
+                .filter(|id| hex(id).starts_with(&prefix))
+                .map(|_| index)
+        })
+        .collect();
+    match matches.as_slice() {
+        [index] => Ok(*index),
+        [] => anyhow::bail!("no matching ID"),
+        _ => anyhow::bail!("ID prefix is ambiguous"),
+    }
+}
+
+pub(super) fn approved_viewers(
+    path: &std::path::Path,
+    stream_id: Uuid,
+) -> Result<Vec<IdentityPublic>> {
+    Ok(load_state(path)?
+        .approved
+        .into_iter()
+        .filter(|grant| grant.stream_id == stream_id)
+        .map(|grant| grant.viewer)
+        .collect())
 }
 
 fn unique_index<I>(values: I, prefix: &str) -> Result<usize>
@@ -678,6 +880,7 @@ mod tests {
         let request = PairRequest::new(
             &viewer,
             publisher.public().unwrap(),
+            Uuid::from_u128(1),
             "device".into(),
             now,
             now + PAIR_LIFETIME_MS,
@@ -713,5 +916,32 @@ mod tests {
             toml::from_str("[viewers]\npolicy = \"trusted_ca\"\n").unwrap();
         assert!(load_policy(config.viewers.policy, config.viewers).is_err());
         assert!(toml::from_str::<PublisherConfig>("unknown = true").is_err());
+    }
+
+    #[test]
+    fn approvals_and_permanent_revocations_are_scoped_to_one_stream() {
+        let viewer = IdentitySecret::generate().public().unwrap();
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+        let mut state = PublisherState::default();
+        add_approved(&mut state, first, viewer).unwrap();
+        assert_eq!(
+            state
+                .approved
+                .iter()
+                .filter(|grant| grant.stream_id == first)
+                .count(),
+            1
+        );
+        assert!(state.approved.iter().all(|grant| grant.stream_id != second));
+
+        let viewer_id = viewer.id().unwrap();
+        state.approved.clear();
+        state.revoked.push(RevokedGrant {
+            stream_id: first,
+            viewer_id,
+        });
+        assert!(add_approved(&mut state, first, viewer).is_err());
+        add_approved(&mut state, second, viewer).unwrap();
     }
 }

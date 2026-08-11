@@ -1,4 +1,4 @@
-//! Bounded protocol-v8 messages exchanged over native Noise transports.
+//! Bounded protocol-v9 messages exchanged over native Noise transports.
 
 use crate::{
     MAX_FRAME_LEN, PROTOCOL_VERSION,
@@ -558,7 +558,7 @@ impl NativeWireMessage for RelayViewerMessage {
     }
 }
 
-/// Canonically encodes one validated protocol-v8 message.
+/// Canonically encodes one validated protocol-v9 message.
 ///
 /// # Errors
 ///
@@ -572,7 +572,7 @@ pub fn encode_native_message<T: NativeWireMessage>(message: &T) -> Result<Vec<u8
     Ok(encoded)
 }
 
-/// Decodes one bounded canonical protocol-v8 message.
+/// Decodes one bounded canonical protocol-v9 message.
 ///
 /// # Errors
 ///
@@ -659,6 +659,7 @@ fn validate_decision_shape(decision: &PublisherDecision) -> Result<(), WireError
     if decision.body.version != PAIRING_VERSION
         || decision.body.request_id == [0; 32]
         || decision.body.viewer_id == [0; IDENTITY_ID_LEN]
+        || decision.body.stream_id.is_nil()
     {
         return Err(WireError::Invalid("invalid publisher decision"));
     }

@@ -8,7 +8,7 @@
 | Viewer layouts | 1, 2, 4, 6 tiles; tile fullscreen; keyboard switching | Unit/build evidence; four-stream performance host gate pending |
 | Retained playback | Oldest, timestamp slider, explicit live edge | Protocol E2E validated |
 | Relay | Linux native TCP, SQLite durable opaque history | Crash/retention/unit and process E2E validated |
-| Browser/offline viewer | Not supported | Removed in protocol v8 |
+| Browser/offline viewer | Not supported | Removed before protocol v9 |
 
 Wayland is the primary viewer and capture target. X11 is a viewer target only;
 publishing uses the Wayland portal/PipeWire capture path. A platform becomes

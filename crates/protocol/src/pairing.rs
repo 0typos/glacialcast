@@ -12,20 +12,21 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use uuid::Uuid;
 
 /// Pairing message format version.
-pub const PAIRING_VERSION: u16 = 1;
+pub const PAIRING_VERSION: u16 = 2;
 /// Maximum encoded pairing record length.
 pub const MAX_PAIRING_MESSAGE_LEN: usize = 32 * 1024;
 /// Maximum UTF-8 device-label length.
 pub const MAX_DEVICE_LABEL_LEN: usize = 128;
 
-const REQUEST_DOMAIN: &[u8] = b"glacialcast-pair-request-v1";
-const OFFER_DOMAIN: &[u8] = b"glacialcast-pair-offer-v1";
-const CONFIRM_DOMAIN: &[u8] = b"glacialcast-pair-viewer-confirm-v1";
-const DECISION_DOMAIN: &[u8] = b"glacialcast-pair-publisher-decision-v1";
-const TRANSCRIPT_DOMAIN: &[u8] = b"glacialcast-pair-transcript-v1";
-const REQUEST_ID_DOMAIN: &[u8] = b"glacialcast-pair-request-id-v1";
+const REQUEST_DOMAIN: &[u8] = b"glacialcast-pair-request-v2";
+const OFFER_DOMAIN: &[u8] = b"glacialcast-pair-offer-v2";
+const CONFIRM_DOMAIN: &[u8] = b"glacialcast-pair-viewer-confirm-v2";
+const DECISION_DOMAIN: &[u8] = b"glacialcast-pair-publisher-decision-v2";
+const TRANSCRIPT_DOMAIN: &[u8] = b"glacialcast-pair-transcript-v2";
+const REQUEST_ID_DOMAIN: &[u8] = b"glacialcast-pair-request-id-v2";
 const CLOCK_SKEW_MS: i64 = 5 * 60 * 1_000;
 
 /// Errors produced by native pairing messages and transcript verification.
@@ -117,6 +118,8 @@ pub struct PairRequestBody {
     pub protocol_version: u16,
     /// Exact publisher identity the viewer intends to pair with.
     pub publisher: IdentityPublic,
+    /// Exact stream for which the viewer requests access.
+    pub stream_id: Uuid,
     /// Persistent viewer identity requesting approval.
     pub viewer: IdentityPublic,
     /// Optional CA credential used for publisher-side automatic approval.
@@ -151,6 +154,7 @@ impl PairRequest {
     pub fn new(
         viewer: &IdentitySecret,
         publisher: IdentityPublic,
+        stream_id: Uuid,
         device_label: String,
         issued_at_ms: i64,
         expires_at_ms: i64,
@@ -158,6 +162,7 @@ impl PairRequest {
         Self::new_with_credential(
             viewer,
             publisher,
+            stream_id,
             device_label,
             None,
             issued_at_ms,
@@ -174,6 +179,7 @@ impl PairRequest {
     pub fn new_with_credential(
         viewer: &IdentitySecret,
         publisher: IdentityPublic,
+        stream_id: Uuid,
         device_label: String,
         viewer_credential: Option<NativeCredential>,
         issued_at_ms: i64,
@@ -185,6 +191,7 @@ impl PairRequest {
             version: PAIRING_VERSION,
             protocol_version: PROTOCOL_VERSION,
             publisher,
+            stream_id,
             viewer: viewer.public()?,
             viewer_credential,
             device_label,
@@ -256,6 +263,9 @@ fn validate_request_metadata(body: &PairRequestBody) -> Result<(), PairingError>
     }
     body.publisher.validate()?;
     body.viewer.validate()?;
+    if body.stream_id.is_nil() {
+        return Err(PairingError::InvalidMetadata("nil requested stream"));
+    }
     if let Some(credential) = &body.viewer_credential
         && (credential.body.role != CredentialRole::Viewer
             || credential.body.identity != body.viewer)
@@ -540,6 +550,8 @@ pub struct PublisherDecisionBody {
     pub request_id: [u8; 32],
     /// Viewer identity affected permanently until revocation.
     pub viewer_id: [u8; IDENTITY_ID_LEN],
+    /// Exact stream affected by this decision.
+    pub stream_id: Uuid,
     /// Transcript hash for manual decisions, or zero for prior-verification modes.
     pub transcript_hash: [u8; 32],
     /// Whether this decision grants access.
@@ -579,6 +591,7 @@ impl PublisherDecision {
                 version: PAIRING_VERSION,
                 request_id: request.id()?,
                 viewer_id: request.body.viewer.id()?,
+                stream_id: request.body.stream_id,
                 transcript_hash: [0; 32],
                 approved: false,
                 reason: PairDecisionReason::Rejected,
@@ -609,6 +622,7 @@ impl PublisherDecision {
                 version: PAIRING_VERSION,
                 request_id: request.id()?,
                 viewer_id: request.body.viewer.id()?,
+                stream_id: request.body.stream_id,
                 transcript_hash: transcript_hash(request, offer)?,
                 approved: true,
                 reason: PairDecisionReason::ManualVerified,
@@ -648,6 +662,7 @@ impl PublisherDecision {
                 version: PAIRING_VERSION,
                 request_id: request.id()?,
                 viewer_id: request.body.viewer.id()?,
+                stream_id: request.body.stream_id,
                 transcript_hash: [0; 32],
                 approved: true,
                 reason,
@@ -676,6 +691,7 @@ impl PublisherDecision {
         if publisher != &request.body.publisher
             || self.body.request_id != request.id()?
             || self.body.viewer_id != request.body.viewer.id()?
+            || self.body.stream_id != request.body.stream_id
         {
             return Err(PairingError::TranscriptMismatch);
         }
@@ -687,6 +703,7 @@ fn validate_decision(body: &PublisherDecisionBody) -> Result<(), PairingError> {
     if body.version != PAIRING_VERSION
         || body.request_id == [0; 32]
         || body.viewer_id == [0; IDENTITY_ID_LEN]
+        || body.stream_id.is_nil()
     {
         return Err(PairingError::InvalidMetadata("invalid decision metadata"));
     }
@@ -758,6 +775,7 @@ mod tests {
         let request = PairRequest::new(
             &viewer,
             publisher.public().unwrap(),
+            Uuid::from_u128(1),
             "living-room".into(),
             1_000,
             1_000 + DAY_MS,
@@ -791,6 +809,7 @@ mod tests {
             PairRequest::new_with_credential(
                 &viewer,
                 publisher.public().unwrap(),
+                Uuid::from_u128(1),
                 "viewer".into(),
                 Some(credential),
                 3_000,
@@ -816,6 +835,13 @@ mod tests {
         decision
             .verify(&request, &publisher.public().unwrap())
             .unwrap();
+        let mut other_stream = request.clone();
+        other_stream.body.stream_id = Uuid::from_u128(2);
+        assert!(
+            decision
+                .verify(&other_stream, &publisher.public().unwrap())
+                .is_err()
+        );
     }
 
     #[test]
@@ -834,6 +860,10 @@ mod tests {
         let mut identity_changed = request.clone();
         identity_changed.body.viewer = IdentitySecret::generate().public().unwrap();
         assert!(transcript_hash(&identity_changed, &offer).is_err());
+
+        let mut stream_changed = request.clone();
+        stream_changed.body.stream_id = Uuid::from_u128(2);
+        assert!(transcript_hash(&stream_changed, &offer).is_err());
     }
 
     #[test]
@@ -894,15 +924,16 @@ mod tests {
     }
 
     #[test]
-    fn pairing_v8_golden_vector_is_stable_and_decodable() {
+    fn pairing_v9_golden_vector_is_stable_and_decodable() {
         let vector: serde_json::Value =
-            serde_json::from_str(include_str!("../../../test-vectors/protocol-v8.json")).unwrap();
+            serde_json::from_str(include_str!("../../../test-vectors/protocol-v9.json")).unwrap();
         let publisher = IdentitySecret::from_private_bytes([1; 32], [2; 32]).unwrap();
         let viewer = IdentitySecret::from_private_bytes([6; 32], [7; 32]).unwrap();
         let request_body = PairRequestBody {
             version: PAIRING_VERSION,
             protocol_version: PROTOCOL_VERSION,
             publisher: publisher.public().unwrap(),
+            stream_id: Uuid::from_u128(1),
             viewer: viewer.public().unwrap(),
             viewer_credential: None,
             device_label: "viewer".into(),

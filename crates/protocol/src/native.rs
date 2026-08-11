@@ -1023,9 +1023,9 @@ mod tests {
     }
 
     #[test]
-    fn native_v8_golden_vector_is_stable_and_decodable() {
+    fn native_v9_golden_vector_is_stable_and_decodable() {
         let vector: serde_json::Value =
-            serde_json::from_str(include_str!("../../../test-vectors/protocol-v8.json")).unwrap();
+            serde_json::from_str(include_str!("../../../test-vectors/protocol-v9.json")).unwrap();
         let publisher = IdentitySecret::from_private_bytes([1; 32], [2; 32]).unwrap();
         let public = publisher.public().unwrap();
         let descriptor = StreamDescriptor::new(
