@@ -475,6 +475,24 @@ impl NativeRelayService {
                     if request.body.viewer != hello.identity {
                         anyhow::bail!("pair request viewer identity mismatch");
                     }
+                    let requested_stream = request.body.stream_id;
+                    let requested_publisher = request.body.publisher;
+                    let descriptor = self
+                        .store_call(move |store| store.descriptor(requested_stream))
+                        .await?;
+                    if descriptor
+                        .as_ref()
+                        .map(|descriptor| descriptor.body.publisher)
+                        != Some(requested_publisher)
+                    {
+                        send_viewer_error(
+                            socket,
+                            RelayErrorCode::NotFound,
+                            "requested stream is not published by that identity",
+                        )
+                        .await?;
+                        continue;
+                    }
                     let request_id = request.id()?;
                     self.pairing_call(move |store| {
                         store.enqueue_request(
@@ -1351,18 +1369,34 @@ mod tests {
     #[tokio::test]
     async fn pairing_request_offer_confirmation_and_decision_queue_while_offline() {
         let root = root();
+        let publisher = IdentitySecret::generate();
+        let viewer = IdentitySecret::generate();
+        let now = glacialcast_protocol::now_ms();
+        let stream_id = Uuid::from_u128(1);
+        let store = NativeStore::open(root.clone(), None, None).unwrap();
+        store
+            .put_descriptor(
+                &StreamDescriptor::new(
+                    &publisher,
+                    stream_id,
+                    "end-to-end".into(),
+                    "test".into(),
+                    false,
+                    now,
+                )
+                .unwrap(),
+            )
+            .unwrap();
         let service = NativeRelayService::new(
-            NativeStore::open(root.clone(), None, None).unwrap(),
+            store,
             NativeAccessPolicy::Public,
             generate_noise_keypair().unwrap(),
         )
         .unwrap();
-        let publisher = IdentitySecret::generate();
-        let viewer = IdentitySecret::generate();
-        let now = glacialcast_protocol::now_ms();
         let request = PairRequest::new(
             &viewer,
             publisher.public().unwrap(),
+            stream_id,
             "viewer".into(),
             now,
             now + PAIRING_REQUEST_LIFETIME_MS,
@@ -1376,6 +1410,31 @@ mod tests {
             generate_noise_keypair().unwrap(),
         )
         .await;
+        let unknown_stream_request = PairRequest::new(
+            &viewer,
+            publisher.public().unwrap(),
+            Uuid::from_u128(2),
+            "viewer".into(),
+            now,
+            now + PAIRING_REQUEST_LIFETIME_MS,
+        )
+        .unwrap();
+        viewer_connection
+            .write(&ViewerMessage::PairRequest(Box::new(
+                unknown_stream_request,
+            )))
+            .await
+            .unwrap();
+        assert!(matches!(
+            viewer_connection
+                .read::<RelayViewerMessage>()
+                .await
+                .unwrap(),
+            RelayViewerMessage::Error(RelayError {
+                code: RelayErrorCode::NotFound,
+                ..
+            })
+        ));
         viewer_connection
             .write(&ViewerMessage::PairRequest(Box::new(request.clone())))
             .await
@@ -1547,7 +1606,6 @@ mod tests {
             RelayViewerMessage::InboxComplete
         );
 
-        let stream_id = Uuid::new_v4();
         let epoch_id = Uuid::new_v4();
         let descriptor = StreamDescriptor::new(
             &publisher,

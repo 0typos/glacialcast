@@ -14,7 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-glacialcast-protocol = { path = "../protocol", version = "0.6.0" }
+glacialcast-protocol = { path = "../protocol", version = "0.7.0" }
 libc.workspace = true
 postcard.workspace = true
 rusqlite.workspace = true

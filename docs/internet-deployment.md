@@ -49,6 +49,7 @@ malicious relay can censor, delay, replay, and observe sizes/timing; E2EE does
 not provide availability or traffic-analysis resistance.
 
 Revoking relay admission requires a new signed CRL and relay restart. Revoking
-stream access uses `gcpub revoke`; the running publisher detects the approval
-state change, rotates the content key immediately, and forces an IDR. Keys
-already delivered cannot be clawed back.
+stream access uses `gcpub revoke VIEWER_PREFIX --stream STREAM_UUID`; the
+running publisher detects the per-stream approval-state change, rotates the
+content key immediately, and forces an IDR. Keys already delivered cannot be
+clawed back.

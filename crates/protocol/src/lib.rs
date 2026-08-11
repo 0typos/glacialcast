@@ -41,7 +41,7 @@ pub mod viewer_key;
 pub mod wire;
 
 /// Publisher/relay message schema version.
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 /// Absolute maximum serialized message size accepted by [`NoiseSocket`].
 pub const MAX_FRAME_LEN: usize = 32 * 1024 * 1024;
 const MAX_WIRE_PACKET_LEN: usize = 65_535;

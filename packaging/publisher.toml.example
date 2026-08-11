@@ -1,0 +1,12 @@
+# GlacialCast viewer authorization policy.
+# Copy to ~/.local/state/glacialcast/config.toml and chmod 600.
+
+[viewers]
+# required: both people compare and approve the authentication string.
+# open: automatically approve every signed request for its exact stream.
+# trusted_ca: automatically approve requests carrying a valid viewer credential.
+policy = "required"
+
+# Required only for policy = "trusted_ca".
+# trusted_authority_file = "/secure/viewer-approval-ca.pub"
+# trusted_revocations_file = "/secure/viewer-approval-ca.crl"

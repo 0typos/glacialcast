@@ -219,7 +219,7 @@ pub(super) async fn run_native_client(
     })?;
     let approval_path = state_dir.join("publisher-state.bin");
     let history_path = state_dir.join("key-history.bin");
-    let mut approved = native_admin::load_state(&approval_path)?.approved;
+    let mut approved = native_admin::approved_viewers(&approval_path, stream_id)?;
     let mut key_history = load_key_history(&history_path)?;
     let history_bytes = args
         .history_bytes
@@ -243,7 +243,7 @@ pub(super) async fn run_native_client(
         if *shutdown.borrow() {
             return Ok(());
         }
-        let latest_approved = native_admin::load_state(&approval_path)?.approved;
+        let latest_approved = native_admin::approved_viewers(&approval_path, stream_id)?;
         let previous_ids: BTreeSet<[u8; 32]> = approved
             .iter()
             .map(IdentityPublicExt::checked_id)

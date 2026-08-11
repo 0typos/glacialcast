@@ -55,15 +55,16 @@ than being silently ignored.
 | --- | --- |
 | 0.5 / v7 | Browser DASH/CENC format, publisher viewer-key salt, portable `GCO1` objects, and Noise NK publisher ingest. |
 | 0.6 / v8 | Native `gcpub`/`gcrelay`/`gcview`; Noise XX relay transports; persistent device identities; native credentials; verified pairing; publisher-signed AEAD stream format v2; HPKE viewer envelopes; H.264 Annex-B payloads. Browser and portable formats are removed. |
+| 0.7 / v9 | Pairing requests, publisher decisions, durable approvals, and revocations are bound to one exact stream; running publishers apply and reload automatic approval policy. |
 
-Version 8 is a clean break. Version 7 peers are rejected before normal traffic.
+Version 9 is a clean break. Earlier peers are rejected before normal traffic.
 The relay does not migrate version 1 DASH history. On first 0.6 startup it moves
 the old store to an explicitly named incompatible quarantine path without
 deleting it, creates an empty version 2 store, and logs the rollback consequence.
 
 ## Golden vectors and fuzzing
 
-Protocol v8 vectors fix canonical identities, credentials, pairing transcripts,
+Protocol v9 vectors fix canonical identities, credentials, pairing transcripts,
 short authentication strings, signatures, key envelopes, encrypted stream
 objects, and exact Postcard messages for deterministic test keys. No production
 secret or random fixture is committed.

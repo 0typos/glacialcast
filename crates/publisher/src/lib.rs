@@ -626,6 +626,13 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
     // that happens to be configured is simply left unused.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(install_signal_handlers(shutdown_tx.clone()));
+    let _approval_worker = tokio::spawn(native_admin::run_live_approvals(
+        args.ingest_addr.clone(),
+        client_state_dir(),
+        args.native_credential.clone(),
+        identity.ingest_server_key,
+        shutdown_rx.clone(),
+    ));
     if serve_control {
         let control_shutdown = shutdown_tx.clone();
         tokio::spawn(async move {

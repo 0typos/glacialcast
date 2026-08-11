@@ -77,6 +77,9 @@ struct Args {
     /// Verify the relay, print its catalog, and exit without opening a window.
     #[arg(long)]
     headless: bool,
+    /// Pair under automatic publisher policy and decode one frame from this stream.
+    #[arg(long, value_name = "STREAM_UUID")]
+    verify_stream: Option<Uuid>,
     /// Write a viewer request for an offline relay-access CA and exit.
     #[arg(long)]
     credential_request: Option<PathBuf>,
@@ -102,6 +105,7 @@ struct Frame {
     height: usize,
     rgb: Vec<u8>,
     sequence: u64,
+    key_group: u64,
 }
 
 enum Event {
@@ -115,7 +119,7 @@ enum Event {
 enum Command {
     Refresh,
     Subscribe(Uuid, IdentityPublic, SubscriptionStart),
-    Pair(IdentityPublic),
+    Pair(Uuid, IdentityPublic),
     ConfirmPairing([u8; 32], bool),
 }
 
@@ -317,7 +321,7 @@ impl eframe::App for ViewerApp {
                                 if ui.button("Pair").clicked() {
                                     let _ = self
                                         .commands
-                                        .send(Command::Pair(descriptor.publisher));
+                                        .send(Command::Pair(descriptor.stream_id, descriptor.publisher));
                                 }
                                 if ui.button("⛶").clicked() {
                                     self.fullscreen = Some(descriptor.stream_id);
@@ -440,6 +444,10 @@ pub fn run() -> Result<()> {
         credential,
         explicit_pin,
     };
+    if let Some(stream_id) = args.verify_stream {
+        let runtime = Runtime::new()?;
+        return runtime.block_on(headless_verify_stream(&profile, stream_id));
+    }
     if args.headless {
         let runtime = Runtime::new()?;
         return runtime.block_on(headless_catalog(&profile));
@@ -461,6 +469,101 @@ pub fn run() -> Result<()> {
         Box::new(move |_| Ok(Box::new(ViewerApp::new(event_rx, command_tx)))),
     )
     .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
+async fn headless_verify_stream(profile: &ConnectionProfile, stream_id: Uuid) -> Result<()> {
+    let mut catalog_socket = connect(profile).await?;
+    catalog_socket.write(&ViewerMessage::Catalog).await?;
+    let catalog = match catalog_socket.read::<RelayViewerMessage>().await? {
+        RelayViewerMessage::Catalog(catalog) => catalog,
+        RelayViewerMessage::Error(error) => anyhow::bail!("catalog rejected: {}", error.detail),
+        _ => anyhow::bail!("unexpected catalog response"),
+    };
+    let publisher = catalog
+        .iter()
+        .find(|entry| entry.descriptor.body.stream_id == stream_id)
+        .map(|entry| entry.descriptor.body.publisher)
+        .context("requested verification stream is not in the catalog")?;
+    let request = begin_pairing(profile, stream_id, publisher).await?;
+    let request_id = request.id()?;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let mut socket = connect(profile).await?;
+            socket.write(&ViewerMessage::FetchInbox).await?;
+            let mut approved = false;
+            loop {
+                match socket.read::<RelayViewerMessage>().await? {
+                    RelayViewerMessage::PairDecision(decision)
+                        if decision.body.request_id == request_id =>
+                    {
+                        decision.verify(&request, &publisher)?;
+                        if !decision.body.approved || decision.body.stream_id != stream_id {
+                            anyhow::bail!("publisher rejected stream verification request");
+                        }
+                        approved = true;
+                    }
+                    RelayViewerMessage::PairOffer(_)
+                    | RelayViewerMessage::PairDecision(_)
+                    | RelayViewerMessage::KeyEnvelope(_) => {}
+                    RelayViewerMessage::InboxComplete => break,
+                    RelayViewerMessage::Error(error) => {
+                        anyhow::bail!("pairing inbox rejected: {}", error.detail)
+                    }
+                    _ => anyhow::bail!("unexpected pairing inbox response"),
+                }
+            }
+            if approved {
+                return Result::<()>::Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .context("timed out waiting for automatic publisher approval")??;
+
+    let keys = Arc::new(Mutex::new(HashMap::new()));
+    let (events, mut received) = mpsc::unbounded_channel();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let subscription = subscribe(
+            profile,
+            &events,
+            &keys,
+            stream_id,
+            publisher,
+            SubscriptionStart::Live,
+        );
+        tokio::pin!(subscription);
+        let mut first_group = None;
+        loop {
+            tokio::select! {
+                result = &mut subscription => return result,
+                event = received.recv() => match event {
+                    Some(Event::Frame(frame))
+                        if frame.stream_id == stream_id && !frame.rgb.is_empty() =>
+                    {
+                        if first_group.is_some_and(|group| group != frame.key_group) {
+                            println!(
+                                "verified\t{}\t{}x{}\tsequence={}\trotated-group={}",
+                                stream_id,
+                                frame.width,
+                                frame.height,
+                                frame.sequence,
+                                frame.key_group,
+                            );
+                            return Ok(());
+                        }
+                        first_group.get_or_insert(frame.key_group);
+                    }
+                    Some(Event::StreamError(_, ref error)) => anyhow::bail!(error.clone()),
+                    Some(_) => {}
+                    None => anyhow::bail!("headless verification event channel closed"),
+                }
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for a decoded stream frame")??;
+    Ok(())
 }
 
 async fn headless_catalog(profile: &ConnectionProfile) -> Result<()> {
@@ -536,20 +639,22 @@ async fn command_worker(
                 });
                 subscriptions.insert(stream_id, task);
             }
-            Command::Pair(publisher) => match begin_pairing(&profile, publisher).await {
-                Ok(request) => {
-                    if let Ok(request_id) = request.id() {
-                        pending.insert(request_id, (request, None));
-                        save_pairing_state(&pairing_path, &pending).ok();
-                        let _ = events.send(Event::Status(
-                            "Pairing request queued; waiting for publisher".into(),
-                        ));
+            Command::Pair(stream_id, publisher) => {
+                match begin_pairing(&profile, stream_id, publisher).await {
+                    Ok(request) => {
+                        if let Ok(request_id) = request.id() {
+                            pending.insert(request_id, (request, None));
+                            save_pairing_state(&pairing_path, &pending).ok();
+                            let _ = events.send(Event::Status(
+                                "Pairing request queued; waiting for publisher".into(),
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        let _ = events.send(Event::Status(format!("Pairing failed: {error:#}")));
                     }
                 }
-                Err(error) => {
-                    let _ = events.send(Event::Status(format!("Pairing failed: {error:#}")));
-                }
-            },
+            }
             Command::ConfirmPairing(request_id, approved) => {
                 if approved {
                     let result = async {
@@ -584,12 +689,14 @@ async fn command_worker(
 
 async fn begin_pairing(
     profile: &ConnectionProfile,
+    stream_id: Uuid,
     publisher: IdentityPublic,
 ) -> Result<PairRequest> {
     let now = glacialcast_protocol::now_ms();
     let request = PairRequest::new_with_credential(
         &profile.identity,
         publisher,
+        stream_id,
         "gcview device".into(),
         profile.credential.clone(),
         now,
@@ -955,6 +1062,7 @@ fn decode_object(
                 height,
                 rgb,
                 sequence: object.header.sequence,
+                key_group: object.header.key_group,
             }));
         }
     }

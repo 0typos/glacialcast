@@ -85,9 +85,10 @@ from a malicious relay.
 ## Manual pairing
 
 The viewer sends a signed, expiring request bound to the intended publisher,
-its device identity, a fresh nonce, and the protocol version. The relay queues
-bounded requests while the publisher is offline. The publisher replies with a
-signed offer containing its identity and fresh handshake material.
+one exact stream, its device identity, a fresh nonce, and the protocol version.
+The relay queues bounded requests while the publisher is offline. The
+publisher replies with a signed offer containing its identity and fresh
+handshake material.
 
 Both peers derive a transcript hash from the request, offer, both persistent
 identities, the relay context, and a domain separator. They independently turn
@@ -96,11 +97,11 @@ each ask a yes/no question after the people compare the strings through an
 independent channel. Neither application offers a skip action. Only two valid,
 signed confirmations for the same transcript make the approval durable.
 
-Approved viewer identity is per device, permanent across IP and relay changes,
-and covers every current and future stream from that publisher. IP and the
-viewer-chosen device name are displayed as context but are not identity. A
-revoked identity remains on a deny list, preventing an old queued request or
-certificate from silently restoring access.
+An approved viewer grant is per device and per stream, and is permanent across
+IP and relay changes. IP and the viewer-chosen device name are displayed as
+context but are not identity. A revoked viewer/stream grant remains on a deny
+list, preventing an old queued request or certificate from silently restoring
+that access while leaving other stream grants untouched.
 
 ## Stream encryption and authenticity
 
@@ -136,7 +137,7 @@ but cannot retract content or keys already delivered to the viewer.
 
 ## Native stream protocol
 
-Protocol version 8 uses bounded Postcard control messages over segmented Noise
+Protocol version 9 uses bounded Postcard control messages over segmented Noise
 records. Stream-object format version 2 replaces MPEG-DASH and fMP4 packaging.
 The outer media profile has an explicit codec identifier so a later codec does
 not require redesigning routing, history, or subscriptions; H.264 Annex-B is
