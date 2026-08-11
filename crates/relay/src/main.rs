@@ -1,5 +1,5 @@
 //! Installed GlacialCast authenticated relay.
 
 fn main() -> anyhow::Result<()> {
-    glacialcast_relay::run()
+    glacialcast_relay::native_runtime::run()
 }

@@ -591,6 +591,37 @@ pub struct RevocationListBody {
 }
 
 impl RevocationList {
+    /// Encodes this signed list in its canonical native representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when serialization fails.
+    pub fn encode(&self) -> Result<Vec<u8>, CredentialError> {
+        postcard::to_stdvec(self).map_err(CredentialError::from)
+    }
+
+    /// Decodes a canonical signed list and rejects trailing bytes.
+    ///
+    /// Signature and time validity are checked separately by [`Self::verify_at`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed, non-canonical, or trailing data.
+    pub fn decode(bytes: &[u8]) -> Result<Self, CredentialError> {
+        let (list, remainder) = postcard::take_from_bytes::<Self>(bytes)?;
+        if !remainder.is_empty() {
+            return Err(CredentialError::InvalidMetadata(
+                "trailing revocation-list data",
+            ));
+        }
+        if list.encode()? != bytes {
+            return Err(CredentialError::InvalidMetadata(
+                "non-canonical revocation-list data",
+            ));
+        }
+        Ok(list)
+    }
+
     /// Verifies issuer, signature, validity, bounds, and sorted-set invariants.
     ///
     /// # Errors
@@ -772,6 +803,22 @@ mod tests {
         let mut tampered = revocations;
         tampered.body.serials.clear();
         assert!(tampered.verify_at(&authority.public(), 3_000).is_err());
+    }
+
+    #[test]
+    fn revocation_list_codec_rejects_truncation_and_trailing_data() {
+        let authority = CertificateAuthoritySecret::generate();
+        let list = authority
+            .sign_revocations(1_000, 1_000 + DAY_MS, vec![[3; 16]])
+            .unwrap();
+        let encoded = list.encode().unwrap();
+        assert_eq!(RevocationList::decode(&encoded).unwrap(), list);
+        for truncated in 0..encoded.len() {
+            assert!(RevocationList::decode(&encoded[..truncated]).is_err());
+        }
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(RevocationList::decode(&trailing).is_err());
     }
 
     #[test]
