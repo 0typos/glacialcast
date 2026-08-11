@@ -30,16 +30,14 @@ fi
 # GLACIALCAST_FUZZ_EPHEMERAL=1 restores the old behaviour for a run that must
 # not touch the tree.
 fuzz_log_dir="$(mktemp -d -t glacialcast-fuzz.XXXXXX)"
-trap 'rm -rf -- "${fuzz_log_dir}"' EXIT
+trap 'find "${fuzz_log_dir}" -depth -delete' EXIT
 ephemeral="${GLACIALCAST_FUZZ_EPHEMERAL:-0}"
 
 for target in \
-  portable_object \
-  cursor_envelope \
   noise_segment \
-  epoch_descriptor \
-  catalog_journal \
-  transfer_index; do
+  native_wire \
+  pair_request \
+  h264_epoch; do
   target_log="${fuzz_log_dir}/${target}.log"
   if [[ "${ephemeral}" == "1" ]]; then
     target_corpus="${fuzz_log_dir}/${target}"
