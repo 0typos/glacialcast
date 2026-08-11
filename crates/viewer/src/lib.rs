@@ -101,6 +101,7 @@ struct Tile {
     texture: Option<egui::TextureHandle>,
     sequence: u64,
     status: String,
+    seek_timestamp: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -148,13 +149,21 @@ impl ViewerApp {
                             tile.catalog.descriptor.body.stream_id
                                 == entry.descriptor.body.stream_id
                         }) {
+                            if let Some(bounds) = entry.retained {
+                                tile.seek_timestamp = tile
+                                    .seek_timestamp
+                                    .clamp(bounds.oldest_timestamp, bounds.newest_timestamp);
+                            }
                             tile.catalog = entry;
                         } else {
+                            let seek_timestamp =
+                                entry.retained.map_or(0, |bounds| bounds.newest_timestamp);
                             self.tiles.push(Tile {
                                 catalog: entry,
                                 texture: None,
                                 sequence: 0,
                                 status: "Available".into(),
+                                seek_timestamp,
                             });
                         }
                     }
@@ -291,6 +300,26 @@ impl eframe::App for ViewerApp {
                                     self.fullscreen = Some(descriptor.stream_id);
                                 }
                             });
+                            if let Some(bounds) = descriptor_retained(&tile.catalog) {
+                                ui.horizontal(|ui| {
+                                    ui.label("Retained");
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut tile.seek_timestamp,
+                                            bounds.oldest_timestamp..=bounds.newest_timestamp,
+                                        )
+                                        .show_value(false),
+                                    );
+                                    if ui.button("Go").clicked() {
+                                        tile.status = "Seeking retained history…".into();
+                                        let _ = self.commands.send(Command::Subscribe(
+                                            descriptor.stream_id,
+                                            descriptor.publisher,
+                                            SubscriptionStart::Timestamp(tile.seek_timestamp),
+                                        ));
+                                    }
+                                });
+                            }
                             let available = ui.available_size_before_wrap();
                             let size = egui::vec2(available.x.max(240.0), (available.y / 2.0).max(160.0));
                             if let Some(texture) = &tile.texture {
@@ -324,6 +353,10 @@ impl eframe::App for ViewerApp {
             }
         });
     }
+}
+
+fn descriptor_retained(entry: &CatalogEntry) -> Option<glacialcast_protocol::wire::RetainedBounds> {
+    entry.retained
 }
 
 /// Starts the native viewer window and background relay workers.
