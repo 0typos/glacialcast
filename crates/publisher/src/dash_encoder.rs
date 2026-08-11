@@ -1005,6 +1005,23 @@ mod tests {
     }
 
     #[test]
+    fn explicit_vaapi_mode_fails_instead_of_silently_using_software() {
+        let error = DashH264Encoder::new(
+            DashEncoderMode::Vaapi,
+            Path::new("/dev/dri/renderD128"),
+            None,
+            1280,
+            720,
+            30.0,
+            2_000_000,
+            120,
+        )
+        .err()
+        .expect("explicit VA-API must fail when the backend is unavailable");
+        assert!(error.to_string().contains("VA-API support is unavailable"));
+    }
+
+    #[test]
     fn rgb_dash_input_resizes_to_encoder_dimensions() {
         let input = DashInputFrame::Rgb(ImageBuffer::from_pixel(5, 3, Rgb([10, 20, 30])))
             .with_output_size(4, 2);
