@@ -50,6 +50,8 @@ const NOISE_SEGMENT_MAGIC: &[u8; 4] = b"GCN1";
 const NOISE_SEGMENT_HEADER_LEN: usize = 12;
 /// Noise protocol pattern used for pinned-server publisher ingest.
 pub const NOISE_PATTERN: &str = "Noise_NK_25519_ChaChaPoly_BLAKE2s";
+/// Mutual-static Noise pattern used by native publisher, relay, and viewer links.
+pub const NOISE_XX_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 /// Byte length of Noise X25519 public and private keys.
 pub const NOISE_KEY_LEN: usize = 32;
 
@@ -818,6 +820,13 @@ pub fn noise_params() -> Result<NoiseParams> {
         .map_err(|err| ProtocolError::Noise(format!("{err:?}")))
 }
 
+/// Parses the mutual-static Noise XX suite used by native transports.
+pub fn noise_xx_params() -> Result<NoiseParams> {
+    NOISE_XX_PATTERN
+        .parse()
+        .map_err(|err| ProtocolError::Noise(format!("{err:?}")))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Persistent X25519 identity used by the Noise responder.
 pub struct NoiseKeypair {
@@ -848,6 +857,49 @@ impl NoiseKeypair {
             .map_err(|err| ProtocolError::Noise(format!("{err:?}")))?;
         Ok(())
     }
+
+    /// Proves that the public half is derived from the private half for Noise XX.
+    pub fn validate_xx(&self) -> Result<()> {
+        let peer = Builder::new(noise_xx_params()?)
+            .generate_keypair()
+            .map_err(|err| ProtocolError::Noise(format!("{err:?}")))?;
+        let peer_private: [u8; NOISE_KEY_LEN] = peer
+            .private
+            .try_into()
+            .map_err(|key: Vec<u8>| ProtocolError::InvalidNoiseKeyLength(key.len()))?;
+        let mut initiator = build_noise_xx_initiator(&self.private)?;
+        let mut responder = build_noise_xx_responder(&peer_private)?;
+        let mut message = [0u8; 128];
+        let mut payload = [0u8; 128];
+
+        let len = initiator
+            .write_message(&[], &mut message)
+            .map_err(|err| ProtocolError::Noise(format!("{err:?}")))?;
+        responder
+            .read_message(&message[..len], &mut payload)
+            .map_err(|err| ProtocolError::Noise(format!("{err:?}")))?;
+        let len = responder
+            .write_message(&[], &mut message)
+            .map_err(|err| ProtocolError::Noise(format!("{err:?}")))?;
+        initiator
+            .read_message(&message[..len], &mut payload)
+            .map_err(|err| ProtocolError::Noise(format!("{err:?}")))?;
+        let len = initiator
+            .write_message(&[], &mut message)
+            .map_err(|err| ProtocolError::Noise(format!("{err:?}")))?;
+        responder
+            .read_message(&message[..len], &mut payload)
+            .map_err(|err| ProtocolError::Noise(format!("{err:?}")))?;
+        let learned = responder
+            .get_remote_static()
+            .ok_or_else(|| ProtocolError::Noise("Noise XX omitted initiator static key".into()))?;
+        if learned != self.public {
+            return Err(ProtocolError::Noise(
+                "Noise private and public keys do not match".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Generates and validates a new cryptographically random Noise identity.
@@ -866,6 +918,7 @@ pub fn generate_noise_keypair() -> Result<NoiseKeypair> {
             .map_err(|key: Vec<u8>| ProtocolError::InvalidNoiseKeyLength(key.len()))?,
     };
     keypair.validate()?;
+    keypair.validate_xx()?;
     Ok(keypair)
 }
 
@@ -896,6 +949,112 @@ pub fn build_noise_responder(local_private_key: &[u8; NOISE_KEY_LEN]) -> Result<
         .local_private_key(local_private_key)
         .build_responder()
         .map_err(|err| ProtocolError::Noise(format!("{err:?}")))
+}
+
+/// Builds the initiating side of a mutual-static Noise XX handshake.
+pub fn build_noise_xx_initiator(local_private_key: &[u8; NOISE_KEY_LEN]) -> Result<HandshakeState> {
+    Builder::new(noise_xx_params()?)
+        .local_private_key(local_private_key)
+        .build_initiator()
+        .map_err(|err| ProtocolError::Noise(format!("{err:?}")))
+}
+
+/// Builds the responding side of a mutual-static Noise XX handshake.
+pub fn build_noise_xx_responder(local_private_key: &[u8; NOISE_KEY_LEN]) -> Result<HandshakeState> {
+    Builder::new(noise_xx_params()?)
+        .local_private_key(local_private_key)
+        .build_responder()
+        .map_err(|err| ProtocolError::Noise(format!("{err:?}")))
+}
+
+fn remote_noise_static(noise: &HandshakeState, role: &str) -> Result<[u8; NOISE_KEY_LEN]> {
+    let key = noise
+        .get_remote_static()
+        .ok_or_else(|| ProtocolError::Noise(format!("Noise XX omitted {role} static key")))?;
+    key.try_into()
+        .map_err(|_| ProtocolError::InvalidNoiseKeyLength(key.len()))
+}
+
+/// Performs the initiating side of a mutual-static Noise XX handshake.
+///
+/// `verify_remote` runs after the responder proves possession of its static
+/// key and before this function sends the final handshake message. Returning
+/// an error therefore prevents untrusted or changed relays from completing a
+/// session. The returned key is the authenticated responder static key.
+///
+/// # Errors
+///
+/// Returns an error for framing, Noise, I/O, missing remote identity, or a
+/// rejected remote identity.
+pub async fn initiator_handshake_xx<S, F>(
+    stream: &mut S,
+    local_private_key: &[u8; NOISE_KEY_LEN],
+    verify_remote: F,
+) -> Result<(TransportState, [u8; NOISE_KEY_LEN])>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: FnOnce(&[u8; NOISE_KEY_LEN]) -> Result<()>,
+{
+    let mut noise = build_noise_xx_initiator(local_private_key)?;
+    let mut buf = vec![0u8; MAX_WIRE_PACKET_LEN];
+    let len = noise
+        .write_message(&[], &mut buf)
+        .map_err(|err| ProtocolError::Noise(format!("{err:?}")))?;
+    write_clear_frame(stream, &buf[..len]).await?;
+
+    let message = read_clear_frame(stream).await?;
+    noise
+        .read_message(&message, &mut buf)
+        .map_err(|err| ProtocolError::Noise(format!("{err:?}")))?;
+    let remote_static = remote_noise_static(&noise, "responder")?;
+    verify_remote(&remote_static)?;
+
+    let len = noise
+        .write_message(&[], &mut buf)
+        .map_err(|err| ProtocolError::Noise(format!("{err:?}")))?;
+    write_clear_frame(stream, &buf[..len]).await?;
+    let transport = noise
+        .into_transport_mode()
+        .map_err(|err| ProtocolError::Noise(format!("{err:?}")))?;
+    Ok((transport, remote_static))
+}
+
+/// Performs the responding side of a mutual-static Noise XX handshake.
+///
+/// The returned key is the authenticated initiator static key and must be
+/// bound to a valid role credential before application messages are accepted.
+///
+/// # Errors
+///
+/// Returns an error for framing, Noise, I/O, or a missing remote identity.
+pub async fn responder_handshake_xx<S>(
+    stream: &mut S,
+    local_private_key: &[u8; NOISE_KEY_LEN],
+) -> Result<(TransportState, [u8; NOISE_KEY_LEN])>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut noise = build_noise_xx_responder(local_private_key)?;
+    let mut buf = vec![0u8; MAX_WIRE_PACKET_LEN];
+    let message = read_clear_frame(stream).await?;
+    noise
+        .read_message(&message, &mut buf)
+        .map_err(|err| ProtocolError::Noise(format!("{err:?}")))?;
+
+    let len = noise
+        .write_message(&[], &mut buf)
+        .map_err(|err| ProtocolError::Noise(format!("{err:?}")))?;
+    write_clear_frame(stream, &buf[..len]).await?;
+
+    let message = read_clear_frame(stream).await?;
+    noise
+        .read_message(&message, &mut buf)
+        .map_err(|err| ProtocolError::Noise(format!("{err:?}")))?;
+    let remote_static = remote_noise_static(&noise, "initiator")?;
+    let transport = noise
+        .into_transport_mode()
+        .map_err(|err| ProtocolError::Noise(format!("{err:?}")))?;
+    Ok((transport, remote_static))
 }
 
 /// Performs the publisher side of the Noise NK handshake.
@@ -1350,6 +1509,51 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn noise_xx_mutually_authenticates_static_keys() {
+        let initiator_key = generate_noise_keypair().unwrap();
+        let responder_key = generate_noise_keypair().unwrap();
+        let (mut initiator_stream, mut responder_stream) = tokio::io::duplex(1024);
+        let responder = tokio::spawn(async move {
+            responder_handshake_xx(&mut responder_stream, &responder_key.private)
+                .await
+                .unwrap()
+                .1
+        });
+
+        let expected = responder_key.public;
+        let (_, learned) =
+            initiator_handshake_xx(&mut initiator_stream, &initiator_key.private, |remote| {
+                if remote == &expected {
+                    Ok(())
+                } else {
+                    Err(ProtocolError::Noise("unexpected relay identity".into()))
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(learned, responder_key.public);
+        assert_eq!(responder.await.unwrap(), initiator_key.public);
+    }
+
+    #[tokio::test]
+    async fn noise_xx_rejects_changed_relay_before_handshake_completion() {
+        let initiator_key = generate_noise_keypair().unwrap();
+        let responder_key = generate_noise_keypair().unwrap();
+        let (mut initiator_stream, mut responder_stream) = tokio::io::duplex(1024);
+        let responder = tokio::spawn(async move {
+            responder_handshake_xx(&mut responder_stream, &responder_key.private).await
+        });
+
+        let result = initiator_handshake_xx(&mut initiator_stream, &initiator_key.private, |_| {
+            Err(ProtocolError::Noise("relay identity changed".into()))
+        })
+        .await;
+        assert!(matches!(result, Err(ProtocolError::Noise(_))));
+        drop(initiator_stream);
+        assert!(responder.await.unwrap().is_err());
     }
 
     #[test]
