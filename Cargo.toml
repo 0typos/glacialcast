@@ -40,10 +40,12 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 cros-codecs = { version = "0.0.6", features = ["vaapi"] }
 ctr = "0.9"
+ed25519-dalek = "3.0"
 futures-util = "0.3"
 gbm = { version = "0.15", default-features = false }
 hkdf = "0.12"
 hmac = "0.12"
+hpke = { version = "0.14", default-features = false, features = ["alloc", "chacha", "getrandom", "x25519"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 openh264 = { version = "0.9.7", default-features = false, features = ["libloading"] }
 libc = "0.2"
@@ -68,6 +70,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
 zbus = { version = "5.15", default-features = false, features = ["tokio"] }
 zvariant = "5.11"
+zeroize = { version = "1.8", features = ["derive"] }
 
 [patch.crates-io]
 # cros-libva 0.0.12 does not initialize libva 1.23's new VP9 fields. Keep
