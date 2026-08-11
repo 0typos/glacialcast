@@ -10,7 +10,6 @@ cargo-fuzz = true
 [dependencies]
 glacialcast-stream = { path = "../crates/stream" }
 glacialcast-protocol = { path = "../crates/protocol" }
-gcrelay = { path = "../crates/relay" }
 libfuzzer-sys = "0.4"
 
 [[bin]]
@@ -37,13 +36,6 @@ bench = false
 [[bin]]
 name = "epoch_descriptor"
 path = "fuzz_targets/epoch_descriptor.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "catalog_journal"
-path = "fuzz_targets/catalog_journal.rs"
 test = false
 doc = false
 bench = false

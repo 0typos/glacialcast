@@ -1,15 +1,15 @@
 //! Installed native relay runtime and configuration.
 
 use crate::{
-    load_or_create_ingest_key, native_access::NativeAccessPolicy,
-    native_service::NativeRelayService, native_store::NativeStore,
+    native_access::NativeAccessPolicy, native_service::NativeRelayService,
+    native_store::NativeStore,
 };
 use anyhow::{Context, Result};
 use clap::Parser;
 use glacialcast_protocol::{
     config_path::{self, ConfigSource},
     credential::{CertificateAuthorityPublic, RevocationList},
-    encode_noise_public_key, parse_human_bytes,
+    encode_noise_public_key, load_or_create_noise_keypair, parse_human_bytes,
 };
 use serde::Deserialize;
 use std::{
@@ -165,7 +165,7 @@ async fn serve(args: Args) -> Result<()> {
     let noise_path = args
         .noise_key_file
         .unwrap_or_else(|| args.data_dir.join("relay-noise.key"));
-    let noise_identity = load_or_create_ingest_key(&noise_path)?;
+    let noise_identity = load_or_create_noise_keypair(&noise_path)?;
     if args.print_server_key {
         println!("{}", encode_noise_public_key(&noise_identity.public));
         return Ok(());
