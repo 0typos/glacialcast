@@ -181,7 +181,7 @@ struct Args {
     client_id: Option<String>,
     #[arg(long)]
     display_name: Option<String>,
-    #[arg(long, value_enum, default_value_t = CaptureMode::DashWayland)]
+    #[arg(long, value_enum, default_value_t = CaptureMode::Wayland)]
     capture: CaptureMode,
     #[arg(long, value_enum, default_value_t = TestPatternMode::Motion)]
     test_pattern: TestPatternMode,
@@ -256,8 +256,8 @@ struct Args {
     video_bitrate: u32,
     #[arg(long)]
     segment_frames: Option<u16>,
-    #[arg(long, value_enum, default_value_t = DashEncoderMode::Auto)]
-    dash_encoder: DashEncoderMode,
+    #[arg(long = "encoder", alias = "dash-encoder", value_enum, default_value_t = DashEncoderMode::Auto)]
+    encoder: DashEncoderMode,
     #[arg(long, default_value = "/dev/dri/renderD128")]
     vaapi_device: PathBuf,
     #[arg(long)]
@@ -381,8 +381,8 @@ struct ClientIdentity {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CaptureMode {
-    DashTest,
-    DashWayland,
+    Test,
+    Wayland,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -701,12 +701,12 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
                 let label = target.label.clone();
                 let result = runtime.block_on(async {
                     let mut capture: Box<dyn Capture> = match args.capture {
-                        CaptureMode::DashTest => Box::new(TestPatternCapture::new(
+                        CaptureMode::Test => Box::new(TestPatternCapture::new(
                             args.width,
                             args.height,
                             args.test_pattern,
                         )),
-                        CaptureMode::DashWayland => {
+                        CaptureMode::Wayland => {
                             Box::new(WaylandPipewireCapture::new(&args, target))
                         }
                     };
@@ -788,7 +788,7 @@ async fn resolve_publish_targets(
     args: &Args,
     identity: &ClientIdentity,
 ) -> Result<Vec<PublishTarget>> {
-    if args.capture != CaptureMode::DashWayland {
+    if args.capture != CaptureMode::Wayland {
         return Ok(vec![PublishTarget {
             label: None,
             backend: args.screencast_backend,
@@ -1211,7 +1211,7 @@ async fn run_dash_connection(
         .transpose()?;
     let epoch_keys = keys.as_ref();
     let encoder = EncoderActor::spawn(EncoderConfig {
-        mode: args.dash_encoder,
+        mode: args.encoder,
         vaapi_device: args.vaapi_device.clone(),
         openh264_library: args.openh264_library.clone(),
         width,
@@ -2981,8 +2981,8 @@ impl WaylandPipewireCapture {
             require_cursor_metadata: args.require_cursor_metadata,
             target_width: args.max_frame_width,
             target_height: args.max_frame_height,
-            prefer_dmabuf: args.capture == CaptureMode::DashWayland
-                && should_capture_dmabuf(args.dash_encoder, &args.vaapi_device),
+            prefer_dmabuf: args.capture == CaptureMode::Wayland
+                && should_capture_dmabuf(args.encoder, &args.vaapi_device),
             gpu_device: args.vaapi_device.clone(),
             inner: None,
         }

@@ -17,7 +17,7 @@ Environment=RUST_LOG=glacialcast_publisher=info
 
 # For a user unit systemd puts these under $XDG_CONFIG_HOME and
 # $XDG_STATE_HOME, which is exactly where the publisher looks for its config
-# and keeps its viewer key. Nothing to create by hand.
+# and keeps its native identity. Nothing to create by hand.
 ConfigurationDirectory=glacialcast
 ConfigurationDirectoryMode=0700
 StateDirectory=glacialcast
@@ -35,23 +35,18 @@ StateDirectoryMode=0700
 # Frame rate, cursor rate, and frame size are left at their defaults, which are
 # the values the bandwidth and cursor gates measure.
 #
-# Every output is published, each as its own stream, all unlocked by the one
-# viewer key. Set all_monitors = false in client.toml to publish only the
-# primary one.
+# Every output is published as its own end-to-end encrypted stream. Set
+# all_monitors = false in client.toml to publish only the primary one.
 ExecStart=/usr/local/bin/gcpub \
     --foreground \
     --ingest-addr 127.0.0.1:8900 \
-    --capture dash-wayland \
+    --capture wayland \
     --portal-source monitor \
     --all-monitors
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
 
-# The startup summary carries the viewer key, so it is printed to the journal
-# only when an operator asks for it:
-#   systemctl --user stop gcpub
-#   gcpub --print-viewer-key
 NoNewPrivileges=yes
 ProtectClock=yes
 ProtectHostname=yes
