@@ -9,6 +9,19 @@ viewer = "0.0.0.0:8899"
 bytes_per_stream = 104857600
 seconds_per_stream = 86400
 
+[limits]
+max_connections = 256
+handshake_seconds = 10
+idle_seconds = 120
+live_channel_items = 32
+max_streams = 1024
+max_streams_per_publisher = 16
+max_objects_per_group = 4096
+max_group_bytes = 67108864
+max_envelopes_per_group = 128
+max_total_bytes = 10737418240
+max_publisher_bytes = 1073741824
+
 # Public mode exposes stream names and accepts any Noise-authenticated peer.
 [access]
 mode = "public"

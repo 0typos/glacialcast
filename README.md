@@ -58,7 +58,10 @@ history can become playable after live playback starts.
 The relay reads `relay.toml`; see `packaging/server.toml.example`. Defaults are
 ports 8900/8899 and 100 MiB or 24 hours retained per stream. `[access]` may be
 `public` or `signed`. Signed mode accepts only CA credentials bound to the
-device identity, Noise key, role, validity, and current revocation list.
+device identity, Noise key, role, validity, and current revocation list. The
+`[limits]` section bounds connections, handshakes, idle sessions, live queues,
+streams, group objects and bytes, envelopes, and global/per-publisher storage.
+In signed mode the relay reloads a valid replacement CRL within one second.
 
 The publisher reads private `client.toml`; see
 `packaging/client.toml.example`. `history_bytes` and `history_seconds` bound the

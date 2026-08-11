@@ -29,13 +29,36 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
-    sync::{broadcast, watch},
+    sync::{Semaphore, broadcast, watch},
 };
 use uuid::Uuid;
 
-const LIVE_CHANNEL_CAPACITY: usize = 1_024;
 const SUBSCRIPTION_PAGE: usize = 1_024;
 const PAIRING_REQUEST_LIFETIME_MS: i64 = 24 * 60 * 60 * 1_000;
+
+/// Hard bounds applied to native relay connections.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeServiceLimits {
+    /// Maximum publisher and viewer TCP sessions combined.
+    pub max_connections: usize,
+    /// Maximum time allowed for Noise and the first application message.
+    pub handshake_timeout: Duration,
+    /// Maximum time a connected peer may send no application data.
+    pub idle_timeout: Duration,
+    /// Maximum opaque live items retained in memory per stream.
+    pub live_channel_capacity: usize,
+}
+
+impl Default for NativeServiceLimits {
+    fn default() -> Self {
+        Self {
+            max_connections: 256,
+            handshake_timeout: Duration::from_secs(10),
+            idle_timeout: Duration::from_secs(120),
+            live_channel_capacity: 32,
+        }
+    }
+}
 
 /// Shared native relay service state.
 #[derive(Clone)]
@@ -50,6 +73,8 @@ struct NativeRelayInner {
     pairing: PairingStore,
     live: Mutex<HashMap<Uuid, broadcast::Sender<LiveItem>>>,
     online_streams: RwLock<HashSet<Uuid>>,
+    limits: NativeServiceLimits,
+    connections: Arc<Semaphore>,
 }
 
 #[derive(Clone)]
@@ -69,6 +94,32 @@ impl NativeRelayService {
         access: NativeAccessPolicy,
         noise_identity: NoiseKeypair,
     ) -> Result<Self> {
+        Self::new_with_limits(
+            store,
+            access,
+            noise_identity,
+            NativeServiceLimits::default(),
+        )
+    }
+
+    /// Creates a native relay with explicit hard connection and timeout bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid Noise identity or zero-valued bounds.
+    pub fn new_with_limits(
+        store: NativeStore,
+        access: NativeAccessPolicy,
+        noise_identity: NoiseKeypair,
+        limits: NativeServiceLimits,
+    ) -> Result<Self> {
+        if limits.max_connections == 0
+            || limits.handshake_timeout.is_zero()
+            || limits.idle_timeout.is_zero()
+            || limits.live_channel_capacity == 0
+        {
+            anyhow::bail!("native service limits must be positive");
+        }
         noise_identity
             .validate_xx()
             .context("validating native relay Noise identity")?;
@@ -81,6 +132,8 @@ impl NativeRelayService {
                 pairing,
                 live: Mutex::new(HashMap::new()),
                 online_streams: RwLock::new(HashSet::new()),
+                limits,
+                connections: Arc::new(Semaphore::new(limits.max_connections)),
             }),
         })
     }
@@ -101,15 +154,21 @@ impl NativeRelayService {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        let (transport, remote_noise_key) =
-            responder_handshake_xx(&mut stream, &self.inner.noise_identity.private)
-                .await
-                .context("performing publisher Noise XX handshake")?;
+        let (transport, remote_noise_key) = tokio::time::timeout(
+            self.inner.limits.handshake_timeout,
+            responder_handshake_xx(&mut stream, &self.inner.noise_identity.private),
+        )
+        .await
+        .context("publisher Noise XX handshake timed out")?
+        .context("performing publisher Noise XX handshake")?;
         let mut socket = NoiseSocket::new(stream, transport);
-        let hello_message = socket
-            .read::<PublisherMessage>()
-            .await
-            .context("reading publisher hello")?;
+        let hello_message = tokio::time::timeout(
+            self.inner.limits.handshake_timeout,
+            socket.read::<PublisherMessage>(),
+        )
+        .await
+        .context("publisher hello timed out")?
+        .context("reading publisher hello")?;
         hello_message
             .validate_wire()
             .context("validating publisher hello")?;
@@ -149,6 +208,17 @@ impl NativeRelayService {
         let result = self
             .publisher_loop(&mut socket, &hello, admission, &mut touched_streams)
             .await;
+        for stream_id in &touched_streams {
+            if let Err(error) = self
+                .store_call({
+                    let stream_id = *stream_id;
+                    move |store| store.finalize_stream(stream_id)
+                })
+                .await
+            {
+                tracing::error!(?error, %stream_id, "failed to finalize disconnected stream");
+            }
+        }
         if let Ok(mut online) = self.inner.online_streams.write() {
             for stream_id in touched_streams {
                 online.remove(&stream_id);
@@ -172,7 +242,26 @@ impl NativeRelayService {
             .id()
             .context("fingerprinting publisher identity")?;
         loop {
-            let message = match read_publisher_until_expiry(socket, admission.expires_at_ms).await {
+            if let Err(error) = self
+                .inner
+                .access
+                .ensure_active(admission, glacialcast_protocol::now_ms())
+            {
+                send_publisher_error(
+                    socket,
+                    active_credential_error_code(admission),
+                    "publisher credential is no longer valid",
+                )
+                .await?;
+                return Err(error.into());
+            }
+            let message = match read_publisher_until_expiry(
+                socket,
+                admission.expires_at_ms,
+                self.inner.limits.idle_timeout,
+            )
+            .await
+            {
                 Ok(message) => message,
                 Err(SessionReadError::Expired) => {
                     send_publisher_error(
@@ -183,6 +272,7 @@ impl NativeRelayService {
                     .await?;
                     anyhow::bail!("publisher credential expired");
                 }
+                Err(SessionReadError::Idle) => anyhow::bail!("publisher session idle timeout"),
                 Err(SessionReadError::Protocol(error)) => return Err(error),
             };
             message
@@ -209,6 +299,7 @@ impl NativeRelayService {
                     for stream in streams {
                         self.validate_resume_stream(&hello.identity, &stream)
                             .await?;
+                        self.claim_online(stream.stream_id, touched_streams)?;
                         let high_water = self
                             .store_call({
                                 let stream_id = stream.stream_id;
@@ -220,32 +311,28 @@ impl NativeRelayService {
                             stream_id: stream.stream_id,
                             committed_through: high_water,
                         });
-                        touched_streams.insert(stream.stream_id);
-                        self.mark_online(stream.stream_id)?;
                     }
                     write_publisher(socket, &RelayPublisherMessage::ResumeState(states)).await?;
                 }
                 PublisherMessage::Descriptor(descriptor) => {
                     require_publisher(&descriptor.body.publisher, &hello.identity)?;
                     let stream_id = descriptor.body.stream_id;
+                    self.claim_online(stream_id, touched_streams)?;
                     self.store_call(move |store| store.put_descriptor(&descriptor))
                         .await?;
-                    touched_streams.insert(stream_id);
-                    self.mark_online(stream_id)?;
                 }
                 PublisherMessage::Object(object) => {
                     if object.header.publisher_id != publisher_id {
                         anyhow::bail!("native object publisher identity mismatch");
                     }
                     let stream_id = object.header.stream_id;
+                    self.claim_online(stream_id, touched_streams)?;
                     let broadcast_object = object.clone();
                     let commit = self
                         .store_call(move |store| {
                             store.store_object(&object, glacialcast_protocol::now_ms())
                         })
                         .await?;
-                    touched_streams.insert(stream_id);
-                    self.mark_online(stream_id)?;
                     if commit.inserted {
                         let _ = self
                             .live_sender(stream_id)?
@@ -366,15 +453,21 @@ impl NativeRelayService {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        let (transport, remote_noise_key) =
-            responder_handshake_xx(&mut stream, &self.inner.noise_identity.private)
-                .await
-                .context("performing viewer Noise XX handshake")?;
+        let (transport, remote_noise_key) = tokio::time::timeout(
+            self.inner.limits.handshake_timeout,
+            responder_handshake_xx(&mut stream, &self.inner.noise_identity.private),
+        )
+        .await
+        .context("viewer Noise XX handshake timed out")?
+        .context("performing viewer Noise XX handshake")?;
         let mut socket = NoiseSocket::new(stream, transport);
-        let hello_message = socket
-            .read::<ViewerMessage>()
-            .await
-            .context("reading viewer hello")?;
+        let hello_message = tokio::time::timeout(
+            self.inner.limits.handshake_timeout,
+            socket.read::<ViewerMessage>(),
+        )
+        .await
+        .context("viewer hello timed out")?
+        .context("reading viewer hello")?;
         hello_message
             .validate_wire()
             .context("validating viewer hello")?;
@@ -424,7 +517,26 @@ impl NativeRelayService {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         loop {
-            let message = match read_viewer_until_expiry(socket, admission.expires_at_ms).await {
+            if let Err(error) = self
+                .inner
+                .access
+                .ensure_active(admission, glacialcast_protocol::now_ms())
+            {
+                send_viewer_error(
+                    socket,
+                    active_credential_error_code(admission),
+                    "viewer credential is no longer valid",
+                )
+                .await?;
+                return Err(error.into());
+            }
+            let message = match read_viewer_until_expiry(
+                socket,
+                admission.expires_at_ms,
+                self.inner.limits.idle_timeout,
+            )
+            .await
+            {
                 Ok(message) => message,
                 Err(SessionReadError::Expired) => {
                     send_viewer_error(
@@ -435,6 +547,7 @@ impl NativeRelayService {
                     .await?;
                     anyhow::bail!("viewer credential expired");
                 }
+                Err(SessionReadError::Idle) => anyhow::bail!("viewer session idle timeout"),
                 Err(SessionReadError::Protocol(error)) => return Err(error),
             };
             message
@@ -457,7 +570,7 @@ impl NativeRelayService {
                         publisher_id,
                         stream_id,
                         start,
-                        admission.expires_at_ms,
+                        admission,
                     )
                     .await?;
                     return Ok(());
@@ -586,11 +699,12 @@ impl NativeRelayService {
         publisher_id: [u8; IDENTITY_ID_LEN],
         stream_id: Uuid,
         start: SubscriptionStart,
-        expires_at_ms: Option<i64>,
+        admission: NativeAdmission,
     ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        let expires_at_ms = admission.expires_at_ms;
         let descriptor = self
             .store_call(move |store| store.descriptor(stream_id))
             .await?
@@ -648,6 +762,7 @@ impl NativeRelayService {
             .await?;
         }
 
+        let mut last_live_activity = tokio::time::Instant::now();
         loop {
             if expires_at_ms.is_some_and(|expiry| glacialcast_protocol::now_ms() >= expiry) {
                 send_viewer_error(
@@ -658,35 +773,33 @@ impl NativeRelayService {
                 .await?;
                 anyhow::bail!("viewer credential expired");
             }
-            let received = match expires_at_ms {
-                None => receiver.recv().await,
-                Some(expiry) => {
-                    let remaining = expiry.saturating_sub(glacialcast_protocol::now_ms());
-                    let Ok(remaining) = u64::try_from(remaining) else {
-                        send_viewer_error(
-                            socket,
-                            RelayErrorCode::CredentialExpired,
-                            "viewer credential expired",
-                        )
-                        .await?;
-                        anyhow::bail!("viewer credential expired");
-                    };
-                    match tokio::time::timeout(Duration::from_millis(remaining), receiver.recv())
-                        .await
-                    {
-                        Ok(received) => received,
-                        Err(_) => {
-                            send_viewer_error(
-                                socket,
-                                RelayErrorCode::CredentialExpired,
-                                "viewer credential expired",
-                            )
-                            .await?;
-                            anyhow::bail!("viewer credential expired");
-                        }
-                    }
-                }
+            if let Err(error) = self
+                .inner
+                .access
+                .ensure_active(admission, glacialcast_protocol::now_ms())
+            {
+                send_viewer_error(
+                    socket,
+                    active_credential_error_code(admission),
+                    "viewer credential is no longer valid",
+                )
+                .await?;
+                return Err(error.into());
+            }
+            let idle_remaining = self
+                .inner
+                .limits
+                .idle_timeout
+                .saturating_sub(last_live_activity.elapsed());
+            if idle_remaining.is_zero() {
+                anyhow::bail!("viewer subscription idle timeout");
+            }
+            let policy_tick = Duration::from_secs(1).min(idle_remaining);
+            let received = match tokio::time::timeout(policy_tick, receiver.recv()).await {
+                Ok(received) => received,
+                Err(_) => continue,
             };
+            last_live_activity = tokio::time::Instant::now();
             match received {
                 Ok(LiveItem::Envelope(envelope)) => {
                     if envelope.header.recipient_id == recipient_id {
@@ -799,12 +912,20 @@ impl NativeRelayService {
         Ok(())
     }
 
-    fn mark_online(&self, stream_id: Uuid) -> Result<()> {
-        self.inner
+    fn claim_online(&self, stream_id: Uuid, touched_streams: &mut HashSet<Uuid>) -> Result<()> {
+        if touched_streams.contains(&stream_id) {
+            return Ok(());
+        }
+        let inserted = self
+            .inner
             .online_streams
             .write()
             .map_err(|_| anyhow::anyhow!("native online-stream lock poisoned"))?
             .insert(stream_id);
+        if !inserted {
+            anyhow::bail!("stream already has an active publisher session");
+        }
+        touched_streams.insert(stream_id);
         Ok(())
     }
 
@@ -816,7 +937,7 @@ impl NativeRelayService {
             .map_err(|_| anyhow::anyhow!("native live-channel lock poisoned"))?;
         Ok(senders
             .entry(stream_id)
-            .or_insert_with(|| broadcast::channel(LIVE_CHANNEL_CAPACITY).0)
+            .or_insert_with(|| broadcast::channel(self.inner.limits.live_channel_capacity).0)
             .clone())
     }
 
@@ -897,8 +1018,14 @@ impl NativeRelayService {
                 }
                 accepted = listener.accept() => {
                     let (stream, peer) = accepted.context("accepting native relay connection")?;
+                    let Ok(permit) = self.inner.connections.clone().try_acquire_owned() else {
+                        tracing::warn!(%peer, "native relay connection limit reached");
+                        drop(stream);
+                        continue;
+                    };
                     let service = self.clone();
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(error) = handler(service, stream, peer).await {
                             tracing::warn!(?error, %peer, "native relay connection ended with error");
                         }
@@ -915,6 +1042,17 @@ fn welcome(admission: NativeAdmission) -> RelayWelcome {
         access_mode: admission.mode,
         relay_time_ms: glacialcast_protocol::now_ms(),
         credential_expires_at_ms: admission.expires_at_ms,
+    }
+}
+
+fn active_credential_error_code(admission: NativeAdmission) -> RelayErrorCode {
+    if admission
+        .expires_at_ms
+        .is_some_and(|expiry| glacialcast_protocol::now_ms() >= expiry)
+    {
+        RelayErrorCode::CredentialExpired
+    } else {
+        RelayErrorCode::Unauthorized
     }
 }
 
@@ -994,48 +1132,61 @@ where
 
 enum SessionReadError {
     Expired,
+    Idle,
     Protocol(anyhow::Error),
 }
 
 async fn read_publisher_until_expiry<S>(
     socket: &mut NoiseSocket<S>,
     expires_at_ms: Option<i64>,
+    idle_timeout: Duration,
 ) -> std::result::Result<PublisherMessage, SessionReadError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    read_until_expiry(socket.read::<PublisherMessage>(), expires_at_ms).await
+    read_until_expiry(
+        socket.read::<PublisherMessage>(),
+        expires_at_ms,
+        idle_timeout,
+    )
+    .await
 }
 
 async fn read_viewer_until_expiry<S>(
     socket: &mut NoiseSocket<S>,
     expires_at_ms: Option<i64>,
+    idle_timeout: Duration,
 ) -> std::result::Result<ViewerMessage, SessionReadError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    read_until_expiry(socket.read::<ViewerMessage>(), expires_at_ms).await
+    read_until_expiry(socket.read::<ViewerMessage>(), expires_at_ms, idle_timeout).await
 }
 
 async fn read_until_expiry<T, F>(
     read: F,
     expires_at_ms: Option<i64>,
+    idle_timeout: Duration,
 ) -> std::result::Result<T, SessionReadError>
 where
     F: Future<Output = glacialcast_protocol::Result<T>>,
 {
     match expires_at_ms {
-        None => read
-            .await
-            .map_err(|error| SessionReadError::Protocol(error.into())),
+        None => match tokio::time::timeout(idle_timeout, read).await {
+            Ok(result) => result.map_err(|error| SessionReadError::Protocol(error.into())),
+            Err(_) => Err(SessionReadError::Idle),
+        },
         Some(expiry) => {
             let remaining_ms = expiry.saturating_sub(glacialcast_protocol::now_ms());
             let Ok(remaining_ms) = u64::try_from(remaining_ms) else {
                 return Err(SessionReadError::Expired);
             };
-            match tokio::time::timeout(Duration::from_millis(remaining_ms), read).await {
+            let remaining = Duration::from_millis(remaining_ms);
+            let timeout = remaining.min(idle_timeout);
+            match tokio::time::timeout(timeout, read).await {
                 Ok(result) => result.map_err(|error| SessionReadError::Protocol(error.into())),
-                Err(_) => Err(SessionReadError::Expired),
+                Err(_) if remaining <= idle_timeout => Err(SessionReadError::Expired),
+                Err(_) => Err(SessionReadError::Idle),
             }
         }
     }
@@ -1060,6 +1211,33 @@ mod tests {
 
     fn root() -> std::path::PathBuf {
         std::env::temp_dir().join(format!("glacialcast-native-service-{}", Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn service_limits_reject_zero_and_idle_reads_time_out() {
+        let root = root();
+        let store = NativeStore::open(root.clone(), None, None).unwrap();
+        let limits = NativeServiceLimits {
+            max_connections: 0,
+            ..NativeServiceLimits::default()
+        };
+        assert!(
+            NativeRelayService::new_with_limits(
+                store,
+                NativeAccessPolicy::Public,
+                generate_noise_keypair().unwrap(),
+                limits,
+            )
+            .is_err()
+        );
+        let result = read_until_expiry(
+            std::future::pending::<glacialcast_protocol::Result<()>>(),
+            None,
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(matches!(result, Err(SessionReadError::Idle)));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     async fn viewer_socket(
@@ -1320,7 +1498,7 @@ mod tests {
             store,
             NativeAccessPolicy::Signed {
                 authority: authority.public(),
-                revocations: None,
+                revocations: std::sync::Arc::new(std::sync::RwLock::new(None)),
             },
             generate_noise_keypair().unwrap(),
         )

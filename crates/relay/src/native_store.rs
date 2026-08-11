@@ -29,6 +29,39 @@ const DATABASE_FILE: &str = "native-v2.sqlite3";
 const SCHEMA_VERSION: i64 = 2;
 const MAX_LIST_OBJECTS: usize = 16_384;
 
+/// Non-retention hard limits that bound hostile publisher resource use.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeStoreLimits {
+    /// Maximum descriptors retained globally.
+    pub max_streams: u64,
+    /// Maximum descriptors owned by one publisher identity.
+    pub max_streams_per_publisher: u64,
+    /// Maximum encoded objects in one keyframe group.
+    pub max_objects_per_group: u64,
+    /// Maximum objects plus envelopes in one keyframe group.
+    pub max_group_bytes: u64,
+    /// Maximum viewer envelopes in one keyframe group.
+    pub max_envelopes_per_group: u64,
+    /// Maximum retained bytes across the complete relay store.
+    pub max_total_bytes: u64,
+    /// Maximum retained bytes owned by one publisher identity.
+    pub max_publisher_bytes: u64,
+}
+
+impl Default for NativeStoreLimits {
+    fn default() -> Self {
+        Self {
+            max_streams: 1_024,
+            max_streams_per_publisher: 16,
+            max_objects_per_group: 4_096,
+            max_group_bytes: 64 * 1024 * 1024,
+            max_envelopes_per_group: 128,
+            max_total_bytes: 10 * 1024 * 1024 * 1024,
+            max_publisher_bytes: 1024 * 1024 * 1024,
+        }
+    }
+}
+
 /// Durable payload-opaque native stream store.
 #[derive(Clone)]
 pub struct NativeStore {
@@ -41,6 +74,22 @@ struct NativeStoreInner {
     retention_bytes: Option<u64>,
     retention_age: Option<Duration>,
     quarantined_v1: Option<PathBuf>,
+    limits: NativeStoreLimits,
+}
+
+#[derive(Clone, Copy)]
+enum GroupItemKind {
+    Object,
+    Envelope,
+}
+
+struct GroupGrowth<'a> {
+    publisher_id: &'a [u8; 32],
+    stream_id: Uuid,
+    epoch_id: Uuid,
+    key_group: u64,
+    added_bytes: u64,
+    item_kind: GroupItemKind,
 }
 
 /// Result of committing one native stream object.
@@ -97,8 +146,40 @@ impl NativeStore {
         retention_bytes: Option<u64>,
         retention_age: Option<Duration>,
     ) -> Result<Self> {
+        Self::open_with_limits(
+            root,
+            retention_bytes,
+            retention_age,
+            NativeStoreLimits::default(),
+        )
+    }
+
+    /// Opens a store with explicit hostile-publisher resource limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::open`], and rejects zero or internally
+    /// inconsistent hard limits.
+    pub fn open_with_limits(
+        root: PathBuf,
+        retention_bytes: Option<u64>,
+        retention_age: Option<Duration>,
+        limits: NativeStoreLimits,
+    ) -> Result<Self> {
         if retention_bytes == Some(0) || retention_age == Some(Duration::ZERO) {
             anyhow::bail!("native retention limits must be positive when configured");
+        }
+        if limits.max_streams == 0
+            || limits.max_streams_per_publisher == 0
+            || limits.max_streams_per_publisher > limits.max_streams
+            || limits.max_objects_per_group == 0
+            || limits.max_group_bytes == 0
+            || limits.max_envelopes_per_group == 0
+            || limits.max_total_bytes == 0
+            || limits.max_publisher_bytes == 0
+            || limits.max_publisher_bytes > limits.max_total_bytes
+        {
+            anyhow::bail!("native store hard limits are zero or inconsistent");
         }
         let quarantined_v1 = prepare_native_root(&root)?;
         fs::create_dir_all(&root)
@@ -129,6 +210,7 @@ impl NativeStore {
                 retention_bytes,
                 retention_age,
                 quarantined_v1,
+                limits,
             }),
         })
     }
@@ -189,6 +271,22 @@ impl NativeStore {
                 }
             }
             None => {
+                let stream_count: i64 = transaction
+                    .query_row("SELECT COUNT(*) FROM streams", [], |row| row.get(0))
+                    .context("counting native streams")?;
+                let publisher_stream_count: i64 = transaction
+                    .query_row(
+                        "SELECT COUNT(*) FROM streams WHERE publisher_id = ?1",
+                        params![publisher_id.as_slice()],
+                        |row| row.get(0),
+                    )
+                    .context("counting publisher streams")?;
+                if u64::try_from(stream_count).unwrap_or(u64::MAX) >= self.inner.limits.max_streams
+                    || u64::try_from(publisher_stream_count).unwrap_or(u64::MAX)
+                        >= self.inner.limits.max_streams_per_publisher
+                {
+                    anyhow::bail!("native stream descriptor limit reached");
+                }
                 transaction
                     .execute(
                         "INSERT INTO streams(stream_id, publisher_id, descriptor, high_water) \
@@ -329,6 +427,20 @@ impl NativeStore {
             }
         }
 
+        let object_bytes =
+            u64::try_from(encoded.len()).context("native object length does not fit u64")?;
+        self.check_group_growth(
+            &transaction,
+            GroupGrowth {
+                publisher_id: &descriptor.body.publisher.id()?,
+                stream_id: object.header.stream_id,
+                epoch_id: object.header.epoch_id,
+                key_group: object.header.key_group,
+                added_bytes: object_bytes,
+                item_kind: GroupItemKind::Object,
+            },
+        )?;
+
         transaction
             .execute(
                 "INSERT INTO objects(stream_id, sequence, epoch_id, key_group, received_at_ms, object) \
@@ -343,10 +455,7 @@ impl NativeStore {
                 ],
             )
             .context("inserting native object")?;
-        let object_bytes = to_sql_u64(
-            u64::try_from(encoded.len()).context("native object length does not fit u64")?,
-            "object byte count",
-        )?;
+        let object_bytes = to_sql_u64(object_bytes, "object byte count")?;
         transaction
             .execute(
                 "UPDATE groups SET last_sequence = ?4, last_timestamp = ?5, \
@@ -440,6 +549,19 @@ impl NativeStore {
             transaction.commit().context("committing envelope retry")?;
             return Ok(false);
         }
+
+        self.check_group_growth(
+            &transaction,
+            GroupGrowth {
+                publisher_id: &descriptor.body.publisher.id()?,
+                stream_id: envelope.header.stream_id,
+                epoch_id: envelope.header.epoch_id,
+                key_group: envelope.header.key_group_id,
+                added_bytes: u64::try_from(encoded.len())
+                    .context("envelope length does not fit u64")?,
+                item_kind: GroupItemKind::Envelope,
+            },
+        )?;
 
         transaction
             .execute(
@@ -706,6 +828,47 @@ impl NativeStore {
             .transpose()
     }
 
+    /// Marks the active group complete when its publisher session ends.
+    ///
+    /// This makes the final group eligible for retained-history bounds and
+    /// eviction. A reconnect starts a fresh epoch/group at the next sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for database failure or an unknown stream.
+    pub fn finalize_stream(&self, stream_id: Uuid) -> Result<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("starting stream finalization")?;
+        let active: Option<(Vec<u8>, i64)> = transaction
+            .query_row(
+                "SELECT active_epoch, active_group FROM streams \
+                 WHERE stream_id = ?1 AND active_epoch IS NOT NULL AND active_group IS NOT NULL",
+                params![uuid_bytes(stream_id).as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .context("reading active stream group")?;
+        if let Some((epoch_id, key_group)) = active {
+            transaction
+                .execute(
+                    "UPDATE groups SET complete = 1 WHERE stream_id = ?1 AND epoch_id = ?2 AND key_group = ?3",
+                    params![uuid_bytes(stream_id).as_slice(), epoch_id, key_group],
+                )
+                .context("completing disconnected stream group")?;
+            transaction
+                .execute(
+                    "UPDATE streams SET active_epoch = NULL, active_group = NULL WHERE stream_id = ?1",
+                    params![uuid_bytes(stream_id).as_slice()],
+                )
+                .context("clearing disconnected stream group")?;
+        }
+        transaction
+            .commit()
+            .context("committing stream finalization")
+    }
+
     /// Returns complete retained bounds for a stream.
     ///
     /// # Errors
@@ -836,6 +999,78 @@ impl NativeStore {
             .connection
             .lock()
             .map_err(|_| anyhow::anyhow!("native store mutex poisoned"))
+    }
+
+    fn check_group_growth(
+        &self,
+        transaction: &Transaction<'_>,
+        growth: GroupGrowth<'_>,
+    ) -> Result<()> {
+        let stream_bytes = uuid_bytes(growth.stream_id);
+        let epoch_bytes = uuid_bytes(growth.epoch_id);
+        let group = params![
+            stream_bytes.as_slice(),
+            epoch_bytes.as_slice(),
+            to_sql_u64(growth.key_group, "resource-limit key group")?,
+        ];
+        let group_bytes: i64 = transaction
+            .query_row(
+                "SELECT retained_bytes FROM groups WHERE stream_id = ?1 AND epoch_id = ?2 AND key_group = ?3",
+                group,
+                |row| row.get(0),
+            )
+            .context("reading group byte usage")?;
+        let count_table = match growth.item_kind {
+            GroupItemKind::Object => "objects",
+            GroupItemKind::Envelope => "envelopes",
+        };
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM {count_table} WHERE stream_id = ?1 AND epoch_id = ?2 AND key_group = ?3"
+        );
+        let item_count: i64 = transaction
+            .query_row(
+                &count_sql,
+                params![
+                    uuid_bytes(growth.stream_id).as_slice(),
+                    uuid_bytes(growth.epoch_id).as_slice(),
+                    to_sql_u64(growth.key_group, "resource-limit key group")?,
+                ],
+                |row| row.get(0),
+            )
+            .context("counting group items")?;
+        let item_limit = match growth.item_kind {
+            GroupItemKind::Object => self.inner.limits.max_objects_per_group,
+            GroupItemKind::Envelope => self.inner.limits.max_envelopes_per_group,
+        };
+        if u64::try_from(item_count).unwrap_or(u64::MAX) >= item_limit
+            || from_sql_u64(group_bytes, "group byte usage")?.saturating_add(growth.added_bytes)
+                > self.inner.limits.max_group_bytes
+        {
+            anyhow::bail!("native keyframe group resource limit reached");
+        }
+        let total_bytes: i64 = transaction
+            .query_row(
+                "SELECT COALESCE(SUM(retained_bytes), 0) FROM groups",
+                [],
+                |row| row.get(0),
+            )
+            .context("summing relay retained bytes")?;
+        let publisher_bytes: i64 = transaction
+            .query_row(
+                "SELECT COALESCE(SUM(g.retained_bytes), 0) FROM groups g JOIN streams s USING(stream_id) WHERE s.publisher_id = ?1",
+                params![growth.publisher_id.as_slice()],
+                |row| row.get(0),
+            )
+            .context("summing publisher retained bytes")?;
+        if from_sql_u64(total_bytes, "relay retained bytes")?.saturating_add(growth.added_bytes)
+            > self.inner.limits.max_total_bytes
+            || from_sql_u64(publisher_bytes, "publisher retained bytes")?
+                .saturating_add(growth.added_bytes)
+                > self.inner.limits.max_publisher_bytes
+        {
+            anyhow::bail!("native relay or publisher byte quota reached");
+        }
+        Ok(())
     }
 
     fn enforce_retention(
@@ -1360,6 +1595,110 @@ mod tests {
     }
 
     #[test]
+    fn hard_limits_reject_stream_object_envelope_and_byte_exhaustion() {
+        let store_root = root();
+        let mut fixture = Fixture::new();
+        let limits = NativeStoreLimits {
+            max_streams: 2,
+            max_streams_per_publisher: 1,
+            max_objects_per_group: 1,
+            max_envelopes_per_group: 1,
+            ..NativeStoreLimits::default()
+        };
+        let store = NativeStore::open_with_limits(store_root.clone(), None, None, limits).unwrap();
+        store.put_descriptor(&fixture.descriptor).unwrap();
+        let same_publisher_stream = StreamDescriptor::new(
+            &fixture.publisher,
+            Uuid::new_v4(),
+            "second".into(),
+            "test".into(),
+            false,
+            1,
+        )
+        .unwrap();
+        assert!(store.put_descriptor(&same_publisher_stream).is_err());
+
+        let other_publisher = IdentitySecret::generate();
+        let other_stream = StreamDescriptor::new(
+            &other_publisher,
+            Uuid::new_v4(),
+            "other".into(),
+            "test".into(),
+            false,
+            1,
+        )
+        .unwrap();
+        store.put_descriptor(&other_stream).unwrap();
+        let third_publisher = IdentitySecret::generate();
+        let third_stream = StreamDescriptor::new(
+            &third_publisher,
+            Uuid::new_v4(),
+            "third".into(),
+            "test".into(),
+            false,
+            1,
+        )
+        .unwrap();
+        assert!(store.put_descriptor(&third_stream).is_err());
+
+        let mut group = fixture.group(0);
+        let first = fixture.media(&mut group, 20);
+        store.store_object(&first, 1_000).unwrap();
+        let second = fixture.media(&mut group, 20);
+        assert!(store.store_object(&second, 1_001).is_err());
+        assert_eq!(store.high_water(fixture.stream_id).unwrap(), Some(1));
+
+        let first_envelope = KeyEnvelope::seal(
+            &fixture.publisher,
+            &fixture.viewer.public().unwrap(),
+            fixture.stream_id,
+            fixture.epoch_id,
+            first.header.key_group,
+            first.header.key_id,
+            &group.content_key(),
+        )
+        .unwrap();
+        store.store_envelope(&first_envelope, 1_002).unwrap();
+        let second_viewer = IdentitySecret::generate();
+        let second_envelope = KeyEnvelope::seal(
+            &fixture.publisher,
+            &second_viewer.public().unwrap(),
+            fixture.stream_id,
+            fixture.epoch_id,
+            first.header.key_group,
+            first.header.key_id,
+            &group.content_key(),
+        )
+        .unwrap();
+        assert!(store.store_envelope(&second_envelope, 1_003).is_err());
+        fs::remove_dir_all(store_root).unwrap();
+
+        let byte_root = root();
+        let mut byte_fixture = Fixture::new();
+        let byte_store = NativeStore::open_with_limits(
+            byte_root.clone(),
+            None,
+            None,
+            NativeStoreLimits {
+                max_group_bytes: 1,
+                max_total_bytes: 1,
+                max_publisher_bytes: 1,
+                ..NativeStoreLimits::default()
+            },
+        )
+        .unwrap();
+        byte_store.put_descriptor(&byte_fixture.descriptor).unwrap();
+        let mut byte_group = byte_fixture.group(0);
+        let object = byte_fixture.media(&mut byte_group, 20);
+        assert!(byte_store.store_object(&object, 1_000).is_err());
+        assert_eq!(
+            byte_store.high_water(byte_fixture.stream_id).unwrap(),
+            Some(0)
+        );
+        fs::remove_dir_all(byte_root).unwrap();
+    }
+
+    #[test]
     fn periodic_age_retention_evicts_only_complete_groups() {
         let root = root();
         let mut fixture = Fixture::new();
@@ -1378,6 +1717,54 @@ mod tests {
         assert_eq!(store.enforce_retention_at(3_000).unwrap(), 1);
         assert!(store.get_object(fixture.stream_id, 1).unwrap().is_none());
         assert!(store.get_object(fixture.stream_id, 2).unwrap().is_some());
+        assert_eq!(store.high_water(fixture.stream_id).unwrap(), Some(2));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disconnect_finalizes_history_and_allows_a_fresh_epoch() {
+        let root = root();
+        let mut fixture = Fixture::new();
+        let store = NativeStore::open(root.clone(), None, None).unwrap();
+        store.put_descriptor(&fixture.descriptor).unwrap();
+        let mut first_group = fixture.group(0);
+        let first = fixture.media(&mut first_group, 20);
+        store.store_object(&first, 1_000).unwrap();
+        assert!(store.retained_bounds(fixture.stream_id).unwrap().is_none());
+        store.finalize_stream(fixture.stream_id).unwrap();
+        assert_eq!(
+            store
+                .retained_bounds(fixture.stream_id)
+                .unwrap()
+                .unwrap()
+                .newest_sequence,
+            1
+        );
+
+        let next_epoch = Uuid::new_v4();
+        let mut next_group = GroupEncryptor::generate(
+            &fixture.publisher.public().unwrap(),
+            fixture.stream_id,
+            next_epoch,
+            1,
+            1,
+        )
+        .unwrap();
+        let second = next_group
+            .seal(
+                &fixture.publisher,
+                NewNativeObject {
+                    sequence: 2,
+                    timestamp: 6_000,
+                    duration: 3_000,
+                    kind: NativeObjectKind::Media,
+                    random_access: true,
+                    codec: Some(CodecId::H264AnnexB),
+                },
+                &[0, 0, 1, 0x65],
+            )
+            .unwrap();
+        store.store_object(&second, 2_000).unwrap();
         assert_eq!(store.high_water(fixture.stream_id).unwrap(), Some(2));
         fs::remove_dir_all(root).unwrap();
     }
