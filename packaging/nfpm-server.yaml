@@ -1,10 +1,8 @@
 # Relay package: the service that stores and serves encrypted objects.
 #
 # Kept separate from the publisher because their dependencies have nothing in
-# common. The relay and the offline viewer link nothing beyond libc — verified
-# by `ldd`, which reports no shared objects for either — so a headless host can
-# run one without installing PipeWire, VA-API, or a GPU stack. Combining them
-# would make every relay drag in a graphics stack it will never call.
+# common. The relay remains suitable for a headless host and never links the
+# publisher capture or native viewer graphics stacks.
 name: gcrelay
 arch: ${GLACIALCAST_PACKAGE_ARCH}
 platform: linux
@@ -15,8 +13,7 @@ maintainer: typo <https://github.com/0typos>
 description: |
   End-to-end-encrypted low-bandwidth screen relay.
   Stores and serves opaque encrypted stream objects with bounded history. The
-  relay never receives a viewer key and cannot decrypt media or cursor
-  contents. Includes the self-contained offline viewer for portable .gco files.
+  relay never receives a media key and cannot decrypt stream contents.
 vendor: typo
 homepage: https://github.com/0typos/glacialcast
 license: MIT
@@ -26,10 +23,6 @@ contents:
     dst: /usr/bin/gcrelay
     file_info:
       mode: 0755
-  - src: ./target/release/glacialcast-offline
-    dst: /usr/bin/glacialcast-offline
-    file_info:
-      mode: 0755
   - src: ./target/package-staging/systemd/gcrelay.service
     dst: /usr/lib/systemd/system/gcrelay.service
     file_info:
@@ -37,7 +30,7 @@ contents:
   # Shipped as an example rather than as the live config: the real one holds
   # ingest tokens, and a package upgrade must never overwrite those.
   - src: ./packaging/server.toml.example
-    dst: /usr/share/doc/gcrelay/server.toml.example
+    dst: /usr/share/doc/gcrelay/relay.toml.example
     file_info:
       mode: 0644
   - src: ./deploy/server.internet.toml.example

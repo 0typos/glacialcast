@@ -1,64 +1,18 @@
 # GlacialCast publisher configuration.
-#
-# Copy to ~/.config/glacialcast/client.toml and chmod 600. That path is
-# searched automatically, so no --config is needed. /etc/glacialcast/client.toml
-# is searched too, for a host where one publisher serves the machine rather
-# than a particular person.
-#
-# This file holds an ingest credential and the viewer key phrase, so it must be
-# a private regular file with mode 0600. Unknown keys are rejected rather than
-# ignored, so a typo fails loudly instead of being silently dropped.
+# Copy to ~/.config/glacialcast/client.toml and chmod 600.
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  SECURITY: change viewer_key_phrase before anyone else can reach the relay.
-#  The value shipped here is in the documentation and in every copy of this
-#  package. Until you change it, anyone who can reach the relay can watch.
-#  The publisher prints a warning on every start while it is unchanged.
-# ─────────────────────────────────────────────────────────────────────────────
-
-# The secret a viewer types to watch. Seven words; case, spacing, and hyphens
-# do not matter, and each word may be shortened to its first three letters.
-#
-# Delete this line entirely to have a private one generated on first start and
-# kept in $XDG_STATE_HOME/glacialcast/viewer-<client_id>.key. That is the right
-# choice for anything real. Read it back at any time with:
-#   gcpub --print-viewer-key
-viewer_key_phrase = "demo-only-weak-amend-now-open-free"
-
-# Durable identity for this publisher. The relay recovers the same stream after
-# a reconnect from it, so keep it stable.
 client_id = "workstation"
-
-# Shown to viewers. When several screens are published, each stream appends its
-# output name to this, giving "Workstation (DP-1)" and so on.
 display_name = "Workstation"
-
-# Publish every connected output rather than only the primary one. Each output
-# becomes its own stream, and one viewer key unlocks all of them.
-#
-# This applies only where the compositor exposes a ScreenCast interface this can
-# drive directly, which today means niri. Everywhere else the XDG Desktop Portal
-# is used and its own chooser decides which outputs are shared, so select them
-# in the dialog instead; the publisher warns rather than pretending this worked.
 all_monitors = true
 
-# Credential the relay was configured to accept. Required unless the relay
-# explicitly allows unauthenticated ingest, which it only permits on loopback.
-# ingest_token = "replace-with-the-token-the-relay-was-given"
+# Newly approved viewers may receive retained group keys within both bounds.
+history_bytes = 104857600
+history_seconds = 86400
 
-# The relay's public Noise key, printed by:
-#   sudo -u glacialcast gcrelay --print-ingest-server-key
-# Pinning it is what stops a substituted relay from accepting this publisher,
-# so it is worth copying accurately.
-# ingest_server_key = "replace-with-the-key-the-relay-printed"
+# Pin the relay Noise identity on first setup when it is distributed out of
+# band. Without an explicit pin, gcpub uses trust on first use and rejects any
+# later key change.
+# ingest_server_key = "URL_SAFE_BASE64_RELAY_NOISE_KEY"
 
-# The address viewers reach the relay on. Setting this makes the publisher print
-# a one-click invitation link at startup:
-#
-#   https://cast.example.com/#k=<your-viewer-key>
-#
-# Opening that link starts playing with nothing to type. The key sits after the
-# '#', which browsers never send to a server, so the relay cannot read it out of
-# the link. Anyone holding the link can watch, exactly as anyone holding the key
-# can, so send it the same way you would send the key.
-# viewer_url = "https://cast.example.com"
+# A signed relay additionally needs a publisher credential:
+# gcpub --native-credential ~/.config/glacialcast/publisher.cred

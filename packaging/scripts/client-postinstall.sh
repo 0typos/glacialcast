@@ -17,7 +17,7 @@ As the user whose screen is to be published, not as root:
      Then set ingest_server_key to what the relay prints.
   2. systemctl --user enable --now gcpub
 
-Print the viewing key to share out of band:
-  gcpub --print-viewer-key
+View with `gcview HOST:8899`, then approve the verified request with
+`gcpub requests` and `gcpub approve REQUEST_PREFIX`.
 NOTE
 fi

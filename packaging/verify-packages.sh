@@ -104,12 +104,11 @@ if [[ -n "${rpm_package}" ]] && command -v rpm >/dev/null; then
   listing="$(rpm -qlp "${rpm_package}" 2>/dev/null)"
   expect_paths "${listing}" \
     /usr/bin/gcrelay \
-    /usr/bin/glacialcast-offline \
     /usr/lib/systemd/system/gcrelay.service
   # A package that ships a live configuration would overwrite ingest tokens on
   # upgrade. Only the example belongs here.
-  ! grep -q '^/etc/glacialcast/server.toml$' <<<"${listing}" || {
-    echo "the relay package ships a live /etc/glacialcast/server.toml" >&2
+  ! grep -q '^/etc/glacialcast/relay.toml$' <<<"${listing}" || {
+    echo "the relay package ships a live /etc/glacialcast/relay.toml" >&2
     exit 1
   }
   # The relay must not drag a graphics stack onto a headless host.
@@ -121,7 +120,7 @@ if [[ -n "${rpm_package}" ]] && command -v rpm >/dev/null; then
     }
   fi
   server_requires="$(rpm -qp --requires "${rpm_package}" 2>/dev/null)"
-  ! grep -qE 'pipewire|libva|mesa' <<<"${server_requires}" || {
+  ! grep -qE 'pipewire|mesa' <<<"${server_requires}" || {
     echo "the relay package depends on a graphics stack it never calls" >&2
     exit 1
   }

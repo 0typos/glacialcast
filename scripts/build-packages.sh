@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds .rpm and .deb packages for both binaries.
+# Builds .rpm and .deb packages for the native components.
 #
 # The unit files are generated from deploy/ rather than copied, because the
 # only difference is the install prefix: deploy/ documents a manual install
@@ -65,7 +65,7 @@ done
 # glibc 2.39 install and then cannot start. Whatever host builds the release,
 # the dependency describes it truthfully.
 minimum_glibc="$(
-  for binary in gcrelay gcpub glacialcast-offline; do
+  for binary in gcrelay gcpub gcview; do
     objdump -T "target/release/${binary}" 2>/dev/null \
       | grep -o 'GLIBC_[0-9.]*' \
       | sed 's/GLIBC_//'
