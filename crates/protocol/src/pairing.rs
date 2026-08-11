@@ -2,6 +2,7 @@
 
 use crate::{
     PROTOCOL_VERSION,
+    credential::{CredentialRole, NativeCredential},
     identity::{
         IDENTITY_ID_LEN, IdentityError, IdentityPublic, IdentitySecret, SignatureBytes, verify,
     },
@@ -118,6 +119,10 @@ pub struct PairRequestBody {
     pub publisher: IdentityPublic,
     /// Persistent viewer identity requesting approval.
     pub viewer: IdentityPublic,
+    /// Optional CA credential used for publisher-side automatic approval.
+    ///
+    /// The request signature binds this credential to the requesting viewer.
+    pub viewer_credential: Option<NativeCredential>,
     /// Human-readable informational device label.
     pub device_label: String,
     /// Fresh request nonce.
@@ -150,6 +155,30 @@ impl PairRequest {
         issued_at_ms: i64,
         expires_at_ms: i64,
     ) -> Result<Self, PairingError> {
+        Self::new_with_credential(
+            viewer,
+            publisher,
+            device_label,
+            None,
+            issued_at_ms,
+            expires_at_ms,
+        )
+    }
+
+    /// Creates a signed pairing request carrying an optional viewer credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid credential binding, identity, label,
+    /// time range, or signature.
+    pub fn new_with_credential(
+        viewer: &IdentitySecret,
+        publisher: IdentityPublic,
+        device_label: String,
+        viewer_credential: Option<NativeCredential>,
+        issued_at_ms: i64,
+        expires_at_ms: i64,
+    ) -> Result<Self, PairingError> {
         validate_device_label(&device_label)?;
         publisher.validate()?;
         let body = PairRequestBody {
@@ -157,6 +186,7 @@ impl PairRequest {
             protocol_version: PROTOCOL_VERSION,
             publisher,
             viewer: viewer.public()?,
+            viewer_credential,
             device_label,
             nonce: random_nonzero(),
             issued_at_ms,
@@ -226,6 +256,14 @@ fn validate_request_metadata(body: &PairRequestBody) -> Result<(), PairingError>
     }
     body.publisher.validate()?;
     body.viewer.validate()?;
+    if let Some(credential) = &body.viewer_credential
+        && (credential.body.role != CredentialRole::Viewer
+            || credential.body.identity != body.viewer)
+    {
+        return Err(PairingError::InvalidMetadata(
+            "viewer credential does not match requesting identity",
+        ));
+    }
     validate_device_label(&body.device_label)?;
     if body.nonce == [0; 32] {
         return Err(PairingError::InvalidMetadata("zero request nonce"));
@@ -703,6 +741,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credential::{CertificateAuthoritySecret, CredentialRequest};
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
     const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -728,6 +767,37 @@ mod tests {
             PairOffer::new(&publisher, &request, [7; 32], 2_000, 2_000 + DAY_MS, DAY_MS).unwrap();
         let confirmation = ViewerConfirmation::approve(&viewer, &request, &offer, 3_000).unwrap();
         (publisher, viewer, request, offer, confirmation)
+    }
+
+    #[test]
+    fn pairing_rejects_a_viewer_credential_bound_to_another_identity() {
+        let publisher = IdentitySecret::generate();
+        let viewer = IdentitySecret::generate();
+        let other = IdentitySecret::generate();
+        let authority = CertificateAuthoritySecret::generate();
+        let credential_request = CredentialRequest::new(
+            &other,
+            "other viewer".into(),
+            CredentialRole::Viewer,
+            [3; 32],
+            1_000,
+            1_000 + DAY_MS,
+        )
+        .unwrap();
+        let credential = authority
+            .issue(&credential_request, 2_000, 2_000 + DAY_MS, DAY_MS)
+            .unwrap();
+        assert!(
+            PairRequest::new_with_credential(
+                &viewer,
+                publisher.public().unwrap(),
+                "viewer".into(),
+                Some(credential),
+                3_000,
+                3_000 + DAY_MS,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -834,6 +904,7 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             publisher: publisher.public().unwrap(),
             viewer: viewer.public().unwrap(),
+            viewer_credential: None,
             device_label: "viewer".into(),
             nonce: [8; 32],
             issued_at_ms: 1_000,

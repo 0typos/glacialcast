@@ -4,7 +4,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use glacialcast_protocol::{
     NoiseKeypair, NoiseSocket, PROTOCOL_VERSION,
-    credential::{CredentialRequest, CredentialRole, NativeCredential},
+    credential::{
+        CertificateAuthorityPublic, CredentialRequest, CredentialRole, NativeCredential,
+        RevocationList,
+    },
     envelope::KeyEnvelope,
     identity::{IdentityPublic, IdentitySecret, load_or_create_identity},
     initiator_handshake_xx, load_or_create_noise_keypair,
@@ -38,6 +41,9 @@ enum ViewerPolicy {
 #[derive(Debug, Parser)]
 #[command(version, about = "Manage native GlacialCast viewer approvals")]
 struct AdminArgs {
+    /// Publisher policy file (defaults to `<state-dir>/config.toml`).
+    #[arg(long)]
+    config: Option<PathBuf>,
     /// Publisher listener in host[:port] form.
     #[arg(long, default_value = "127.0.0.1:8900")]
     relay: String,
@@ -50,9 +56,9 @@ struct AdminArgs {
     /// Optional signed-relay publisher credential.
     #[arg(long)]
     credential: Option<PathBuf>,
-    /// Viewer approval policy. `trusted-ca` is reserved until viewer credentials enter pairing requests.
-    #[arg(long, value_enum, default_value_t)]
-    policy: ViewerPolicy,
+    /// Viewer approval policy, overriding `config.toml`.
+    #[arg(long, value_enum)]
+    policy: Option<ViewerPolicy>,
     #[command(subcommand)]
     command: AdminCommand,
 }
@@ -116,6 +122,26 @@ struct Profile {
     pin: Option<[u8; 32]>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct PublisherConfig {
+    viewers: ViewerConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ViewerConfig {
+    policy: ViewerPolicy,
+    trusted_authority_file: Option<PathBuf>,
+    trusted_revocations_file: Option<PathBuf>,
+}
+
+struct ApprovalPolicy {
+    mode: ViewerPolicy,
+    authority: Option<CertificateAuthorityPublic>,
+    revocations: Option<RevocationList>,
+}
+
 pub(super) fn is_admin_command() -> bool {
     std::env::args().skip(1).any(|argument| {
         matches!(
@@ -135,6 +161,8 @@ pub(super) fn run() -> Result<()> {
     let args = AdminArgs::parse();
     let state_dir = args.state_dir.unwrap_or_else(super::client_state_dir);
     std::fs::create_dir_all(&state_dir)?;
+    let config = load_config(args.config.as_deref(), &state_dir)?;
+    let policy = load_policy(args.policy.unwrap_or(config.viewers.policy), config.viewers)?;
     let profile = Profile {
         relay: normalize_relay(&args.relay),
         identity: load_or_create_identity(&state_dir.join("native-identity.key"))?,
@@ -154,10 +182,10 @@ pub(super) fn run() -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(execute(profile, args.policy, args.command))
+    runtime.block_on(execute(profile, policy, args.command))
 }
 
-async fn execute(profile: Profile, policy: ViewerPolicy, command: AdminCommand) -> Result<()> {
+async fn execute(profile: Profile, policy: ApprovalPolicy, command: AdminCommand) -> Result<()> {
     let state_path = profile.state_dir.join("publisher-state.bin");
     let mut state = load_state(&state_path)?;
     if !matches!(
@@ -166,7 +194,7 @@ async fn execute(profile: Profile, policy: ViewerPolicy, command: AdminCommand) 
             | AdminCommand::Revoke { .. }
             | AdminCommand::CredentialRequest { .. }
     ) {
-        refresh_requests(&profile, &mut state, policy).await?;
+        refresh_requests(&profile, &mut state, &policy).await?;
     }
     match command {
         AdminCommand::Requests => print_requests(&state)?,
@@ -229,13 +257,8 @@ async fn execute(profile: Profile, policy: ViewerPolicy, command: AdminCommand) 
 async fn refresh_requests(
     profile: &Profile,
     state: &mut PublisherState,
-    policy: ViewerPolicy,
+    policy: &ApprovalPolicy,
 ) -> Result<()> {
-    if matches!(policy, ViewerPolicy::TrustedCa) {
-        anyhow::bail!(
-            "trusted-ca policy requires viewer credentials in pairing requests and is not enabled yet"
-        );
-    }
     let (mut socket, relay_key) = connect(profile).await?;
     socket.write(&PublisherMessage::FetchPairingInbox).await?;
     let mut requests = Vec::new();
@@ -247,7 +270,7 @@ async fn refresh_requests(
                 source_addr,
                 ..
             } => {
-                requests.push((request, source_addr.to_string()));
+                requests.push((*request, source_addr.to_string()));
             }
             RelayPublisherMessage::ViewerConfirmation(confirmation) => {
                 confirmations.push(confirmation)
@@ -273,11 +296,36 @@ async fn refresh_requests(
         {
             continue;
         }
-        if matches!(policy, ViewerPolicy::Open) {
+        let policy_reason = match policy.mode {
+            ViewerPolicy::Open => Some(PairDecisionReason::OpenPolicy),
+            ViewerPolicy::TrustedCa => {
+                let Some(credential) = request.body.viewer_credential.as_ref() else {
+                    continue;
+                };
+                let Some(authority) = policy.authority.as_ref() else {
+                    continue;
+                };
+                if credential
+                    .verify_at(
+                        authority,
+                        policy.revocations.as_ref(),
+                        CredentialRole::Viewer,
+                        &credential.body.noise_static_key,
+                        glacialcast_protocol::now_ms(),
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+                Some(PairDecisionReason::TrustedViewerCa)
+            }
+            ViewerPolicy::Required => None,
+        };
+        if let Some(reason) = policy_reason {
             let decision = PublisherDecision::approve_by_policy(
                 &profile.identity,
                 &request,
-                PairDecisionReason::OpenPolicy,
+                reason,
                 glacialcast_protocol::now_ms(),
             )?;
             socket
@@ -321,6 +369,46 @@ async fn refresh_requests(
         .pending
         .sort_by_key(|pending| pending.request.id().unwrap_or([0; 32]));
     Ok(())
+}
+
+fn load_config(
+    path: Option<&std::path::Path>,
+    state_dir: &std::path::Path,
+) -> Result<PublisherConfig> {
+    let path = path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state_dir.join("config.toml"));
+    if !path.exists() {
+        return Ok(PublisherConfig::default());
+    }
+    let bytes = read_private(&path, 1024 * 1024)
+        .with_context(|| format!("reading publisher config {}", path.display()))?;
+    toml::from_str(std::str::from_utf8(&bytes).context("publisher config is not UTF-8")?)
+        .with_context(|| format!("parsing publisher config {}", path.display()))
+}
+
+fn load_policy(mode: ViewerPolicy, config: ViewerConfig) -> Result<ApprovalPolicy> {
+    let authority = config
+        .trusted_authority_file
+        .as_deref()
+        .map(|path| CertificateAuthorityPublic::decode(&read_private(path, MAX_CREDENTIAL_BYTES)?))
+        .transpose()?;
+    let revocations = config
+        .trusted_revocations_file
+        .as_deref()
+        .map(|path| RevocationList::decode(&read_private(path, MAX_CREDENTIAL_BYTES)?))
+        .transpose()?;
+    if matches!(mode, ViewerPolicy::TrustedCa) && authority.is_none() {
+        anyhow::bail!("trusted_ca policy requires viewers.trusted_authority_file");
+    }
+    if let (Some(authority), Some(revocations)) = (&authority, &revocations) {
+        revocations.verify_at(authority, glacialcast_protocol::now_ms())?;
+    }
+    Ok(ApprovalPolicy {
+        mode,
+        authority,
+        revocations,
+    })
 }
 
 async fn decide(
@@ -613,5 +701,17 @@ mod tests {
         let id = hex(&pending[0].request.id().unwrap());
         assert_eq!(unique_request(&pending, &id[..12]).unwrap(), 0);
         assert!(unique_request(&pending, "not-hex").is_err());
+    }
+
+    #[test]
+    fn publisher_config_defaults_to_required_and_trusted_ca_needs_an_authority() {
+        let config: PublisherConfig = toml::from_str("").unwrap();
+        assert!(matches!(config.viewers.policy, ViewerPolicy::Required));
+        assert!(load_policy(ViewerPolicy::Required, config.viewers).is_ok());
+
+        let config: PublisherConfig =
+            toml::from_str("[viewers]\npolicy = \"trusted_ca\"\n").unwrap();
+        assert!(load_policy(config.viewers.policy, config.viewers).is_err());
+        assert!(toml::from_str::<PublisherConfig>("unknown = true").is_err());
     }
 }

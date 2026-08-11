@@ -497,16 +497,17 @@ async fn begin_pairing(
     publisher: IdentityPublic,
 ) -> Result<PairRequest> {
     let now = glacialcast_protocol::now_ms();
-    let request = PairRequest::new(
+    let request = PairRequest::new_with_credential(
         &profile.identity,
         publisher,
         "gcview device".into(),
+        profile.credential.clone(),
         now,
         now.saturating_add(24 * 60 * 60 * 1_000),
     )?;
     let mut socket = connect(profile).await?;
     socket
-        .write(&ViewerMessage::PairRequest(request.clone()))
+        .write(&ViewerMessage::PairRequest(Box::new(request.clone())))
         .await?;
     match socket.read::<RelayViewerMessage>().await? {
         RelayViewerMessage::PairingQueued { request_id } if request_id == request.id()? => {
