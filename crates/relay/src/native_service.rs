@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use glacialcast_protocol::{
     NoiseKeypair, NoiseSocket,
     credential::CredentialRole,
+    envelope::KeyEnvelope,
     identity::{IDENTITY_ID_LEN, IdentityPublic},
     native::NativeObject,
     responder_handshake_xx,
@@ -47,8 +48,14 @@ struct NativeRelayInner {
     access: NativeAccessPolicy,
     noise_identity: NoiseKeypair,
     pairing: PairingStore,
-    live: Mutex<HashMap<Uuid, broadcast::Sender<NativeObject>>>,
+    live: Mutex<HashMap<Uuid, broadcast::Sender<LiveItem>>>,
     online_streams: RwLock<HashSet<Uuid>>,
+}
+
+#[derive(Clone)]
+enum LiveItem {
+    Object(NativeObject),
+    Envelope(KeyEnvelope),
 }
 
 impl NativeRelayService {
@@ -240,7 +247,9 @@ impl NativeRelayService {
                     touched_streams.insert(stream_id);
                     self.mark_online(stream_id)?;
                     if commit.inserted {
-                        let _ = self.live_sender(stream_id)?.send(broadcast_object);
+                        let _ = self
+                            .live_sender(stream_id)?
+                            .send(LiveItem::Object(broadcast_object));
                     }
                     write_publisher(
                         socket,
@@ -255,10 +264,18 @@ impl NativeRelayService {
                     if envelope.header.publisher_id != publisher_id {
                         anyhow::bail!("key envelope publisher identity mismatch");
                     }
-                    self.store_call(move |store| {
-                        store.store_envelope(&envelope, glacialcast_protocol::now_ms())
-                    })
-                    .await?;
+                    let broadcast_envelope = envelope.clone();
+                    let stream_id = envelope.header.stream_id;
+                    let inserted = self
+                        .store_call(move |store| {
+                            store.store_envelope(&envelope, glacialcast_protocol::now_ms())
+                        })
+                        .await?;
+                    if inserted {
+                        let _ = self
+                            .live_sender(stream_id)?
+                            .send(LiveItem::Envelope(broadcast_envelope));
+                    }
                 }
                 PublisherMessage::PairOffer(offer) => {
                     if offer.body.publisher != hello.identity {
@@ -436,6 +453,7 @@ impl NativeRelayService {
                 } => {
                     self.subscription(
                         socket,
+                        hello.identity.id()?,
                         publisher_id,
                         stream_id,
                         start,
@@ -546,6 +564,7 @@ impl NativeRelayService {
     async fn subscription<S>(
         &self,
         socket: &mut NoiseSocket<S>,
+        recipient_id: [u8; IDENTITY_ID_LEN],
         publisher_id: [u8; IDENTITY_ID_LEN],
         stream_id: Uuid,
         start: SubscriptionStart,
@@ -582,8 +601,24 @@ impl NativeRelayService {
         )
         .await?;
 
+        if anchor > high_water
+            && high_water > 0
+            && let Some(object) = self
+                .store_call(move |store| store.get_object(stream_id, high_water))
+                .await?
+        {
+            self.send_group_envelope(
+                socket,
+                stream_id,
+                object.header.epoch_id,
+                object.header.key_group,
+                recipient_id,
+            )
+            .await?;
+        }
+
         let mut last_sequence = anchor.saturating_sub(1);
-        self.reanchor_from_store(socket, stream_id, &mut last_sequence)
+        self.reanchor_from_store(socket, stream_id, recipient_id, &mut last_sequence)
             .await?;
         if last_sequence > 0 {
             write_viewer(
@@ -635,14 +670,21 @@ impl NativeRelayService {
                 }
             };
             match received {
-                Ok(object) if object.header.sequence <= last_sequence => {}
-                Ok(object) if object.header.sequence == last_sequence.saturating_add(1) => {
+                Ok(LiveItem::Envelope(envelope)) => {
+                    if envelope.header.recipient_id == recipient_id {
+                        write_viewer(socket, &RelayViewerMessage::KeyEnvelope(envelope)).await?;
+                    }
+                }
+                Ok(LiveItem::Object(object)) if object.header.sequence <= last_sequence => {}
+                Ok(LiveItem::Object(object))
+                    if object.header.sequence == last_sequence.saturating_add(1) =>
+                {
                     last_sequence = object.header.sequence;
                     write_viewer(socket, &RelayViewerMessage::Object(object)).await?;
                 }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
                     let before = last_sequence;
-                    self.reanchor_from_store(socket, stream_id, &mut last_sequence)
+                    self.reanchor_from_store(socket, stream_id, recipient_id, &mut last_sequence)
                         .await?;
                     if last_sequence == before {
                         send_viewer_error(
@@ -665,6 +707,7 @@ impl NativeRelayService {
         &self,
         socket: &mut NoiseSocket<S>,
         stream_id: Uuid,
+        recipient_id: [u8; IDENTITY_ID_LEN],
         last_sequence: &mut u64,
     ) -> Result<()>
     where
@@ -679,9 +722,16 @@ impl NativeRelayService {
                 return Ok(());
             }
             let count = objects.len();
+            let mut delivered_group = None;
             for object in objects {
                 if object.header.sequence != last_sequence.saturating_add(1) {
                     anyhow::bail!("retained native stream contains a sequence gap");
+                }
+                let group = (object.header.epoch_id, object.header.key_group);
+                if delivered_group != Some(group) {
+                    self.send_group_envelope(socket, stream_id, group.0, group.1, recipient_id)
+                        .await?;
+                    delivered_group = Some(group);
                 }
                 *last_sequence = object.header.sequence;
                 write_viewer(socket, &RelayViewerMessage::Object(object)).await?;
@@ -690,6 +740,28 @@ impl NativeRelayService {
                 return Ok(());
             }
         }
+    }
+
+    async fn send_group_envelope<S>(
+        &self,
+        socket: &mut NoiseSocket<S>,
+        stream_id: Uuid,
+        epoch_id: Uuid,
+        key_group: u64,
+        recipient_id: [u8; IDENTITY_ID_LEN],
+    ) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let envelope = self
+            .store_call(move |store| {
+                store.get_envelope(stream_id, epoch_id, key_group, recipient_id)
+            })
+            .await?;
+        if let Some(envelope) = envelope {
+            write_viewer(socket, &RelayViewerMessage::KeyEnvelope(envelope)).await?;
+        }
+        Ok(())
     }
 
     async fn validate_resume_stream(
@@ -718,7 +790,7 @@ impl NativeRelayService {
         Ok(())
     }
 
-    fn live_sender(&self, stream_id: Uuid) -> Result<broadcast::Sender<NativeObject>> {
+    fn live_sender(&self, stream_id: Uuid) -> Result<broadcast::Sender<LiveItem>> {
         let mut senders = self
             .inner
             .live
@@ -1642,6 +1714,13 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(
+            viewer_connection
+                .read::<RelayViewerMessage>()
+                .await
+                .unwrap(),
+            RelayViewerMessage::KeyEnvelope(first_envelope)
+        );
         let RelayViewerMessage::Object(delivered_epoch) = viewer_connection
             .read::<RelayViewerMessage>()
             .await
@@ -1676,6 +1755,117 @@ mod tests {
                 .unwrap(),
             media_plaintext
         );
+        assert!(matches!(
+            viewer_connection
+                .read::<RelayViewerMessage>()
+                .await
+                .unwrap(),
+            RelayViewerMessage::Object(object) if object.header.sequence == 3
+        ));
+        assert_eq!(
+            viewer_connection
+                .read::<RelayViewerMessage>()
+                .await
+                .unwrap(),
+            RelayViewerMessage::Live {
+                through_sequence: 3
+            }
+        );
+
+        let second_envelope = KeyEnvelope::seal(
+            &publisher,
+            &viewer.public().unwrap(),
+            stream_id,
+            epoch_id,
+            2,
+            second_group.key_id(),
+            &second_group.content_key(),
+        )
+        .unwrap();
+        publisher_connection
+            .write(&PublisherMessage::KeyEnvelope(second_envelope.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            viewer_connection
+                .read::<RelayViewerMessage>()
+                .await
+                .unwrap(),
+            RelayViewerMessage::KeyEnvelope(second_envelope.clone())
+        );
+        let second_media_plaintext = vec![0, 0, 0, 1, 0x65, 6, 5, 4];
+        let second_media = second_group
+            .seal(
+                &publisher,
+                NewNativeObject {
+                    sequence: 4,
+                    timestamp: 45_000,
+                    duration: 45_000,
+                    kind: NativeObjectKind::Media,
+                    random_access: true,
+                    codec: Some(CodecId::H264AnnexB),
+                },
+                &second_media_plaintext,
+            )
+            .unwrap();
+        publisher_connection
+            .write(&PublisherMessage::Object(second_media))
+            .await
+            .unwrap();
+        assert!(matches!(
+            publisher_connection
+                .read::<RelayPublisherMessage>()
+                .await
+                .unwrap(),
+            RelayPublisherMessage::PublishAck {
+                committed_through: 4,
+                ..
+            }
+        ));
+        let RelayViewerMessage::Object(delivered_second_media) = viewer_connection
+            .read::<RelayViewerMessage>()
+            .await
+            .unwrap()
+        else {
+            panic!("expected live media after rotated envelope");
+        };
+        assert_eq!(
+            delivered_second_media
+                .open(
+                    &publisher.public().unwrap(),
+                    &ContentKey::from_bytes(second_group.content_key()).unwrap(),
+                    &second_group.key_id(),
+                )
+                .unwrap(),
+            second_media_plaintext
+        );
+        let mut live_joiner = viewer_socket(
+            service.clone(),
+            viewer.public().unwrap(),
+            generate_noise_keypair().unwrap(),
+        )
+        .await;
+        live_joiner
+            .write(&ViewerMessage::Subscribe {
+                publisher_id: publisher.public().unwrap().id().unwrap(),
+                stream_id,
+                start: SubscriptionStart::Live,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            live_joiner.read::<RelayViewerMessage>().await.unwrap(),
+            RelayViewerMessage::SubscriptionStarted {
+                first_sequence: 5,
+                live: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            live_joiner.read::<RelayViewerMessage>().await.unwrap(),
+            RelayViewerMessage::KeyEnvelope(second_envelope)
+        );
+        drop(live_joiner);
         drop(viewer_connection);
         drop(publisher_connection);
         tokio::time::sleep(Duration::from_millis(20)).await;
