@@ -14,7 +14,7 @@ if (( ${#missing_commands[@]} > 0 )); then
 fi
 
 missing_modules=()
-for module_name in libpipewire-0.3 libva gbm; do
+for module_name in libpipewire-0.3; do
   if ! pkg-config --exists "${module_name}"; then
     missing_modules+=("${module_name}")
   fi
@@ -23,8 +23,8 @@ done
 if (( ${#missing_modules[@]} > 0 )); then
   echo "missing pkg-config modules: ${missing_modules[*]}" >&2
   echo "Fedora install command:" >&2
-  echo "  sudo dnf install pipewire-devel libva-devel mesa-libgbm-devel clang-devel pkgconf-pkg-config" >&2
+  echo "  sudo dnf install pipewire-devel clang-devel pkgconf-pkg-config" >&2
   exit 1
 fi
 
-echo "PASS: Rust, Clang, PipeWire, libva, and GBM build prerequisites are available"
+echo "PASS: Rust, Clang, and PipeWire build prerequisites are available"

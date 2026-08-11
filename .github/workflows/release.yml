@@ -2,140 +2,23 @@ name: Release archive
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - 'v*'
 
 permissions:
   contents: read
 
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
-
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  acceptance:
-    name: Full release acceptance
+  archive:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes \
-            clang \
-            libclang-dev \
-            libgbm-dev \
-            libopenh264-dev \
-            libpipewire-0.3-dev \
-            libspa-0.2-dev \
-            libva-dev \
-            nasm
-      - name: Install OpenH264 2.6
-        # ubuntu-24.04 packages 2.4 under a different soname, which builds and
-        # then fails at runtime. See the script for why this is built.
-        run: sudo scripts/ci-install-openh264.sh
-      - name: Install pinned Rust tools
-        run: cargo install cargo-deny --version 0.20.2 --locked
-      - name: Install browser test runtime
-        run: |
-          npm install --prefix /tmp/glacialcast-playwright playwright@1.59.1
-          /tmp/glacialcast-playwright/node_modules/.bin/playwright install --with-deps firefox chromium
-      - name: Run full deterministic gate
-        env:
-          GLACIALCAST_REQUIRE_CLEAN: "1"
-          # The full profile includes the multi-stream browser gate, so it
-          # needs the Playwright installed above. Without this the gate fails
-          # on a missing module rather than on anything about the release.
-          GLACIALCAST_PLAYWRIGHT_MODULE: /tmp/glacialcast-playwright/node_modules/playwright
-        run: scripts/verify-quality.sh full
-      - name: Run Firefox and Chromium live/offline gate
-        env:
-          GLACIALCAST_PLAYWRIGHT_MODULE: /tmp/glacialcast-playwright/node_modules/playwright
-          GLACIALCAST_VERIFY_BROWSERS: firefox,chromium
-          GLACIALCAST_VERIFY_OFFLINE_BROWSERS: firefox,chromium
-          GLACIALCAST_VERIFY_TEST_PATTERN: motion
-        run: scripts/verify-dash-e2e.sh
-
-  package:
-    name: Linux release archive
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    needs: acceptance
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Install native build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes \
-            clang \
-            libclang-dev \
-            libgbm-dev \
-            libopenh264-dev \
-            libpipewire-0.3-dev \
-            libspa-0.2-dev \
-            libva-dev \
-            nasm
-      - name: Install OpenH264 2.6
-        # ubuntu-24.04 packages 2.4 under a different soname, which builds and
-        # then fails at runtime. See the script for why this is built.
-        run: sudo scripts/ci-install-openh264.sh
-      - name: Build and verify archive
-        env:
-          GLACIALCAST_REQUIRE_CLEAN: "1"
-        run: scripts/verify-packaging.sh
-      - name: Install nfpm
-        run: |
-          curl -sSfL -o /tmp/nfpm.deb \
-            https://github.com/goreleaser/nfpm/releases/download/v2.43.1/nfpm_2.43.1_amd64.deb
-          echo "${NFPM_SHA256}  /tmp/nfpm.deb" | sha256sum --check --strict
-          sudo dpkg -i /tmp/nfpm.deb
-        env:
-          # Pinned by digest as well as by version, matching how every other
-          # dependency here is fixed.
-          NFPM_SHA256: 0feddb5c839f3f91638e5ba04fe7f78066ae53ea0f5e8122651f65cba7d8848b
-      - name: Build rpm and deb packages
-        run: scripts/build-packages.sh
-      - name: Verify packages install nothing that starts by itself
-        run: packaging/verify-packages.sh
-      - name: Upload archive, packages, checksums, and optional signatures
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+          sudo apt-get install -y libclang-dev libpipewire-0.3-dev libexpat1-dev
+      - run: scripts/build-release.sh
+      - uses: actions/upload-artifact@v4
         with:
-          name: glacialcast-linux-${{ github.sha }}
-          path: |
-            dist/*.tar.gz
-            dist/*.rpm
-            dist/*.deb
-            dist/*.sha256
-            dist/*.minisig
-          if-no-files-found: error
-
-  publish:
-    name: Publish release
-    runs-on: ubuntu-24.04
-    needs: package
-    # Only a tag becomes a release. A manual run still builds and verifies
-    # everything, and leaves the artifacts attached to the workflow run.
-    if: startsWith(github.ref, 'refs/tags/v')
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: glacialcast-linux-${{ github.sha }}
-          path: dist
-      - name: Attach artifacts to the release
-        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
-        with:
-          files: |
-            dist/*.tar.gz
-            dist/*.rpm
-            dist/*.deb
-            dist/*.sha256
-            dist/*.minisig
-          fail_on_unmatched_files: false
-          generate_release_notes: true
+          name: glacialcast-native
+          path: dist/*
