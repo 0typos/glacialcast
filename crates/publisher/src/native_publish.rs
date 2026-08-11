@@ -29,8 +29,6 @@ const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
 const MEDIA_TIMESCALE: u64 = 90_000;
 const KEY_HISTORY_VERSION: u16 = 1;
 const MAX_KEY_HISTORY_BYTES: usize = 16 * 1024 * 1024;
-const DEFAULT_HISTORY_CONTENT_BYTES: u64 = 100 * 1024 * 1024;
-const DEFAULT_HISTORY_AGE_MS: i64 = 24 * 60 * 60 * 1_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct RetainedGroupKey {
@@ -89,13 +87,18 @@ fn save_key_history(path: &Path, groups: &[RetainedGroupKey]) -> Result<()> {
     Ok(())
 }
 
-fn prune_key_history(groups: &mut Vec<RetainedGroupKey>, now_ms: i64) {
-    groups.retain(|group| now_ms.saturating_sub(group.created_at_ms) <= DEFAULT_HISTORY_AGE_MS);
+fn prune_key_history(
+    groups: &mut Vec<RetainedGroupKey>,
+    now_ms: i64,
+    max_content_bytes: u64,
+    max_age_ms: i64,
+) {
+    groups.retain(|group| now_ms.saturating_sub(group.created_at_ms) <= max_age_ms);
     let mut retained_bytes = 0u64;
     let mut keep_from = groups.len();
     for (index, group) in groups.iter().enumerate().rev() {
         let next = retained_bytes.saturating_add(group.content_bytes);
-        if next > DEFAULT_HISTORY_CONTENT_BYTES && keep_from < groups.len() {
+        if next > max_content_bytes && keep_from < groups.len() {
             break;
         }
         retained_bytes = next;
@@ -218,6 +221,15 @@ pub(super) async fn run_native_client(
     let history_path = state_dir.join("key-history.bin");
     let mut approved = native_admin::load_state(&approval_path)?.approved;
     let mut key_history = load_key_history(&history_path)?;
+    let history_bytes = args
+        .history_bytes
+        .context("history byte limit was not resolved")?;
+    let history_age_ms = i64::try_from(
+        args.history_seconds
+            .context("history time limit was not resolved")?
+            .saturating_mul(1_000),
+    )
+    .unwrap_or(i64::MAX);
     let duration =
         ((MEDIA_TIMESCALE as f64 / args.fps).round() as u64).clamp(1, u64::from(u32::MAX)) as u32;
     let mut sequence = committed;
@@ -266,7 +278,12 @@ pub(super) async fn run_native_client(
                 created_at_ms: glacialcast_protocol::now_ms(),
                 content_bytes: 0,
             });
-            prune_key_history(&mut key_history, glacialcast_protocol::now_ms());
+            prune_key_history(
+                &mut key_history,
+                glacialcast_protocol::now_ms(),
+                history_bytes,
+                history_age_ms,
+            );
             save_key_history(&history_path, &key_history)?;
             group = Some(next_group);
         } else if let Some(current_group) = &group {
@@ -366,7 +383,12 @@ pub(super) async fn run_native_client(
                 .content_bytes
                 .saturating_add(u64::try_from(encoded.annex_b.len()).unwrap_or(u64::MAX));
         }
-        prune_key_history(&mut key_history, glacialcast_protocol::now_ms());
+        prune_key_history(
+            &mut key_history,
+            glacialcast_protocol::now_ms(),
+            history_bytes,
+            history_age_ms,
+        );
         save_key_history(&history_path, &key_history)?;
         frame_index = frame_index.saturating_add(1);
         timestamp = timestamp.saturating_add(u64::from(duration));
@@ -449,9 +471,11 @@ mod tests {
 
     #[test]
     fn key_history_is_private_and_prunes_oldest_groups_by_age_and_bytes() {
+        const HISTORY_BYTES: u64 = 100 * 1024 * 1024;
+        const HISTORY_AGE_MS: i64 = 24 * 60 * 60 * 1_000;
         let root = std::env::temp_dir().join(format!("gcpub-key-history-{}", Uuid::new_v4()));
         let path = root.join("history.bin");
-        let now = 2 * DEFAULT_HISTORY_AGE_MS;
+        let now = 2 * HISTORY_AGE_MS;
         let group = |id: u64, created_at_ms: i64, content_bytes: u64| RetainedGroupKey {
             stream_id: Uuid::from_u128(1),
             epoch_id: Uuid::from_u128(2),
@@ -463,10 +487,10 @@ mod tests {
         };
         let mut groups = vec![
             group(1, 0, 1),
-            group(2, now - 1_000, DEFAULT_HISTORY_CONTENT_BYTES - 1),
+            group(2, now - 1_000, HISTORY_BYTES - 1),
             group(3, now, 1),
         ];
-        prune_key_history(&mut groups, now);
+        prune_key_history(&mut groups, now, HISTORY_BYTES, HISTORY_AGE_MS);
         assert_eq!(
             groups
                 .iter()
