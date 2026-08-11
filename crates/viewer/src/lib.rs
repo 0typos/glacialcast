@@ -12,11 +12,12 @@ use glacialcast_protocol::{
     initiator_handshake_xx, load_or_create_noise_keypair,
     native::{CodecId, LiveSequenceGuard, NativeObjectKind},
     pairing::{PairOffer, PairRequest, ViewerConfirmation, authentication_string},
-    private_state::read_private,
+    private_state::{read_private, replace_private},
     trust::KnownRelays,
     wire::{CatalogEntry, RelayViewerMessage, SessionHello, SubscriptionStart, ViewerMessage},
 };
 use openh264::{decoder::Decoder, formats::YUVSource, nal_units};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     io::IsTerminal,
@@ -29,6 +30,9 @@ use uuid::Uuid;
 
 const DEFAULT_VIEWER_PORT: u16 = 8899;
 const MAX_CREDENTIAL_FILE: usize = 64 * 1024;
+const PAIRING_STATE_VERSION: u16 = 1;
+const MAX_PAIRING_STATE_BYTES: usize = 4 * 1024 * 1024;
+type PendingPairings = HashMap<[u8; 32], (PairRequest, Option<PairOffer>)>;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "View GlacialCast streams from a native relay")]
@@ -97,6 +101,12 @@ struct Tile {
     texture: Option<egui::TextureHandle>,
     sequence: u64,
     status: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PairingState {
+    version: u16,
+    pending: Vec<(PairRequest, Option<PairOffer>)>,
 }
 
 struct ViewerApp {
@@ -256,12 +266,20 @@ impl eframe::App for ViewerApp {
                                     self.selected = index;
                                 }
                                 ui.label(&tile.status);
-                                if ui.button("View").clicked() {
+                                if ui.button("History").clicked() {
                                     tile.status = "Connecting…".into();
                                     let _ = self.commands.send(Command::Subscribe(
                                         descriptor.stream_id,
                                         descriptor.publisher,
                                         SubscriptionStart::OldestRetained,
+                                    ));
+                                }
+                                if ui.button("Live").clicked() {
+                                    tile.status = "Connecting to live edge…".into();
+                                    let _ = self.commands.send(Command::Subscribe(
+                                        descriptor.stream_id,
+                                        descriptor.publisher,
+                                        SubscriptionStart::Live,
                                     ));
                                 }
                                 if ui.button("Pair").clicked() {
@@ -421,7 +439,17 @@ async fn command_worker(
     mut commands: mpsc::UnboundedReceiver<Command>,
 ) {
     let keys = Arc::new(Mutex::new(HashMap::new()));
-    let mut pending: HashMap<[u8; 32], (PairRequest, Option<PairOffer>)> = HashMap::new();
+    let pairing_path = profile.state_dir.join("pending-pairings.bin");
+    let mut pending = match load_pairing_state(&pairing_path) {
+        Ok(pending) => pending,
+        Err(error) => {
+            let _ = events.send(Event::Status(format!(
+                "Pending pairing state is unusable: {error:#}"
+            )));
+            HashMap::new()
+        }
+    };
+    let mut subscriptions: HashMap<Uuid, tokio::task::JoinHandle<()>> = HashMap::new();
     while let Some(command) = commands.recv().await {
         match command {
             Command::Refresh => {
@@ -434,10 +462,13 @@ async fn command_worker(
                 }
             }
             Command::Subscribe(stream_id, publisher, start) => {
+                if let Some(previous) = subscriptions.remove(&stream_id) {
+                    previous.abort();
+                }
                 let profile = profile.clone();
                 let events = events.clone();
                 let keys = keys.clone();
-                tokio::spawn(async move {
+                let task = tokio::spawn(async move {
                     if let Err(error) =
                         subscribe(&profile, &events, &keys, stream_id, publisher, start).await
                     {
@@ -447,11 +478,13 @@ async fn command_worker(
                         ));
                     }
                 });
+                subscriptions.insert(stream_id, task);
             }
             Command::Pair(publisher) => match begin_pairing(&profile, publisher).await {
                 Ok(request) => {
                     if let Ok(request_id) = request.id() {
                         pending.insert(request_id, (request, None));
+                        save_pairing_state(&pairing_path, &pending).ok();
                         let _ = events.send(Event::Status(
                             "Pairing request queued; waiting for publisher".into(),
                         ));
@@ -485,6 +518,7 @@ async fn command_worker(
                     }
                 } else {
                     pending.remove(&request_id);
+                    save_pairing_state(&pairing_path, &pending).ok();
                     let _ = events.send(Event::Status("Pairing comparison rejected".into()));
                 }
             }
@@ -530,15 +564,22 @@ async fn refresh_pairing(
     loop {
         match socket.read::<RelayViewerMessage>().await? {
             RelayViewerMessage::PairOffer(offer) => {
-                if let Some((request, stored)) = pending.get_mut(&offer.body.request_id) {
-                    offer.verify(
-                        request,
-                        glacialcast_protocol::now_ms(),
-                        24 * 60 * 60 * 1_000,
-                    )?;
-                    let authentication = authentication_string(request, &offer)?;
-                    *stored = Some(offer);
-                    let _ = events.send(Event::PairingPrompt(request.id()?, authentication));
+                let prompt =
+                    if let Some((request, stored)) = pending.get_mut(&offer.body.request_id) {
+                        offer.verify(
+                            request,
+                            glacialcast_protocol::now_ms(),
+                            24 * 60 * 60 * 1_000,
+                        )?;
+                        let authentication = authentication_string(request, &offer)?;
+                        *stored = Some(offer);
+                        Some((request.id()?, authentication))
+                    } else {
+                        None
+                    };
+                if let Some((request_id, authentication)) = prompt {
+                    save_pairing_state(&profile.state_dir.join("pending-pairings.bin"), pending)?;
+                    let _ = events.send(Event::PairingPrompt(request_id, authentication));
                 }
             }
             RelayViewerMessage::PairDecision(decision) => {
@@ -552,6 +593,7 @@ async fn refresh_pairing(
                     let _ = events.send(Event::Status(status.into()));
                 }
                 pending.remove(&decision.body.request_id);
+                save_pairing_state(&profile.state_dir.join("pending-pairings.bin"), pending)?;
             }
             RelayViewerMessage::InboxComplete => return Ok(()),
             RelayViewerMessage::KeyEnvelope(_) => {}
@@ -561,6 +603,40 @@ async fn refresh_pairing(
             _ => anyhow::bail!("unexpected pairing inbox response"),
         }
     }
+}
+
+fn load_pairing_state(path: &Path) -> Result<PendingPairings> {
+    let bytes = match read_private(path, MAX_PAIRING_STATE_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let (state, remainder) = postcard::take_from_bytes::<PairingState>(&bytes)?;
+    if !remainder.is_empty()
+        || state.version != PAIRING_STATE_VERSION
+        || postcard::to_stdvec(&state)? != bytes
+    {
+        anyhow::bail!("pending pairing state is invalid or non-canonical");
+    }
+    let mut pending = HashMap::new();
+    for pair in state.pending {
+        let id = pair.0.id()?;
+        if pending.insert(id, pair).is_some() {
+            anyhow::bail!("pending pairing state contains duplicate requests");
+        }
+    }
+    Ok(pending)
+}
+
+fn save_pairing_state(path: &Path, pending: &PendingPairings) -> Result<()> {
+    let mut entries: Vec<_> = pending.values().cloned().collect();
+    entries.sort_by_key(|(request, _)| request.id().unwrap_or([0; 32]));
+    let encoded = postcard::to_stdvec(&PairingState {
+        version: PAIRING_STATE_VERSION,
+        pending: entries,
+    })?;
+    replace_private(path, &encoded, MAX_PAIRING_STATE_BYTES)?;
+    Ok(())
 }
 
 async fn confirm_pairing(
