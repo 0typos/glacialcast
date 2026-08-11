@@ -15,17 +15,96 @@ use glacialcast_protocol::{
         CodecId, GroupEncryptor, H264EpochPayload, NativeObjectKind, NewNativeObject,
         StreamDescriptor,
     },
-    private_state::read_private,
+    private_state::{read_private, replace_private},
     trust::KnownRelays,
     wire::{PublisherMessage, PublisherResumeStream, RelayPublisherMessage, SessionHello},
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::time::Duration;
+use std::{collections::BTreeSet, path::Path, time::Duration};
 use tokio::{net::TcpStream, sync::watch};
 use uuid::Uuid;
 
 const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
 const MEDIA_TIMESCALE: u64 = 90_000;
+const KEY_HISTORY_VERSION: u16 = 1;
+const MAX_KEY_HISTORY_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_HISTORY_CONTENT_BYTES: u64 = 100 * 1024 * 1024;
+const DEFAULT_HISTORY_AGE_MS: i64 = 24 * 60 * 60 * 1_000;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct RetainedGroupKey {
+    pub(super) stream_id: Uuid,
+    pub(super) epoch_id: Uuid,
+    pub(super) key_group_id: u64,
+    pub(super) key_id: [u8; 16],
+    pub(super) content_key: [u8; 32],
+    created_at_ms: i64,
+    content_bytes: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct KeyHistory {
+    version: u16,
+    groups: Vec<RetainedGroupKey>,
+}
+
+impl Default for KeyHistory {
+    fn default() -> Self {
+        Self {
+            version: KEY_HISTORY_VERSION,
+            groups: Vec::new(),
+        }
+    }
+}
+
+pub(super) fn load_key_history(path: &Path) -> Result<Vec<RetainedGroupKey>> {
+    match read_private(path, MAX_KEY_HISTORY_BYTES) {
+        Ok(bytes) => {
+            let (history, remainder) = postcard::take_from_bytes::<KeyHistory>(&bytes)?;
+            if !remainder.is_empty()
+                || history.version != KEY_HISTORY_VERSION
+                || postcard::to_stdvec(&history)? != bytes
+                || history.groups.len() > 65_536
+            {
+                anyhow::bail!("publisher key history is invalid or non-canonical");
+            }
+            Ok(history.groups)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn save_key_history(path: &Path, groups: &[RetainedGroupKey]) -> Result<()> {
+    let history = KeyHistory {
+        version: KEY_HISTORY_VERSION,
+        groups: groups.to_vec(),
+    };
+    let encoded = postcard::to_stdvec(&history)?;
+    if encoded.len() > MAX_KEY_HISTORY_BYTES {
+        anyhow::bail!("publisher key history exceeds its file bound");
+    }
+    replace_private(path, &encoded, MAX_KEY_HISTORY_BYTES)?;
+    Ok(())
+}
+
+fn prune_key_history(groups: &mut Vec<RetainedGroupKey>, now_ms: i64) {
+    groups.retain(|group| now_ms.saturating_sub(group.created_at_ms) <= DEFAULT_HISTORY_AGE_MS);
+    let mut retained_bytes = 0u64;
+    let mut keep_from = groups.len();
+    for (index, group) in groups.iter().enumerate().rev() {
+        let next = retained_bytes.saturating_add(group.content_bytes);
+        if next > DEFAULT_HISTORY_CONTENT_BYTES && keep_from < groups.len() {
+            break;
+        }
+        retained_bytes = next;
+        keep_from = index;
+    }
+    if keep_from > 0 {
+        groups.drain(..keep_from);
+    }
+}
 
 pub(super) async fn run_native_client(
     args: &Args,
@@ -135,7 +214,10 @@ pub(super) async fn run_native_client(
         bitrate: args.video_bitrate,
         segment_frames: group_frames,
     })?;
-    let approved = native_admin::load_state(&state_dir.join("publisher-state.bin"))?.approved;
+    let approval_path = state_dir.join("publisher-state.bin");
+    let history_path = state_dir.join("key-history.bin");
+    let mut approved = native_admin::load_state(&approval_path)?.approved;
+    let mut key_history = load_key_history(&history_path)?;
     let duration =
         ((MEDIA_TIMESCALE as f64 / args.fps).round() as u64).clamp(1, u64::from(u32::MAX)) as u32;
     let mut sequence = committed;
@@ -149,17 +231,60 @@ pub(super) async fn run_native_client(
         if *shutdown.borrow() {
             return Ok(());
         }
-        let starts_group = group.is_none() || frame_index.is_multiple_of(u64::from(group_frames));
+        let latest_approved = native_admin::load_state(&approval_path)?.approved;
+        let previous_ids: BTreeSet<[u8; 32]> = approved
+            .iter()
+            .map(IdentityPublicExt::checked_id)
+            .collect::<Result<_>>()?;
+        let latest_ids: BTreeSet<[u8; 32]> = latest_approved
+            .iter()
+            .map(IdentityPublicExt::checked_id)
+            .collect::<Result<_>>()?;
+        let revoked = previous_ids.iter().any(|id| !latest_ids.contains(id));
+        let newly_approved: Vec<_> = latest_approved
+            .iter()
+            .filter(|viewer| viewer.id().is_ok_and(|id| !previous_ids.contains(&id)))
+            .copied()
+            .collect();
+        let starts_group =
+            group.is_none() || revoked || frame_index.is_multiple_of(u64::from(group_frames));
         if starts_group {
             group_id = group_id.saturating_add(1);
-            group = Some(GroupEncryptor::generate(
+            let next_group = GroupEncryptor::generate(
                 &publisher.public()?,
                 stream_id,
                 epoch_id,
                 group_id,
                 sequence,
-            )?);
+            )?;
+            key_history.push(RetainedGroupKey {
+                stream_id,
+                epoch_id,
+                key_group_id: group_id,
+                key_id: next_group.key_id(),
+                content_key: next_group.content_key(),
+                created_at_ms: glacialcast_protocol::now_ms(),
+                content_bytes: 0,
+            });
+            prune_key_history(&mut key_history, glacialcast_protocol::now_ms());
+            save_key_history(&history_path, &key_history)?;
+            group = Some(next_group);
+        } else if let Some(current_group) = &group {
+            for viewer in &newly_approved {
+                socket
+                    .write(&PublisherMessage::KeyEnvelope(KeyEnvelope::seal(
+                        &publisher,
+                        viewer,
+                        stream_id,
+                        epoch_id,
+                        group_id,
+                        current_group.key_id(),
+                        &current_group.content_key(),
+                    )?))
+                    .await?;
+            }
         }
+        approved = latest_approved;
         let frame = match next_frame.take() {
             Some(frame) => frame,
             None => {
@@ -232,9 +357,30 @@ pub(super) async fn run_native_client(
             &encoded.annex_b,
         )?;
         publish(&mut socket, media, sequence).await?;
+        if let Some(retained) = key_history.last_mut()
+            && retained.stream_id == stream_id
+            && retained.epoch_id == epoch_id
+            && retained.key_group_id == group_id
+        {
+            retained.content_bytes = retained
+                .content_bytes
+                .saturating_add(u64::try_from(encoded.annex_b.len()).unwrap_or(u64::MAX));
+        }
+        prune_key_history(&mut key_history, glacialcast_protocol::now_ms());
+        save_key_history(&history_path, &key_history)?;
         frame_index = frame_index.saturating_add(1);
         timestamp = timestamp.saturating_add(u64::from(duration));
         tokio::time::sleep(Duration::from_secs_f64(1.0 / args.fps)).await;
+    }
+}
+
+trait IdentityPublicExt {
+    fn checked_id(&self) -> Result<[u8; 32]>;
+}
+
+impl IdentityPublicExt for glacialcast_protocol::identity::IdentityPublic {
+    fn checked_id(&self) -> Result<[u8; 32]> {
+        Ok(self.id()?)
     }
 }
 
@@ -281,6 +427,7 @@ fn normalize_endpoint(endpoint: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn stable_stream_ids_are_label_and_publisher_specific() {
@@ -298,5 +445,43 @@ mod tests {
             stable_stream_id(&first, "one").unwrap(),
             stable_stream_id(&second, "one").unwrap()
         );
+    }
+
+    #[test]
+    fn key_history_is_private_and_prunes_oldest_groups_by_age_and_bytes() {
+        let root = std::env::temp_dir().join(format!("gcpub-key-history-{}", Uuid::new_v4()));
+        let path = root.join("history.bin");
+        let now = 2 * DEFAULT_HISTORY_AGE_MS;
+        let group = |id: u64, created_at_ms: i64, content_bytes: u64| RetainedGroupKey {
+            stream_id: Uuid::from_u128(1),
+            epoch_id: Uuid::from_u128(2),
+            key_group_id: id,
+            key_id: [u8::try_from(id).unwrap(); 16],
+            content_key: [u8::try_from(id).unwrap(); 32],
+            created_at_ms,
+            content_bytes,
+        };
+        let mut groups = vec![
+            group(1, 0, 1),
+            group(2, now - 1_000, DEFAULT_HISTORY_CONTENT_BYTES - 1),
+            group(3, now, 1),
+        ];
+        prune_key_history(&mut groups, now);
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.key_group_id)
+                .collect::<Vec<_>>(),
+            [2, 3]
+        );
+        save_key_history(&path, &groups).unwrap();
+        assert_eq!(load_key_history(&path).unwrap().len(), 2);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_key_history(&path).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

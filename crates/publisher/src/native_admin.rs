@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use glacialcast_protocol::{
     NoiseKeypair, NoiseSocket, PROTOCOL_VERSION,
     credential::{CredentialRole, NativeCredential},
+    envelope::KeyEnvelope,
     identity::{IdentityPublic, IdentitySecret, load_or_create_identity},
     initiator_handshake_xx, load_or_create_noise_keypair,
     pairing::{
@@ -326,11 +327,50 @@ async fn decide(
     if approve {
         add_approved(state, pending.request.body.viewer)?;
         println!("approved {}", hex(&pending.request.body.viewer.id()?));
+        if let Err(error) = publish_history_envelopes(profile, &pending.request.body.viewer).await {
+            eprintln!(
+                "history authorization will retry during publication; immediate attempt failed: {error:#}"
+            );
+        }
     } else {
         println!("denied {}", hex(&request_id));
     }
     state.pending.remove(index);
     Ok(())
+}
+
+async fn publish_history_envelopes(profile: &Profile, viewer: &IdentityPublic) -> Result<()> {
+    let groups =
+        super::native_publish::load_key_history(&profile.state_dir.join("key-history.bin"))?;
+    if groups.is_empty() {
+        return Ok(());
+    }
+    let (mut socket, _) = connect(profile).await?;
+    for group in groups.iter().rev() {
+        socket
+            .write(&PublisherMessage::KeyEnvelope(KeyEnvelope::seal(
+                &profile.identity,
+                viewer,
+                group.stream_id,
+                group.epoch_id,
+                group.key_group_id,
+                group.key_id,
+                &group.content_key,
+            )?))
+            .await?;
+    }
+    socket
+        .write(&PublisherMessage::Ping {
+            now_ms: glacialcast_protocol::now_ms(),
+        })
+        .await?;
+    match socket.read::<RelayPublisherMessage>().await? {
+        RelayPublisherMessage::Pong { .. } => Ok(()),
+        RelayPublisherMessage::Error(error) => {
+            anyhow::bail!("relay rejected retained key envelope: {}", error.detail)
+        }
+        _ => anyhow::bail!("relay did not confirm retained key-envelope processing"),
+    }
 }
 
 fn add_approved(state: &mut PublisherState, viewer: IdentityPublic) -> Result<()> {
