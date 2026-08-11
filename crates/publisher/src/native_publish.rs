@@ -15,7 +15,7 @@ use glacialcast_protocol::{
         CodecId, GroupEncryptor, H264EpochPayload, NativeObjectKind, NewNativeObject,
         StreamDescriptor,
     },
-    private_state::{read_private, replace_private},
+    private_state::{PrivateLockMode, lock_private, read_private, replace_private},
     trust::KnownRelays,
     wire::{PublisherMessage, PublisherResumeStream, RelayPublisherMessage, SessionHello},
 };
@@ -29,6 +29,7 @@ const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
 const MEDIA_TIMESCALE: u64 = 90_000;
 const KEY_HISTORY_VERSION: u16 = 1;
 const MAX_KEY_HISTORY_BYTES: usize = 16 * 1024 * 1024;
+const NETWORK_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct RetainedGroupKey {
@@ -56,7 +57,15 @@ impl Default for KeyHistory {
     }
 }
 
-pub(super) fn load_key_history(path: &Path) -> Result<Vec<RetainedGroupKey>> {
+fn history_lock_path(path: &Path) -> Result<std::path::PathBuf> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("key history path has no UTF-8 file name")?;
+    Ok(path.with_file_name(format!(".{name}.lock")))
+}
+
+fn load_key_history_unlocked(path: &Path) -> Result<Vec<RetainedGroupKey>> {
     match read_private(path, MAX_KEY_HISTORY_BYTES) {
         Ok(bytes) => {
             let (history, remainder) = postcard::take_from_bytes::<KeyHistory>(&bytes)?;
@@ -74,7 +83,13 @@ pub(super) fn load_key_history(path: &Path) -> Result<Vec<RetainedGroupKey>> {
     }
 }
 
-fn save_key_history(path: &Path, groups: &[RetainedGroupKey]) -> Result<()> {
+pub(super) fn load_key_history(path: &Path) -> Result<Vec<RetainedGroupKey>> {
+    let lock_path = history_lock_path(path)?;
+    let _lock = lock_private(&lock_path, PrivateLockMode::Shared)?;
+    load_key_history_unlocked(path)
+}
+
+fn save_key_history_unlocked(path: &Path, groups: &[RetainedGroupKey]) -> Result<()> {
     let history = KeyHistory {
         version: KEY_HISTORY_VERSION,
         groups: groups.to_vec(),
@@ -85,6 +100,27 @@ fn save_key_history(path: &Path, groups: &[RetainedGroupKey]) -> Result<()> {
     }
     replace_private(path, &encoded, MAX_KEY_HISTORY_BYTES)?;
     Ok(())
+}
+
+fn replace_stream_key_history(
+    path: &Path,
+    stream_id: Uuid,
+    stream_groups: &[RetainedGroupKey],
+) -> Result<()> {
+    let lock_path = history_lock_path(path)?;
+    let _lock = lock_private(&lock_path, PrivateLockMode::Exclusive)?;
+    let mut groups = load_key_history_unlocked(path)?;
+    groups.retain(|group| group.stream_id != stream_id);
+    groups.extend_from_slice(stream_groups);
+    groups.sort_by_key(|group| {
+        (
+            group.stream_id,
+            group.created_at_ms,
+            group.epoch_id,
+            group.key_group_id,
+        )
+    });
+    save_key_history_unlocked(path, &groups)
 }
 
 fn prune_key_history(
@@ -125,31 +161,38 @@ pub(super) async fn run_native_client(
         .map(|path| NativeCredential::decode(&read_private(path, MAX_CREDENTIAL_BYTES)?))
         .transpose()?;
     let endpoint = normalize_endpoint(&args.ingest_addr);
-    let mut stream = TcpStream::connect(&endpoint).await?;
+    let mut stream = tokio::time::timeout(NETWORK_TIMEOUT, TcpStream::connect(&endpoint))
+        .await
+        .context("publisher relay connection timed out")??;
     let known_path = state_dir.join("known-relays.bin");
     let explicit_pin = stream_identity.client.ingest_server_key;
     let expected = explicit_pin.or(KnownRelays::open(&known_path)?.get(&endpoint)?);
-    let (transport, remote) =
+    let (transport, remote) = tokio::time::timeout(
+        NETWORK_TIMEOUT,
         initiator_handshake_xx(&mut stream, &noise.private, |actual| match expected {
             Some(expected) if actual != &expected => Err(
                 glacialcast_protocol::ProtocolError::Noise("relay identity changed".into()),
             ),
             _ => Ok(()),
-        })
-        .await?;
+        }),
+    )
+    .await
+    .context("publisher relay handshake timed out")??;
     if explicit_pin.is_none() {
         KnownRelays::open(known_path)?.verify_or_learn(&endpoint, remote)?;
     }
     let mut socket = NoiseSocket::new(stream, transport);
-    socket
-        .write(&PublisherMessage::Hello(SessionHello {
+    write_publisher(
+        &mut socket,
+        &PublisherMessage::Hello(SessionHello {
             protocol_version: PROTOCOL_VERSION,
             role: CredentialRole::Publisher,
             identity: publisher.public()?,
             credential,
-        }))
-        .await?;
-    match socket.read::<RelayPublisherMessage>().await? {
+        }),
+    )
+    .await?;
+    match read_relay(&mut socket).await? {
         RelayPublisherMessage::Welcome(_) => {}
         RelayPublisherMessage::Error(error) => {
             anyhow::bail!("relay rejected publisher: {}", error.detail)
@@ -160,8 +203,9 @@ pub(super) async fn run_native_client(
     let label = stream_identity.label.unwrap_or("default");
     let stream_id = stable_stream_id(&publisher, label)?;
     let epoch_id = Uuid::new_v4();
-    socket
-        .write(&PublisherMessage::Resume {
+    write_publisher(
+        &mut socket,
+        &PublisherMessage::Resume {
             publisher_id: publisher.public()?.id()?,
             streams: vec![PublisherResumeStream {
                 stream_id,
@@ -169,9 +213,10 @@ pub(super) async fn run_native_client(
                 epoch_id,
                 key_group: 1,
             }],
-        })
-        .await?;
-    let committed = match socket.read::<RelayPublisherMessage>().await? {
+        },
+    )
+    .await?;
+    let committed = match read_relay(&mut socket).await? {
         RelayPublisherMessage::ResumeState(states) => {
             states
                 .first()
@@ -193,9 +238,7 @@ pub(super) async fn run_native_client(
         true,
         glacialcast_protocol::now_ms(),
     )?;
-    socket
-        .write(&PublisherMessage::Descriptor(descriptor))
-        .await?;
+    write_publisher(&mut socket, &PublisherMessage::Descriptor(descriptor)).await?;
 
     let first = capture
         .capture_dash_frame(args.max_frame_width, args.max_frame_height)
@@ -220,7 +263,10 @@ pub(super) async fn run_native_client(
     let approval_path = state_dir.join("publisher-state.bin");
     let history_path = state_dir.join("key-history.bin");
     let mut approved = native_admin::approved_viewers(&approval_path, stream_id)?;
-    let mut key_history = load_key_history(&history_path)?;
+    let mut key_history: Vec<_> = load_key_history(&history_path)?
+        .into_iter()
+        .filter(|group| group.stream_id == stream_id)
+        .collect();
     let history_bytes = args
         .history_bytes
         .context("history byte limit was not resolved")?;
@@ -269,27 +315,12 @@ pub(super) async fn run_native_client(
                 group_id,
                 sequence,
             )?;
-            key_history.push(RetainedGroupKey {
-                stream_id,
-                epoch_id,
-                key_group_id: group_id,
-                key_id: next_group.key_id(),
-                content_key: next_group.content_key(),
-                created_at_ms: glacialcast_protocol::now_ms(),
-                content_bytes: 0,
-            });
-            prune_key_history(
-                &mut key_history,
-                glacialcast_protocol::now_ms(),
-                history_bytes,
-                history_age_ms,
-            );
-            save_key_history(&history_path, &key_history)?;
             group = Some(next_group);
         } else if let Some(current_group) = &group {
             for viewer in &newly_approved {
-                socket
-                    .write(&PublisherMessage::KeyEnvelope(KeyEnvelope::seal(
+                write_publisher(
+                    &mut socket,
+                    &PublisherMessage::KeyEnvelope(KeyEnvelope::seal(
                         &publisher,
                         viewer,
                         stream_id,
@@ -297,8 +328,9 @@ pub(super) async fn run_native_client(
                         group_id,
                         current_group.key_id(),
                         &current_group.content_key(),
-                    )?))
-                    .await?;
+                    )?),
+                )
+                .await?;
             }
         }
         approved = latest_approved;
@@ -345,6 +377,22 @@ pub(super) async fn run_native_client(
                 .encode()?,
             )?;
             publish(&mut socket, epoch, sequence).await?;
+            key_history.push(RetainedGroupKey {
+                stream_id,
+                epoch_id,
+                key_group_id: group_id,
+                key_id: group.key_id(),
+                content_key: group.content_key(),
+                created_at_ms: glacialcast_protocol::now_ms(),
+                content_bytes: 0,
+            });
+            prune_key_history(
+                &mut key_history,
+                glacialcast_protocol::now_ms(),
+                history_bytes,
+                history_age_ms,
+            );
+            replace_stream_key_history(&history_path, stream_id, &key_history)?;
             for viewer in &approved {
                 let envelope = KeyEnvelope::seal(
                     &publisher,
@@ -355,9 +403,7 @@ pub(super) async fn run_native_client(
                     group.key_id(),
                     &group.content_key(),
                 )?;
-                socket
-                    .write(&PublisherMessage::KeyEnvelope(envelope))
-                    .await?;
+                write_publisher(&mut socket, &PublisherMessage::KeyEnvelope(envelope)).await?;
             }
         }
         sequence = sequence.saturating_add(1);
@@ -389,7 +435,7 @@ pub(super) async fn run_native_client(
             history_bytes,
             history_age_ms,
         );
-        save_key_history(&history_path, &key_history)?;
+        replace_stream_key_history(&history_path, stream_id, &key_history)?;
         frame_index = frame_index.saturating_add(1);
         timestamp = timestamp.saturating_add(u64::from(duration));
         tokio::time::sleep(Duration::from_secs_f64(1.0 / args.fps)).await;
@@ -412,8 +458,8 @@ async fn publish(
     expected: u64,
 ) -> Result<()> {
     let stream_id = object.header.stream_id;
-    socket.write(&PublisherMessage::Object(object)).await?;
-    match socket.read::<RelayPublisherMessage>().await? {
+    write_publisher(socket, &PublisherMessage::Object(object)).await?;
+    match read_relay(socket).await? {
         RelayPublisherMessage::PublishAck {
             stream_id: acknowledged,
             committed_through,
@@ -423,6 +469,23 @@ async fn publish(
         }
         _ => anyhow::bail!("unexpected publication acknowledgement"),
     }
+}
+
+async fn write_publisher(
+    socket: &mut NoiseSocket<TcpStream>,
+    message: &PublisherMessage,
+) -> Result<()> {
+    tokio::time::timeout(NETWORK_TIMEOUT, socket.write(message))
+        .await
+        .context("publisher relay write timed out")??;
+    Ok(())
+}
+
+async fn read_relay(socket: &mut NoiseSocket<TcpStream>) -> Result<RelayPublisherMessage> {
+    tokio::time::timeout(NETWORK_TIMEOUT, socket.read::<RelayPublisherMessage>())
+        .await
+        .context("publisher relay response timed out")?
+        .map_err(Into::into)
 }
 
 fn stable_stream_id(publisher: &IdentitySecret, label: &str) -> Result<Uuid> {
@@ -498,7 +561,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [2, 3]
         );
-        save_key_history(&path, &groups).unwrap();
+        save_key_history_unlocked(&path, &groups).unwrap();
         assert_eq!(load_key_history(&path).unwrap().len(), 2);
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -506,6 +569,35 @@ mod tests {
         );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(load_key_history(&path).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stream_history_updates_preserve_other_monitor_groups() {
+        const HISTORY_BYTES: u64 = 10;
+        let root = std::env::temp_dir().join(format!("gcpub-key-merge-{}", Uuid::new_v4()));
+        let path = root.join("history.bin");
+        let first_stream = Uuid::from_u128(1);
+        let second_stream = Uuid::from_u128(2);
+        let group = |stream_id, key_group_id| RetainedGroupKey {
+            stream_id,
+            epoch_id: Uuid::from_u128(u128::from(key_group_id)),
+            key_group_id,
+            key_id: [u8::try_from(key_group_id).unwrap(); 16],
+            content_key: [u8::try_from(key_group_id).unwrap(); 32],
+            created_at_ms: i64::try_from(key_group_id).unwrap(),
+            content_bytes: HISTORY_BYTES,
+        };
+
+        replace_stream_key_history(&path, first_stream, &[group(first_stream, 1)]).unwrap();
+        replace_stream_key_history(&path, second_stream, &[group(second_stream, 2)]).unwrap();
+        replace_stream_key_history(&path, first_stream, &[group(first_stream, 3)]).unwrap();
+
+        let groups = load_key_history(&path).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().any(|group| group.stream_id == second_stream));
+        assert!(groups.iter().any(|group| group.key_group_id == 3));
+        assert!(!groups.iter().any(|group| group.key_group_id == 1));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

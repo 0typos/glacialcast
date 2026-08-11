@@ -154,6 +154,75 @@ pub fn replace_private(path: &Path, bytes: &[u8], max_existing_len: usize) -> io
     result
 }
 
+/// Requested advisory-lock behavior for a private lock file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrivateLockMode {
+    /// Wait for a shared reader lock.
+    Shared,
+    /// Wait for an exclusive writer lock.
+    Exclusive,
+    /// Return [`io::ErrorKind::WouldBlock`] if an exclusive lock is held.
+    TryExclusive,
+}
+
+/// An advisory lock held until this value is dropped.
+#[derive(Debug)]
+pub struct PrivateFileLock {
+    file: File,
+}
+
+impl PrivateFileLock {
+    /// Returns the locked file's metadata for diagnostics and tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if metadata can no longer be read from the open file.
+    pub fn metadata(&self) -> io::Result<fs::Metadata> {
+        self.file.metadata()
+    }
+}
+
+/// Opens a private regular lock file without following symlinks and locks it.
+///
+/// Lock files contain no data, use mode `0600`, and must have exactly one hard
+/// link. Locks coordinate atomic read-modify-replace transactions by using a
+/// stable sibling file rather than the state inode that replacement changes.
+///
+/// # Errors
+///
+/// Returns an error for unsafe metadata, file-system failures, interrupted
+/// locking, or a contended [`PrivateLockMode::TryExclusive`] request.
+pub fn lock_private(path: &Path, mode: PrivateLockMode) -> io::Result<PrivateFileLock> {
+    let parent = prepare_parent(path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    validate_private_metadata(path, &file.metadata()?, 0)?;
+    let operation = match mode {
+        PrivateLockMode::Shared => libc::LOCK_SH,
+        PrivateLockMode::Exclusive => libc::LOCK_EX,
+        PrivateLockMode::TryExclusive => libc::LOCK_EX | libc::LOCK_NB,
+    };
+    loop {
+        // SAFETY: `file` owns a valid open descriptor for the duration of this
+        // call, and `flock` neither dereferences pointers nor takes ownership.
+        let result = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), operation) };
+        if result == 0 {
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    sync_directory(&parent)?;
+    Ok(PrivateFileLock { file })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +269,29 @@ mod tests {
         assert!(read_private(&link, 4).is_err());
         assert!(replace_private(&link, b"nope", 4).is_err());
         assert_eq!(read_private(&path, 4).unwrap(), b"abcd");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_locks_are_exclusive_and_reject_unsafe_files() {
+        let root = temporary_root();
+        let path = root.join("state.lock");
+        let first = lock_private(&path, PrivateLockMode::TryExclusive).unwrap();
+        assert_eq!(
+            first.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            lock_private(&path, PrivateLockMode::TryExclusive)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(first);
+        assert!(lock_private(&path, PrivateLockMode::TryExclusive).is_ok());
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(lock_private(&path, PrivateLockMode::Shared).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }

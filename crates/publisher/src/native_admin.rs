@@ -15,7 +15,7 @@ use glacialcast_protocol::{
         PairDecisionReason, PairOffer, PairRequest, PublisherDecision, ViewerConfirmation,
         authentication_string,
     },
-    private_state::{read_private, replace_private},
+    private_state::{PrivateLockMode, lock_private, read_private, replace_private},
     trust::KnownRelays,
     wire::{PublisherMessage, RelayPublisherMessage, SessionHello},
 };
@@ -26,10 +26,11 @@ use tokio::{net::TcpStream, sync::watch};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-const STATE_VERSION: u16 = 2;
+const STATE_VERSION: u16 = 3;
 const MAX_STATE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
 const PAIR_LIFETIME_MS: i64 = 24 * 60 * 60 * 1_000;
+const NETWORK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -107,6 +108,17 @@ pub(super) struct PublisherState {
     pending: Vec<PendingPairing>,
     approved: Vec<StreamGrant>,
     revoked: Vec<RevokedGrant>,
+    offer_outbox: Vec<[u8; 32]>,
+    decision_outbox: Vec<PublisherDecision>,
+    history_outbox: Vec<StreamGrant>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PublisherStateV2 {
+    version: u16,
+    pending: Vec<PendingPairing>,
+    approved: Vec<StreamGrant>,
+    revoked: Vec<RevokedGrant>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -128,6 +140,9 @@ impl Default for PublisherState {
             pending: Vec::new(),
             approved: Vec::new(),
             revoked: Vec::new(),
+            offer_outbox: Vec::new(),
+            decision_outbox: Vec::new(),
+            history_outbox: Vec::new(),
         }
     }
 }
@@ -245,18 +260,23 @@ pub(super) async fn run_live_approvals(
         pin,
     };
     let state_path = state_dir.join("publisher-state.bin");
+    let state_lock_path = state_dir.join(".publisher-state.lock");
     loop {
         if *shutdown.borrow() {
             return;
         }
         let result = async {
+            let _state_lock = lock_private(&state_lock_path, PrivateLockMode::Exclusive)?;
             let config = load_config(None, &state_dir)?;
             let policy = load_policy(config.viewers.policy, config.viewers)?;
-            let mut state = load_state(&state_path)?;
+            let mut state = load_state_unlocked(&state_path)?;
+            flush_outbox(&profile, &mut state, &state_path).await?;
             let pending_before = state.pending.len();
             let grants_before = state.approved.len();
             refresh_requests(&profile, &mut state, &policy).await?;
-            save_state(&state_path, &state)?;
+            save_state_unlocked(&state_path, &state)?;
+            flush_outbox(&profile, &mut state, &state_path).await?;
+            flush_history_outbox(&profile, &mut state, &state_path).await;
             if state.pending.len() > pending_before {
                 info!(
                     new_requests = state.pending.len() - pending_before,
@@ -286,15 +306,35 @@ pub(super) async fn run_live_approvals(
 }
 
 async fn execute(profile: Profile, policy: ApprovalPolicy, command: AdminCommand) -> Result<()> {
+    if let AdminCommand::CredentialRequest { output, subject } = &command {
+        let now = glacialcast_protocol::now_ms();
+        let request = CredentialRequest::new(
+            &profile.identity,
+            subject.clone(),
+            CredentialRole::Publisher,
+            profile.noise.public,
+            now,
+            now.saturating_add(PAIR_LIFETIME_MS),
+        )?;
+        glacialcast_protocol::private_state::create_private(output, &request.encode()?)?;
+        println!("wrote publisher credential request {}", output.display());
+        return Ok(());
+    }
     let state_path = profile.state_dir.join("publisher-state.bin");
-    let mut state = load_state(&state_path)?;
-    if !matches!(
-        command,
-        AdminCommand::Viewers
-            | AdminCommand::Revoke { .. }
-            | AdminCommand::CredentialRequest { .. }
-    ) {
+    let _state_lock = lock_private(
+        &profile.state_dir.join(".publisher-state.lock"),
+        PrivateLockMode::Exclusive,
+    )?;
+    let mut state = load_state_unlocked(&state_path)?;
+    let offline_command = matches!(
+        &command,
+        AdminCommand::Viewers | AdminCommand::Revoke { .. }
+    );
+    if !offline_command {
+        flush_outbox(&profile, &mut state, &state_path).await?;
         refresh_requests(&profile, &mut state, &policy).await?;
+        save_state_unlocked(&state_path, &state)?;
+        flush_outbox(&profile, &mut state, &state_path).await?;
     }
     match command {
         AdminCommand::Requests => print_requests(&state)?,
@@ -328,6 +368,9 @@ async fn execute(profile: Profile, policy: ApprovalPolicy, command: AdminCommand
                 state.revoked.push(revoked);
                 state.revoked.sort_unstable();
             }
+            state.history_outbox.retain(|grant| {
+                grant.stream_id != stream || grant.viewer.id().ok() != Some(viewer_id)
+            });
             println!(
                 "revoked {} from {}; active publication must rotate its group immediately",
                 hex(&viewer_id),
@@ -342,21 +385,15 @@ async fn execute(profile: Profile, policy: ApprovalPolicy, command: AdminCommand
                 println!("revoked  {} {}", grant.stream_id, hex(&grant.viewer_id));
             }
         }
-        AdminCommand::CredentialRequest { output, subject } => {
-            let now = glacialcast_protocol::now_ms();
-            let request = CredentialRequest::new(
-                &profile.identity,
-                subject,
-                CredentialRole::Publisher,
-                profile.noise.public,
-                now,
-                now.saturating_add(PAIR_LIFETIME_MS),
-            )?;
-            glacialcast_protocol::private_state::create_private(&output, &request.encode()?)?;
-            println!("wrote publisher credential request {}", output.display());
-        }
+        AdminCommand::CredentialRequest { .. } => unreachable!("handled before loading state"),
     }
-    save_state(&state_path, &state)
+    save_state_unlocked(&state_path, &state)?;
+    if offline_command {
+        return Ok(());
+    }
+    flush_outbox(&profile, &mut state, &state_path).await?;
+    flush_history_outbox(&profile, &mut state, &state_path).await;
+    Ok(())
 }
 
 async fn refresh_requests(
@@ -365,11 +402,11 @@ async fn refresh_requests(
     policy: &ApprovalPolicy,
 ) -> Result<()> {
     let (mut socket, relay_key) = connect(profile).await?;
-    socket.write(&PublisherMessage::FetchPairingInbox).await?;
+    write_publisher(&mut socket, &PublisherMessage::FetchPairingInbox).await?;
     let mut requests = Vec::new();
     let mut confirmations = Vec::new();
     loop {
-        match socket.read::<RelayPublisherMessage>().await? {
+        match read_relay(&mut socket).await? {
             RelayPublisherMessage::PairRequest {
                 request,
                 source_addr,
@@ -430,34 +467,14 @@ async fn refresh_requests(
             ViewerPolicy::Required => None,
         };
         if let Some(reason) = policy_reason {
-            if let Err(error) = publish_history_envelopes_on_socket(
-                &mut socket,
-                &profile.state_dir,
-                request.body.stream_id,
-                &profile.identity,
-                &request.body.viewer,
-            )
-            .await
-            {
-                warn!(
-                    stream = %request.body.stream_id,
-                    viewer = %hex(&request.body.viewer.id()?),
-                    error = %format!("{error:#}"),
-                    "retained keys could not be delivered; automatic approval will retry"
-                );
-                continue;
-            }
             let decision = PublisherDecision::approve_by_policy(
                 &profile.identity,
                 &request,
                 reason,
                 glacialcast_protocol::now_ms(),
             )?;
-            socket
-                .write(&PublisherMessage::PairDecision(decision))
-                .await?;
-            expect_pairing_ack(&mut socket, request_id).await?;
             add_approved(state, request.body.stream_id, request.body.viewer)?;
+            queue_decision(state, decision)?;
             continue;
         }
         let now = glacialcast_protocol::now_ms();
@@ -469,16 +486,16 @@ async fn refresh_requests(
             request.body.expires_at_ms,
             PAIR_LIFETIME_MS,
         )?;
-        socket
-            .write(&PublisherMessage::PairOffer(offer.clone()))
-            .await?;
-        expect_pairing_ack(&mut socket, request_id).await?;
         state.pending.push(PendingPairing {
             request,
             offer,
             confirmation: None,
             source_addr,
         });
+        if !state.offer_outbox.contains(&request_id) {
+            state.offer_outbox.push(request_id);
+            state.offer_outbox.sort_unstable();
+        }
     }
     for confirmation in confirmations {
         if let Some(pending) = state
@@ -562,12 +579,6 @@ async fn decide(
             glacialcast_protocol::now_ms(),
         )?
     };
-    let request_id = pending.request.id()?;
-    let (mut socket, _) = connect(profile).await?;
-    socket
-        .write(&PublisherMessage::PairDecision(decision))
-        .await?;
-    expect_pairing_ack(&mut socket, request_id).await?;
     if approve {
         add_approved(
             state,
@@ -579,22 +590,91 @@ async fn decide(
             hex(&pending.request.body.viewer.id()?),
             pending.request.body.stream_id
         );
-        if let Err(error) = publish_history_envelopes(
-            profile,
-            pending.request.body.stream_id,
-            &pending.request.body.viewer,
-        )
-        .await
-        {
-            eprintln!(
-                "history authorization will retry during publication; immediate attempt failed: {error:#}"
-            );
-        }
     } else {
-        println!("denied {}", hex(&request_id));
+        println!("denied {}", hex(&pending.request.id()?));
     }
+    queue_decision(state, decision)?;
     state.pending.remove(index);
+    let request_id = pending.request.id()?;
+    state.offer_outbox.retain(|queued| queued != &request_id);
     Ok(())
+}
+
+fn queue_decision(state: &mut PublisherState, decision: PublisherDecision) -> Result<()> {
+    let request_id = decision.body.request_id;
+    if let Some(existing) = state
+        .decision_outbox
+        .iter()
+        .find(|queued| queued.body.request_id == request_id)
+    {
+        if existing != &decision {
+            anyhow::bail!("publisher decision outbox contains conflicting content");
+        }
+        return Ok(());
+    }
+    state.decision_outbox.push(decision);
+    state
+        .decision_outbox
+        .sort_by_key(|queued| queued.body.request_id);
+    Ok(())
+}
+
+async fn flush_outbox(
+    profile: &Profile,
+    state: &mut PublisherState,
+    state_path: &std::path::Path,
+) -> Result<()> {
+    if state.offer_outbox.is_empty() && state.decision_outbox.is_empty() {
+        return Ok(());
+    }
+    let (mut socket, _) = connect(profile).await?;
+    while let Some(request_id) = state.offer_outbox.first().copied() {
+        let offer = state
+            .pending
+            .iter()
+            .find(|pending| pending.request.id().ok() == Some(request_id))
+            .map(|pending| pending.offer.clone())
+            .context("publisher offer outbox lost its pending request")?;
+        write_publisher(&mut socket, &PublisherMessage::PairOffer(offer)).await?;
+        expect_pairing_ack(&mut socket, request_id).await?;
+        state.offer_outbox.remove(0);
+        save_state_unlocked(state_path, state)?;
+    }
+    while let Some(decision) = state.decision_outbox.first().cloned() {
+        let request_id = decision.body.request_id;
+        write_publisher(&mut socket, &PublisherMessage::PairDecision(decision)).await?;
+        expect_pairing_ack(&mut socket, request_id).await?;
+        state.decision_outbox.remove(0);
+        save_state_unlocked(state_path, state)?;
+    }
+    Ok(())
+}
+
+async fn flush_history_outbox(
+    profile: &Profile,
+    state: &mut PublisherState,
+    state_path: &std::path::Path,
+) {
+    for grant in state.history_outbox.clone() {
+        match publish_history_envelopes(profile, grant.stream_id, &grant.viewer).await {
+            Ok(()) => {
+                let viewer_id = grant.viewer.id().ok();
+                state.history_outbox.retain(|queued| {
+                    queued.stream_id != grant.stream_id || queued.viewer.id().ok() != viewer_id
+                });
+                if let Err(error) = save_state_unlocked(state_path, state) {
+                    warn!(error = %format!("{error:#}"), "could not commit retained-key outbox progress");
+                    return;
+                }
+            }
+            Err(error) => warn!(
+                stream = %grant.stream_id,
+                viewer = %grant.viewer.id().map(|id| hex(&id)).unwrap_or_else(|_| "invalid".into()),
+                error = %format!("{error:#}"),
+                "retained-key authorization is still queued"
+            ),
+        }
+    }
 }
 
 async fn publish_history_envelopes(
@@ -606,17 +686,6 @@ async fn publish_history_envelopes(
         super::native_publish::load_key_history(&profile.state_dir.join("key-history.bin"))?;
     let (mut socket, _) = connect(profile).await?;
     publish_history_groups(&mut socket, &profile.identity, viewer, stream_id, &groups).await
-}
-
-async fn publish_history_envelopes_on_socket(
-    socket: &mut NoiseSocket<TcpStream>,
-    state_dir: &std::path::Path,
-    stream_id: Uuid,
-    publisher: &IdentitySecret,
-    viewer: &IdentityPublic,
-) -> Result<()> {
-    let groups = super::native_publish::load_key_history(&state_dir.join("key-history.bin"))?;
-    publish_history_groups(socket, publisher, viewer, stream_id, &groups).await
 }
 
 async fn publish_history_groups(
@@ -635,8 +704,9 @@ async fn publish_history_groups(
         return Ok(());
     }
     for group in groups {
-        socket
-            .write(&PublisherMessage::KeyEnvelope(KeyEnvelope::seal(
+        write_publisher(
+            socket,
+            &PublisherMessage::KeyEnvelope(KeyEnvelope::seal(
                 publisher,
                 viewer,
                 group.stream_id,
@@ -644,15 +714,18 @@ async fn publish_history_groups(
                 group.key_group_id,
                 group.key_id,
                 &group.content_key,
-            )?))
-            .await?;
-    }
-    socket
-        .write(&PublisherMessage::Ping {
-            now_ms: glacialcast_protocol::now_ms(),
-        })
+            )?),
+        )
         .await?;
-    match socket.read::<RelayPublisherMessage>().await? {
+    }
+    write_publisher(
+        socket,
+        &PublisherMessage::Ping {
+            now_ms: glacialcast_protocol::now_ms(),
+        },
+    )
+    .await?;
+    match read_relay(socket).await? {
         RelayPublisherMessage::Pong { .. } => Ok(()),
         RelayPublisherMessage::Error(error) => {
             anyhow::bail!("relay rejected retained key envelope: {}", error.detail)
@@ -678,9 +751,14 @@ fn add_approved(state: &mut PublisherState, stream_id: Uuid, viewer: IdentityPub
         .iter()
         .any(|grant| grant.stream_id == stream_id && grant.viewer.id().ok() == Some(id))
     {
-        state.approved.push(StreamGrant { stream_id, viewer });
+        let grant = StreamGrant { stream_id, viewer };
+        state.approved.push(grant.clone());
         state
             .approved
+            .sort_by_key(|grant| (grant.stream_id, grant.viewer.id().unwrap_or([0; 32])));
+        state.history_outbox.push(grant);
+        state
+            .history_outbox
             .sort_by_key(|grant| (grant.stream_id, grant.viewer.id().unwrap_or([0; 32])));
     }
     Ok(())
@@ -709,35 +787,43 @@ fn print_requests(state: &PublisherState) -> Result<()> {
 }
 
 async fn connect(profile: &Profile) -> Result<(NoiseSocket<TcpStream>, [u8; 32])> {
-    let mut stream = TcpStream::connect(&profile.relay).await?;
+    let mut stream = tokio::time::timeout(NETWORK_TIMEOUT, TcpStream::connect(&profile.relay))
+        .await
+        .context("publisher relay connection timed out")??;
     let known_path = profile.state_dir.join("known-relays.bin");
     let expected = profile
         .pin
         .or(KnownRelays::open(&known_path)?.get(&profile.relay)?);
-    let (transport, remote) = initiator_handshake_xx(
-        &mut stream,
-        &profile.noise.private,
-        |actual| match expected {
-            Some(expected) if actual != &expected => Err(
-                glacialcast_protocol::ProtocolError::Noise("relay identity changed".into()),
-            ),
-            _ => Ok(()),
-        },
+    let (transport, remote) = tokio::time::timeout(
+        NETWORK_TIMEOUT,
+        initiator_handshake_xx(
+            &mut stream,
+            &profile.noise.private,
+            |actual| match expected {
+                Some(expected) if actual != &expected => Err(
+                    glacialcast_protocol::ProtocolError::Noise("relay identity changed".into()),
+                ),
+                _ => Ok(()),
+            },
+        ),
     )
-    .await?;
+    .await
+    .context("publisher relay handshake timed out")??;
     if profile.pin.is_none() {
         KnownRelays::open(known_path)?.verify_or_learn(&profile.relay, remote)?;
     }
     let mut socket = NoiseSocket::new(stream, transport);
-    socket
-        .write(&PublisherMessage::Hello(SessionHello {
+    write_publisher(
+        &mut socket,
+        &PublisherMessage::Hello(SessionHello {
             protocol_version: PROTOCOL_VERSION,
             role: CredentialRole::Publisher,
             identity: profile.identity.public()?,
             credential: profile.credential.clone(),
-        }))
-        .await?;
-    match socket.read::<RelayPublisherMessage>().await? {
+        }),
+    )
+    .await?;
+    match read_relay(&mut socket).await? {
         RelayPublisherMessage::Welcome(_) => Ok((socket, remote)),
         RelayPublisherMessage::Error(error) => {
             anyhow::bail!("relay rejected publisher: {}", error.detail)
@@ -747,7 +833,7 @@ async fn connect(profile: &Profile) -> Result<(NoiseSocket<TcpStream>, [u8; 32])
 }
 
 async fn expect_pairing_ack(socket: &mut NoiseSocket<TcpStream>, expected: [u8; 32]) -> Result<()> {
-    match socket.read::<RelayPublisherMessage>().await? {
+    match read_relay(socket).await? {
         RelayPublisherMessage::PairingAck { request_id } if request_id == expected => Ok(()),
         RelayPublisherMessage::Error(error) => {
             anyhow::bail!("relay rejected pairing record: {}", error.detail)
@@ -756,29 +842,98 @@ async fn expect_pairing_ack(socket: &mut NoiseSocket<TcpStream>, expected: [u8; 
     }
 }
 
-pub(super) fn load_state(path: &std::path::Path) -> Result<PublisherState> {
+async fn write_publisher(
+    socket: &mut NoiseSocket<TcpStream>,
+    message: &PublisherMessage,
+) -> Result<()> {
+    tokio::time::timeout(NETWORK_TIMEOUT, socket.write(message))
+        .await
+        .context("publisher relay write timed out")??;
+    Ok(())
+}
+
+async fn read_relay(socket: &mut NoiseSocket<TcpStream>) -> Result<RelayPublisherMessage> {
+    tokio::time::timeout(NETWORK_TIMEOUT, socket.read::<RelayPublisherMessage>())
+        .await
+        .context("publisher relay response timed out")?
+        .map_err(Into::into)
+}
+
+fn load_state_unlocked(path: &std::path::Path) -> Result<PublisherState> {
     match read_private(path, MAX_STATE_BYTES) {
         Ok(bytes) => {
-            let (state, remainder) = postcard::take_from_bytes::<PublisherState>(&bytes)?;
-            if !remainder.is_empty()
-                || state.version != STATE_VERSION
-                || postcard::to_stdvec(&state)? != bytes
+            if let Ok((state, remainder)) = postcard::take_from_bytes::<PublisherState>(&bytes)
+                && remainder.is_empty()
+                && state.version == STATE_VERSION
+                && postcard::to_stdvec(&state)? == bytes
+            {
+                validate_state(&state)?;
+                return Ok(state);
+            }
+            let (state, remainder) = postcard::take_from_bytes::<PublisherStateV2>(&bytes)?;
+            if !remainder.is_empty() || state.version != 2 || postcard::to_stdvec(&state)? != bytes
             {
                 anyhow::bail!("publisher state is invalid or non-canonical");
             }
-            Ok(state)
+            let migrated = PublisherState {
+                version: STATE_VERSION,
+                pending: state.pending,
+                history_outbox: state.approved.clone(),
+                approved: state.approved,
+                revoked: state.revoked,
+                offer_outbox: Vec::new(),
+                decision_outbox: Vec::new(),
+            };
+            validate_state(&migrated)?;
+            Ok(migrated)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(PublisherState::default()),
         Err(error) => Err(error.into()),
     }
 }
 
-fn save_state(path: &std::path::Path, state: &PublisherState) -> Result<()> {
+pub(super) fn load_state(path: &std::path::Path) -> Result<PublisherState> {
+    let lock_path = path.with_file_name(".publisher-state.lock");
+    let _lock = lock_private(&lock_path, PrivateLockMode::Shared)?;
+    load_state_unlocked(path)
+}
+
+fn save_state_unlocked(path: &std::path::Path, state: &PublisherState) -> Result<()> {
+    validate_state(state)?;
     let encoded = postcard::to_stdvec(state)?;
     if encoded.len() > MAX_STATE_BYTES {
         anyhow::bail!("publisher state exceeds its bound");
     }
     replace_private(path, &encoded, MAX_STATE_BYTES)?;
+    Ok(())
+}
+
+fn validate_state(state: &PublisherState) -> Result<()> {
+    const MAX_RECORDS: usize = 65_536;
+    if state.pending.len() > MAX_RECORDS
+        || state.approved.len() > MAX_RECORDS
+        || state.revoked.len() > MAX_RECORDS
+        || state.offer_outbox.len() > MAX_RECORDS
+        || state.decision_outbox.len() > MAX_RECORDS
+        || state.history_outbox.len() > MAX_RECORDS
+        || !state.offer_outbox.windows(2).all(|pair| pair[0] < pair[1])
+        || !state
+            .decision_outbox
+            .windows(2)
+            .all(|pair| pair[0].body.request_id < pair[1].body.request_id)
+        || !state.history_outbox.windows(2).all(|pair| {
+            (pair[0].stream_id, pair[0].viewer.id().unwrap_or([0; 32]))
+                < (pair[1].stream_id, pair[1].viewer.id().unwrap_or([0; 32]))
+        })
+        || state.offer_outbox.iter().any(|request_id| {
+            !state
+                .pending
+                .iter()
+                .any(|pending| pending.request.id().ok() == Some(*request_id))
+        })
+    {
+        anyhow::bail!("publisher state has invalid bounds, ordering, or outbox references");
+    }
     Ok(())
 }
 
@@ -871,6 +1026,7 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glacialcast_protocol::private_state::replace_private;
 
     #[test]
     fn request_prefixes_must_be_unique_and_hexadecimal() {
@@ -943,5 +1099,66 @@ mod tests {
         });
         assert!(add_approved(&mut state, first, viewer).is_err());
         add_approved(&mut state, second, viewer).unwrap();
+    }
+
+    #[test]
+    fn version_two_state_migrates_and_queues_existing_grants_for_history() {
+        let root = std::env::temp_dir().join(format!("gcpub-state-v2-{}", Uuid::new_v4()));
+        let path = root.join("publisher-state.bin");
+        let viewer = IdentitySecret::generate().public().unwrap();
+        let old = PublisherStateV2 {
+            version: 2,
+            pending: Vec::new(),
+            approved: vec![StreamGrant {
+                stream_id: Uuid::from_u128(1),
+                viewer,
+            }],
+            revoked: Vec::new(),
+        };
+        replace_private(&path, &postcard::to_stdvec(&old).unwrap(), MAX_STATE_BYTES).unwrap();
+
+        let migrated = load_state(&path).unwrap();
+        assert_eq!(migrated.version, STATE_VERSION);
+        assert_eq!(migrated.approved.len(), 1);
+        assert!(migrated.offer_outbox.is_empty());
+        assert!(migrated.decision_outbox.is_empty());
+        assert_eq!(migrated.history_outbox.len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn approval_and_exact_decision_survive_before_relay_acknowledgement() {
+        let root = std::env::temp_dir().join(format!("gcpub-state-outbox-{}", Uuid::new_v4()));
+        let path = root.join("publisher-state.bin");
+        let publisher = IdentitySecret::generate();
+        let viewer = IdentitySecret::generate();
+        let stream_id = Uuid::from_u128(9);
+        let now = glacialcast_protocol::now_ms();
+        let request = PairRequest::new(
+            &viewer,
+            publisher.public().unwrap(),
+            stream_id,
+            "viewer".into(),
+            now,
+            now + PAIR_LIFETIME_MS,
+        )
+        .unwrap();
+        let decision = PublisherDecision::approve_by_policy(
+            &publisher,
+            &request,
+            PairDecisionReason::OpenPolicy,
+            now,
+        )
+        .unwrap();
+        let mut state = PublisherState::default();
+        add_approved(&mut state, stream_id, viewer.public().unwrap()).unwrap();
+        queue_decision(&mut state, decision.clone()).unwrap();
+        save_state_unlocked(&path, &state).unwrap();
+
+        let recovered = load_state(&path).unwrap();
+        assert_eq!(recovered.approved.len(), 1);
+        assert_eq!(recovered.decision_outbox, vec![decision]);
+        assert_eq!(recovered.history_outbox.len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
