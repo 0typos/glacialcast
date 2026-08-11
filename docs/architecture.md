@@ -1,411 +1,224 @@
 # GlacialCast Architecture
 
-## Product Contract
+## Product contract
 
-GlacialCast is a low-bandwidth, end-to-end-encrypted Wayland screen viewer --
-by default, and always on an Internet-facing relay; a publisher on a trusted
-LAN may opt out with `--no-encryption`, which exists because iPhones cannot
-decrypt these streams in any browser. It
-captures through the XDG Desktop Portal and PipeWire, publishes video at a very
-low frame rate, publishes cursor updates independently at a higher rate, keeps
-a bounded replay window, and can copy the same stream files to an offline
-machine for playback.
+GlacialCast is a low-bandwidth, end-to-end-encrypted Wayland screen viewer. It
+ships three native Linux programs:
 
-The current pre-1.0 product is deliberately video-only and view-only. Remote
-input and audio are outside the product contract.
+- `gcpub` captures and publishes screens and authorizes viewer devices;
+- `gcrelay` stores and forwards opaque encrypted streams;
+- `gcview` discovers, pairs with, and displays one or more streams.
 
-## MVP Requirements
+The first native release is video-only and view-only. It targets Wayland first,
+supports X11 viewing where the host stack permits it, and carries H.264 Annex-B
+access units. Audio, remote input, browser playback, portable/offline playback,
+relay clustering, and federation are outside the 0.6 contract.
 
-The MVP is complete when all of the following are true:
+The publisher uses the XDG Desktop Portal and PipeWire, samples changed video
+at a low rate, encodes H.264, and publishes cursor state independently at a
+higher cadence. The relay keeps history bounded by age and bytes. A native
+viewer can seek through retained history and return to live playback.
 
-1. The client captures a selected Wayland monitor or window through the XDG
-   Desktop Portal and PipeWire.
-2. Video defaults to 5 frames per second. A captured frame is available to an
-   already-connected viewer within 250 milliseconds under local test
-   conditions.
-3. Cursor position, visibility, hotspot, and bitmap changes are carried
-   independently of video at up to 60 updates per second, bounded in practice
-   by the rate the compositor delivers cursor metadata.
-4. The client produces an MPEG-DASH presentation made from fragmented MP4 H.264
-   media. Every segment begins at a decodable random-access point.
-5. Media samples use MPEG Common Encryption (`cenc`). The relay never receives
-   the content key. Firefox and Chromium decrypt through the
-   `org.w3.clearkey` EME key system.
-6. Cursor records use authenticated encryption and share the media timebase.
-7. The server relays opaque stream objects and retains them using both a maximum
-   age and a maximum byte count per stream.
-8. A reconnecting viewer can begin at the oldest usable retained random-access
-   point and scrub through every retained capture epoch. Publisher reconnects
-   append a newly keyed epoch without reloading the viewer.
-9. A self-contained `glacialcast-offline` executable serves a copied stream
-   bundle on loopback for playback by an installed Firefox or Chromium without
-   Internet access.
-10. The runtime does not depend on FFmpeg, GStreamer, MediaMTX, or a third-party
-    DASH player.
-11. The capture path detects whether the selected portal backend supports
-    cursor metadata. Missing metadata is reported as an unmet capability rather
-    than silently claiming independent cursor support.
+## Trust model
 
-## System Shape
+The relay is an untrusted store-and-forward peer. It may be malicious: it can
+observe metadata, delay, drop, replay, reorder, or invent relay messages. It
+must not be able to decrypt screen or cursor content, forge publisher content,
+substitute a viewer during a verified pairing, or strip encryption. Availability
+against a malicious relay is not promised.
+
+Publisher-to-relay and viewer-to-relay connections use Noise XX. Clients learn
+the relay static key through trust on first use (TOFU) or receive an explicit
+pin in configuration or a `glacialcast://` invitation. A learned key change
+fails closed until the operator explicitly forgets or replaces it. Noise
+protects the two network hops; it is not the stream's end-to-end boundary.
+
+Each publisher and each viewer device owns a persistent identity with separate
+Ed25519 signing and X25519 key-encapsulation keys. A publisher signs descriptors,
+encrypted objects, pairing decisions, and viewer-specific key envelopes. A
+viewer pins the publisher identity when pairing and verifies those signatures
+itself. Relay validation is only an early corruption check.
 
 ```text
-XDG portal / PipeWire
-       |
-       +-- raw video --> damage-aware sampler --> H.264 encoder --> fMP4/CENC
-       |
-       +-- cursor metadata ------------------------------> AEAD cursor records
-                                                                  |
-                                                        stream object protocol
-                                                                  |
-                                  +-------------------------------+-------------+
-                                  |                                             |
-                         authenticated relay                         stream bundle files
-                       + bounded opaque history                     + checksummed chunk index
-                                  |                                             |
-                                  +----------- Firefox/Chromium ----------------+
-                                                MSE + EME
-                                          independent cursor overlay
+publisher                    untrusted relay                     viewer
+    |<-------- Noise XX ---------->|<---------- Noise XX ---------->|
+    |                                                                |
+    |<--- signed pairing transcript / verified short auth string --->|
+    |                                                                |
+    |---- signed AEAD ciphertext + viewer-specific HPKE envelopes --->|
+    |                                                                |
+    +---------------- end-to-end confidentiality ---------------------+
 ```
 
-The server is trusted for availability and authorization, but not with captured
-content. The ingest channel uses a pinned Noise NK server identity to encrypt
-the ingest token and stream objects in transit. In the Internet profile, Caddy
-terminates browser HTTPS and proxies to a loopback-only application listener.
-Content encryption remains necessary because browser transport encryption
-terminates at the server.
+## Relay admission and viewing approval
 
-Browser access uses independently rotatable high-entropy access tokens. A
-successful login creates a signed, expiring, `HttpOnly`, `Secure`,
-`SameSite=Strict` session. Viewer principals are scoped to authenticated
-publisher identities; administrators can manage all streams. WebSocket
-upgrades and mutations require the exact configured public origin, and
-cookie-authorized mutations also require a session-bound CSRF value. A
-principal's token, role, or scope change changes its session version and
-invalidates prior sessions after configuration reload through a relay restart.
+Relay admission is separate from publisher-controlled viewing approval.
 
-HTTP requests, browser WebSockets, publisher connections, login attempts, and
-authenticated request rates are bounded. Per-principal WebSocket and
-per-source-address ingest limits prevent one credential or host from consuming
-the global connection pools. Noise handshakes and idle publisher connections
-have deadlines. The publisher resolves DNS names and reconnects with capped
-exponential backoff and jitter. Health endpoints and administrator-only
-counters expose availability and rejection signals without exposing stream
-contents or credentials.
+A relay operates in one of two modes:
 
-## Media Profile
+- `signed`: after Noise, require a valid native credential bound to the Noise
+  client key and carrying the correct `publisher` or `viewer` role. Until then,
+  the catalog is hidden and data operations are denied.
+- `public`: accept any Noise client and expose stream metadata. This does not
+  grant a content key.
 
-The initial interoperable media profile is:
+Native credentials contain a format version, issuer, unique serial, subject,
+role, validity bounds, the subject's Noise, signing, and key-encapsulation
+public keys, and an Ed25519 issuer signature. Long-running sessions disconnect
+at credential expiry. A signed revocation list may reject a credential before
+expiry. The relay has only CA public material; CA private keys are managed
+offline with explicit `gcrelay` PKI commands.
 
-- ISO Base Media File Format initialization and media fragments
-- H.264/AVC constrained baseline where the encoder supports it
-- MPEG Common Encryption using the `cenc` AES-CTR scheme
-- 90,000 tick media timescale
-- 5 FPS default video cadence
-- no B-frames
-- four-second group of pictures and segment target
-- one complete `moof`/`mdat` fragment per published frame
-- IDR plus SPS and PPS at the start of each segment
+A publisher independently chooses one viewer policy:
 
-The configured video rate is the maximum sampling and change-notification
-cadence. The client requests PipeWire video-damage regions, falls back to
-fingerprinting CPU-readable pixels, and treats DMA-BUF content without damage
-metadata as changed. Unchanged content is coalesced into a variable-duration
-predicted sample and emitted on the bounded idle heartbeat. If content changes
-while such a sample is pending, the client publishes the completed idle span
-before immediately publishing the changed frame. This keeps retained history
-continuous without resending static pixels every video tick. Independent live
-cursor rendering does not wait for the media clock. Samples arrive batched, so
-the viewer paces them against a wall clock rather than rendering only the newest
-of each batch, which would reduce the cursor to the publisher's flush rate.
+- `required`: manual pairing with a two-sided authentication-string check;
+- `trusted_ca`: automatically approve viewer identities signed by one of the
+  publisher's explicitly configured viewer-approval CAs;
+- `open`: approve every requesting identity.
 
-The overlay plays from a small buffer held a fixed distance behind the newest
-sample; that distance is the entire budget for absorbing a late batch. Running
-dry once must not cost the buffer permanently, so the playhead rebuilds it by
-running fractionally slow rather than by rewinding, which would show the pointer
-retracing itself. When the source stops the playhead converges on the newest
-sample, or the cursor would come to rest where the pointer was a moment before
-it stopped.
+Relay-access and viewer-approval CAs are distinct trust domains. Configuring
+the same external CA for both is an explicit operator decision, never an
+implicit trust inheritance. `open` still encrypts every stream, but the relay
+can request a key as a viewer, so the mode deliberately gives up confidentiality
+from a malicious relay.
 
-The relay may assemble four published fragments into one retained `.m4s`
-object without delaying live notification. Segment timeline duration spans
-from the first sample start through the final sample end, including any sparse
-publication interval.
+## Manual pairing
 
-The MPD uses a dynamic `SegmentTemplate` and `SegmentTimeline` for live viewing.
-A finalized copy uses a static MPD. GlacialCast implements the constrained
-profile it generates instead of embedding a general DASH player.
+The viewer sends a signed, expiring request bound to the intended publisher,
+its device identity, a fresh nonce, and the protocol version. The relay queues
+bounded requests while the publisher is offline. The publisher replies with a
+signed offer containing its identity and fresh handshake material.
 
-## Content Keys and Integrity
+Both peers derive a transcript hash from the request, offer, both persistent
+identities, the relay context, and a domain separator. They independently turn
+that hash into the same short authentication string. The viewer and publisher
+each ask a yes/no question after the people compare the strings through an
+independent channel. Neither application offers a skip action. Only two valid,
+signed confirmations for the same transcript make the approval durable.
 
-Each capture epoch has a random 128-bit CENC content key and key identifier.
-During the MVP, the client owner distributes the URL-safe base64 key to an
-authorized viewer out of band. The key is never included in an ingest message,
-server response, URL, or log record.
+Approved viewer identity is per device, permanent across IP and relay changes,
+and covers every current and future stream from that publisher. IP and the
+viewer-chosen device name are displayed as context but are not identity. A
+revoked identity remains on a deny list, preventing an old queued request or
+certificate from silently restoring access.
 
-The browser supplies the key to EME Clear Key. Clear Key is not a DRM boundary;
-an authorized viewer can access the content key. The security property is that
-the relay, archive, and unauthorized network participants cannot decrypt the
-capture.
+## Stream encryption and authenticity
 
-CENC does not authenticate media samples. A separate epoch authentication key
-therefore authenticates the presentation index and object hashes. Cursor
-records use AES-256-GCM with stream ID, epoch, sequence, media timestamp, source
-dimensions, and record type as associated data. A later release can replace
-manual key distribution with per-viewer public-key envelopes without changing
-the stored media profile.
+Every stream consists of keyframe groups. A group starts at an IDR and uses an
+independent random content-encryption key. The normal keyframe target is about
+four seconds; revocation immediately ends the current group, creates a new key,
+and forces an IDR.
 
-## Stream Objects
+Codec configuration, H.264 access units, and cursor batches are AEAD-encrypted.
+Canonical object headers are associated data and include version, publisher,
+stream, epoch and key-group identities, sequence, timing, kind, random-access
+state, codec identifier where applicable, ciphertext length and hash, and a
+nonce. The publisher signs the canonical header and ciphertext hash. Nonce
+uniqueness is an explicit protocol invariant. There is no plaintext stream
+variant and a paired viewer never accepts a downgrade.
 
-The client publishes versioned objects:
+For every approved viewer, the publisher seals the group's content key into an
+RFC 9180 HPKE envelope. The signed envelope binds publisher, recipient, stream,
+epoch, key group, and key identifier. Per-viewer envelopes are intentionally
+simple; the expected upper end is about twenty concurrent viewer devices.
 
-- `epoch`: stream metadata, dimensions, codec configuration, key identifier,
-  and encrypted-content declarations
-- `init`: an fMP4 initialization segment
-- `media`: one independently addressable media fragment
-- `cursor`: an authenticated batch of cursor events
-- `index`: timing, hashes, and random-access metadata
-- `end`: a clean epoch boundary
+The relay stores ciphertext and envelopes together and evicts them as one
+group. An already approved viewer can therefore reconnect and play retained or
+live content while the publisher is offline. The publisher privately retains
+recent group keys and byte/time accounting so it can generate historical
+envelopes for a newly approved viewer. History is selected newest-first in
+complete groups, independently per stream, and stops when either configured
+limit is reached. Defaults are 100 MB and 24 hours per stream.
 
-Object headers expose only routing and retention information: stream identity,
-object kind, epoch, sequence, media timestamp, duration, random-access status,
-and payload length. Captured pixels, cursor coordinates, and cursor bitmaps are
-opaque to the relay.
+History envelope generation is asynchronous: live playback may start first and
+older authorized groups appear afterward. Revocation prevents future access,
+but cannot retract content or keys already delivered to the viewer.
 
-The protocol has explicit size limits and rejects unknown versions and invalid
-dimensions before allocating payload storage.
+## Native stream protocol
 
-Ingest control envelopes use Postcard's documented stable wire format behind
-the GlacialCast protocol-version gate. Media payloads remain opaque byte
-strings and are not re-encoded by the relay.
+Protocol version 8 uses bounded Postcard control messages over segmented Noise
+records. Stream-object format version 2 replaces MPEG-DASH and fMP4 packaging.
+The outer media profile has an explicit codec identifier so a later codec does
+not require redesigning routing, history, or subscriptions; H.264 Annex-B is
+the only 0.6 codec.
 
-The server persists one Noise static keypair in its data directory with private
-file mode `0600`. Clients pin the URL-safe base64 public key. A client never
-sends its ingest token until the Noise NK handshake has authenticated the
-server, preventing credential disclosure to an accidental or malicious relay
-endpoint. Replacing the server identity is an explicit client configuration
-change.
+Initial object roles are:
 
-Cursor batches use a compact, versioned binary payload. Position-only events
-do not repeat bitmap pixels; a bitmap is included only when its identity or
-content changes. Batches flush often enough to keep live cursor latency below
-250 ms without paying per-event object and authentication overhead. Cursor
-events are validated for ordered timestamps, bounded source coordinates,
-visibility-state consistency, bitmap dimensions, hotspots, exact RGBA length,
-and authenticated stream/epoch/timing context before use.
+- a signed stream descriptor containing public name/source metadata;
+- an encrypted epoch descriptor containing codec configuration and dimensions;
+- an encrypted media object containing one timestamped H.264 access unit;
+- an encrypted compact cursor batch;
+- viewer-addressed key envelopes indexed alongside their group.
 
-## Retention
+The relay listens for publishers on port 8900 and viewers on port 8899 by
+default. The viewer uses one control connection and one connection per active
+subscription, avoiding head-of-line blocking between streams. A subscription
+may start live, at the oldest retained group, or at an explicit sequence/time.
+The relay catches up from durable storage and then changes gaplessly to a
+broadcast tail. A lagged consumer re-anchors from storage instead of silently
+losing objects.
 
-Retention is evaluated per stream. Objects are evicted when either:
+All inbound lengths, counts, labels, dimensions, timestamps, and enum values
+are bounded and validated before allocation or state mutation. Unknown versions
+and codecs fail closed. Canonical decoders reject truncation and trailing data.
 
-- their segment is older than the configured maximum age, or
-- total retained bytes exceed the configured maximum.
+## Capture, decoding, and presentation
 
-The default is 30 minutes and 512 MiB. Eviction operates on decodable segment
-groups and retains the epoch initialization object required by every surviving
-group. Cursor batches are evicted with their corresponding media time range,
-and cursor-only groups are subject to the same age and byte limits.
-The relay evaluates the policy on ingest and startup and runs a periodic
-one-second sweep, so an inactive stream cannot retain objects indefinitely
-after its age window expires.
+The publisher retains the existing portal/PipeWire capture, damage-aware
+sampling, VA-API/OpenH264 encoding, cursor metadata, reconnect, and resend
+machinery. Both encoder paths already produce H.264 Annex-B access units; native
+media publication uses those bytes directly rather than wrapping each frame in
+fMP4. Video and cursor share the publisher's monotonic media clock.
 
-Acknowledgement means an object is durably written and indexed, not merely
-queued in memory.
+`gcview` separates a GUI-independent session/decode/timeline core from an
+eframe/egui shell. Tokio networking and one OpenH264 decoder per active stream
+run on background workers. Bounded channels deliver copied RGBA frames and
+state changes to the UI, which maintains one texture per tile and paints the
+cursor independently.
 
-The durable index uses an independent mutex and checksummed append journal per
-stream. A newly accepted object is acknowledged only after both its immutable
-payload file and catalog transaction have been synchronized. Atomic catalog
-snapshots periodically compact the journal; recovery tolerates and truncates
-only an incomplete final record, rejects corrupt complete records, and safely
-ignores transactions already represented by a completed snapshot. Independent
-streams do not serialize their filesystem work through one global catalog
-mutex. Startup removes stale untracked payloads and interrupted temporary
-files, but preserves the single next sequence that could have been synchronized
-immediately before a crash. A publisher retry adopts that payload only when its
-bytes exactly match the authenticated object being resent; conflicting content
-is never replaced.
+The viewer provides 1, 2, 4, and 6-stream layouts. It is performance-gated for
+four concurrent streams, supports the six-tile layout, and imposes no protocol
+stream-count limit. Any tile can become fullscreen. Keyboard controls select a
+visible tile, enter/leave fullscreen, and move to the next or previous active
+stream. Retained playback has a timeline and an explicit return-to-live action.
 
-## Cursor Timing
+## Retention and durability
 
-Video and cursor events use the same monotonic capture clock. Live cursor
-rendering advances from a viewer-side monotonic anchor rather than depending on
-`HTMLMediaElement.currentTime` at the sparse buffered edge. Historical cursor
-rendering follows the media playhead.
+The relay keeps the existing opaque object-store guarantees: immutable payload
+publication, per-stream checksummed journals, atomic snapshots, fsync before
+acknowledgement, idempotent retry, bounded regular-file reads, symlink refusal,
+startup recovery, and monotonic high-water marks. Retention is per stream and
+evicts complete decodable keyframe groups when either the age or byte limit is
+exceeded. Cursor objects and key envelopes cannot outlive their media group.
 
-The viewer maps cursor coordinates into the actual contained video rectangle,
-including letterbox and pillarbox offsets. A cursor bitmap is sent only when its
-identity or pixels change, with a periodic refresh so a retained-history viewer
-can recover the current shape. The browser converts a bitmap to a canvas surface
-once and reuses it; unchanged cursor states do not rebuild image data every
-animation frame.
+Pairing queues and envelope indexes are also durable, bounded, expiring, and
+safe under crash/replay. Acknowledgement means the corresponding object and
+catalog transaction are durable, not merely queued in memory.
 
-Metadata cursor mode is mandatory for the independent overlay. Embedded cursor
-mode may be exposed as an explicitly degraded diagnostic option, but it does not
-satisfy the MVP capability.
+Version 1 DASH history is not migrated. A 0.6 relay detects it, moves it to an
+explicit incompatible quarantine path without deleting it, and starts a new
+version 2 store.
 
-## Offline Object Stream
+## Local state and metadata exposure
 
-Every authenticated stream object can be wrapped in a standalone `GCO1`
-portable file containing its public header and opaque payload. Files are named
-by monotonically increasing object sequence and are independently verifiable,
-so a one-way file transport can copy them incrementally without understanding
-the media or possessing the viewer key.
+Secret identity, approval, revocation, and retained-key state uses private
+regular files with mode `0600`, `O_NOFOLLOW`, bounded reads, atomic replacement,
+and directory fsync. Relay known-host records use the same discipline. Encrypted
+state export/import is deferred.
 
-`glacialcast-offline mirror` materializes these files atomically from a relay.
-It indexes existing files once at startup, requests only sequence numbers beyond
-its high-water mark while following a stream, and atomically publishes a
-versioned `glacialcast-transfer.json`. The v2 root manifest references immutable,
-content-addressed chunks of at most 1,024 object records. Those records contain
-the exact public headers, lengths, and SHA-256 checksums. A new object therefore
-rewrites only its bounded chunk and the compact root index rather than hashing
-the full history on every poll. The verifier remains able to read the legacy v1
-single-file manifest. Existing valid objects are skipped, so mirroring resumes
-at object granularity. `glacialcast-offline verify` checks the root, chunk, and
-object checksums and reports missing or unexpected object filenames, allowing
-files to arrive out of order through any out-of-band mechanism. These checksums
-detect transfer errors; they are not a signature or a substitute for a trusted
-transport. The authenticated `.gco` contents remain protected by the
-out-of-band viewer key.
-`glacialcast-offline serve` watches a received directory and embeds the complete
-local viewer and MPEG-DASH endpoints in one binary. The offline host therefore
-needs only that binary, the object files, and an installed Firefox or Chromium
-browser; it does not need Internet access or third-party JavaScript. The
-offline catalog accepts only bounded regular `.gco` files, rejects duplicate
-stream/sequence identities, and ignores incomplete transfer files. Manifest,
-chunk, and object reads open the final path with `O_NOFOLLOW`, validate the
-opened descriptor as a bounded regular file, and reject changes in length
-during the read. The service binds to loopback by default and requires an
-explicit `--allow-non-loopback` override before exposing the key-entry viewer
-to a trusted network.
+The relay necessarily learns publisher and stream existence, display names,
+viewer and publisher network addresses, connection and request timing,
+ciphertext sizes, viewer recipient identifiers for envelopes, and requested
+streams. Traffic-analysis resistance is not claimed. A malicious relay may
+censor service or lie about availability; signed timestamps, sequences, and
+publisher heartbeats let the viewer label stale data but cannot restore
+availability.
 
-## Runtime Dependency Boundary
+## Runtime dependency boundary
 
-The intended runtime boundary includes:
-
-- XDG Desktop Portal, D-Bus, PipeWire, and SPA for capture
-- VA-API for the initial Intel/AMD hardware encoder
-- focused, audited cryptography and HTTP/WebSocket libraries
-- Firefox or Chromium for browser playback
-
-FFmpeg, GStreamer, MediaMTX, WebRTC, and dash.js are not part of the target
-runtime. The project may use external conformance tools during development
-without shipping them.
-
-When VA-API H.264 encoding is unavailable, automatic mode falls back to the
-focused OpenH264 software encoder. An operator can require either backend
-explicitly. NVIDIA hardware encoding is not currently required.
-
-On Intel and AMD render nodes that expose both constrained-baseline H.264
-encoding and the VA-API video-processing entrypoint, the Wayland path imports
-the compositor's RGB DMA-BUF and converts/scales it into an owned NV12 GBM
-surface before encoding. The client does not return the PipeWire buffer to its
-pool until that GPU operation has synchronized. If either capability is absent,
-the portal stream requests CPU-readable buffers. A compositor may nevertheless
-return a non-linear or non-mappable DMA-BUF; the client then asks the render
-driver to resolve the tiling before software encoding. `gbm_bo_map` is tried
-first because it is the cheapest transfer, and a driver that refuses to map a
-foreign buffer object falls back to importing the descriptor as an `EGLImage`,
-attaching it to a framebuffer object, and reading linear pixels with
-`glReadPixels`. The proprietary NVIDIA stack rejects the GBM map indefinitely
-with `EAGAIN`, so the EGL path is what makes its compositors usable; `libEGL`
-and `libGLESv2` are dynamically loaded only when that fallback is reached, and
-the EGL context is created on, and stays bound to, the PipeWire loop thread.
-Whichever path fails first is latched off so an unsupported path is not retried
-once per frame. Raw `mmap` is limited to explicitly linear, mappable DMA-BUFs so
-tiled GPU memory cannot be mistaken for a linear image.
-
-### Watching several streams
-
-The player is a factory rather than a page singleton, so one document can host
-several independent instances: each owns its live WebSocket, MediaSource, key
-session, and cursor overlay, and each is destroyed when its tile is emptied.
-The relay's per-principal WebSocket limit accounts for a four-tile view plus
-the operations dashboard's control socket.
-
-A viewing key is transferred as a seven-word phrase and turned into 32 bytes
-with PBKDF2-HMAC-SHA-256 over a per-publisher salt, which the publisher sends in
-its hello and the relay republishes as public stream metadata. Because the salt
-is per publisher rather than per stream, one phrase resolves to one key for
-every screen that publisher casts, and the viewer applies it to all of them from
-a single entry. The derivation is implemented twice — in `viewer_key.rs` and in
-`viewer-key.js` — from one shared wordlist and one shared vector file, since a
-disagreement between them would look like a valid key that decrypts nothing.
-
-Before a key is accepted, the viewer authenticates one real epoch object with
-it. That turns a wrong key into an immediate, accurate message instead of tiles
-that build and then fail during decode.
-
-What the viewer stores is the secret that was entered, in `localStorage`, rather
-than the per-stream keys derived from it. Derived keys only open the streams that
-existed when they were made, so a screen added later would prompt again — and
-being prompted repeatedly was the single largest complaint about the viewer. The
-derived keys sit beside the secret purely as a cache, because each derivation is
-600,000 PBKDF2 iterations and redoing that per publisher on every page load is a
-visible stall; a cached key is still authenticated against a real object before
-use, so a rotated publisher key falls back to deriving rather than failing
-silently.
-
-Storing the secret puts it in the browser profile on disk, which the tab-scoped
-`sessionStorage` it replaced did not. That is the deliberate cost of asking once,
-and "Forget keys" removes it. The relay still never receives a viewer key, and
-neither does it receive the fragment of an invitation link — a `/#k=<key>` URL
-keeps the key after the `#`, which browsers do not transmit.
-
-### Publishing several screens
-
-A publisher asked for more than one output opens one relay connection per
-output, each on its own thread with its own encoder: the VA-API encoder holds
-thread-affine handles, and separate threads also keep one slow encode from
-delaying another screen's cadence. A fatal error on any output shuts the whole
-publisher down rather than leaving a daemon serving only some of the screens
-the operator asked for.
-
-The two interfaces reach several outputs differently. Under the Mutter
-interface each output is its own session, opened by its own publisher thread.
-The portal instead approves a whole selection in one dialog, so that session is
-opened once before any thread starts and each thread is handed one already-open
-stream; the session is shared and closes when the last capture is dropped. The
-publisher also asks the portal to persist the grant and stores the returned
-token with mode 0600, because a detached publisher cannot answer a dialog after
-a reboot. A stale token falls back to prompting rather than failing.
-
-The relay keys durable streams on the authenticated publisher identity, so
-several outputs under one ingest token would otherwise collide on a single
-stream record. `StreamHello` therefore carries an optional `source_label`, and
-the relay forms the identity as `<principal>:<label>`. The label is restricted
-to ASCII letters, digits, `-`, and `_`: it is concatenated onto an
-authenticated principal, so a label containing the separator would let a
-publisher register under a principal it never authenticated as. Viewer scopes
-match the principal up to the first separator, which authorizes every screen a
-publisher casts without authorizing a different publisher whose name merely
-shares a prefix.
-
-## Compatibility Matrix
-
-Release verification covers:
-
-- current Firefox on Linux
-- current Chromium on Linux
-- XDG portal implementations used by GNOME and KDE Plasma
-- the wlroots portal family
-- niri's supported portal path
-
-The browser gate verifies MSE fragmented-MP4 playback, EME Clear Key sessions,
-live append across forced publisher reconnects, retained multi-epoch history
-seeking, and cursor synchronization in both live and copied-file viewers. Each
-epoch's zero-based media and cursor clocks are rebased into one continuous
-viewer timeline. The compositor gate records portal source selection, PipeWire
-buffer types, video damage metadata, and cursor metadata availability.
-
-## Completed Replacement
-
-The 0.2 vertical slice replaced the 0.1 transport in this order:
-
-1. Introduce the format and cryptographic primitives.
-2. Add opaque relay and storage.
-3. Add Firefox-first DASH playback.
-4. Add client packaging and direct encoding.
-5. Add offline bundle playback.
-6. Remove WebRTC, Noise NN, and FFmpeg runtime paths.
-
-This is a breaking protocol and configuration change. Version 0.2 does not
-promise compatibility with retained 0.1 media or clients.
+GlacialCast does not require FFmpeg, GStreamer, MediaMTX, or a browser. The
+publisher depends on the Linux portal/PipeWire and an H.264 encoder. The viewer
+depends on egui/winit and a loadable OpenH264 decoder. Cryptography uses
+maintained implementations of Noise XX, Ed25519, RFC 9180 HPKE, HKDF/SHA-256,
+and an AEAD; GlacialCast defines composition, canonical messages, and domain
+separation but no new primitive.

@@ -7,12 +7,12 @@ in whatever they had open, so please treat findings here as sensitive.
 
 Report privately through GitHub's [private vulnerability
 reporting](https://github.com/0typos/glacialcast/security/advisories/new). Do
-not open a public issue for anything that affects confidentiality of a stream,
-authentication to the relay, or the integrity of published objects.
+not open a public issue for anything that affects stream confidentiality,
+identity or credential validation, relay admission, viewer approval, or object
+integrity.
 
-Include the version or commit, the platform and compositor, and enough detail
-to reproduce. A failing script under `scripts/` is the most useful form a
-report can take.
+Include the version or commit, platform and compositor, and enough detail to
+reproduce. A failing test or script under `scripts/` is the most useful report.
 
 This is a pre-1.0 project maintained on a best-effort basis. There is no paid
 bounty and no guaranteed response time.
@@ -22,90 +22,89 @@ bounty and no guaranteed response time.
 Only the tip of `main` is supported. Fixes land there; there are no maintained
 release branches before 1.0.
 
-## What is in scope
+## Security boundary
 
-The security properties GlacialCast actually claims, and therefore the ones
-worth reporting against:
+The publisher and approved viewer device are trusted with plaintext. The relay
+and network are not. A relay may actively alter, substitute, replay, reorder,
+delay, or discard traffic. Publisher-to-relay and viewer-to-relay Noise XX
+sessions protect each network hop, while publisher signatures, AEAD stream
+objects, and viewer-specific HPKE key envelopes form the separate end-to-end
+boundary.
 
-- **The relay cannot read a stream.** Media is CENC-encrypted and cursor
-  batches are AES-GCM sealed under a viewer key the relay never receives. Any
-  path by which an operator of the relay recovers screen content or cursor
-  positions is in scope. This is the claim for a stream published normally; a
-  publisher that passed `--no-encryption` has deliberately given it up, and
-  that case is covered under "out of scope" below.
-- **Encryption cannot be stripped from a stream that has it.** A relay refuses
-  an unencrypted epoch unless started with `--trusted-lan`, which is itself
-  refused alongside `security.public_origin`. A viewer holding a key for a
-  stream refuses an epoch served in the clear on it, rather than playing
-  whatever arrives. Any path by which a hostile relay downgrades a stream a
-  viewer holds a key for — or by which an unencrypted epoch is accepted by a
-  relay that did not opt in — is in scope.
-- **Ingest is authenticated and pinned.** The publisher pins the relay's Noise
-  NK public key. Any path by which an unpinned or substituted server accepts
-  ingest, or by which an unauthenticated party publishes to a stream, is in
-  scope.
-- **A publisher cannot impersonate another.** Durable identity is
-  `{principal}:{source_label}` and labels are sanitized. Any label or hello
-  field that lets one publisher claim another's identity, or lets a scope
-  authorize a publisher it should not, is in scope.
-- **Authorization is enforced on the viewer surface.** Session and bearer
-  authentication, publisher-scoped viewing, CSRF and origin enforcement, and
-  the request and connection limits are all in scope, particularly under the
-  fail-closed Internet profile in `docs/internet-deployment.md`.
-- **Objects are integrity-checked.** Retained and offline `.gco` objects are
-  authenticated; forging one that a viewer accepts is in scope.
+The following properties are in scope:
 
-Memory-safety faults reachable from untrusted input — a hostile relay
-answering a publisher, a hostile publisher feeding a relay, or a malformed
-`.gco` file — are in scope. `fuzz/` exists for exactly this.
+- **A relay cannot read a protected stream.** Codec configuration, video, and
+  cursor data remain encrypted under content keys the relay never receives.
+- **Encryption cannot be stripped.** There is no plaintext stream format. A
+  paired viewer rejects missing or invalid signatures, envelopes, AEAD tags,
+  versions, identity bindings, and publisher pins.
+- **A relay cannot silently substitute a viewer.** Manual pairing binds both
+  persistent identities and fresh material into a short authentication string
+  compared through an independent channel. Both endpoints must confirm it and
+  neither offers a skip action.
+- **A relay cannot forge a publisher.** Viewers pin the publisher identity and
+  verify signed descriptors, objects, pairing decisions, and key envelopes.
+- **Relay admission fails closed in signed mode.** Native credentials bind the
+  authenticated Noise client key, role, validity period, application keys, and
+  issuer. Missing, expired, revoked, wrongly signed, or wrong-role credentials
+  reveal no catalog and authorize no operation.
+- **Relay and viewer-approval trust do not bleed together.** A relay-access CA
+  is not a publisher viewer-approval CA unless the operator explicitly
+  configures the same external issuer for both jobs.
+- **Revocation stops future access.** The publisher durably revokes the viewer,
+  rotates the content key, forces a new random-access group, and issues no new
+  envelope to that identity.
+- **Objects and state fail closed.** Malformed, oversized, truncated,
+  noncanonical, cross-stream, replayed-as-live, or unauthenticated inputs are
+  rejected before unsafe allocation or state mutation. Private state refuses
+  unsafe permissions and symlinks.
 
-## What is out of scope
+Memory-safety faults reachable from a hostile relay, publisher, viewer,
+credential, stream object, state file, or retained catalog are in scope. The
+bounded fuzz targets exist for those boundaries.
 
-These are design limits, not bugs. They are documented so a report does not
-have to rediscover them:
+## Deliberate limits
 
-- **A stream published with `--no-encryption` is readable, by design.** The
-  media and cursor batches are plaintext to the relay, to anything that can
-  reach its HTTP surface, and to anything on the network path TLS does not
-  cover. Such objects also carry no authentication tag, because there is no key
-  to derive one from: a viewer can check an object against its own SHA-256 but
-  cannot tell who produced it. Integrity is hop-by-hop — Noise for ingest, TLS
-  to the browser — and not end to end. The mode exists because WebKit offers
-  FairPlay and never ClearKey, so an iPhone can play no other kind. Reports that
-  an unencrypted stream is readable are not findings; reports that one can be
-  published to a relay that did not opt in, or served to a viewer holding a key,
-  are.
-- **The viewer key unlocks everything the publisher casts.** One key covers
-  every screen from one publisher, by design. Sharing it shares all of them.
-- **A key phrase carries 70 bits, not 256.** A viewing key is seven words from
-  a 1024-word list, stretched into 32 bytes with PBKDF2-HMAC-SHA-256 at 600,000
-  iterations over a per-publisher salt. That the derived key has less entropy
-  than a random 32-byte key is the deliberate trade for a key a person can
-  actually transfer. Reports that the phrase space is smaller than 2^256 are not
-  findings; a flaw in the derivation, the salt handling, or the word decoding
-  very much is.
-- **An unlocked key is stored in `localStorage`, on disk in the browser
-  profile.** It is plaintext there, readable by any script already running on
-  the page, and it survives a restart rather than ending with the tab. That is a
-  deliberate trade for entering the key once instead of on every reload;
-  **Forget keys** erases it and is the right thing to use on a shared machine.
-  Script injection into the viewer is in scope; the storage choice itself is
-  not, since such a script could equally read the key from memory.
-- **The relay learns metadata.** Stream existence, display names, object sizes,
-  and timing are visible to it. Traffic analysis of a screen stream is not
-  something this design defends against.
-- **A compromised publisher or viewer host.** If the machine capturing or
-  displaying the screen is compromised, GlacialCast cannot help.
-- **Anything requiring a desktop-session foothold**, such as reading the viewer
-  key file at `$XDG_STATE_HOME/glacialcast/` — it is mode 0600, and an attacker
-  already inside that session can read the screen directly.
-- **Denial of service against your own relay** by an authorized publisher.
-- Missing hardening headers or similar findings on a relay deliberately run
-  without the Internet profile, which is documented as LAN-only.
+These are design limits rather than vulnerabilities:
+
+- **Open publisher approval is public.** `approval = "open"` automatically
+  grants every requester a viewer envelope. Data remains encrypted on the wire,
+  but the relay itself may request access, so this policy does not protect
+  plaintext from a malicious relay.
+- **Public relay admission exposes metadata.** `access.mode = "public"` lets
+  anyone enumerate the catalog and request pairing. Publisher viewer approval
+  still controls content keys.
+- **Already delivered keys cannot be recalled.** Revocation prevents access to
+  later key groups. It cannot erase plaintext, ciphertext, screenshots, or
+  historical keys a viewer already obtained.
+- **The relay learns metadata.** Publisher and stream existence and names,
+  peer IP addresses, request timing, ciphertext sizes, envelope recipient
+  identifiers, and subscription choices are visible. Traffic-analysis
+  resistance is not claimed.
+- **A malicious relay can deny service.** It can drop, delay, selectively hide,
+  or replay old signed data. Viewers detect invalid or stale claims where the
+  signed protocol permits, but GlacialCast cannot force delivery.
+- **TOFU does not authenticate an unseen relay out of band.** Manual first
+  contact trusts the first Noise key. An invitation or explicit key pin avoids
+  that first-contact assumption. Later key changes fail closed.
+- **A configured trust authority is trusted.** A viewer-approval CA can enroll
+  viewers without the manual comparison. Compromise or misuse of that CA is
+  equivalent to approving those identities. CA private keys should remain on
+  an offline administration host.
+- **Publisher or viewer host compromise is terminal.** An attacker able to read
+  the private `0600` state in either desktop session can access the same screen,
+  keys, or decoded content as the application.
+- **Viewer identity is per device.** Copying private identity state copies the
+  device's authority. Automated identity synchronization and encrypted backup
+  are not part of 0.6.
+- **Audio, remote input, and offline recordings are absent.** Findings premised
+  on those unsupported features are outside the current boundary.
 
 ## Cryptography
 
-GlacialCast composes existing primitives — Noise NK, AES-GCM, CENC,
-PBKDF2-SHA-256, HKDF — rather than implementing them. Reports of misuse of
-those primitives are very much in scope; the composition is where the bugs
-would be.
+GlacialCast composes maintained implementations of Noise XX, Ed25519, RFC 9180
+HPKE with X25519 and HKDF-SHA-256, SHA-256, and an AEAD. Signing and
+key-encapsulation keys are separate. Canonical encodings and domain-separation
+labels are versioned and covered by golden vectors. Reports about nonce reuse,
+weak transcript binding, signature confusion, key substitution, downgrade,
+cross-recipient envelopes, or misuse of these primitives are in scope.

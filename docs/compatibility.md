@@ -1,87 +1,85 @@
 # Compatibility Policy
 
 GlacialCast is pre-1.0 software. Its supported compatibility unit is the whole
-release: publisher, relay, live viewer assets, offline mirror, and offline
-viewer should use the same minor version unless a release note explicitly
-states otherwise. Rolling upgrades and mixed-minor operation are not yet a
-compatibility promise.
+release: `gcpub`, `gcrelay`, and `gcview` use the same minor version unless a
+release note explicitly says otherwise. Rolling upgrades and mixed-minor
+operation are not yet compatibility promises.
 
 ## Versioned boundaries
 
-GlacialCast has separate version checks because each boundary evolves for a
-different reason:
+GlacialCast version-checks each boundary that can otherwise be silently
+misinterpreted:
 
-- `PROTOCOL_VERSION` covers the Postcard publisher/relay messages carried by
-  Noise. Peers reject any unequal version before normal ingest.
-- `DASH_FORMAT_VERSION` covers authenticated object metadata and the portable
-  `GCO1` representation. The relay and offline tools reject unknown versions.
-- The JSON transfer index has an independent version. Writers publish a compact
-  v2 root manifest plus immutable v1 chunk files; readers continue to accept
-  the legacy v1 root manifest. An unknown root or chunk version is rejected.
-- Epoch descriptors carry their own format version and cryptographic
-  parameters. Viewers reject a descriptor they cannot validate.
-- The constrained fMP4/CENC profile is standards-based but intentionally
-  narrow. Any change must still pass Firefox-first and Chromium playback gates.
-- The catalog snapshot and journal are relay-internal recovery formats. A
-  release must either read the previous durable format or provide an explicit
-  migration and rollback procedure.
+- `PROTOCOL_VERSION` covers bounded Postcard publisher/relay, viewer/relay, and
+  relayed publisher/viewer pairing messages carried by Noise XX.
+- `STREAM_FORMAT_VERSION` covers canonical signed object headers, AEAD
+  associated data, key envelopes, stream descriptors, and codec identifiers.
+- Native identity documents, credentials, revocation lists, known-relay state,
+  and publisher/viewer private state each carry an independent version.
+- The relay catalog snapshot and checksummed journal are internal durable
+  formats. A release either reads the preceding format or performs a documented,
+  fail-closed migration/quarantine operation.
 
-The relay cannot translate encrypted media or cursor payloads because it does
-not have the viewer key. Compatibility shims therefore belong at the
-publisher/viewer boundary, not in the opaque relay.
+The relay cannot translate encrypted media, cursor payloads, or key envelopes
+because it has no content key and cannot forge publisher signatures.
+Compatibility shims therefore belong at the publisher/viewer boundary, not in
+the opaque relay.
 
 ## Change rules
 
-An incompatible wire, portable-object, epoch, or retained-storage change below
-1.0 requires:
+An incompatible wire, stream-object, credential, identity, or retained-storage
+change below 1.0 requires:
 
-1. A minor Semantic Versioning increment and the applicable format constant
-   increment.
-2. A clear error for the prior version; silent reinterpretation is forbidden.
-3. Updated architecture and deployment documentation, including retained-data
-   and rollback consequences.
-4. Updated golden vectors and parser fuzz targets.
-5. Full live, recovery, offline-transfer, Firefox, and Chromium gates.
+1. a minor Semantic Versioning increment and the applicable format constant
+   increment;
+2. a clear error for the prior version—silent reinterpretation is forbidden;
+3. updated architecture, security, deployment, and retained-data documentation;
+4. updated golden vectors and bounded parser fuzz targets;
+5. full live, malicious-relay, credential, recovery, native-viewer, and
+   representative Wayland gates.
 
 Appending a field to a Rust type is not assumed compatible with Postcard.
-Changing field order, enum variant order, integer representation, canonical
-authentication bytes, key derivation, MIME meaning, or timing units requires
-the same explicit review.
+Changing field or enum-variant order, integer representation, canonical signing
+bytes, AEAD associated data, transcript construction, domain labels, key
+derivation, nonce construction, timing units, role meaning, or codec identifier
+requires the same explicit review.
 
-Additive HTTP JSON fields are compatible when existing fields retain their
-meaning and clients ignore unknown fields. Removing or redefining a field,
-route, authorization rule, or configuration default is incompatible.
+Additive configuration keys are compatible when old behavior remains safe.
+Removing or redefining a key, policy, default, binary, or listener is
+incompatible. Removed security-sensitive keys produce actionable errors rather
+than being silently ignored.
 
-## Protocol version history
+## Version history
 
-| Version | Change |
+| Release/protocol | Change |
 | --- | --- |
-| 6 | `StreamHello.source_label`, so one authenticated publisher can own several durable stream identities. |
-| 7 | `StreamHello.viewer_key_salt`, the public per-publisher salt a viewer needs to turn a key phrase into the viewer key. `PublicStream` gained `publisher` and `viewer_key_salt` alongside it. |
+| 0.5 / v7 | Browser DASH/CENC format, publisher viewer-key salt, portable `GCO1` objects, and Noise NK publisher ingest. |
+| 0.6 / v8 | Native `gcpub`/`gcrelay`/`gcview`; Noise XX relay transports; persistent device identities; native credentials; verified pairing; publisher-signed AEAD stream format v2; HPKE viewer envelopes; H.264 Annex-B payloads. Browser and portable formats are removed. |
 
-Version 7 also changes how a viewer key is shared, without changing what a
-viewer key is. Key material is still 32 bytes and the epoch derivation is
-untouched, so retained objects and portable files are unaffected. A publisher
-whose key file predates the change keeps sharing raw base64 and sends no salt;
-its viewers are unaffected. `--new-viewer-key` opts into a phrase and, by
-design, invalidates keys already shared.
+Version 8 is a clean break. Version 7 peers are rejected before normal traffic.
+The relay does not migrate version 1 DASH history. On first 0.6 startup it moves
+the old store to an explicitly named incompatible quarantine path without
+deleting it, creates an empty version 2 store, and logs the rollback consequence.
 
 ## Golden vectors and fuzzing
 
-[`test-vectors/protocol-v7.json`](../test-vectors/protocol-v7.json) fixes the
-derived keys and exact portable bytes for deterministic test inputs. The
-workspace test decodes and authenticates it on every normal test run.
+Protocol v8 vectors fix canonical identities, credentials, pairing transcripts,
+short authentication strings, signatures, key envelopes, encrypted stream
+objects, and exact Postcard messages for deterministic test keys. No production
+secret or random fixture is committed.
 
-The six fuzz targets cover portable objects, cursor envelopes, Noise segment
-headers, epoch descriptors, relay catalog-journal records, and both generations
-of transfer-index JSON. Transfer-index compatibility is additionally fixed by
-unit vectors that exercise legacy v1, chunked v2, checksum failure, duplicate
-metadata, symlink rejection, and size limits:
+Fuzz targets cover every untrusted binary or structured boundary, including
+Noise segmentation, native credentials and revocation lists, pairing messages,
+encrypted stream headers, key envelopes, cursor batches, and relay catalog
+journal records. Parsers must cover maximum sizes, truncation, trailing data,
+unknown versions, invalid enums, inconsistent lengths, and authentication
+failure.
+
+Run the bounded suite with:
 
 ```sh
 GLACIALCAST_FUZZ_SECONDS=30 scripts/verify-fuzz.sh
 ```
 
-Fuzzing uses the repository-pinned nightly and a temporary working corpus.
-Crashing inputs are retained under `fuzz/artifacts/` and uploaded by the
-nightly workflow; generated corpus growth is not committed automatically.
+Crashing inputs are retained under `fuzz/artifacts/` and uploaded by the nightly
+workflow. Generated corpus growth is not committed automatically.
