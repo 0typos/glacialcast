@@ -16,6 +16,8 @@ use uuid::Uuid;
 pub const KEY_ENVELOPE_VERSION: u16 = 1;
 /// Content-encryption key size in bytes.
 pub const CONTENT_KEY_LEN: usize = 32;
+/// Maximum canonical encoded key-envelope length.
+pub const MAX_KEY_ENVELOPE_LEN: usize = 1024;
 
 const ENVELOPE_DOMAIN: &[u8] = b"glacialcast-key-envelope-v1";
 const HPKE_INFO_PREFIX: &[u8] = b"glacialcast-hpke-content-key-v1";
@@ -119,6 +121,24 @@ fn hpke_context(header: &KeyEnvelopeHeader) -> Result<(Vec<u8>, Vec<u8>), Envelo
 }
 
 impl KeyEnvelope {
+    /// Validates the relay-visible envelope shape without trusting its signature.
+    ///
+    /// Viewers and relays that know the publisher identity should additionally
+    /// call [`Self::verify_public`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid header metadata or ciphertext length.
+    pub fn validate_shape(&self) -> Result<(), EnvelopeError> {
+        self.header.validate()?;
+        if self.ciphertext.len() != HPKE_CIPHERTEXT_LEN {
+            return Err(EnvelopeError::InvalidMetadata(
+                "unexpected HPKE ciphertext length",
+            ));
+        }
+        Ok(())
+    }
+
     /// Encrypts one content key to a viewer and signs the resulting envelope.
     ///
     /// The supplied header fields are completed with the publisher and viewer
@@ -197,32 +217,11 @@ impl KeyEnvelope {
         recipient: &IdentitySecret,
         publisher: &IdentityPublic,
     ) -> Result<[u8; CONTENT_KEY_LEN], EnvelopeError> {
-        self.header.validate()?;
-        publisher.validate()?;
+        self.verify_public(publisher)?;
         let recipient_public = recipient.public()?;
         if self.header.recipient_id != recipient_public.id()? {
             return Err(EnvelopeError::WrongRecipient);
         }
-        if self.header.publisher_id != publisher.id()? {
-            return Err(EnvelopeError::WrongPublisher);
-        }
-        if self.ciphertext.len() != HPKE_CIPHERTEXT_LEN {
-            return Err(EnvelopeError::InvalidMetadata(
-                "unexpected HPKE ciphertext length",
-            ));
-        }
-        let unsigned = UnsignedEnvelope {
-            header: &self.header,
-            encapsulated_key: &self.encapsulated_key,
-            ciphertext: &self.ciphertext,
-        };
-        verify(
-            publisher,
-            ENVELOPE_DOMAIN,
-            &unsigned,
-            &self.publisher_signature,
-        )?;
-
         let (info, aad) = hpke_context(&self.header)?;
         let private_key = recipient.kem_private_key()?;
         let encapsulated_key = <Kem as hpke::Kem>::EncappedKey::from_bytes(&self.encapsulated_key)
@@ -239,6 +238,69 @@ impl KeyEnvelope {
         plaintext
             .try_into()
             .map_err(|_| EnvelopeError::InvalidMetadata("unexpected content key length"))
+    }
+
+    /// Verifies envelope shape, publisher binding, and signature without opening it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid metadata, ciphertext length, publisher, or
+    /// signature.
+    pub fn verify_public(&self, publisher: &IdentityPublic) -> Result<(), EnvelopeError> {
+        self.validate_shape()?;
+        publisher.validate()?;
+        if self.header.publisher_id != publisher.id()? {
+            return Err(EnvelopeError::WrongPublisher);
+        }
+        let unsigned = UnsignedEnvelope {
+            header: &self.header,
+            encapsulated_key: &self.encapsulated_key,
+            ciphertext: &self.ciphertext,
+        };
+        verify(
+            publisher,
+            ENVELOPE_DOMAIN,
+            &unsigned,
+            &self.publisher_signature,
+        )?;
+        Ok(())
+    }
+
+    /// Canonically encodes this verified envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid envelope data, serialization, or bounds.
+    pub fn encode(&self, publisher: &IdentityPublic) -> Result<Vec<u8>, EnvelopeError> {
+        self.verify_public(publisher)?;
+        let encoded = canonical(self)?;
+        if encoded.len() > MAX_KEY_ENVELOPE_LEN {
+            return Err(EnvelopeError::InvalidMetadata("key envelope too large"));
+        }
+        Ok(encoded)
+    }
+
+    /// Decodes one canonical bounded envelope and verifies its publisher claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for bounds, truncation, trailing/noncanonical data, or
+    /// invalid metadata and signatures.
+    pub fn decode(bytes: &[u8], publisher: &IdentityPublic) -> Result<Self, EnvelopeError> {
+        if bytes.len() > MAX_KEY_ENVELOPE_LEN {
+            return Err(EnvelopeError::InvalidMetadata("key envelope too large"));
+        }
+        let (envelope, remainder) = postcard::take_from_bytes::<Self>(bytes)
+            .map_err(IdentityError::from)
+            .map_err(EnvelopeError::from)?;
+        if !remainder.is_empty() {
+            return Err(EnvelopeError::InvalidMetadata("trailing key envelope data"));
+        }
+        envelope.verify_public(publisher)?;
+        if canonical(&envelope)? != bytes {
+            return Err(EnvelopeError::InvalidMetadata("noncanonical key envelope"));
+        }
+        Ok(envelope)
     }
 }
 

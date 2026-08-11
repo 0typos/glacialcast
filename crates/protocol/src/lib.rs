@@ -32,13 +32,16 @@ pub mod credential;
 pub mod daemon;
 pub mod envelope;
 pub mod identity;
+pub mod native;
+pub mod pairing;
 pub mod private_state;
 pub mod transfer;
 pub mod trust;
 pub mod viewer_key;
+pub mod wire;
 
 /// Publisher/relay message schema version.
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 /// Absolute maximum serialized message size accepted by [`NoiseSocket`].
 pub const MAX_FRAME_LEN: usize = 32 * 1024 * 1024;
 const MAX_WIRE_PACKET_LEN: usize = 65_535;
@@ -1344,7 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_golden_vector_is_stable_and_decodable() {
+    fn legacy_v7_golden_vector_remains_stable_while_adapter_exists() {
         let vector: serde_json::Value =
             serde_json::from_str(include_str!("../../../test-vectors/protocol-v7.json")).unwrap();
         let string = |field: &str| vector[field].as_str().unwrap();
@@ -1358,7 +1361,7 @@ mod tests {
         let keys = EpochKeys::derive(&viewer_key, stream_id, epoch_id).unwrap();
 
         assert_eq!(vector["schema"], "glacialcast-protocol-golden-v1");
-        assert_eq!(vector["protocol_version"], PROTOCOL_VERSION);
+        assert_eq!(vector["protocol_version"], 7);
         assert_eq!(vector["dash_format_version"], DASH_FORMAT_VERSION);
         assert_eq!(string("key_id_b64"), keys.key_id_b64());
         assert_eq!(string("cenc_key_b64"), keys.cenc_key_b64());

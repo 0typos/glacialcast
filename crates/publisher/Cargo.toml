@@ -19,8 +19,8 @@ clap.workspace = true
 cros-codecs.workspace = true
 futures-util.workspace = true
 gbm.workspace = true
-glacialcast-stream = { path = "../stream", version = "0.5.0" }
-glacialcast-protocol = { path = "../protocol", version = "0.5.0" }
+glacialcast-stream = { path = "../stream", version = "0.6.0" }
+glacialcast-protocol = { path = "../protocol", version = "0.6.0" }
 image.workspace = true
 libc.workspace = true
 libloading.workspace = true
