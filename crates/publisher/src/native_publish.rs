@@ -1,9 +1,6 @@
 //! Native Annex-B capture publication with per-viewer key envelopes.
 
-use super::{
-    Args, Capture, EncoderActor, EncoderConfig, StreamIdentity, dash_encoder::DashEncoderMode,
-    native_admin,
-};
+use super::{Args, Capture, EncoderActor, EncoderConfig, StreamIdentity, native_admin};
 use anyhow::{Context, Result};
 use glacialcast_protocol::{
     NoiseSocket, PROTOCOL_VERSION,
@@ -248,10 +245,7 @@ pub(super) async fn run_native_client(
     let height = first.height();
     let group_frames = ((args.fps * 4.0).round() as u64).clamp(1, u64::from(u16::MAX)) as u16;
     let encoder = EncoderActor::spawn(EncoderConfig {
-        mode: match args.encoder {
-            DashEncoderMode::Vaapi => DashEncoderMode::Openh264,
-            mode => mode,
-        },
+        mode: args.encoder,
         vaapi_device: args.vaapi_device.clone(),
         openh264_library: args.openh264_library.clone(),
         width,
