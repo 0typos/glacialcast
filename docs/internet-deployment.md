@@ -17,6 +17,19 @@ viewer = "0.0.0.0:8899"
 bytes_per_stream = 104857600
 seconds_per_stream = 86400
 
+[limits]
+max_connections = 256
+handshake_seconds = 10
+idle_seconds = 120
+live_channel_items = 32
+max_streams = 1024
+max_streams_per_publisher = 16
+max_objects_per_group = 4096
+max_group_bytes = 67108864
+max_envelopes_per_group = 128
+max_total_bytes = 10737418240
+max_publisher_bytes = 1073741824
+
 [access]
 mode = "signed"
 authority_file = "/etc/glacialcast/relay-ca.pub"
@@ -42,14 +55,20 @@ separate. With publisher policy `required`, a malicious relay cannot substitute
 a viewer because both endpoints must confirm the same signed transcript. With
 publisher policy `open`, the relay can request a viewer key by design.
 
-Firewall each listener to the populations that need it, bound concurrent peers
-at the network edge, monitor disk consumption and repeated credential failures,
-and keep host time synchronized for credential and revocation validity. A
+Firewall each listener to the populations that need it. The relay also enforces
+configured connection, timeout, stream, group, envelope, per-publisher, and
+global-storage limits; size these below the host's actual capacity. Monitor disk
+consumption and repeated credential failures, and keep host time synchronized
+for credential and revocation validity. A
 malicious relay can censor, delay, replay, and observe sizes/timing; E2EE does
 not provide availability or traffic-analysis resistance.
 
-Revoking relay admission requires a new signed CRL and relay restart. Revoking
-stream access uses `gcpub revoke VIEWER_PREFIX --stream STREAM_UUID`; the
+Revoking relay admission requires atomically replacing the configured signed
+CRL. The relay checks for a new list every second, verifies it before replacing
+the last valid list, and disconnects an affected active subscription within one
+second. Invalid, missing, expired, or wrong-authority replacements fail closed
+to the last valid list. Revoking stream access uses
+`gcpub revoke VIEWER_PREFIX --stream STREAM_UUID`; the
 running publisher detects the per-stream approval-state change, rotates the
 content key immediately, and forces an IDR. Keys already delivered cannot be
 clawed back.

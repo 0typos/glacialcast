@@ -65,8 +65,10 @@ A relay operates in one of two modes:
 Native credentials contain a format version, issuer, unique serial, subject,
 role, validity bounds, the subject's Noise, signing, and key-encapsulation
 public keys, and an Ed25519 issuer signature. Long-running sessions disconnect
-at credential expiry. A signed revocation list may reject a credential before
-expiry. The relay has only CA public material; CA private keys are managed
+at credential expiry. The relay reloads a configured signed revocation list
+every second and rechecks active subscriptions, so a newly revoked credential
+cannot continue receiving data. Invalid replacements preserve the last valid
+list. The relay has only CA public material; CA private keys are managed
 offline with explicit `gcrelay` PKI commands.
 
 A publisher independently chooses one viewer policy:
@@ -187,7 +189,10 @@ stream. Retained playback has a timeline and an explicit return-to-live action.
 The relay uses SQLite WAL storage with full synchronization, atomic object and
 envelope transactions, fsync-backed acknowledgement, idempotent retry, bounded
 regular-file reads, symlink refusal, startup recovery, and monotonic high-water
-marks. Retention is per stream and
+marks. Configured hard limits bound concurrent connections, handshake and idle
+time, live queues, stream counts, group objects and bytes, envelopes, and
+global/per-publisher storage. Limit violations reject the transaction without
+advancing the stream high-water mark. Retention is per stream and
 evicts complete decodable keyframe groups when either the age or byte limit is
 exceeded. Cursor objects and key envelopes cannot outlive their media group.
 

@@ -4,6 +4,7 @@ use glacialcast_protocol::{
     credential::{CertificateAuthorityPublic, CredentialError, CredentialRole, RevocationList},
     wire::{RelayAccessMode, SessionHello},
 };
+use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
 /// Relay admission policy applied after Noise XX authentication.
@@ -16,7 +17,7 @@ pub enum NativeAccessPolicy {
         /// Public relay-access certificate authority.
         authority: CertificateAuthorityPublic,
         /// Optional current signed credential revocation list.
-        revocations: Option<RevocationList>,
+        revocations: Arc<RwLock<Option<RevocationList>>>,
     },
 }
 
@@ -27,6 +28,8 @@ pub struct NativeAdmission {
     pub mode: RelayAccessMode,
     /// Exclusive credential expiry; absent in public mode.
     pub expires_at_ms: Option<i64>,
+    /// Signed credential serial; absent in public mode.
+    pub credential_serial: Option<[u8; 16]>,
 }
 
 /// Errors produced while admitting a native Noise peer.
@@ -41,6 +44,9 @@ pub enum NativeAccessError {
     /// Credential issuer, signature, role, key binding, validity, or revocation failed.
     #[error("native relay credential rejected: {0}")]
     Credential(#[from] CredentialError),
+    /// In-process policy state was poisoned and cannot fail open.
+    #[error("native relay access policy is unavailable")]
+    Unavailable,
 }
 
 impl NativeAccessPolicy {
@@ -68,6 +74,7 @@ impl NativeAccessPolicy {
             Self::Public => Ok(NativeAdmission {
                 mode: RelayAccessMode::Public,
                 expires_at_ms: None,
+                credential_serial: None,
             }),
             Self::Signed {
                 authority,
@@ -84,6 +91,9 @@ impl NativeAccessPolicy {
                         ),
                     ));
                 }
+                let revocations = revocations
+                    .read()
+                    .map_err(|_| NativeAccessError::Unavailable)?;
                 credential.verify_at(
                     authority,
                     revocations.as_ref(),
@@ -94,7 +104,74 @@ impl NativeAccessPolicy {
                 Ok(NativeAdmission {
                     mode: RelayAccessMode::Signed,
                     expires_at_ms: Some(credential.body.not_after_ms),
+                    credential_serial: Some(credential.body.serial),
                 })
+            }
+        }
+    }
+
+    /// Replaces the current signed revocation list after full verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for public mode, an invalid list, or poisoned policy state.
+    pub fn replace_revocations(
+        &self,
+        revocations: Option<RevocationList>,
+        now_ms: i64,
+    ) -> Result<(), NativeAccessError> {
+        let Self::Signed {
+            authority,
+            revocations: current,
+        } = self
+        else {
+            return Err(NativeAccessError::Unavailable);
+        };
+        if let Some(list) = &revocations {
+            list.verify_at(authority, now_ms)?;
+        }
+        *current
+            .write()
+            .map_err(|_| NativeAccessError::Unavailable)? = revocations;
+        Ok(())
+    }
+
+    /// Rechecks expiry and live revocation state for an admitted session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error once the credential expires, is revoked, or policy
+    /// state becomes unavailable.
+    pub fn ensure_active(
+        &self,
+        admission: NativeAdmission,
+        now_ms: i64,
+    ) -> Result<(), NativeAccessError> {
+        match self {
+            Self::Public => Ok(()),
+            Self::Signed {
+                authority,
+                revocations,
+            } => {
+                if admission
+                    .expires_at_ms
+                    .is_none_or(|expiry| now_ms >= expiry)
+                {
+                    return Err(CredentialError::Expired.into());
+                }
+                let serial = admission
+                    .credential_serial
+                    .ok_or(NativeAccessError::Unavailable)?;
+                let current = revocations
+                    .read()
+                    .map_err(|_| NativeAccessError::Unavailable)?;
+                if let Some(list) = current.as_ref() {
+                    list.verify_at(authority, now_ms)?;
+                    if list.body.serials.binary_search(&serial).is_ok() {
+                        return Err(CredentialError::Revoked.into());
+                    }
+                }
+                Ok(())
             }
         }
     }
@@ -137,7 +214,7 @@ mod tests {
         (
             NativeAccessPolicy::Signed {
                 authority: authority.public(),
-                revocations: None,
+                revocations: Arc::new(RwLock::new(None)),
             },
             SessionHello {
                 protocol_version: PROTOCOL_VERSION,
@@ -179,7 +256,7 @@ mod tests {
             .unwrap();
         let revoked = NativeAccessPolicy::Signed {
             authority: authority.public(),
-            revocations: Some(revocations),
+            revocations: Arc::new(RwLock::new(Some(revocations))),
         };
         assert!(
             revoked
@@ -202,5 +279,27 @@ mod tests {
                 .admit(&hello, CredentialRole::Viewer, &noise_key, 3_000)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn admitted_session_is_rejected_after_live_revocation() {
+        let (policy, hello, noise_key, authority) = signed_hello(CredentialRole::Viewer);
+        let admission = policy
+            .admit(&hello, CredentialRole::Viewer, &noise_key, 3_000)
+            .unwrap();
+        assert!(policy.ensure_active(admission, 3_000).is_ok());
+
+        let serial = hello.credential.as_ref().unwrap().body.serial;
+        let revocations = authority
+            .sign_revocations(3_000, 3_000 + DAY_MS, vec![serial])
+            .unwrap();
+        policy
+            .replace_revocations(Some(revocations), 3_000)
+            .unwrap();
+
+        assert!(matches!(
+            policy.ensure_active(admission, 3_000),
+            Err(NativeAccessError::Credential(CredentialError::Revoked))
+        ));
     }
 }
