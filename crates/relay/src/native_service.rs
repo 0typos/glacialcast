@@ -296,7 +296,7 @@ impl NativeRelayService {
                         write_publisher(
                             socket,
                             &RelayPublisherMessage::PairRequest {
-                                request: delivery.request,
+                                request: Box::new(delivery.request),
                                 source_addr: delivery.source_addr,
                                 received_at_ms: delivery.received_at_ms,
                             },
@@ -460,7 +460,7 @@ impl NativeRelayService {
                     let request_id = request.id()?;
                     self.pairing_call(move |store| {
                         store.enqueue_request(
-                            &request,
+                            request.as_ref(),
                             source_addr,
                             glacialcast_protocol::now_ms(),
                             PAIRING_REQUEST_LIFETIME_MS,
@@ -1305,7 +1305,7 @@ mod tests {
         )
         .await;
         viewer_connection
-            .write(&ViewerMessage::PairRequest(request.clone()))
+            .write(&ViewerMessage::PairRequest(Box::new(request.clone())))
             .await
             .unwrap();
         assert_eq!(
@@ -1336,7 +1336,7 @@ mod tests {
         else {
             panic!("expected queued pair request");
         };
-        assert_eq!(delivered, request);
+        assert_eq!(*delivered, request);
         assert_eq!(
             publisher_connection
                 .read::<RelayPublisherMessage>()

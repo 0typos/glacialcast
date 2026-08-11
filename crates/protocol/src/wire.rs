@@ -208,7 +208,7 @@ pub enum RelayPublisherMessage {
     /// One queued viewer request with informational network metadata.
     PairRequest {
         /// Unmodified signed viewer request.
-        request: PairRequest,
+        request: Box<PairRequest>,
         /// Network peer address observed by the relay.
         source_addr: SocketAddr,
         /// Relay receive time as Unix milliseconds.
@@ -324,7 +324,7 @@ pub enum ViewerMessage {
     /// Request the admitted stream catalog.
     Catalog,
     /// Queue a signed request for its named publisher.
-    PairRequest(PairRequest),
+    PairRequest(Box<PairRequest>),
     /// Deliver the viewer's explicit yes confirmation.
     PairConfirmation(ViewerConfirmation),
     /// Fetch queued offers, decisions, and envelopes for this viewer.
