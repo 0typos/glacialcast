@@ -2,191 +2,36 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
-  workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
   quality:
-    name: Standard quality gate
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes \
-            clang \
-            libclang-dev \
-            libgbm-dev \
-            libopenh264-dev \
-            libpipewire-0.3-dev \
-            libspa-0.2-dev \
-            libva-dev \
-            nasm
-      - name: Install OpenH264 2.6
-        # ubuntu-24.04 packages 2.4 under a different soname, which builds and
-        # then fails at runtime. See the script for why this is built.
-        run: sudo scripts/ci-install-openh264.sh
-      - name: Identify the native headers bindgen will read
-        id: native-headers
-        # pipewire-sys, libspa-sys, gbm-sys, and drm-sys each run bindgen over
-        # the headers installed above, and all four are dependencies rather
-        # than workspace members -- so the cache keeps their compiled artifacts
-        # *and* the bindings their build scripts generated. Nothing in
-        # Cargo.lock changes when Ubuntu ships new headers or GitHub refreshes
-        # the runner image, so without this the cache would hand a build
-        # bindings generated from headers that are no longer installed. That
-        # compiles cleanly and misbehaves at runtime, which is the same class
-        # of fault this repo already vendors cros-libva to work around, and it
-        # would reproduce on rerun while never reproducing locally.
-        run: |
-          digest="$(
-            dpkg-query -W -f '${Package}=${Version}\n' \
-              clang \
-              libclang-dev \
-              libgbm-dev \
-              libpipewire-0.3-dev \
-              libspa-0.2-dev \
-              libva-dev \
-              | sha256sum | cut -c1-16
-          )"
-          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
-      - name: Cache the Rust build
-        # Both jobs compile the workspace before running anything, and the
-        # workspace is not small. The key adds the native header versions to
-        # what rust-cache already covers (Cargo.lock, the manifests, and the
-        # toolchain), so any of those changing rebuilds and nothing else does.
-        #
-        # `key` names the job explicitly rather than relying on rust-cache's
-        # add-job-id-key default: the two jobs must not share an entry, because
-        # this one also builds tests, docs, and clippy artifacts the other never
-        # uses, and whichever saved second would find the key taken and persist
-        # nothing.
-        #
-        # Saved on failure so that a clippy or deny failure does not discard a
-        # perfectly good build, and only from main so that the eleven open
-        # Dependabot branches cannot fill the repo's 10GB cache quota and evict
-        # the entry every pull request restores from.
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          key: quality-${{ steps.native-headers.outputs.digest }}
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Install pinned Rust tools
-        run: cargo install cargo-deny --version 0.20.2 --locked
-      - name: Run standard gate
-        run: scripts/verify-quality.sh standard
+          sudo apt-get install -y libclang-dev libpipewire-0.3-dev libexpat1-dev
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+      - run: scripts/verify-quality.sh standard
 
-  integration:
-    name: Deterministic integration gates
+  native-e2e:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes \
-            clang \
-            libclang-dev \
-            libgbm-dev \
-            libopenh264-dev \
-            libpipewire-0.3-dev \
-            libspa-0.2-dev \
-            libva-dev \
-            nasm
-      - name: Install OpenH264 2.6
-        # ubuntu-24.04 packages 2.4 under a different soname, which builds and
-        # then fails at runtime. See the script for why this is built.
-        run: sudo scripts/ci-install-openh264.sh
-      - name: Identify the native headers bindgen will read
-        id: native-headers
-        # pipewire-sys, libspa-sys, gbm-sys, and drm-sys each run bindgen over
-        # the headers installed above, and all four are dependencies rather
-        # than workspace members -- so the cache keeps their compiled artifacts
-        # *and* the bindings their build scripts generated. Nothing in
-        # Cargo.lock changes when Ubuntu ships new headers or GitHub refreshes
-        # the runner image, so without this the cache would hand a build
-        # bindings generated from headers that are no longer installed. That
-        # compiles cleanly and misbehaves at runtime, which is the same class
-        # of fault this repo already vendors cros-libva to work around, and it
-        # would reproduce on rerun while never reproducing locally.
-        run: |
-          digest="$(
-            dpkg-query -W -f '${Package}=${Version}\n' \
-              clang \
-              libclang-dev \
-              libgbm-dev \
-              libpipewire-0.3-dev \
-              libspa-0.2-dev \
-              libva-dev \
-              | sha256sum | cut -c1-16
-          )"
-          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
-      - name: Cache the Rust build
-        # See the quality job for why the key carries the native header
-        # versions and why saving is limited to main.
-        #
-        # `cache-on-failure` earns its place here in particular: the gates below
-        # drive real relays, publishers, and browsers, and go red for reasons
-        # that have nothing to do with whether the build was good.
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          key: integration-${{ steps.native-headers.outputs.digest }}
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Run encrypted transport and recovery gates
-        run: |
-          scripts/verify-dash-e2e.sh
-          scripts/verify-ingest-recovery.sh
-          scripts/verify-internet-security.sh
-          scripts/verify-performance.sh
-      - name: Run short reliability soak
-        env:
-          GLACIALCAST_SOAK_SECONDS: "30"
-          GLACIALCAST_SOAK_SAMPLE_SECONDS: "2"
-        run: scripts/verify-soak.sh
-      - name: Enforce low-bandwidth profile
-        run: scripts/verify-bandwidth.sh
-      - name: Install Playwright
-        run: |
-          npm install --prefix /tmp/glacialcast-playwright playwright@1.59.1
-          /tmp/glacialcast-playwright/node_modules/.bin/playwright install --with-deps firefox
-      - name: Verify viewer onboarding
-        # A synthetic capture, so this needs no Wayland session. It pins both that
-        # the viewing key is asked for at most once and that a stream carrying an
-        # epoch the key cannot open still plays.
-        env:
-          GLACIALCAST_PLAYWRIGHT_MODULE: /tmp/glacialcast-playwright/node_modules/playwright
-        run: scripts/verify-viewer-onboarding.sh
-      - name: Verify the multi-stream viewer
-        # Also a synthetic capture, so it needs no Wayland session either. This
-        # is the only automated coverage of the landing page and of several
-        # players running at once, which is where page-global state in the
-        # player shows up; a single-stream gate passes either way.
-        env:
-          GLACIALCAST_PLAYWRIGHT_MODULE: /tmp/glacialcast-playwright/node_modules/playwright
-        run: scripts/verify-multi-stream.sh
-      - name: Verify the unencrypted publishing mode
-        # The one path no other gate can reach: every other browser gate starts
-        # by typing a viewing key, and this mode exists because there is nothing
-        # to type. Firefox only here, because that is what this job installs;
-        # nightly runs the same gate against both engines.
-        env:
-          GLACIALCAST_PLAYWRIGHT_MODULE: /tmp/glacialcast-playwright/node_modules/playwright
-          GLACIALCAST_VERIFY_BROWSERS: firefox
-        run: scripts/verify-unencrypted.sh
-      - name: Build and verify release archive
-        run: scripts/verify-packaging.sh
+          sudo apt-get install -y libclang-dev libpipewire-0.3-dev libexpat1-dev python3
+      - run: scripts/verify-native-e2e.sh

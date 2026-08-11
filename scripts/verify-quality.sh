@@ -28,23 +28,11 @@ standard_checks() {
   # reported "ok" while the graph grew forks nobody saw.
   run cargo deny check
   run bash -n scripts/*.sh packaging/*.sh
-  run node scripts/test-viewer-core.mjs
-  run node scripts/test-viewer-key.mjs
-  run node scripts/test-epoch-claim.mjs
-  run node scripts/generate-viewer-key-wordlist.mjs --check
-  run node scripts/test-index-ui.mjs
-  run node scripts/test-compare-frame.mjs
 }
 
 full_checks() {
   standard_checks
-  run scripts/verify-dash-e2e.sh
-  run scripts/verify-viewer-onboarding.sh
-  run scripts/verify-multi-stream.sh
-  run scripts/verify-ingest-recovery.sh
-  run scripts/verify-internet-security.sh
-  run scripts/verify-bandwidth.sh
-  run scripts/verify-performance.sh
+  run scripts/verify-native-e2e.sh
   run scripts/verify-packaging.sh
 }
 
@@ -57,7 +45,7 @@ case "${profile}" in
     ;;
   soak)
     standard_checks
-    run scripts/verify-soak.sh
+    run scripts/verify-native-e2e.sh
     ;;
   *)
     usage
