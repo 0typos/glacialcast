@@ -1,46 +1,735 @@
-//! Native GlacialCast viewer entry point.
-//!
-//! The networking, decoding, and graphical shell are introduced in later
-//! native-protocol checkpoints. This crate reserves the installed `gcview`
-//! command while the publisher and relay are renamed independently.
+//! Native multi-stream GlacialCast viewer.
 
 #![deny(missing_docs)]
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
+use eframe::egui;
+use glacialcast_protocol::{
+    NoiseKeypair, NoiseSocket, PROTOCOL_VERSION,
+    credential::{CredentialRole, NativeCredential},
+    identity::{IdentityPublic, IdentitySecret, load_or_create_identity},
+    initiator_handshake_xx, load_or_create_noise_keypair,
+    native::{CodecId, LiveSequenceGuard, NativeObjectKind},
+    pairing::{PairOffer, PairRequest, ViewerConfirmation, authentication_string},
+    private_state::read_private,
+    trust::KnownRelays,
+    wire::{CatalogEntry, RelayViewerMessage, SessionHello, SubscriptionStart, ViewerMessage},
+};
+use openh264::{decoder::Decoder, formats::YUVSource, nal_units};
+use std::{
+    collections::HashMap,
+    io::IsTerminal,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::{net::TcpStream, runtime::Runtime, sync::mpsc};
+use uuid::Uuid;
+
+const DEFAULT_VIEWER_PORT: u16 = 8899;
+const MAX_CREDENTIAL_FILE: usize = 64 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "View GlacialCast streams from a native relay")]
 struct Args {
-    /// Relay endpoint in `host[:port]` form.
+    /// Relay endpoint (`host[:port]`) or a `glacialcast://` invite.
     relay: String,
+    /// Private viewer state directory.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    /// Optional relay-access credential file for a signed relay.
+    #[arg(long)]
+    credential: Option<PathBuf>,
+    /// Explicit relay Noise key pin (URL-safe base64).
+    #[arg(long)]
+    server_key: Option<String>,
+    /// Forget this relay's learned key and exit.
+    #[arg(long)]
+    forget_relay: bool,
 }
 
-/// Parses the native viewer command line.
+#[derive(Clone)]
+struct ConnectionProfile {
+    endpoint: String,
+    state_dir: PathBuf,
+    identity: Arc<IdentitySecret>,
+    noise: NoiseKeypair,
+    credential: Option<NativeCredential>,
+    explicit_pin: Option<[u8; 32]>,
+}
+
+#[derive(Clone)]
+struct Frame {
+    stream_id: Uuid,
+    width: usize,
+    height: usize,
+    rgb: Vec<u8>,
+    sequence: u64,
+}
+
+enum Event {
+    Status(String),
+    Catalog(Vec<CatalogEntry>),
+    Frame(Frame),
+    StreamError(Uuid, String),
+    PairingPrompt([u8; 32], String),
+}
+
+enum Command {
+    Refresh,
+    Subscribe(Uuid, IdentityPublic, SubscriptionStart),
+    Pair(IdentityPublic),
+    ConfirmPairing([u8; 32], bool),
+}
+
+struct Tile {
+    catalog: CatalogEntry,
+    texture: Option<egui::TextureHandle>,
+    sequence: u64,
+    status: String,
+}
+
+struct ViewerApp {
+    events: mpsc::UnboundedReceiver<Event>,
+    commands: mpsc::UnboundedSender<Command>,
+    tiles: Vec<Tile>,
+    status: String,
+    selected: usize,
+    fullscreen: Option<Uuid>,
+    layout: usize,
+    pairing_prompt: Option<([u8; 32], String)>,
+}
+
+impl ViewerApp {
+    fn new(
+        events: mpsc::UnboundedReceiver<Event>,
+        commands: mpsc::UnboundedSender<Command>,
+    ) -> Self {
+        let _ = commands.send(Command::Refresh);
+        Self {
+            events,
+            commands,
+            tiles: Vec::new(),
+            status: "Connecting…".into(),
+            selected: 0,
+            fullscreen: None,
+            layout: 4,
+            pairing_prompt: None,
+        }
+    }
+
+    fn drain_events(&mut self, context: &egui::Context) {
+        while let Ok(event) = self.events.try_recv() {
+            match event {
+                Event::Status(status) => self.status = status,
+                Event::Catalog(entries) => {
+                    for entry in entries {
+                        if let Some(tile) = self.tiles.iter_mut().find(|tile| {
+                            tile.catalog.descriptor.body.stream_id
+                                == entry.descriptor.body.stream_id
+                        }) {
+                            tile.catalog = entry;
+                        } else {
+                            self.tiles.push(Tile {
+                                catalog: entry,
+                                texture: None,
+                                sequence: 0,
+                                status: "Available".into(),
+                            });
+                        }
+                    }
+                    self.tiles
+                        .sort_by_key(|tile| tile.catalog.descriptor.body.stream_id);
+                    self.status = format!("{} stream(s) visible", self.tiles.len());
+                }
+                Event::Frame(frame) => {
+                    if let Some(tile) = self
+                        .tiles
+                        .iter_mut()
+                        .find(|tile| tile.catalog.descriptor.body.stream_id == frame.stream_id)
+                    {
+                        let image =
+                            egui::ColorImage::from_rgb([frame.width, frame.height], &frame.rgb);
+                        tile.texture = Some(context.load_texture(
+                            frame.stream_id.to_string(),
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        ));
+                        tile.sequence = frame.sequence;
+                        tile.status = "Live".into();
+                    }
+                }
+                Event::StreamError(stream_id, error) => {
+                    if let Some(tile) = self
+                        .tiles
+                        .iter_mut()
+                        .find(|tile| tile.catalog.descriptor.body.stream_id == stream_id)
+                    {
+                        tile.status = error;
+                    }
+                }
+                Event::PairingPrompt(request_id, authentication) => {
+                    self.pairing_prompt = Some((request_id, authentication));
+                }
+            }
+        }
+    }
+
+    fn keyboard(&mut self, context: &egui::Context) {
+        context.input(|input| {
+            if input.key_pressed(egui::Key::Escape) {
+                self.fullscreen = None;
+            }
+            if input.key_pressed(egui::Key::Enter) && !self.tiles.is_empty() {
+                self.fullscreen = Some(self.tiles[self.selected].catalog.descriptor.body.stream_id);
+            }
+            if input.key_pressed(egui::Key::ArrowRight) && !self.tiles.is_empty() {
+                self.selected = (self.selected + 1) % self.tiles.len();
+                if self.fullscreen.is_some() {
+                    self.fullscreen =
+                        Some(self.tiles[self.selected].catalog.descriptor.body.stream_id);
+                }
+            }
+            if input.key_pressed(egui::Key::ArrowLeft) && !self.tiles.is_empty() {
+                self.selected = self.selected.checked_sub(1).unwrap_or(self.tiles.len() - 1);
+                if self.fullscreen.is_some() {
+                    self.fullscreen =
+                        Some(self.tiles[self.selected].catalog.descriptor.body.stream_id);
+                }
+            }
+        });
+    }
+}
+
+impl eframe::App for ViewerApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let context = ui.ctx().clone();
+        self.drain_events(&context);
+        self.keyboard(&context);
+        context.request_repaint_after(Duration::from_millis(100));
+        egui::Frame::central_panel(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("GlacialCast");
+                for count in [1, 2, 4, 6] {
+                    ui.selectable_value(&mut self.layout, count, count.to_string());
+                }
+                if ui.button("Refresh").clicked() {
+                    let _ = self.commands.send(Command::Refresh);
+                }
+                ui.label(&self.status);
+            });
+            ui.separator();
+            let visible: Vec<usize> = if let Some(fullscreen) = self.fullscreen {
+                self.tiles
+                    .iter()
+                    .position(|tile| tile.catalog.descriptor.body.stream_id == fullscreen)
+                    .into_iter()
+                    .collect()
+            } else {
+                (0..self.tiles.len().min(self.layout)).collect()
+            };
+            let columns = match visible.len() {
+                0 | 1 => 1,
+                2 => 2,
+                _ => 2,
+            };
+            egui::Grid::new("streams")
+                .num_columns(columns)
+                .spacing([8.0, 8.0])
+                .show(ui, |ui| {
+                    for (position, index) in visible.into_iter().enumerate() {
+                        let tile = &mut self.tiles[index];
+                        let descriptor = &tile.catalog.descriptor.body;
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                if ui.selectable_label(self.selected == index, &descriptor.name).clicked() {
+                                    self.selected = index;
+                                }
+                                ui.label(&tile.status);
+                                if ui.button("View").clicked() {
+                                    tile.status = "Connecting…".into();
+                                    let _ = self.commands.send(Command::Subscribe(
+                                        descriptor.stream_id,
+                                        descriptor.publisher,
+                                        SubscriptionStart::OldestRetained,
+                                    ));
+                                }
+                                if ui.button("Pair").clicked() {
+                                    let _ = self
+                                        .commands
+                                        .send(Command::Pair(descriptor.publisher));
+                                }
+                                if ui.button("⛶").clicked() {
+                                    self.fullscreen = Some(descriptor.stream_id);
+                                }
+                            });
+                            let available = ui.available_size_before_wrap();
+                            let size = egui::vec2(available.x.max(240.0), (available.y / 2.0).max(160.0));
+                            if let Some(texture) = &tile.texture {
+                                ui.add(egui::Image::new(texture).fit_to_exact_size(size));
+                            } else {
+                                ui.allocate_ui(size, |ui| { ui.centered_and_justified(|ui| { ui.label("Encrypted stream — approve this viewer on the publisher if playback stays locked"); }); });
+                            }
+                        });
+                        if (position + 1) % columns == 0 {
+                            ui.end_row();
+                        }
+                    }
+                });
+            if let Some((request_id, authentication)) = self.pairing_prompt.clone() {
+                egui::Window::new("Verify publisher")
+                    .collapsible(false)
+                    .show(&context, |ui| {
+                        ui.label("Compare this value with the publisher. Do they match?");
+                        ui.heading(authentication);
+                        ui.horizontal(|ui| {
+                            if ui.button("Yes, they match").clicked() {
+                                let _ = self.commands.send(Command::ConfirmPairing(request_id, true));
+                                self.pairing_prompt = None;
+                            }
+                            if ui.button("No").clicked() {
+                                let _ = self.commands.send(Command::ConfirmPairing(request_id, false));
+                                self.pairing_prompt = None;
+                            }
+                        });
+                    });
+            }
+        });
+    }
+}
+
+/// Starts the native viewer window and background relay workers.
 ///
 /// # Errors
 ///
-/// Returns an error until the native relay protocol is implemented. Keeping
-/// that failure explicit prevents this preparatory binary from pretending it
-/// connected successfully.
+/// Returns an error for invalid state, command-line input, or window startup.
 pub fn run() -> Result<()> {
     let args = Args::parse();
-    anyhow::bail!(
-        "native viewer connection to {} is not implemented yet",
-        args.relay
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "glacialcast_viewer=info".into()),
+        )
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
+        .init();
+    let (endpoint, invite_pin) = parse_relay(&args.relay)?;
+    let state_dir = args.state_dir.unwrap_or_else(default_state_dir);
+    std::fs::create_dir_all(&state_dir)?;
+    let mut known = KnownRelays::open(state_dir.join("known-relays.bin"))?;
+    if args.forget_relay {
+        known.forget(&endpoint)?;
+        return Ok(());
+    }
+    let explicit_pin = args
+        .server_key
+        .as_deref()
+        .map(glacialcast_protocol::decode_noise_public_key)
+        .transpose()?
+        .or(invite_pin);
+    let identity = Arc::new(load_or_create_identity(&state_dir.join("identity.key"))?);
+    let noise = load_or_create_noise_keypair(&state_dir.join("noise.key"))?;
+    let credential = args
+        .credential
+        .as_deref()
+        .map(|path| NativeCredential::decode(&read_private(path, MAX_CREDENTIAL_FILE)?))
+        .transpose()?;
+    let profile = ConnectionProfile {
+        endpoint,
+        state_dir,
+        identity,
+        noise,
+        credential,
+        explicit_pin,
+    };
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let (command_tx, command_rx) = mpsc::unbounded_channel();
+    std::thread::Builder::new()
+        .name("gcview-network".into())
+        .spawn(move || {
+            let runtime = Runtime::new().expect("viewer Tokio runtime");
+            runtime.block_on(command_worker(profile, event_tx, command_rx));
+        })?;
+    eframe::run_native(
+        "GlacialCast Viewer",
+        eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 800.0]),
+            ..Default::default()
+        },
+        Box::new(move |_| Ok(Box::new(ViewerApp::new(event_rx, command_tx)))),
     )
+    .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
+async fn command_worker(
+    profile: ConnectionProfile,
+    events: mpsc::UnboundedSender<Event>,
+    mut commands: mpsc::UnboundedReceiver<Command>,
+) {
+    let keys = Arc::new(Mutex::new(HashMap::new()));
+    let mut pending: HashMap<[u8; 32], (PairRequest, Option<PairOffer>)> = HashMap::new();
+    while let Some(command) = commands.recv().await {
+        match command {
+            Command::Refresh => {
+                if let Err(error) = refresh(&profile, &events, &keys).await {
+                    let _ = events.send(Event::Status(format!("Connection failed: {error:#}")));
+                }
+                if let Err(error) = refresh_pairing(&profile, &events, &mut pending).await {
+                    let _ =
+                        events.send(Event::Status(format!("Pairing refresh failed: {error:#}")));
+                }
+            }
+            Command::Subscribe(stream_id, publisher, start) => {
+                let profile = profile.clone();
+                let events = events.clone();
+                let keys = keys.clone();
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        subscribe(&profile, &events, &keys, stream_id, publisher, start).await
+                    {
+                        let _ = events.send(Event::StreamError(
+                            stream_id,
+                            format!("Playback failed: {error:#}"),
+                        ));
+                    }
+                });
+            }
+            Command::Pair(publisher) => match begin_pairing(&profile, publisher).await {
+                Ok(request) => {
+                    if let Ok(request_id) = request.id() {
+                        pending.insert(request_id, (request, None));
+                        let _ = events.send(Event::Status(
+                            "Pairing request queued; waiting for publisher".into(),
+                        ));
+                    }
+                }
+                Err(error) => {
+                    let _ = events.send(Event::Status(format!("Pairing failed: {error:#}")));
+                }
+            },
+            Command::ConfirmPairing(request_id, approved) => {
+                if approved {
+                    let result = async {
+                        let (request, offer) = pending
+                            .get(&request_id)
+                            .context("pairing request is no longer pending")?;
+                        let offer = offer.as_ref().context("publisher offer is not available")?;
+                        confirm_pairing(&profile, request, offer).await
+                    }
+                    .await;
+                    match result {
+                        Ok(()) => {
+                            let _ = events.send(Event::Status(
+                                "Viewer confirmation queued; waiting for publisher approval".into(),
+                            ));
+                        }
+                        Err(error) => {
+                            let _ = events.send(Event::Status(format!(
+                                "Pair confirmation failed: {error:#}"
+                            )));
+                        }
+                    }
+                } else {
+                    pending.remove(&request_id);
+                    let _ = events.send(Event::Status("Pairing comparison rejected".into()));
+                }
+            }
+        }
+    }
+}
+
+async fn begin_pairing(
+    profile: &ConnectionProfile,
+    publisher: IdentityPublic,
+) -> Result<PairRequest> {
+    let now = glacialcast_protocol::now_ms();
+    let request = PairRequest::new(
+        &profile.identity,
+        publisher,
+        "gcview device".into(),
+        now,
+        now.saturating_add(24 * 60 * 60 * 1_000),
+    )?;
+    let mut socket = connect(profile).await?;
+    socket
+        .write(&ViewerMessage::PairRequest(request.clone()))
+        .await?;
+    match socket.read::<RelayViewerMessage>().await? {
+        RelayViewerMessage::PairingQueued { request_id } if request_id == request.id()? => {
+            Ok(request)
+        }
+        RelayViewerMessage::Error(error) => {
+            anyhow::bail!("relay rejected pairing: {}", error.detail)
+        }
+        _ => anyhow::bail!("unexpected pairing response"),
+    }
+}
+
+async fn refresh_pairing(
+    profile: &ConnectionProfile,
+    events: &mpsc::UnboundedSender<Event>,
+    pending: &mut HashMap<[u8; 32], (PairRequest, Option<PairOffer>)>,
+) -> Result<()> {
+    let mut socket = connect(profile).await?;
+    socket.write(&ViewerMessage::FetchInbox).await?;
+    loop {
+        match socket.read::<RelayViewerMessage>().await? {
+            RelayViewerMessage::PairOffer(offer) => {
+                if let Some((request, stored)) = pending.get_mut(&offer.body.request_id) {
+                    offer.verify(
+                        request,
+                        glacialcast_protocol::now_ms(),
+                        24 * 60 * 60 * 1_000,
+                    )?;
+                    let authentication = authentication_string(request, &offer)?;
+                    *stored = Some(offer);
+                    let _ = events.send(Event::PairingPrompt(request.id()?, authentication));
+                }
+            }
+            RelayViewerMessage::PairDecision(decision) => {
+                if let Some((request, _)) = pending.get(&decision.body.request_id) {
+                    decision.verify(request, &request.body.publisher)?;
+                    let status = if decision.body.approved {
+                        "Publisher approved this viewer"
+                    } else {
+                        "Publisher rejected this viewer"
+                    };
+                    let _ = events.send(Event::Status(status.into()));
+                }
+                pending.remove(&decision.body.request_id);
+            }
+            RelayViewerMessage::InboxComplete => return Ok(()),
+            RelayViewerMessage::KeyEnvelope(_) => {}
+            RelayViewerMessage::Error(error) => {
+                anyhow::bail!("pairing inbox rejected: {}", error.detail)
+            }
+            _ => anyhow::bail!("unexpected pairing inbox response"),
+        }
+    }
+}
+
+async fn confirm_pairing(
+    profile: &ConnectionProfile,
+    request: &PairRequest,
+    offer: &PairOffer,
+) -> Result<()> {
+    let confirmation = ViewerConfirmation::approve(
+        &profile.identity,
+        request,
+        offer,
+        glacialcast_protocol::now_ms(),
+    )?;
+    let mut socket = connect(profile).await?;
+    socket
+        .write(&ViewerMessage::PairConfirmation(confirmation))
+        .await?;
+    match socket.read::<RelayViewerMessage>().await? {
+        RelayViewerMessage::PairingQueued { request_id } if request_id == request.id()? => Ok(()),
+        RelayViewerMessage::Error(error) => {
+            anyhow::bail!("relay rejected confirmation: {}", error.detail)
+        }
+        _ => anyhow::bail!("unexpected confirmation response"),
+    }
+}
+
+async fn connect(profile: &ConnectionProfile) -> Result<NoiseSocket<TcpStream>> {
+    let mut stream = TcpStream::connect(&profile.endpoint)
+        .await
+        .with_context(|| format!("connecting to {}", profile.endpoint))?;
+    let expected = if let Some(pin) = profile.explicit_pin {
+        Some(pin)
+    } else {
+        KnownRelays::open(profile.state_dir.join("known-relays.bin"))?.get(&profile.endpoint)?
+    };
+    let (transport, remote) = initiator_handshake_xx(
+        &mut stream,
+        &profile.noise.private,
+        |actual| match expected {
+            Some(expected) if actual != &expected => {
+                Err(glacialcast_protocol::ProtocolError::Noise(
+                    "relay identity does not match its pin".into(),
+                ))
+            }
+            _ => Ok(()),
+        },
+    )
+    .await?;
+    if profile.explicit_pin.is_none() {
+        KnownRelays::open(profile.state_dir.join("known-relays.bin"))?
+            .verify_or_learn(&profile.endpoint, remote)?;
+    }
+    let mut socket = NoiseSocket::new(stream, transport);
+    socket
+        .write(&ViewerMessage::Hello(SessionHello {
+            protocol_version: PROTOCOL_VERSION,
+            role: CredentialRole::Viewer,
+            identity: profile.identity.public()?,
+            credential: profile.credential.clone(),
+        }))
+        .await?;
+    match socket.read::<RelayViewerMessage>().await? {
+        RelayViewerMessage::Welcome(_) => Ok(socket),
+        RelayViewerMessage::Error(error) => {
+            anyhow::bail!("relay rejected viewer: {:?}: {}", error.code, error.detail)
+        }
+        _ => anyhow::bail!("relay did not send a welcome first"),
+    }
+}
+
+async fn refresh(
+    profile: &ConnectionProfile,
+    events: &mpsc::UnboundedSender<Event>,
+    keys: &Arc<Mutex<HashMap<[u8; 16], [u8; 32]>>>,
+) -> Result<()> {
+    let mut socket = connect(profile).await?;
+    socket.write(&ViewerMessage::Catalog).await?;
+    let catalog = match socket.read::<RelayViewerMessage>().await? {
+        RelayViewerMessage::Catalog(catalog) => catalog,
+        RelayViewerMessage::Error(error) => anyhow::bail!("catalog rejected: {}", error.detail),
+        _ => anyhow::bail!("unexpected catalog response"),
+    };
+    let publishers: HashMap<[u8; 32], IdentityPublic> = catalog
+        .iter()
+        .map(|entry| {
+            Ok((
+                entry.descriptor.body.publisher.id()?,
+                entry.descriptor.body.publisher,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    socket.write(&ViewerMessage::FetchInbox).await?;
+    loop {
+        match socket.read::<RelayViewerMessage>().await? {
+            RelayViewerMessage::KeyEnvelope(envelope) => {
+                if let Some(publisher) = publishers.get(&envelope.header.publisher_id) {
+                    let content_key = envelope.open(&profile.identity, publisher)?;
+                    keys.lock()
+                        .map_err(|_| anyhow::anyhow!("key cache poisoned"))?
+                        .insert(envelope.header.key_id, content_key);
+                }
+            }
+            RelayViewerMessage::InboxComplete => break,
+            RelayViewerMessage::PairOffer(_) | RelayViewerMessage::PairDecision(_) => {}
+            RelayViewerMessage::Error(error) => anyhow::bail!("inbox rejected: {}", error.detail),
+            _ => anyhow::bail!("unexpected inbox response"),
+        }
+    }
+    let _ = events.send(Event::Catalog(catalog));
+    Ok(())
+}
+
+async fn subscribe(
+    profile: &ConnectionProfile,
+    events: &mpsc::UnboundedSender<Event>,
+    keys: &Arc<Mutex<HashMap<[u8; 16], [u8; 32]>>>,
+    stream_id: Uuid,
+    publisher: IdentityPublic,
+    start: SubscriptionStart,
+) -> Result<()> {
+    let mut socket = connect(profile).await?;
+    let publisher_id = publisher.id()?;
+    socket
+        .write(&ViewerMessage::Subscribe {
+            publisher_id,
+            stream_id,
+            start,
+        })
+        .await?;
+    let first_sequence = match socket.read::<RelayViewerMessage>().await? {
+        RelayViewerMessage::SubscriptionStarted { first_sequence, .. } => first_sequence,
+        RelayViewerMessage::Error(error) => {
+            anyhow::bail!("subscription rejected: {}", error.detail)
+        }
+        _ => anyhow::bail!("unexpected subscription response"),
+    };
+    let mut guard =
+        LiveSequenceGuard::new(publisher_id, stream_id, first_sequence.saturating_sub(1));
+    let mut decoder = Decoder::new()?;
+    loop {
+        match socket.read::<RelayViewerMessage>().await? {
+            RelayViewerMessage::Object(object) => {
+                guard.accept(&object)?;
+                if object.header.kind != NativeObjectKind::Media
+                    || object.header.codec != Some(CodecId::H264AnnexB)
+                {
+                    continue;
+                }
+                let key = keys
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("key cache poisoned"))?
+                    .get(&object.header.key_id)
+                    .copied();
+                let Some(key) = key else {
+                    anyhow::bail!("waiting for publisher key envelope");
+                };
+                let plaintext = object.open(
+                    &publisher,
+                    &glacialcast_protocol::native::ContentKey::from_bytes(key)?,
+                    &object.header.key_id,
+                )?;
+                for unit in nal_units(&plaintext) {
+                    if let Some(yuv) = decoder.decode(unit)? {
+                        let (width, height) = yuv.dimensions();
+                        let mut rgb = vec![0; yuv.rgb8_len()];
+                        yuv.write_rgb8(&mut rgb);
+                        let _ = events.send(Event::Frame(Frame {
+                            stream_id,
+                            width,
+                            height,
+                            rgb,
+                            sequence: object.header.sequence,
+                        }));
+                    }
+                }
+            }
+            RelayViewerMessage::Live { .. } | RelayViewerMessage::Pong { .. } => {}
+            RelayViewerMessage::Error(error) => {
+                anyhow::bail!("relay stream error: {}", error.detail)
+            }
+            _ => anyhow::bail!("unexpected subscription message"),
+        }
+    }
+}
+
+fn parse_relay(input: &str) -> Result<(String, Option<[u8; 32]>)> {
+    let value = input.strip_prefix("glacialcast://").unwrap_or(input);
+    let (authority, query) = value.split_once('?').unwrap_or((value, ""));
+    let endpoint = if authority.contains(':') {
+        authority.to_string()
+    } else {
+        format!("{authority}:{DEFAULT_VIEWER_PORT}")
+    };
+    glacialcast_protocol::trust::canonical_relay_endpoint(&endpoint)?;
+    let pin = query
+        .split('&')
+        .find_map(|part| part.strip_prefix("key="))
+        .map(glacialcast_protocol::decode_noise_public_key)
+        .transpose()?;
+    Ok((endpoint, pin))
+}
+
+fn default_state_dir() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("glacialcast/viewer")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Args;
-    use clap::Parser;
+    use super::*;
 
     #[test]
-    fn viewer_requires_exactly_one_relay_endpoint() {
-        assert!(Args::try_parse_from(["gcview"]).is_err());
-        let args = Args::try_parse_from(["gcview", "relay.example:8899"]).unwrap();
-        assert_eq!(args.relay, "relay.example:8899");
-        assert!(Args::try_parse_from(["gcview", "one", "two"]).is_err());
+    fn relay_argument_accepts_host_port_and_invite_pin() {
+        assert_eq!(
+            parse_relay("relay.example").unwrap().0,
+            "relay.example:8899"
+        );
+        let key = glacialcast_protocol::encode_noise_public_key(&[7; 32]);
+        let (_, pin) = parse_relay(&format!("glacialcast://relay.example:99?key={key}")).unwrap();
+        assert_eq!(pin, Some([7; 32]));
+        assert!(parse_relay("bad host").is_err());
     }
 }

@@ -503,6 +503,32 @@ pub struct NativeCredentialBody {
 }
 
 impl NativeCredential {
+    /// Encodes this credential canonically for a private credential file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when serialization fails.
+    pub fn encode(&self) -> Result<Vec<u8>, CredentialError> {
+        postcard::to_stdvec(self).map_err(CredentialError::from)
+    }
+
+    /// Decodes a canonical credential and rejects trailing data.
+    ///
+    /// Issuer and time validation is performed by [`Self::verify_at`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed, trailing, or non-canonical data.
+    pub fn decode(bytes: &[u8]) -> Result<Self, CredentialError> {
+        let (credential, remainder) = postcard::take_from_bytes::<Self>(bytes)?;
+        if !remainder.is_empty() || credential.encode()? != bytes {
+            return Err(CredentialError::InvalidMetadata(
+                "trailing or non-canonical credential data",
+            ));
+        }
+        Ok(credential)
+    }
+
     /// Verifies issuer, signature, role, session key, validity, and revocation.
     ///
     /// # Errors

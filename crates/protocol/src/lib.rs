@@ -925,6 +925,52 @@ pub fn generate_noise_keypair() -> Result<NoiseKeypair> {
     Ok(keypair)
 }
 
+/// Loads or creates a private persistent Noise XX identity.
+///
+/// The file is a bounded canonical private-state record and is never followed
+/// through a symlink. A concurrently created valid identity is adopted.
+///
+/// # Errors
+///
+/// Returns an error for unsafe file metadata, malformed key material, or a
+/// create/read/synchronization failure.
+pub fn load_or_create_noise_keypair(path: &std::path::Path) -> Result<NoiseKeypair> {
+    const MAGIC: &[u8; 5] = b"GCXX1";
+    const FILE_LEN: usize = MAGIC.len() + NOISE_KEY_LEN * 2;
+    let decode = |bytes: &[u8]| -> Result<NoiseKeypair> {
+        if bytes.len() != FILE_LEN || !bytes.starts_with(MAGIC) {
+            return Err(ProtocolError::Noise("invalid Noise identity file".into()));
+        }
+        let keypair = NoiseKeypair {
+            private: bytes[MAGIC.len()..MAGIC.len() + NOISE_KEY_LEN]
+                .try_into()
+                .expect("validated Noise private-key length"),
+            public: bytes[MAGIC.len() + NOISE_KEY_LEN..]
+                .try_into()
+                .expect("validated Noise public-key length"),
+        };
+        keypair.validate_xx()?;
+        Ok(keypair)
+    };
+    match private_state::read_private(path, FILE_LEN) {
+        Ok(bytes) => return decode(&bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let keypair = generate_noise_keypair()?;
+    let mut encoded = Vec::with_capacity(FILE_LEN);
+    encoded.extend_from_slice(MAGIC);
+    encoded.extend_from_slice(&keypair.private);
+    encoded.extend_from_slice(&keypair.public);
+    match private_state::create_private(path, &encoded) {
+        Ok(()) => Ok(keypair),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            decode(&private_state::read_private(path, FILE_LEN)?)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Encodes a Noise public key as unpadded URL-safe base64.
 pub fn encode_noise_public_key(key: &[u8; NOISE_KEY_LEN]) -> String {
     URL_SAFE_NO_PAD.encode(key)
@@ -1512,6 +1558,23 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn noise_xx_identity_file_is_private_stable_and_rejects_public_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("glacialcast-noise-{}", Uuid::new_v4()));
+        let path = root.join("noise.key");
+        let first = load_or_create_noise_keypair(&path).unwrap();
+        let second = load_or_create_noise_keypair(&path).unwrap();
+        assert_eq!(first.public, second.public);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_or_create_noise_keypair(&path).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
