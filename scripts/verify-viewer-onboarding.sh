@@ -49,10 +49,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cargo build -p glacialcast-server -p glacialcast-client
+cargo build -p gcrelay -p gcpub
 
 ingest_server_key="$(
-  target/debug/glacialcast-server \
+  target/debug/gcrelay \
     --no-config --data-dir "${work_dir}/data" --print-ingest-server-key
 )"
 
@@ -61,7 +61,7 @@ ingest_server_key="$(
 retired_key="$(node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))")"
 current_key="$(node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))")"
 
-target/debug/glacialcast-server \
+target/debug/gcrelay \
   --no-config \
   --data-dir "${work_dir}/data" \
   --control-addr "${control_addr}" \
@@ -84,7 +84,7 @@ curl -sf "${origin}/api/streams" >/dev/null || {
 
 start_client() {
   local key="$1"
-  target/debug/glacialcast-client \
+  target/debug/gcpub \
     --no-config \
     --ingest-addr "${ingest_addr}" \
     "--ingest-server-key=${ingest_server_key}" \

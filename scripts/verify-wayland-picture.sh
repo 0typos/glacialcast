@@ -50,16 +50,16 @@ if ! scripts/screenshot-output.sh "${work_dir}/probe.png" >/dev/null 2>&1; then
 fi
 rm -f "${work_dir}/probe.png"
 
-cargo build -p glacialcast-server -p glacialcast-client
+cargo build -p gcrelay -p gcpub
 ingest_server_key="$(
-  target/debug/glacialcast-server \
+  target/debug/gcrelay \
     --no-config \
     --data-dir "${work_dir}/data" \
     --print-ingest-server-key
 )"
 viewer_key="$(node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))")"
 
-target/debug/glacialcast-server \
+target/debug/gcrelay \
   --no-config \
   --control-addr "${control_addr}" \
   --ingest-addr "${ingest_addr}" \
@@ -102,7 +102,7 @@ if [[ -n "${GLACIALCAST_VERIFY_MAX_FRAME_HEIGHT:-}" ]]; then
   client_args+=(--max-frame-height "${GLACIALCAST_VERIFY_MAX_FRAME_HEIGHT}")
 fi
 
-RUST_LOG=glacialcast_client=info target/debug/glacialcast-client "${client_args[@]}" \
+RUST_LOG=glacialcast_publisher=info target/debug/gcpub "${client_args[@]}" \
   >"${client_log}" 2>&1 &
 client_pid="$!"
 

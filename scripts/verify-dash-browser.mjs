@@ -385,7 +385,7 @@ try {
   result.paintedVideoBytes = paintedVideo.byteLength;
   if (paintedVideo.byteLength < 5_000) {
     const screenshot = process.env.GLACIALCAST_DASH_SCREENSHOT
-      || `/tmp/glacialcast-dash-${browserName}.png`;
+      || `/tmp/glacialcast-stream-${browserName}.png`;
     await page.screenshot({ path: screenshot });
     throw new Error(`decoded video did not paint: ${JSON.stringify(result)}`);
   }

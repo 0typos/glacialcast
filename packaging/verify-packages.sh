@@ -78,16 +78,16 @@ done
 for argument in 0 remove; do
   : >"${work_dir}/calls.log"
   run_script packaging/scripts/server-preremove.sh "${argument}"
-  grep -q 'disable --now glacialcast-server' "${work_dir}/calls.log" || {
+  grep -q 'disable --now gcrelay' "${work_dir}/calls.log" || {
     echo "removal (preremove ${argument}) left the relay enabled" >&2
     exit 1
   }
 done
 
 # Contents, checked against whichever tooling this host has.
-rpm_package="$(find "${dist_dir}" -name 'glacialcast-server*.rpm' -print -quit)"
-deb_package="$(find "${dist_dir}" -name 'glacialcast-server*.deb' -print -quit)"
-client_rpm="$(find "${dist_dir}" -name 'glacialcast-client*.rpm' -print -quit)"
+rpm_package="$(find "${dist_dir}" -name 'gcrelay*.rpm' -print -quit)"
+deb_package="$(find "${dist_dir}" -name 'gcrelay*.deb' -print -quit)"
+client_rpm="$(find "${dist_dir}" -name 'gcpub*.rpm' -print -quit)"
 
 expect_paths() {
   local listing="$1"
@@ -103,9 +103,9 @@ expect_paths() {
 if [[ -n "${rpm_package}" ]] && command -v rpm >/dev/null; then
   listing="$(rpm -qlp "${rpm_package}" 2>/dev/null)"
   expect_paths "${listing}" \
-    /usr/bin/glacialcast-server \
+    /usr/bin/gcrelay \
     /usr/bin/glacialcast-offline \
-    /usr/lib/systemd/system/glacialcast-server.service
+    /usr/lib/systemd/system/gcrelay.service
   # A package that ships a live configuration would overwrite ingest tokens on
   # upgrade. Only the example belongs here.
   ! grep -q '^/etc/glacialcast/server.toml$' <<<"${listing}" || {
@@ -130,8 +130,8 @@ fi
 if [[ -n "${deb_package}" ]] && command -v dpkg >/dev/null; then
   listing="$(dpkg -c "${deb_package}" 2>/dev/null | awk '{print $6}')"
   expect_paths "${listing}" \
-    ./usr/bin/glacialcast-server \
-    ./usr/lib/systemd/system/glacialcast-server.service
+    ./usr/bin/gcrelay \
+    ./usr/lib/systemd/system/gcrelay.service
 fi
 
 echo "PASS: packages install files without enabling anything, and split their dependencies"

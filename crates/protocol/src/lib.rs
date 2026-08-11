@@ -14,7 +14,7 @@
 #![deny(missing_docs)]
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use glacialcast_dash::{
+use glacialcast_stream::{
     DASH_FORMAT_VERSION, EpochKeys, MAX_CURSOR_PAYLOAD, MAX_MEDIA_PAYLOAD, authenticate_object,
     verify_object_authentication,
 };
@@ -314,7 +314,7 @@ impl DashObject {
     /// # Examples
     ///
     /// ```
-    /// use glacialcast_dash::EpochKeys;
+    /// use glacialcast_stream::EpochKeys;
     /// use glacialcast_protocol::{DashObject, DashObjectKind, NewDashObject};
     /// use uuid::Uuid;
     ///

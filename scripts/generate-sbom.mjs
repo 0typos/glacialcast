@@ -23,8 +23,8 @@ if (cargo.status !== 0) {
 
 const metadata = JSON.parse(cargo.stdout);
 const workspace = new Set(metadata.workspace_members);
-const rootPackage = metadata.packages.find(pkg => pkg.name === 'glacialcast-server');
-if (!rootPackage) throw new Error('workspace does not contain glacialcast-server');
+const rootPackage = metadata.packages.find(pkg => pkg.name === 'gcrelay');
+if (!rootPackage) throw new Error('workspace does not contain gcrelay');
 
 const revision = process.env.GLACIALCAST_RELEASE_REVISION || 'uncommitted';
 const epoch = Number(process.env.SOURCE_DATE_EPOCH || 0);
@@ -90,8 +90,8 @@ for (const node of metadata.resolve?.nodes || []) {
     });
   }
 }
-const client = metadata.packages.find(pkg => pkg.name === 'glacialcast-client');
-if (!client) throw new Error('workspace does not contain glacialcast-client');
+const client = metadata.packages.find(pkg => pkg.name === 'gcpub');
+if (!client) throw new Error('workspace does not contain gcpub');
 for (const dependency of nativePackages) {
   relationships.push({
     spdxElementId: packageIds.get(client.id),

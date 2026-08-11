@@ -38,9 +38,9 @@ if ! [[ "${publishers}" =~ ^[1-4]$ ]]; then
   exit 2
 fi
 
-cargo build -p glacialcast-server -p glacialcast-client
+cargo build -p gcrelay -p gcpub
 ingest_server_key="$(
-  target/debug/glacialcast-server \
+  target/debug/gcrelay \
     --no-config \
     --data-dir "${work_dir}/data" \
     --print-ingest-server-key
@@ -51,13 +51,13 @@ ingest_server_key="$(
 # "enter one key, unlock every screen" path real here rather than simulated.
 viewer_key_file="${work_dir}/viewer.key"
 viewer_key="$(
-  target/debug/glacialcast-client \
+  target/debug/gcpub \
     --no-config \
     --viewer-key-file "${viewer_key_file}" \
     --print-viewer-key
 )"
 
-target/debug/glacialcast-server \
+target/debug/gcrelay \
   --no-config \
   --control-addr "${control_addr}" \
   --ingest-addr "${ingest_addr}" \
@@ -72,7 +72,7 @@ done
 curl -fsS "${origin}/api/streams" >/dev/null
 
 for index in $(seq 1 "${publishers}"); do
-  target/debug/glacialcast-client \
+  target/debug/gcpub \
     --no-config \
     --ingest-addr "${ingest_addr}" \
     "--ingest-server-key=${ingest_server_key}" \

@@ -13,7 +13,7 @@
 // byte-order mark and a repeated key; `TextDecoder` and `JSON.parse` accept
 // both. Three bytes in front of an ordinary descriptor were enough.
 //
-// crates/dash drives the same vector file over the Rust reader. Neither side
+// crates/stream drives the same vector file over the Rust reader. Neither side
 // may be changed alone.
 
 import { readFileSync } from 'node:fs';

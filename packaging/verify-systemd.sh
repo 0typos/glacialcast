@@ -14,7 +14,7 @@ command -v systemd-analyze >/dev/null || {
 # checkout usually has them; a clean one does not, and verify-packaging.sh
 # builds into throwaway target directories to compare two independent builds,
 # so running under it is no guarantee either.
-for binary in glacialcast-server glacialcast-client; do
+for binary in gcrelay gcpub; do
   if [[ ! -x "target/release/${binary}" ]]; then
     cargo build --release --locked -p "${binary}" >&2
   fi
@@ -27,25 +27,25 @@ cleanup() {
 trap cleanup EXIT
 
 sed \
-  "s#/usr/local/bin/glacialcast-server#${repo_root}/target/release/glacialcast-server#" \
-  deploy/glacialcast-server.service >"${work_dir}/glacialcast-server.service"
-systemd-analyze verify "${work_dir}/glacialcast-server.service"
+  "s#/usr/local/bin/gcrelay#${repo_root}/target/release/gcrelay#" \
+  deploy/gcrelay.service >"${work_dir}/gcrelay.service"
+systemd-analyze verify "${work_dir}/gcrelay.service"
 
 sed \
-  "s#/usr/local/bin/glacialcast-client#${repo_root}/target/release/glacialcast-client#" \
-  deploy/glacialcast-publisher.service >"${work_dir}/glacialcast-publisher.service"
-systemd-analyze --user verify "${work_dir}/glacialcast-publisher.service"
+  "s#/usr/local/bin/gcpub#${repo_root}/target/release/gcpub#" \
+  deploy/gcpub.service >"${work_dir}/gcpub.service"
+systemd-analyze --user verify "${work_dir}/gcpub.service"
 
 # The publisher detaches by default, so a supervised unit must keep it in the
 # foreground or systemd would treat the immediate parent exit as a failure.
-grep -Fq -- '--foreground' deploy/glacialcast-publisher.service || {
+grep -Fq -- '--foreground' deploy/gcpub.service || {
   echo "publisher unit must pass --foreground so systemd can supervise it" >&2
   exit 1
 }
 
 # A relative --config resolves against the working directory, which for a unit
 # without WorkingDirectory= is /. That silently reads /server.toml, or nothing.
-for unit in deploy/glacialcast-server.service deploy/glacialcast-publisher.service; do
+for unit in deploy/gcrelay.service deploy/gcpub.service; do
   # Comments discuss --config at length; only what is executed matters here.
   if grep -v '^[[:space:]]*#' "${unit}" \
       | grep -oP -- '--config\s+\K\S+' \
@@ -58,7 +58,7 @@ done
 # Naming a configuration file that is not there must stop the service rather
 # than start it on built-in defaults, which for the relay would mean no ingest
 # tokens and for the publisher a stream nobody is expecting.
-for binary in glacialcast-server glacialcast-client; do
+for binary in gcrelay gcpub; do
   if "${repo_root}/target/release/${binary}" \
       --config "${work_dir}/definitely-absent.toml" \
       --print-viewer-key --print-ingest-server-key >/dev/null 2>&1; then
@@ -73,8 +73,8 @@ mkdir -p "${work_dir}/xdg/glacialcast"
 printf '[ingest]\nrequire_token = false\n' >"${work_dir}/xdg/glacialcast/server.toml"
 chmod 600 "${work_dir}/xdg/glacialcast/server.toml"
 discovered="$(
-  cd "${work_dir}" && XDG_CONFIG_HOME="${work_dir}/xdg" RUST_LOG=glacialcast_server=info \
-    timeout 10 "${repo_root}/target/release/glacialcast-server" \
+  cd "${work_dir}" && XDG_CONFIG_HOME="${work_dir}/xdg" RUST_LOG=glacialcast_relay=info \
+    timeout 10 "${repo_root}/target/release/gcrelay" \
     --data-dir "${work_dir}/data" \
     --control-addr 127.0.0.1:19797 \
     --ingest-addr 127.0.0.1:19798 2>&1 &

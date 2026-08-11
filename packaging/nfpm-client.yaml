@@ -8,7 +8,7 @@
 # whose DMA-BUFs cannot be mapped through GBM. A hard dependency on those would
 # make the package uninstallable on hosts where it would have worked, and
 # OpenH264 in particular ships from a separate repository on Fedora.
-name: glacialcast-client
+name: gcpub
 arch: ${GLACIALCAST_PACKAGE_ARCH}
 platform: linux
 version: ${GLACIALCAST_VERSION}
@@ -25,22 +25,22 @@ homepage: https://github.com/0typos/glacialcast
 license: MIT
 
 contents:
-  - src: ./target/release/glacialcast-client
-    dst: /usr/bin/glacialcast-client
+  - src: ./target/release/gcpub
+    dst: /usr/bin/gcpub
     file_info:
       mode: 0755
   # A user unit, not a system one: the publisher captures a logged-in graphical
   # session and has to start and stop with it.
-  - src: ./target/package-staging/systemd/glacialcast-publisher.service
-    dst: /usr/lib/systemd/user/glacialcast-publisher.service
+  - src: ./target/package-staging/systemd/gcpub.service
+    dst: /usr/lib/systemd/user/gcpub.service
     file_info:
       mode: 0644
   - src: ./LICENSE
-    dst: /usr/share/doc/glacialcast-client/LICENSE
+    dst: /usr/share/doc/gcpub/LICENSE
     file_info:
       mode: 0644
   - src: ./packaging/client.toml.example
-    dst: /usr/share/doc/glacialcast-client/client.toml.example
+    dst: /usr/share/doc/gcpub/client.toml.example
     file_info:
       mode: 0644
 

@@ -30,7 +30,7 @@ use cros_codecs::{
         gbm_video_frame::{GbmDevice, GbmExternalBufferDescriptor, GbmUsage, GbmVideoFrame},
     },
 };
-use glacialcast_dash::AvcConfig;
+use glacialcast_stream::AvcConfig;
 use image::{ImageBuffer, Rgb};
 use openh264::{
     OpenH264API,

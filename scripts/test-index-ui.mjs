@@ -44,7 +44,7 @@ const context = {
 };
 vm.createContext(context);
 vm.runInContext(
-  fs.readFileSync(new URL('../crates/server/static/index.js', import.meta.url), 'utf8'),
+  fs.readFileSync(new URL('../crates/relay/static/index.js', import.meta.url), 'utf8'),
   context,
 );
 

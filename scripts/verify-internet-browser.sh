@@ -69,10 +69,10 @@ https://localhost:${https_port} {
 CADDY
 mkdir -p "${work_dir}/caddy-data" "${work_dir}/caddy-config"
 
-cargo build -p glacialcast-server -p glacialcast-client
+cargo build -p gcrelay -p gcpub
 
 ingest_server_key="$(
-  target/debug/glacialcast-server \
+  target/debug/gcrelay \
     --config "${work_dir}/server.toml" \
     --control-addr "${backend_addr}" \
     --ingest-addr "${ingest_addr}" \
@@ -80,7 +80,7 @@ ingest_server_key="$(
     --print-ingest-server-key
 )"
 
-target/debug/glacialcast-server \
+target/debug/gcrelay \
   --config "${work_dir}/server.toml" \
   --control-addr "${backend_addr}" \
   --ingest-addr "${ingest_addr}" \
@@ -121,7 +121,7 @@ done
 curl --insecure --fail --silent "${public_origin}/health/ready" >/dev/null
 
 viewer_key="$(node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))")"
-RUST_LOG=glacialcast_client=info target/debug/glacialcast-client \
+RUST_LOG=glacialcast_publisher=info target/debug/gcpub \
   --no-config \
   --ingest-addr "${ingest_addr}" \
   "--ingest-server-key=${ingest_server_key}" \

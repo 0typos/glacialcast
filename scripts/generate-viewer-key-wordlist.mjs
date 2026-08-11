@@ -10,7 +10,7 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 
 const SOURCE = 'crates/protocol/wordlist.txt';
-const TARGET = 'crates/server/static/viewer-key.js';
+const TARGET = 'crates/relay/static/viewer-key.js';
 const BEGIN = '  // BEGIN GENERATED WORDLIST';
 const END = '  // END GENERATED WORDLIST';
 

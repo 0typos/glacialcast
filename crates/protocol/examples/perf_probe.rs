@@ -1,8 +1,8 @@
-use glacialcast_dash::{
+use glacialcast_protocol::{DashObject, DashObjectKind, NewDashObject};
+use glacialcast_stream::{
     CursorBatch, CursorBitmap, CursorContext, CursorEvent, EpochKeys, FragmentInput,
     build_fragment, decrypt_cursor_batch, encrypt_cursor_batch,
 };
-use glacialcast_protocol::{DashObject, DashObjectKind, NewDashObject};
 use std::{
     hint::black_box,
     time::{Duration, Instant},

@@ -45,10 +45,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cargo build -p glacialcast-server -p glacialcast-client
+cargo build -p gcrelay -p gcpub
 
 ingest_server_key="$(
-  target/debug/glacialcast-server \
+  target/debug/gcrelay \
     --no-config \
     --data-dir "${work_dir}/data" \
     --print-ingest-server-key
@@ -56,7 +56,7 @@ ingest_server_key="$(
 
 # --no-tls because the listeners are loopback, which browsers already treat as a
 # secure context. A LAN deployment wants the TLS this flag turns off.
-RUST_LOG=glacialcast_server=info target/debug/glacialcast-server \
+RUST_LOG=glacialcast_relay=info target/debug/gcrelay \
   --no-config \
   --data-dir "${work_dir}/data" \
   --trusted-lan \
@@ -92,7 +92,7 @@ fail_with_log() {
   exit 1
 }
 
-RUST_LOG=glacialcast_client=info target/debug/glacialcast-client \
+RUST_LOG=glacialcast_publisher=info target/debug/gcpub \
   --no-config \
   --ingest-addr "${ingest_addr}" \
   "--ingest-server-key=${ingest_server_key}" \
@@ -170,13 +170,13 @@ done
 # needs that relay's key. Reusing the first one fails the Noise handshake, which
 # looks like a refusal without ever testing one.
 strict_ingest_server_key="$(
-  target/debug/glacialcast-server \
+  target/debug/gcrelay \
     --no-config \
     --data-dir "${work_dir}/strict-data" \
     --print-ingest-server-key
 )"
 
-RUST_LOG=glacialcast_server=info target/debug/glacialcast-server \
+RUST_LOG=glacialcast_relay=info target/debug/gcrelay \
   --no-config \
   --data-dir "${work_dir}/strict-data" \
   --control-addr "${strict_control_addr}" \
@@ -185,7 +185,7 @@ RUST_LOG=glacialcast_server=info target/debug/glacialcast-server \
 strict_server_pid="$!"
 wait_for_origin "http://${strict_control_addr}"
 
-RUST_LOG=glacialcast_client=info target/debug/glacialcast-client \
+RUST_LOG=glacialcast_publisher=info target/debug/gcpub \
   --no-config \
   --ingest-addr "${strict_ingest_addr}" \
   "--ingest-server-key=${strict_ingest_server_key}" \

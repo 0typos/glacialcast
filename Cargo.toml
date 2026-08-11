@@ -1,10 +1,11 @@
 [workspace]
 members = [
-    "crates/client",
-    "crates/dash",
+    "crates/publisher",
+    "crates/stream",
     "crates/offline",
     "crates/protocol",
-    "crates/server",
+    "crates/relay",
+    "crates/viewer",
 ]
 resolver = "3"
 

@@ -1,6 +1,6 @@
 #![no_main]
 
-use glacialcast_dash::EpochDescriptor;
+use glacialcast_stream::EpochDescriptor;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

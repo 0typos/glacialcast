@@ -16,12 +16,6 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use clap::{Parser, ValueEnum};
 use futures_util::StreamExt;
-use glacialcast_dash::{
-    CursorBatch as DashCursorBatch, CursorBitmap as DashCursorBitmap,
-    CursorContext as DashCursorContext, CursorEvent as DashCursorEvent, DASH_FORMAT_VERSION,
-    EpochDescriptor, EpochKeys, FragmentInput, MEDIA_TIMESCALE, build_fragment, build_init_segment,
-    encode_plain_cursor_batch, encrypt_cursor_batch,
-};
 use glacialcast_protocol::{
     CaptureSource, ClientMessage, DashObject, DashObjectKind, NewDashObject, NoiseSocket,
     PROTOCOL_VERSION, ServerMessage, StreamHello,
@@ -32,6 +26,12 @@ use glacialcast_protocol::{
     },
     decode_key_b64, decode_noise_public_key, encode_key_b64, initiator_handshake, now_ms,
     parse_human_bytes, viewer_key,
+};
+use glacialcast_stream::{
+    CursorBatch as DashCursorBatch, CursorBitmap as DashCursorBitmap,
+    CursorContext as DashCursorContext, CursorEvent as DashCursorEvent, DASH_FORMAT_VERSION,
+    EpochDescriptor, EpochKeys, FragmentInput, MEDIA_TIMESCALE, build_fragment, build_init_segment,
+    encode_plain_cursor_batch, encrypt_cursor_batch,
 };
 use image::{ImageBuffer, Rgb, imageops::FilterType};
 use pipewire as pw;
@@ -479,7 +479,7 @@ pub fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "glacialcast_client=info".into()),
+                .unwrap_or_else(|_| "glacialcast_publisher=info".into()),
         )
         // Diagnostics go to stderr, leaving stdout for values a caller
         // captures, such as `--print-viewer-key`.
@@ -584,7 +584,7 @@ fn url_encode_fragment(value: &str) -> String {
 fn client_daemon_socket(args: &Args, identity: &ClientIdentity) -> PathBuf {
     args.daemon_socket.clone().unwrap_or_else(|| {
         let client_id = sanitize_socket_component(&identity.client_id);
-        PathBuf::from(format!("/tmp/glacialcast-client-{client_id}.sock"))
+        PathBuf::from(format!("/tmp/gcpub-{client_id}.sock"))
     })
 }
 
@@ -7190,7 +7190,7 @@ impl DashResendBuffer {
 }
 
 fn hostname() -> String {
-    std::env::var("HOSTNAME").unwrap_or_else(|_| "glacialcast-client".to_string())
+    std::env::var("HOSTNAME").unwrap_or_else(|_| "gcpub".to_string())
 }
 
 #[cfg(test)]
@@ -7389,7 +7389,7 @@ mod tests {
     #[test]
     fn command_line_accepts_url_safe_keys_that_begin_with_hyphens() {
         let args = Args::try_parse_from([
-            "glacialcast-client",
+            "gcpub",
             "--ingest-token",
             "-token",
             "--ingest-server-key",
@@ -7405,8 +7405,7 @@ mod tests {
 
     #[test]
     fn client_config_must_be_private_regular_and_rejects_unknown_keys() {
-        let root =
-            std::env::temp_dir().join(format!("glacialcast-client-config-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("gcpub-config-{}", Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         let path = root.join("client.toml");
         let mut file = std::fs::OpenOptions::new()
@@ -7472,7 +7471,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let args = Args::parse_from(["glacialcast-client"]);
+            let args = Args::parse_from(["gcpub"]);
             let identity = ClientIdentity {
                 client_id: "chooser".to_string(),
                 auth_token: None,
@@ -7955,8 +7954,7 @@ mod tests {
 
     #[test]
     fn segment_length_tracks_the_frame_rate() {
-        let args_at =
-            |fps: f64| Args::parse_from(["glacialcast-client", "--fps", &fps.to_string()]);
+        let args_at = |fps: f64| Args::parse_from(["gcpub", "--fps", &fps.to_string()]);
         // Segment boundaries force an IDR, so the frame count has to rise with
         // the frame rate or the keyframe rate rises instead and takes the
         // bitrate with it.
@@ -7966,8 +7964,7 @@ mod tests {
         assert_eq!(args_at(0.5).segment_frames(), 2);
 
         // An explicit choice still wins.
-        let explicit =
-            Args::parse_from(["glacialcast-client", "--fps", "5", "--segment-frames", "4"]);
+        let explicit = Args::parse_from(["gcpub", "--fps", "5", "--segment-frames", "4"]);
         assert_eq!(explicit.segment_frames(), 4);
     }
 

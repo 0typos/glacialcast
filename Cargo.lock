@@ -1022,6 +1022,75 @@ dependencies = [
 ]
 
 [[package]]
+name = "gcpub"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "clap",
+ "cros-codecs",
+ "futures-util",
+ "gbm",
+ "glacialcast-protocol",
+ "glacialcast-stream",
+ "image",
+ "libc",
+ "libloading",
+ "openh264",
+ "pipewire",
+ "rand 0.8.6",
+ "serde",
+ "sha2",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "zbus",
+ "zvariant",
+]
+
+[[package]]
+name = "gcrelay"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "clap",
+ "futures-util",
+ "glacialcast-protocol",
+ "glacialcast-stream",
+ "hmac",
+ "libc",
+ "rand 0.8.6",
+ "rcgen",
+ "rusqlite",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tokio",
+ "tokio-rustls",
+ "toml 0.8.23",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "gcview"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "clap",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1082,54 +1151,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "glacialcast-client"
-version = "0.5.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "clap",
- "cros-codecs",
- "futures-util",
- "gbm",
- "glacialcast-dash",
- "glacialcast-protocol",
- "image",
- "libc",
- "libloading",
- "openh264",
- "pipewire",
- "rand 0.8.6",
- "serde",
- "sha2",
- "tokio",
- "toml 0.8.23",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "zbus",
- "zvariant",
-]
-
-[[package]]
-name = "glacialcast-dash"
-version = "0.5.0"
-dependencies = [
- "aes",
- "aes-gcm",
- "base64",
- "ctr",
- "hkdf",
- "hmac",
- "rand 0.8.6",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.18",
- "uuid",
-]
-
-[[package]]
 name = "glacialcast-offline"
 version = "0.5.0"
 dependencies = [
@@ -1137,8 +1158,8 @@ dependencies = [
  "axum",
  "clap",
  "futures-util",
- "glacialcast-dash",
  "glacialcast-protocol",
+ "glacialcast-stream",
  "libc",
  "reqwest",
  "serde",
@@ -1157,7 +1178,7 @@ dependencies = [
  "anyhow",
  "base64",
  "bytes",
- "glacialcast-dash",
+ "glacialcast-stream",
  "hmac",
  "libc",
  "postcard",
@@ -1171,33 +1192,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "glacialcast-server"
+name = "glacialcast-stream"
 version = "0.5.0"
 dependencies = [
- "anyhow",
- "axum",
+ "aes",
+ "aes-gcm",
  "base64",
- "clap",
- "futures-util",
- "glacialcast-dash",
- "glacialcast-protocol",
+ "ctr",
+ "hkdf",
  "hmac",
- "libc",
  "rand 0.8.6",
- "rcgen",
- "rusqlite",
- "rustls",
- "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2",
- "subtle",
- "tokio",
- "tokio-rustls",
- "toml 0.8.23",
- "tower-http",
- "tracing",
- "tracing-subscriber",
+ "thiserror 2.0.18",
  "uuid",
 ]
 

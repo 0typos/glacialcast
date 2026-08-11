@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const core = require('../crates/server/static/dash-viewer-core.js');
+const core = require('../crates/relay/static/dash-viewer-core.js');
 
 let tests = 0;
 

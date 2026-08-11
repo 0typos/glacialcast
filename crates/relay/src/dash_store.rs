@@ -9,8 +9,8 @@
 //! sizes, media chunk continuity, journal records, and symlink boundaries.
 
 use anyhow::{Context, Result};
-use glacialcast_dash::{EpochDescriptor, MpdConfig, SegmentTimelineEntry, build_mpd};
 use glacialcast_protocol::{DashObject, DashObjectHeader, DashObjectKind, MAX_FRAME_LEN};
+use glacialcast_stream::{EpochDescriptor, MpdConfig, SegmentTimelineEntry, build_mpd};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -1350,11 +1350,11 @@ fn remove_retained_paths(paths: Vec<PathBuf>, operation: &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glacialcast_dash::{DASH_FORMAT_VERSION, EpochKeys, MEDIA_TIMESCALE};
     use glacialcast_protocol::{DashObjectKind, NewDashObject};
+    use glacialcast_stream::{DASH_FORMAT_VERSION, EpochKeys, MEDIA_TIMESCALE};
 
     fn test_store(retention_bytes: u64) -> (PathBuf, DashStore) {
-        let root = std::env::temp_dir().join(format!("glacialcast-dash-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("glacialcast-stream-{}", Uuid::new_v4()));
         let store =
             DashStore::open(root.clone(), retention_bytes, Duration::from_secs(1800)).unwrap();
         (root, store)
@@ -1828,7 +1828,7 @@ mod tests {
 
     #[test]
     fn catalog_reload_enforces_retention_age() {
-        let root = std::env::temp_dir().join(format!("glacialcast-dash-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("glacialcast-stream-{}", Uuid::new_v4()));
         let store = DashStore::open(root.clone(), 1024 * 1024, Duration::from_secs(1)).unwrap();
         let stream_id = Uuid::from_u128(21);
         let epoch_id = Uuid::from_u128(22);
@@ -1863,7 +1863,7 @@ mod tests {
 
     #[test]
     fn periodic_retention_expires_an_idle_stream_durably() {
-        let root = std::env::temp_dir().join(format!("glacialcast-dash-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("glacialcast-stream-{}", Uuid::new_v4()));
         let store = DashStore::open(root.clone(), 1024 * 1024, Duration::from_secs(1)).unwrap();
         let stream_id = Uuid::from_u128(23);
         let epoch_id = Uuid::from_u128(24);
@@ -2355,7 +2355,7 @@ mod tests {
 
     #[test]
     fn catalog_reload_rejects_oversized_catalog_before_parsing() {
-        let root = std::env::temp_dir().join(format!("glacialcast-dash-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("glacialcast-stream-{}", Uuid::new_v4()));
         let stream_id = Uuid::new_v4();
         let stream_dir = root.join("streams").join(stream_id.to_string());
         std::fs::create_dir_all(&stream_dir).unwrap();
