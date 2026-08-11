@@ -11,6 +11,10 @@
 //! contents.
 
 #![deny(missing_docs)]
+#![allow(
+    dead_code,
+    reason = "legacy DASH helpers remain temporarily while native capture parity is verified"
+)]
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -38,10 +42,12 @@ use pipewire as pw;
 use pw::{properties::properties, spa};
 use rand::{RngCore, rngs::OsRng};
 use serde::Deserialize;
+#[cfg(any())]
+use std::os::fd::BorrowedFd;
 use std::{
     collections::VecDeque,
     io::{IsTerminal, Read, Write},
-    os::fd::{BorrowedFd, FromRawFd, OwnedFd, RawFd},
+    os::fd::{FromRawFd, OwnedFd, RawFd},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::PathBuf,
     ptr,
@@ -65,12 +71,16 @@ use zbus::{
 };
 
 mod dash_encoder;
+#[cfg(any())]
 mod egl_readback;
+mod native_admin;
+mod native_publish;
 
 use dash_encoder::{
     DashDmaBufFrame, DashEncoderMode, DashFrameRelease, DashH264Encoder, DashInputFrame,
     should_capture_dmabuf,
 };
+#[cfg(any())]
 use egl_readback::{DmaBufPlane, EglReadback, ReadbackLayout};
 
 const PORTAL_SOURCE_MONITOR: u32 = 1;
@@ -140,6 +150,9 @@ struct Args {
         allow_hyphen_values = true
     )]
     ingest_server_key: Option<String>,
+    /// Native relay-access publisher credential.
+    #[arg(long)]
+    native_credential: Option<PathBuf>,
     #[arg(long, allow_hyphen_values = true)]
     viewer_key: Option<String>,
     /// Viewer key as a word phrase, instead of letting one be generated.
@@ -421,18 +434,19 @@ impl PortalCursorMode {
 /// daemon-management action, clean shutdown, or a fatal configuration,
 /// capture, encoding, or transport error.
 pub fn run() -> Result<()> {
-    let args = Args::parse();
+    if native_admin::is_admin_command() {
+        return native_admin::run();
+    }
+    let mut args = Args::parse();
+    if args.no_encryption {
+        bail!("native GlacialCast streams are always end-to-end encrypted");
+    }
+    if args.print_viewer_key {
+        bail!("native viewers pair by identity; there is no shared viewer key to print");
+    }
+    args.no_viewer_key = true;
     let identity = resolve_client_identity(&args)?;
     let daemon_socket = client_daemon_socket(&args, &identity);
-
-    if args.print_viewer_key {
-        // Prints what a viewer types, which is the phrase when there is one.
-        let key = identity.viewer_key_shareable.as_deref().context(
-            "no viewer key is configured; remove --no-viewer-key to create a persistent one",
-        )?;
-        println!("{key}");
-        return Ok(());
-    }
 
     if args.list_monitors {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -463,7 +477,7 @@ pub fn run() -> Result<()> {
         .clone()
         .unwrap_or_else(|| default_log_file(&identity.client_id));
     if detach {
-        print_sharing_summary(&identity, &daemon_socket, &log_file, args.no_encryption);
+        print_sharing_summary(&identity, &daemon_socket, &log_file, false);
     }
     if daemonize_if_requested(
         detach,
@@ -504,22 +518,13 @@ fn print_sharing_summary(
     identity: &ClientIdentity,
     daemon_socket: &std::path::Path,
     log_file: &std::path::Path,
-    unencrypted: bool,
+    _unencrypted: bool,
 ) {
     println!("GlacialCast publisher \"{}\"", identity.display_name);
     if let Some(viewer_url) = &identity.viewer_url {
         println!("  viewer page  {viewer_url}");
     }
-    if unencrypted {
-        // Printing a key here would be worse than printing nothing: it reads as
-        // a secret protecting the stream, and this stream has none.
-        println!("  viewer key   (not used; this stream is published unencrypted)");
-    } else {
-        match identity.viewer_key_shareable.as_deref() {
-            Some(key) => println!("  viewer key   {key}"),
-            None => println!("  viewer key   (none configured; publishing will fail)"),
-        }
-    }
+    println!("  viewer access  identity pairing (no shared passphrase)");
     if let Some(path) = &identity.config_path {
         println!("  config       {}", path.display());
     }
@@ -528,26 +533,12 @@ fn print_sharing_summary(
     }
     println!("  log file     {}", log_file.display());
     println!("  control      {}", daemon_socket.display());
-    if let Some(link) = invite_link(identity).filter(|_| !unencrypted) {
-        println!();
-        println!("Invitation link — opens and starts playing, with nothing to type:");
-        println!("  {link}");
-    }
     println!();
-    if unencrypted {
-        println!(
-            "This stream is NOT encrypted. Anyone who can reach the relay can watch it,\n\
-             and anyone who can reach the relay's ingest port can inject frames a viewer\n\
-             cannot tell from yours. The relay can read the picture and the cursor. Use\n\
-             this only on a network you trust; the relay refuses it otherwise."
-        );
-    } else {
-        println!(
-            "Share the viewer key over a secure out-of-band channel. It is stable across\n\
-             restarts, and one key unlocks every screen this publisher casts; the relay\n\
-             cannot decrypt any of them."
-        );
-    }
+    println!(
+        "Streams are end-to-end encrypted. Run `gcpub requests`, compare the displayed\n\
+         authentication string with the viewer, then approve it; the relay never receives\n\
+         a content key. `gcpub approve-all` accepts every currently confirmed request."
+    );
 }
 
 /// Builds the one-click invitation link for this publisher's viewer key.
@@ -607,17 +598,6 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
     // the key was not used, daemonized looking healthy, and then died here --
     // in the child's log, where nobody was looking. The flag decides; a key
     // that happens to be configured is simply left unused.
-    let viewer_key = if args.no_encryption {
-        None
-    } else {
-        let encoded = identity.viewer_key_b64.as_deref().context(
-            "encrypted DASH capture requires --viewer-key or viewer_key_b64 in client.toml",
-        )?;
-        Some(decode_key_b64(encoded).context("viewer key must be URL-safe base64 for 32 bytes")?)
-    };
-    identity.ingest_server_key.as_ref().context(
-        "ingest server key is required; pass --ingest-server-key or set ingest_server_key in client.toml",
-    )?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(install_signal_handlers(shutdown_tx.clone()));
     if serve_control {
@@ -701,16 +681,13 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
                             Box::new(WaylandPipewireCapture::new(&args, target))
                         }
                     };
-                    let mut resend = DashResendBuffer::new(args.resend_bytes);
-                    run_dash_client(
+                    native_publish::run_native_client(
                         &args,
                         StreamIdentity {
                             client: &identity,
                             label: label.as_deref(),
                         },
-                        viewer_key.as_ref(),
                         capture.as_mut(),
-                        &mut resend,
                         shutdown_rx,
                     )
                     .await
@@ -6070,6 +6047,7 @@ struct DmaBufReadback {
 /// indefinitely — are served by importing the descriptor as an `EGLImage` and
 /// reading a framebuffer instead. Whichever path fails first is latched off so
 /// a permanently unsupported path is not retried once per frame.
+#[cfg(any())]
 struct GpuReadback {
     // Declared before `device` so the EGL context is torn down while the GBM
     // device it was created from is still alive.
@@ -6080,6 +6058,7 @@ struct GpuReadback {
     egl_unusable: bool,
 }
 
+#[cfg(any())]
 impl GpuReadback {
     fn new(device_path: PathBuf) -> Self {
         Self {
@@ -6370,6 +6349,31 @@ impl GpuReadback {
                 Err(err) => return Err(err).context("mapping imported DMA-BUF through GBM"),
             }
         }
+    }
+}
+
+/// CPU-only build placeholder for compositor DMA-BUFs that are not mappable.
+struct GpuReadback;
+
+impl GpuReadback {
+    fn new(_device_path: PathBuf) -> Self {
+        Self
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_dmabuf_scaled(
+        &mut self,
+        _fd: RawFd,
+        _offset: usize,
+        _width: u32,
+        _height: u32,
+        _stride: usize,
+        _video_format: spa::param::video::VideoFormat,
+        _modifier: u64,
+        _target_width: u32,
+        _target_height: u32,
+    ) -> Result<DmaBufReadback> {
+        bail!("non-mappable DMA-BUF capture requires a runtime GPU readback backend")
     }
 }
 

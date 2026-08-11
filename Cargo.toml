@@ -39,12 +39,10 @@ aes-gcm = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 chacha20poly1305 = "0.10"
 clap = { version = "4.5", features = ["derive", "env"] }
-cros-codecs = { version = "0.0.6", features = ["vaapi"] }
 ctr = "0.9"
 ed25519-dalek = "3.0"
 eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 futures-util = "0.3"
-gbm = { version = "0.15", default-features = false }
 hkdf = "0.12"
 hmac = "0.12"
 hpke = { version = "0.14", default-features = false, features = ["alloc", "chacha", "getrandom", "x25519"] }
@@ -73,11 +71,6 @@ uuid = { version = "1.10", features = ["v4", "serde"] }
 zbus = { version = "5.15", default-features = false, features = ["tokio"] }
 zvariant = "5.11"
 zeroize = { version = "1.8", features = ["derive"] }
-
-[patch.crates-io]
-# cros-libva 0.0.12 does not initialize libva 1.23's new VP9 fields. Keep
-# cros-codecs' expected API and carry the one-line forward-compatibility fix.
-cros-libva = { path = "vendor/cros-libva" }
 
 # Numeric conversions that can silently lose data, denied in the crates that
 # parse untrusted bytes and build authenticated ones. Most existing casts are

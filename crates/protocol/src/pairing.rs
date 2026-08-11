@@ -522,6 +522,33 @@ pub struct PublisherDecision {
 }
 
 impl PublisherDecision {
+    /// Signs an explicit publisher rejection for one request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the publisher does not own the request or signing fails.
+    pub fn reject(
+        publisher: &IdentitySecret,
+        request: &PairRequest,
+        decided_at_ms: i64,
+    ) -> Result<Self, PairingError> {
+        if publisher.public()? != request.body.publisher {
+            return Err(PairingError::TranscriptMismatch);
+        }
+        Self::sign(
+            publisher,
+            PublisherDecisionBody {
+                version: PAIRING_VERSION,
+                request_id: request.id()?,
+                viewer_id: request.body.viewer.id()?,
+                transcript_hash: [0; 32],
+                approved: false,
+                reason: PairDecisionReason::Rejected,
+                decided_at_ms,
+            },
+        )
+    }
+
     /// Signs a manual approval after verifying the viewer confirmation.
     ///
     /// # Errors
