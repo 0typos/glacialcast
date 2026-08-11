@@ -142,7 +142,7 @@ struct Args {
     no_config: bool,
     #[arg(long, default_value = "127.0.0.1:8900")]
     ingest_addr: String,
-    #[arg(long, allow_hyphen_values = true)]
+    #[arg(long, allow_hyphen_values = true, hide = true)]
     ingest_token: Option<String>,
     #[arg(
         long,
@@ -159,23 +159,32 @@ struct Args {
     /// Publisher key history age bound in seconds (default 24 hours).
     #[arg(long)]
     history_seconds: Option<u64>,
-    #[arg(long, allow_hyphen_values = true)]
+    #[arg(long, allow_hyphen_values = true, hide = true)]
     viewer_key: Option<String>,
     /// Viewer key as a word phrase, instead of letting one be generated.
-    #[arg(long, allow_hyphen_values = true, conflicts_with = "viewer_key")]
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        conflicts_with = "viewer_key",
+        hide = true
+    )]
     viewer_key_phrase: Option<String>,
-    #[arg(long, conflicts_with = "viewer_key")]
+    #[arg(long, conflicts_with = "viewer_key", hide = true)]
     no_viewer_key: bool,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     viewer_key_file: Option<PathBuf>,
     /// Replaces the stored viewer key with a fresh key phrase.
     ///
     /// Every key already shared for this publisher stops working.
-    #[arg(long, conflicts_with_all = ["viewer_key", "no_viewer_key"])]
+    #[arg(
+        long,
+        conflicts_with_all = ["viewer_key", "no_viewer_key"],
+        hide = true
+    )]
     new_viewer_key: bool,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     print_viewer_key: bool,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     viewer_url: Option<String>,
     #[arg(long)]
     client_id: Option<String>,
@@ -210,29 +219,12 @@ struct Args {
     #[arg(long, default_value_t = 1440)]
     max_frame_height: u32,
     /// Captured updates per second, between 0.5 and 15.
-    ///
-    /// Below about 1.25 the frame period itself reaches the roughly one-second
-    /// sample duration Firefox will not decode, so such a stream plays only in
-    /// Chromium-family browsers. The publisher warns at startup rather than
-    /// refusing, because low rates remain valid for capture validation and for
-    /// deployments that never involve Firefox.
     #[arg(long, value_parser = parse_update_rate, default_value = "5")]
     fps: f64,
     /// Longest time an unchanged picture is held before being re-sent, in
     /// seconds. Fractions are accepted.
     ///
-    /// This bounds the duration of every published media sample, and staying
-    /// under one second is what keeps Firefox decoding: samples of a second or
-    /// longer stall in the viewer there, where Chromium plays the same bytes.
-    /// Measured against identical fragments with only durations rewritten,
-    /// 0.95s played and 1.0s stalled, so the default keeps a wide margin.
-    /// Raising this above a second cuts idle bandwidth further but limits
-    /// playback to Chromium.
-    ///
-    /// The cause is not established. The same fragments play at both durations
-    /// in a standalone page, so the duration is necessary but not sufficient
-    /// and something about the viewer's page context is part of it. The default
-    /// is validated by outcome rather than by a diagnosis.
+    /// This bounds latency after an unchanged picture and limits idle traffic.
     #[arg(long, value_parser = parse_idle_heartbeat_seconds, default_value_t = 0.5)]
     idle_heartbeat_seconds: f64,
     /// Publishes without encryption, so no viewing key is needed to watch.
@@ -246,7 +238,7 @@ struct Args {
     /// WebKit offers only FairPlay, never the Clear Key scheme this uses, so an
     /// iPhone or iPad has no way to decrypt one. Unencrypted is the only form
     /// they can play.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     no_encryption: bool,
     #[arg(long, default_value_t = 60)]
     cursor_hz: u64,
@@ -254,7 +246,7 @@ struct Args {
     cursor_flush_ms: u64,
     #[arg(long, default_value_t = 2_500_000)]
     video_bitrate: u32,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     segment_frames: Option<u16>,
     #[arg(long = "encoder", alias = "dash-encoder", value_enum, default_value_t = DashEncoderMode::Auto)]
     encoder: DashEncoderMode,
@@ -262,7 +254,12 @@ struct Args {
     vaapi_device: PathBuf,
     #[arg(long)]
     openh264_library: Option<PathBuf>,
-    #[arg(long, value_parser = parse_human_bytes, default_value = "128MiB")]
+    #[arg(
+        long,
+        value_parser = parse_human_bytes,
+        default_value = "128MiB",
+        hide = true
+    )]
     resend_bytes: u64,
     #[arg(long)]
     foreground: bool,
