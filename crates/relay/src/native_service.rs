@@ -956,10 +956,14 @@ mod tests {
     use super::*;
     use glacialcast_protocol::{
         credential::CertificateAuthoritySecret,
+        envelope::KeyEnvelope,
         generate_noise_keypair,
         identity::IdentitySecret,
         initiator_handshake_xx,
-        native::{CodecId, GroupEncryptor, NativeObjectKind, NewNativeObject, StreamDescriptor},
+        native::{
+            CodecId, ContentKey, GroupEncryptor, H264EpochPayload, NativeObjectKind,
+            NewNativeObject, StreamDescriptor,
+        },
         pairing::{PairOffer, PairRequest, PublisherDecision, ViewerConfirmation},
         wire::RelayAccessMode,
     };
@@ -1469,6 +1473,208 @@ mod tests {
                 .await
                 .unwrap(),
             RelayViewerMessage::InboxComplete
+        );
+
+        let stream_id = Uuid::new_v4();
+        let epoch_id = Uuid::new_v4();
+        let descriptor = StreamDescriptor::new(
+            &publisher,
+            stream_id,
+            "end-to-end".into(),
+            "test".into(),
+            false,
+            now,
+        )
+        .unwrap();
+        publisher_connection
+            .write(&PublisherMessage::Descriptor(descriptor))
+            .await
+            .unwrap();
+        let mut first_group =
+            GroupEncryptor::generate(&publisher.public().unwrap(), stream_id, epoch_id, 1, 0)
+                .unwrap();
+        let epoch_payload = H264EpochPayload {
+            width: 16,
+            height: 16,
+            codec_config: vec![0, 0, 0, 1, 0x67, 1],
+        }
+        .encode()
+        .unwrap();
+        let epoch_object = first_group
+            .seal(
+                &publisher,
+                NewNativeObject {
+                    sequence: 1,
+                    timestamp: 0,
+                    duration: 1,
+                    kind: NativeObjectKind::Epoch,
+                    random_access: true,
+                    codec: Some(CodecId::H264AnnexB),
+                },
+                &epoch_payload,
+            )
+            .unwrap();
+        let media_plaintext = vec![0, 0, 0, 1, 0x65, 9, 8, 7];
+        let media_object = first_group
+            .seal(
+                &publisher,
+                NewNativeObject {
+                    sequence: 2,
+                    timestamp: 0,
+                    duration: 45_000,
+                    kind: NativeObjectKind::Media,
+                    random_access: true,
+                    codec: Some(CodecId::H264AnnexB),
+                },
+                &media_plaintext,
+            )
+            .unwrap();
+        let mut second_group =
+            GroupEncryptor::generate(&publisher.public().unwrap(), stream_id, epoch_id, 2, 2)
+                .unwrap();
+        let second_epoch = second_group
+            .seal(
+                &publisher,
+                NewNativeObject {
+                    sequence: 3,
+                    timestamp: 45_000,
+                    duration: 1,
+                    kind: NativeObjectKind::Epoch,
+                    random_access: true,
+                    codec: Some(CodecId::H264AnnexB),
+                },
+                &epoch_payload,
+            )
+            .unwrap();
+        for object in [epoch_object.clone(), media_object.clone(), second_epoch] {
+            let sequence = object.header.sequence;
+            publisher_connection
+                .write(&PublisherMessage::Object(object))
+                .await
+                .unwrap();
+            assert!(matches!(
+                publisher_connection
+                    .read::<RelayPublisherMessage>()
+                    .await
+                    .unwrap(),
+                RelayPublisherMessage::PublishAck { committed_through, .. }
+                    if committed_through == sequence
+            ));
+        }
+        let first_envelope = KeyEnvelope::seal(
+            &publisher,
+            &viewer.public().unwrap(),
+            stream_id,
+            epoch_id,
+            1,
+            first_group.key_id(),
+            &first_group.content_key(),
+        )
+        .unwrap();
+        publisher_connection
+            .write(&PublisherMessage::KeyEnvelope(first_envelope.clone()))
+            .await
+            .unwrap();
+        publisher_connection
+            .write(&PublisherMessage::Ping { now_ms: now })
+            .await
+            .unwrap();
+        assert!(matches!(
+            publisher_connection
+                .read::<RelayPublisherMessage>()
+                .await
+                .unwrap(),
+            RelayPublisherMessage::Pong { .. }
+        ));
+
+        viewer_connection
+            .write(&ViewerMessage::FetchInbox)
+            .await
+            .unwrap();
+        assert!(matches!(
+            viewer_connection
+                .read::<RelayViewerMessage>()
+                .await
+                .unwrap(),
+            RelayViewerMessage::PairOffer(_)
+        ));
+        assert!(matches!(
+            viewer_connection
+                .read::<RelayViewerMessage>()
+                .await
+                .unwrap(),
+            RelayViewerMessage::PairDecision(_)
+        ));
+        let RelayViewerMessage::KeyEnvelope(delivered_envelope) = viewer_connection
+            .read::<RelayViewerMessage>()
+            .await
+            .unwrap()
+        else {
+            panic!("expected viewer key envelope");
+        };
+        assert_eq!(delivered_envelope, first_envelope);
+        let content_key = delivered_envelope
+            .open(&viewer, &publisher.public().unwrap())
+            .unwrap();
+        assert_eq!(content_key, first_group.content_key());
+        assert_eq!(
+            viewer_connection
+                .read::<RelayViewerMessage>()
+                .await
+                .unwrap(),
+            RelayViewerMessage::InboxComplete
+        );
+        viewer_connection
+            .write(&ViewerMessage::Subscribe {
+                publisher_id: publisher.public().unwrap().id().unwrap(),
+                stream_id,
+                start: SubscriptionStart::OldestRetained,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            viewer_connection
+                .read::<RelayViewerMessage>()
+                .await
+                .unwrap(),
+            RelayViewerMessage::SubscriptionStarted {
+                first_sequence: 1,
+                ..
+            }
+        ));
+        let RelayViewerMessage::Object(delivered_epoch) = viewer_connection
+            .read::<RelayViewerMessage>()
+            .await
+            .unwrap()
+        else {
+            panic!("expected retained epoch");
+        };
+        assert_eq!(
+            delivered_epoch
+                .open(
+                    &publisher.public().unwrap(),
+                    &ContentKey::from_bytes(content_key).unwrap(),
+                    &first_group.key_id(),
+                )
+                .unwrap(),
+            epoch_payload
+        );
+        let RelayViewerMessage::Object(delivered_media) = viewer_connection
+            .read::<RelayViewerMessage>()
+            .await
+            .unwrap()
+        else {
+            panic!("expected retained media");
+        };
+        assert_eq!(
+            delivered_media
+                .open(
+                    &publisher.public().unwrap(),
+                    &ContentKey::from_bytes(content_key).unwrap(),
+                    &first_group.key_id(),
+                )
+                .unwrap(),
+            media_plaintext
         );
         drop(viewer_connection);
         drop(publisher_connection);

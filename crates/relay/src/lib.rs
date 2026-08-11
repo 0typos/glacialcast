@@ -10,6 +10,7 @@
 
 mod dash_store;
 pub mod native_access;
+pub mod native_pki;
 pub mod native_runtime;
 pub mod native_service;
 pub mod native_store;

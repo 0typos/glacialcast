@@ -122,6 +122,9 @@ enum AccessConfig {
 /// Returns an error for invalid configuration, unsafe state, listener failure,
 /// or a failed native service task.
 pub fn run() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("pki") {
+        return crate::native_pki::run();
+    }
     let args = Args::parse();
     tracing_subscriber::fmt()
         .with_env_filter(

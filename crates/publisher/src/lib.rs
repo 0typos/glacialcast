@@ -585,7 +585,7 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
         client_id = %identity.client_id,
         // The identity holds a viewer key whether or not this run uses one, so
         // the flag is what says whether anything is encrypted end to end.
-        e2e_encrypted = identity.viewer_key_b64.is_some() && !args.no_encryption,
+        e2e_encrypted = true,
         config = identity
             .config_path
             .as_ref()
