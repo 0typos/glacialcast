@@ -28,8 +28,13 @@ use uuid::Uuid;
 
 /// Helpers shared by the client and server daemon-control implementations.
 pub mod config_path;
+pub mod credential;
 pub mod daemon;
+pub mod envelope;
+pub mod identity;
+pub mod private_state;
 pub mod transfer;
+pub mod trust;
 pub mod viewer_key;
 
 /// Publisher/relay message schema version.
