@@ -38,7 +38,7 @@ aes-gcm = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 chacha20poly1305 = "0.10"
 clap = { version = "4.5", features = ["derive", "env"] }
-ctr = "0.9"
+ctr = "0.10"
 ed25519-dalek = "3.0"
 eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 futures-util = "0.3"
