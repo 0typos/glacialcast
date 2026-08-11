@@ -145,6 +145,8 @@ pub enum PublisherMessage {
     PairOffer(PairOffer),
     /// Deliver the publisher's final signed pairing decision.
     PairDecision(PublisherDecision),
+    /// Fetch queued viewer requests and confirmations for this publisher.
+    FetchPairingInbox,
     /// Keepalive carrying sender wall clock.
     Ping {
         /// Unix milliseconds.
@@ -184,7 +186,7 @@ impl PublisherMessage {
                 .map_err(|_| WireError::Invalid("invalid key envelope")),
             Self::PairOffer(offer) => validate_offer_shape(offer),
             Self::PairDecision(decision) => validate_decision_shape(decision),
-            Self::Ping { .. } => Ok(()),
+            Self::FetchPairingInbox | Self::Ping { .. } => Ok(()),
         }
     }
 }
@@ -214,6 +216,13 @@ pub enum RelayPublisherMessage {
     },
     /// Viewer yes confirmation for a pending manual ceremony.
     ViewerConfirmation(ViewerConfirmation),
+    /// Durable acknowledgement for a publisher pairing record.
+    PairingAck {
+        /// Request affected by the accepted offer or decision.
+        request_id: [u8; 32],
+    },
+    /// Marks the end of the currently queued publisher pairing inbox.
+    PairingInboxComplete,
     /// Stable relay failure.
     Error(RelayError),
     /// Keepalive reply.
@@ -246,8 +255,14 @@ impl RelayPublisherMessage {
                 .map(|_| ())
                 .map_err(|_| WireError::Invalid("invalid pairing request")),
             Self::ViewerConfirmation(confirmation) => validate_confirmation_shape(confirmation),
+            Self::PairingAck { request_id } if *request_id == [0; 32] => {
+                Err(WireError::Invalid("invalid pairing acknowledgement"))
+            }
             Self::Error(error) => error.validate(),
-            Self::PublishAck { .. } | Self::Pong { .. } => Ok(()),
+            Self::PublishAck { .. }
+            | Self::PairingAck { .. }
+            | Self::PairingInboxComplete
+            | Self::Pong { .. } => Ok(()),
         }
     }
 }
@@ -378,6 +393,13 @@ pub enum RelayViewerMessage {
     PairDecision(PublisherDecision),
     /// Viewer-addressed content-key envelope.
     KeyEnvelope(KeyEnvelope),
+    /// Durable acknowledgement that a viewer pairing record was queued.
+    PairingQueued {
+        /// Request affected by the accepted request or confirmation.
+        request_id: [u8; 32],
+    },
+    /// Marks the end of offers, decisions, and envelopes currently queued.
+    InboxComplete,
     /// Subscription anchor and current retained range.
     SubscriptionStarted {
         /// First sequence the relay will send.
@@ -429,6 +451,9 @@ impl RelayViewerMessage {
             Self::KeyEnvelope(envelope) => envelope
                 .validate_shape()
                 .map_err(|_| WireError::Invalid("invalid key envelope")),
+            Self::PairingQueued { request_id } if *request_id == [0; 32] => {
+                Err(WireError::Invalid("invalid queued pairing request ID"))
+            }
             Self::SubscriptionStarted {
                 first_sequence,
                 retained,
@@ -449,7 +474,10 @@ impl RelayViewerMessage {
                 Err(WireError::Invalid("invalid live-tail sequence"))
             }
             Self::Error(error) => error.validate(),
-            Self::Live { .. } | Self::Pong { .. } => Ok(()),
+            Self::PairingQueued { .. }
+            | Self::InboxComplete
+            | Self::Live { .. }
+            | Self::Pong { .. } => Ok(()),
         }
     }
 }

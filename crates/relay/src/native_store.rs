@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use glacialcast_protocol::{
     envelope::KeyEnvelope,
     native::{NativeObject, NativeObjectKind, StreamDescriptor},
+    wire::SubscriptionStart,
 };
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
@@ -672,6 +673,74 @@ impl NativeStore {
     pub fn retained_bounds(&self, stream_id: Uuid) -> Result<Option<NativeRetainedBounds>> {
         let connection = self.connection()?;
         retained_bounds_in_connection(&connection, stream_id)
+    }
+
+    /// Resolves a subscription request to a keyframe-group sequence boundary.
+    ///
+    /// Live starts after the current high-water mark. Explicit sequence/time
+    /// starts select the containing or immediately preceding group, falling
+    /// back to the oldest complete retained group. If no retained group exists,
+    /// the result is the next live sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a missing stream, database corruption, numeric
+    /// overflow, or query failure.
+    pub fn subscription_anchor(&self, stream_id: Uuid, start: SubscriptionStart) -> Result<u64> {
+        let connection = self.connection()?;
+        let high_water: i64 = connection
+            .query_row(
+                "SELECT high_water FROM streams WHERE stream_id = ?1",
+                params![uuid_bytes(stream_id).as_slice()],
+                |row| row.get(0),
+            )
+            .context("subscription stream does not exist")?;
+        let next_live = from_sql_u64(high_water, "subscription high-water")?
+            .checked_add(1)
+            .context("native sequence space exhausted")?;
+        if start == SubscriptionStart::Live {
+            return Ok(next_live);
+        }
+        let selected: Option<i64> = match start {
+            SubscriptionStart::Live => unreachable!("live returned above"),
+            SubscriptionStart::OldestRetained => connection
+                .query_row(
+                    "SELECT first_sequence FROM groups WHERE stream_id = ?1 AND complete = 1 \
+                     ORDER BY first_sequence LIMIT 1",
+                    params![uuid_bytes(stream_id).as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("finding oldest retained group")?,
+            SubscriptionStart::Sequence(sequence) => connection
+                .query_row(
+                    "SELECT first_sequence FROM groups WHERE stream_id = ?1 AND first_sequence <= ?2 \
+                     ORDER BY first_sequence DESC LIMIT 1",
+                    params![
+                        uuid_bytes(stream_id).as_slice(),
+                        to_sql_u64(sequence, "subscription sequence")?
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("finding sequence subscription group")?,
+            SubscriptionStart::Timestamp(timestamp) => connection
+                .query_row(
+                    "SELECT first_sequence FROM groups WHERE stream_id = ?1 AND first_timestamp <= ?2 \
+                     ORDER BY first_timestamp DESC, first_sequence DESC LIMIT 1",
+                    params![
+                        uuid_bytes(stream_id).as_slice(),
+                        to_sql_u64(timestamp, "subscription timestamp")?
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("finding timestamp subscription group")?,
+        };
+        match selected {
+            Some(sequence) => from_sql_u64(sequence, "subscription anchor"),
+            None => Ok(next_live),
+        }
     }
 
     /// Returns summaries for every native stream ordered by stream ID.
