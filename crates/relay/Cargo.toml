@@ -21,8 +21,8 @@ tokio-rustls.workspace = true
 base64.workspace = true
 clap.workspace = true
 futures-util.workspace = true
-glacialcast-stream = { path = "../stream", version = "0.5.0" }
-glacialcast-protocol = { path = "../protocol", version = "0.5.0" }
+glacialcast-stream = { path = "../stream", version = "0.6.0" }
+glacialcast-protocol = { path = "../protocol", version = "0.6.0" }
 hmac.workspace = true
 libc.workspace = true
 rand.workspace = true

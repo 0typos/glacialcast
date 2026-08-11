@@ -163,6 +163,30 @@ impl fmt::Debug for IdentitySecret {
 }
 
 impl IdentitySecret {
+    /// Imports separate Ed25519 and X25519 private keys from secure state.
+    ///
+    /// Callers must obtain these bytes from a private authenticated source;
+    /// this function performs structural validation but cannot establish their
+    /// provenance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for all-zero or malformed key material.
+    pub fn from_private_bytes(
+        signing_secret: [u8; IDENTITY_KEY_LEN],
+        kem_secret: [u8; IDENTITY_KEY_LEN],
+    ) -> Result<Self, IdentityError> {
+        if signing_secret == [0; IDENTITY_KEY_LEN] || kem_secret == [0; IDENTITY_KEY_LEN] {
+            return Err(IdentityError::InvalidKey);
+        }
+        let identity = Self {
+            signing_secret,
+            kem_secret,
+        };
+        identity.public()?;
+        Ok(identity)
+    }
+
     /// Generates independent random Ed25519 signing and X25519 HPKE keys.
     #[must_use]
     pub fn generate() -> Self {
@@ -253,12 +277,7 @@ impl IdentitySecret {
         {
             return Err(IdentityError::InvalidKey);
         }
-        let identity = Self {
-            signing_secret: stored.signing_secret,
-            kem_secret: stored.kem_secret,
-        };
-        identity.public()?;
-        Ok(identity)
+        Self::from_private_bytes(stored.signing_secret, stored.kem_secret)
     }
 }
 

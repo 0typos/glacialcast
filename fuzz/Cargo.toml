@@ -55,5 +55,26 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "native_wire"
+path = "fuzz_targets/native_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pair_request"
+path = "fuzz_targets/pair_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h264_epoch"
+path = "fuzz_targets/h264_epoch.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]
