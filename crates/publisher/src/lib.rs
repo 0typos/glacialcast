@@ -659,10 +659,8 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
         "publishing capture targets"
     );
 
-    // Each target runs on its own thread with its own current-thread runtime.
-    // The VA-API encoder holds thread-affine handles and is deliberately not
-    // `Send`, and giving every stream its own encoder thread also keeps one
-    // slow encode from delaying another output's cadence.
+    // Each target runs on its own thread. Giving every stream its own encoder
+    // worker keeps one slow encode from delaying another output's cadence.
     let args = Arc::new(args);
     let identity = Arc::new(identity);
     let mut publishers = Vec::new();
@@ -670,7 +668,6 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
         let args = Arc::clone(&args);
         let identity = Arc::clone(&identity);
         let shutdown_rx = shutdown_rx.clone();
-        let shutdown_tx = shutdown_tx.clone();
         let name = target
             .label
             .clone()
@@ -699,35 +696,50 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
                     .build()
                     .context("building publisher runtime")?;
                 let label = target.label.clone();
-                let result = runtime.block_on(async {
-                    let mut capture: Box<dyn Capture> = match args.capture {
-                        CaptureMode::Test => Box::new(TestPatternCapture::new(
-                            args.width,
-                            args.height,
-                            args.test_pattern,
-                        )),
-                        CaptureMode::Wayland => {
-                            Box::new(WaylandPipewireCapture::new(&args, target))
-                        }
-                    };
-                    native_publish::run_native_client(
+                let mut capture: Box<dyn Capture> = match args.capture {
+                    CaptureMode::Test => Box::new(TestPatternCapture::new(
+                        args.width,
+                        args.height,
+                        args.test_pattern,
+                    )),
+                    CaptureMode::Wayland => Box::new(WaylandPipewireCapture::new(&args, target)),
+                };
+                let mut reconnect_attempt = 0u32;
+                loop {
+                    let result = runtime.block_on(native_publish::run_native_client(
                         &args,
                         StreamIdentity {
                             client: &identity,
                             label: label.as_deref(),
                         },
                         capture.as_mut(),
-                        shutdown_rx,
-                    )
-                    .await
-                });
-                // A fatal error on one output must stop the whole publisher
-                // rather than leave a daemon serving only some of the screens
-                // the operator asked for.
-                if result.is_err() {
-                    let _ = shutdown_tx.send(true);
+                        shutdown_rx.clone(),
+                    ));
+                    match result {
+                        Ok(()) => break Ok(()),
+                        Err(_) if *shutdown_rx.borrow() => break Ok(()),
+                        Err(error) => {
+                            let delay = reconnect_delay(reconnect_attempt);
+                            reconnect_attempt = reconnect_attempt.saturating_add(1);
+                            warn!(
+                                stream = %name,
+                                error = %format!("{error:#}"),
+                                retry_ms = delay.as_millis(),
+                                "native publication disconnected; retrying with a fresh epoch"
+                            );
+                            let stopped = runtime.block_on(async {
+                                let mut retry_shutdown = shutdown_rx.clone();
+                                tokio::select! {
+                                    _ = tokio::time::sleep(delay) => false,
+                                    _ = retry_shutdown.changed() => true,
+                                }
+                            });
+                            if stopped {
+                                break Ok(());
+                            }
+                        }
+                    }
                 }
-                result.with_context(|| format!("publishing capture target {name}"))
             })
             .context("spawning publisher thread")?;
         publishers.push(handle);
@@ -758,6 +770,10 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
         Some(err) => Err(err),
         None => Ok(()),
     }
+}
+
+fn reconnect_delay(attempt: u32) -> Duration {
+    Duration::from_millis(250u64.saturating_mul(1u64 << attempt.min(5)))
 }
 
 /// One capture source this process publishes as its own stream.
@@ -7229,6 +7245,13 @@ fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_reconnect_backoff_is_fast_then_bounded() {
+        assert_eq!(reconnect_delay(0), Duration::from_millis(250));
+        assert_eq!(reconnect_delay(5), Duration::from_secs(8));
+        assert_eq!(reconnect_delay(u32::MAX), Duration::from_secs(8));
+    }
 
     fn invite_identity(viewer_url: Option<&str>, key: Option<&str>) -> ClientIdentity {
         ClientIdentity {
