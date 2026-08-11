@@ -153,6 +153,12 @@ struct Args {
     /// Native relay-access publisher credential.
     #[arg(long)]
     native_credential: Option<PathBuf>,
+    /// Publisher key history size bound (default `100MiB`).
+    #[arg(long, value_parser = parse_human_bytes)]
+    history_bytes: Option<u64>,
+    /// Publisher key history age bound in seconds (default 24 hours).
+    #[arg(long)]
+    history_seconds: Option<u64>,
     #[arg(long, allow_hyphen_values = true)]
     viewer_key: Option<String>,
     /// Viewer key as a word phrase, instead of letting one be generated.
@@ -315,6 +321,10 @@ struct ClientConfig {
     viewer_url: Option<String>,
     /// Publishes every connected output rather than the primary one.
     all_monitors: Option<bool>,
+    /// Maximum encoded content whose group keys remain available to newly approved viewers.
+    history_bytes: Option<u64>,
+    /// Maximum age in seconds of group keys offered to newly approved viewers.
+    history_seconds: Option<u64>,
 }
 
 /// Salt used when a phrase is supplied but no key file is kept.
@@ -438,6 +448,25 @@ pub fn run() -> Result<()> {
         return native_admin::run();
     }
     let mut args = Args::parse();
+    let config_source = if args.no_config {
+        ConfigSource::Defaults
+    } else {
+        config_path::resolve(args.config.clone(), "client.toml")
+    };
+    let config = load_client_config_from(&config_source)?;
+    args.history_bytes = Some(
+        args.history_bytes
+            .or(config.history_bytes)
+            .unwrap_or(100 * 1024 * 1024),
+    );
+    args.history_seconds = Some(
+        args.history_seconds
+            .or(config.history_seconds)
+            .unwrap_or(24 * 60 * 60),
+    );
+    if args.history_bytes == Some(0) || args.history_seconds == Some(0) {
+        bail!("history byte and time limits must be positive");
+    }
     if args.no_encryption {
         bail!("native GlacialCast streams are always end-to-end encrypted");
     }
