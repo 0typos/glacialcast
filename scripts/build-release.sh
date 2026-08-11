@@ -39,8 +39,8 @@ mkdir -p \
   "${dist_dir}"
 cp -a \
   "${target_dir}/release/gcpub" \
-  "${target_dir}/release/glacialcast-offline" \
   "${target_dir}/release/gcrelay" \
+  "${target_dir}/release/gcview" \
   "${bundle_root}/bin/"
 cp -a deploy/. "${bundle_root}/deploy/"
 cp -a \

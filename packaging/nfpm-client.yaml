@@ -1,4 +1,4 @@
-# Publisher package: the process that captures a Wayland screen.
+# Native publisher and viewer package.
 #
 # This one genuinely needs a graphics stack. The dependency lists below are the
 # libraries `ldd` reports against the built binary, named per distribution;
@@ -18,8 +18,8 @@ maintainer: typo <https://github.com/0typos>
 description: |
   End-to-end-encrypted low-bandwidth Wayland screen publisher.
   Captures a monitor through the XDG Desktop Portal and PipeWire, encodes
-  H.264, and publishes CENC-encrypted fragmented MP4 with an independent cursor
-  overlay. The relay it publishes to cannot decrypt the stream.
+  H.264 Annex-B, and publishes end-to-end encrypted native objects. Includes
+  the gcview multi-stream Wayland/X11 viewer.
 vendor: typo
 homepage: https://github.com/0typos/glacialcast
 license: MIT
@@ -27,6 +27,10 @@ license: MIT
 contents:
   - src: ./target/release/gcpub
     dst: /usr/bin/gcpub
+    file_info:
+      mode: 0755
+  - src: ./target/release/gcview
+    dst: /usr/bin/gcview
     file_info:
       mode: 0755
   # A user unit, not a system one: the publisher captures a logged-in graphical
@@ -54,29 +58,18 @@ overrides:
       # rather than installing something that cannot start.
       - ${GLACIALCAST_LIBC_DEB}
       - libpipewire-0.3-0
-      - libva2
-      - libva-drm2
-      - libgbm1
-      - libdrm2
       - libexpat1
     recommends:
-      # dlopen'd: the software encoder fallback and the EGL readback path.
+      # OpenH264 is used by both publication and playback.
       - libopenh264-7
-      - libegl1
-      - libgles2
       - xdg-desktop-portal
   rpm:
     depends:
       - ${GLACIALCAST_LIBC_RPM}
       - pipewire-libs
-      - libva
-      - mesa-libgbm
-      - libdrm
       - expat
     recommends:
       - openh264
-      - mesa-libEGL
-      - mesa-libGLES
       - xdg-desktop-portal
 
 rpm:

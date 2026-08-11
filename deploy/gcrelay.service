@@ -9,7 +9,7 @@ Type=simple
 User=glacialcast
 Group=glacialcast
 UMask=0077
-Environment=RUST_LOG=glacialcast_relay=info,tower_http=info
+Environment=RUST_LOG=glacialcast_relay=info
 
 # systemd creates and owns both directories, so installing this unit needs no
 # mkdir and no chown. %S is the state root, which is /var/lib for a system unit.
@@ -18,7 +18,7 @@ ConfigurationDirectoryMode=0750
 StateDirectory=glacialcast
 StateDirectoryMode=0700
 
-# No --config here on purpose: the relay finds /etc/glacialcast/server.toml by
+# No --config here on purpose: the relay finds /etc/glacialcast/relay.toml by
 # itself. Point it somewhere else without editing this unit by dropping in
 #   [Service]
 #   Environment=GLACIALCAST_CONFIG=/somewhere/else.toml
@@ -28,11 +28,11 @@ StateDirectoryMode=0700
 # explicitly that is not there fails startup rather than falling back to
 # defaults, which would quietly mean a relay with no ingest tokens.
 ExecStart=/usr/local/bin/gcrelay \
-    --control-addr 127.0.0.1:8899 \
-    --ingest-addr 0.0.0.0:8900 \
+    --viewer-addr 0.0.0.0:8899 \
+    --publisher-addr 0.0.0.0:8900 \
     --data-dir %S/glacialcast \
-    --retention-bytes-per-stream 512MiB \
-    --retention-seconds 1800
+    --retention-bytes 100MiB \
+    --retention-seconds 86400
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s

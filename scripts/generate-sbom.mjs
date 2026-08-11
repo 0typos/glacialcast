@@ -39,10 +39,6 @@ const packageIds = new Map(
 );
 const nativePackages = [
   ['SPDXRef-Native-PipeWire', 'PipeWire'],
-  ['SPDXRef-Native-libgbm', 'libgbm'],
-  ['SPDXRef-Native-libva', 'libva'],
-  ['SPDXRef-Native-libEGL', 'libEGL'],
-  ['SPDXRef-Native-libGLESv2', 'libGLESv2'],
   ['SPDXRef-Native-OpenH264', 'OpenH264'],
 ].map(([SPDXID, name]) => ({
   SPDXID,
@@ -99,6 +95,13 @@ for (const dependency of nativePackages) {
     relatedSpdxElement: dependency.SPDXID,
   });
 }
+const viewer = metadata.packages.find(pkg => pkg.name === 'gcview');
+if (!viewer) throw new Error('workspace does not contain gcview');
+relationships.push({
+  spdxElementId: packageIds.get(viewer.id),
+  relationshipType: 'DEPENDS_ON',
+  relatedSpdxElement: 'SPDXRef-Native-OpenH264',
+});
 
 const document = {
   spdxVersion: 'SPDX-2.3',
