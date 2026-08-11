@@ -9,7 +9,10 @@
 #![deny(missing_docs)]
 
 mod dash_store;
+pub mod native_access;
+pub mod native_service;
 pub mod native_store;
+pub mod pairing_store;
 mod security;
 mod storage;
 mod tls;
