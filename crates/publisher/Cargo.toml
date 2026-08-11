@@ -1,11 +1,15 @@
 [package]
-name = "glacialcast-client"
+name = "gcpub"
 edition.workspace = true
 description = "Wayland screen capture publisher: portal/PipeWire capture, H.264 encoding, and encrypted ingest."
 license.workspace = true
 repository.workspace = true
 publish = false
 version.workspace = true
+
+[lib]
+name = "glacialcast_publisher"
+path = "src/lib.rs"
 
 [dependencies]
 anyhow.workspace = true
@@ -15,7 +19,7 @@ clap.workspace = true
 cros-codecs.workspace = true
 futures-util.workspace = true
 gbm.workspace = true
-glacialcast-dash = { path = "../dash", version = "0.5.0" }
+glacialcast-stream = { path = "../stream", version = "0.5.0" }
 glacialcast-protocol = { path = "../protocol", version = "0.5.0" }
 image.workspace = true
 libc.workspace = true
@@ -32,3 +36,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 zbus.workspace = true
 zvariant.workspace = true
+
+[[bin]]
+name = "gcpub"
+path = "src/main.rs"

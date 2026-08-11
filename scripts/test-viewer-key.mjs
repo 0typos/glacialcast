@@ -10,7 +10,7 @@ import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const viewerKey = require('../crates/server/static/viewer-key.js');
+const viewerKey = require('../crates/relay/static/viewer-key.js');
 
 let failures = 0;
 async function test(name, body) {

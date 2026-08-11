@@ -236,7 +236,7 @@ printf '%s\n' \
   >"$demo_dir/server.toml"
 
 server_key="$(
-  target/release/glacialcast-server \
+  target/release/gcrelay \
     --config "$demo_dir/server.toml" \
     --data-dir "$demo_dir/data" \
     --print-ingest-server-key
@@ -263,7 +263,7 @@ demo_dir=/tmp/glacialcast-demo.REPLACE_ME
 ### Terminal A: start the relay
 
 ```sh
-target/release/glacialcast-server \
+target/release/gcrelay \
   --config "$demo_dir/server.toml" \
   --control-addr 127.0.0.1:8899 \
   --ingest-addr 127.0.0.1:8900 \
@@ -284,7 +284,7 @@ Both should return a success status and a short text response.
 ### Terminal B: publish the deterministic demo
 
 ```sh
-target/release/glacialcast-client \
+target/release/gcpub \
   --config "$demo_dir/client.toml" \
   --ingest-addr 127.0.0.1:8900 \
   --foreground \
@@ -337,7 +337,7 @@ Start the relay as in Terminal A. In Terminal B, run this from the target
 graphical user session:
 
 ```sh
-target/release/glacialcast-client \
+target/release/gcpub \
   --config "$demo_dir/client.toml" \
   --ingest-addr 127.0.0.1:8900 \
   --capture dash-wayland \
@@ -360,7 +360,7 @@ The publisher detaches after printing its viewer key, so this terminal returns
 immediately. Follow its progress in the printed log file, and stop it with:
 
 ```sh
-target/release/glacialcast-client --config "$demo_dir/client.toml" --daemon-stop
+target/release/gcpub --config "$demo_dir/client.toml" --daemon-stop
 ```
 
 Run the deterministic application-traffic matrix separately:

@@ -7,7 +7,7 @@ cd "${repo_root}"
 version="$(
   cargo metadata --locked --no-deps --format-version 1 \
     | node -e \
-      "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const m=JSON.parse(s);process.stdout.write(m.packages.find(p=>p.name==='glacialcast-server').version)})"
+      "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const m=JSON.parse(s);process.stdout.write(m.packages.find(p=>p.name==='gcrelay').version)})"
 )"
 revision="$(git rev-parse HEAD 2>/dev/null || printf 'uncommitted')"
 if [[ -n "$(git status --porcelain=v1 --untracked-files=normal 2>/dev/null)" ]]; then
@@ -52,7 +52,7 @@ tar -xzf "${archive}" -C "${extract_dir}"
 bundle_root="$(find "${extract_dir}" -mindepth 1 -maxdepth 1 -type d -print -quit)"
 [[ -n "${bundle_root}" ]]
 
-for binary in glacialcast-client glacialcast-offline glacialcast-server; do
+for binary in gcpub glacialcast-offline gcrelay; do
   actual="$("${bundle_root}/bin/${binary}" --version)"
   [[ "${actual}" == "${binary} ${version}" ]] || {
     echo "${binary} reported ${actual@Q}, expected version ${version}" >&2
@@ -66,7 +66,7 @@ const document = JSON.parse(fs.readFileSync(process.argv[2]));
 const version = process.argv[3];
 const revision = process.argv[4];
 if (document.spdxVersion !== 'SPDX-2.3') throw new Error('unexpected SPDX version');
-for (const name of ['glacialcast-client', 'glacialcast-offline', 'glacialcast-server']) {
+for (const name of ['gcpub', 'glacialcast-offline', 'gcrelay']) {
   if (!document.packages.some(pkg => pkg.name === name && pkg.versionInfo === version)) {
     throw new Error(`SBOM is missing ${name}`);
   }
@@ -88,7 +88,7 @@ for expected in \
   LICENSE \
   README.md \
   SBOM.spdx.json \
-  deploy/glacialcast-server.service \
+  deploy/gcrelay.service \
   docs/release-operations.md; do
   [[ -f "${bundle_root}/${expected}" ]] || {
     echo "release archive is missing ${expected}" >&2

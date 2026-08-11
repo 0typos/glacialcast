@@ -22,7 +22,7 @@
 # Delete this line entirely to have a private one generated on first start and
 # kept in $XDG_STATE_HOME/glacialcast/viewer-<client_id>.key. That is the right
 # choice for anything real. Read it back at any time with:
-#   glacialcast-client --print-viewer-key
+#   gcpub --print-viewer-key
 viewer_key_phrase = "demo-only-weak-amend-now-open-free"
 
 # Durable identity for this publisher. The relay recovers the same stream after
@@ -47,7 +47,7 @@ all_monitors = true
 # ingest_token = "replace-with-the-token-the-relay-was-given"
 
 # The relay's public Noise key, printed by:
-#   sudo -u glacialcast glacialcast-server --print-ingest-server-key
+#   sudo -u glacialcast gcrelay --print-ingest-server-key
 # Pinning it is what stops a substituted relay from accepting this publisher,
 # so it is worth copying accurately.
 # ingest_server_key = "replace-with-the-key-the-relay-printed"

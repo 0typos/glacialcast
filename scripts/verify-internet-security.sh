@@ -77,10 +77,10 @@ role = "viewer"
 publishers = ["another-client"]
 TOML
 
-cargo build -p glacialcast-server -p glacialcast-client -p glacialcast-offline
+cargo build -p gcrelay -p gcpub -p glacialcast-offline
 
 ingest_server_key="$(
-  target/debug/glacialcast-server \
+  target/debug/gcrelay \
     --config "${work_dir}/server.toml" \
     --control-addr "${control_addr}" \
     --ingest-addr "${ingest_addr}" \
@@ -88,7 +88,7 @@ ingest_server_key="$(
     --print-ingest-server-key
 )"
 
-target/debug/glacialcast-server \
+target/debug/gcrelay \
   --config "${work_dir}/server.toml" \
   --control-addr "${control_addr}" \
   --ingest-addr "${ingest_addr}" \
@@ -234,7 +234,7 @@ status="$(
 }
 
 viewer_key="$(node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))")"
-RUST_LOG=glacialcast_client=info target/debug/glacialcast-client \
+RUST_LOG=glacialcast_publisher=info target/debug/gcpub \
   --no-config \
   --ingest-addr "${ingest_addr}" \
   "--ingest-server-key=${ingest_server_key}" \
@@ -441,7 +441,7 @@ if grep -Fq "${admin_token}" "${server_log}" \
 fi
 
 chmod 0644 "${work_dir}/server.toml"
-if target/debug/glacialcast-server \
+if target/debug/gcrelay \
   --config "${work_dir}/server.toml" \
   --control-addr 127.0.0.1:19699 \
   --ingest-addr 127.0.0.1:19700 \
@@ -452,7 +452,7 @@ if target/debug/glacialcast-server \
 fi
 grep -Fq "private regular file with mode 0600" "${work_dir}/unsafe.log"
 
-if target/debug/glacialcast-server \
+if target/debug/gcrelay \
   --no-config \
   --control-addr 0.0.0.0:19699 \
   --ingest-addr 127.0.0.1:19700 \

@@ -655,7 +655,7 @@ pub fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "glacialcast_server=info,tower_http=info".into()),
+                .unwrap_or_else(|_| "glacialcast_relay=info,tower_http=info".into()),
         )
         // Diagnostics go to stderr so stdout carries only what a caller asked
         // to capture. `--print-ingest-server-key` is read straight into a shell
@@ -677,7 +677,7 @@ pub fn run() -> Result<()> {
 fn server_daemon_socket(args: &Args) -> PathBuf {
     args.daemon_socket
         .clone()
-        .unwrap_or_else(|| PathBuf::from("/tmp/glacialcast-server.sock"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/gcrelay.sock"))
 }
 
 async fn run_server(args: Args, daemon_socket: PathBuf) -> Result<()> {
@@ -2075,7 +2075,7 @@ fn websocket_guard(state: &AppState, principal_name: &str) -> Result<ConnectionG
 /// can read the claim without any viewer key -- which is the whole point: an
 /// unencrypted epoch has no key, and the relay has never had one anyway.
 ///
-/// Only the claim is read, through [`glacialcast_dash::epoch_encryption_claim`],
+/// Only the claim is read, through [`glacialcast_stream::epoch_encryption_claim`],
 /// which lives beside the field so the lenient reader and the strict one cannot
 /// disagree about its name or its default. Requiring the whole descriptor to
 /// validate here was a bypass; that function documents why.
@@ -2093,9 +2093,9 @@ fn refuse_unencrypted_epoch(object: &DashObject, allow_unencrypted: bool) -> Res
     if allow_unencrypted || object.header.kind != DashObjectKind::Epoch {
         return Ok(());
     }
-    match glacialcast_dash::epoch_encryption_claim(&object.payload) {
-        glacialcast_dash::EncryptionClaim::Encrypted => Ok(()),
-        glacialcast_dash::EncryptionClaim::Unencrypted => anyhow::bail!(
+    match glacialcast_stream::epoch_encryption_claim(&object.payload) {
+        glacialcast_stream::EncryptionClaim::Encrypted => Ok(()),
+        glacialcast_stream::EncryptionClaim::Unencrypted => anyhow::bail!(
             "refusing an unencrypted epoch: this relay serves streams end-to-end encrypted. \
              Start it with --trusted-lan to accept publishers that send in the clear"
         ),
@@ -2104,7 +2104,7 @@ fn refuse_unencrypted_epoch(object: &DashObject, allow_unencrypted: bool) -> Res
         // read it perfectly well -- the two parsers are not the same program.
         // Accepting what it cannot read is how the previous version of this
         // check was bypassed with three bytes of byte-order mark.
-        glacialcast_dash::EncryptionClaim::Unreadable => anyhow::bail!(
+        glacialcast_stream::EncryptionClaim::Unreadable => anyhow::bail!(
             "refusing an epoch whose descriptor could not be read: this relay serves streams \
              end-to-end encrypted and cannot confirm that this one is"
         ),
@@ -2478,17 +2478,17 @@ mod tests {
     /// `GLACIALCAST_*` variable in the developer's shell cannot decide the
     /// result.
     fn server_args(flags: &[&str]) -> Args {
-        let mut argv = vec!["glacialcast-server"];
+        let mut argv = vec!["gcrelay"];
         argv.extend_from_slice(flags);
         Args::parse_from(argv)
     }
 
     fn epoch_object(encrypted: bool) -> DashObject {
-        use glacialcast_dash::{EpochKeys, MEDIA_TIMESCALE};
+        use glacialcast_stream::{EpochKeys, MEDIA_TIMESCALE};
         let stream_id = Uuid::new_v4();
         let epoch_id = Uuid::new_v4();
         let keys = EpochKeys::derive(&[9u8; 32], stream_id, epoch_id).unwrap();
-        let descriptor = glacialcast_dash::EpochDescriptor {
+        let descriptor = glacialcast_stream::EpochDescriptor {
             format_version: 1,
             stream_id,
             epoch_id,
@@ -2823,8 +2823,7 @@ mod tests {
 
     #[test]
     fn server_config_must_be_private_regular_and_rejects_unknown_keys() {
-        let root =
-            std::env::temp_dir().join(format!("glacialcast-server-config-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("gcrelay-config-{}", Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         let path = root.join("server.toml");
         let mut file = std::fs::OpenOptions::new()

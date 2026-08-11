@@ -9,7 +9,7 @@
 #
 # The defaults below suit a trusted LAN: the relay listens for viewers on
 # loopback only, and publishers authenticate with a token. For anything reached
-# from the Internet, see /usr/share/doc/glacialcast-server/internet-deployment.md
+# from the Internet, see /usr/share/doc/gcrelay/internet-deployment.md
 # and set security.public_origin, which switches on the fail-closed profile.
 
 # ─────────────────────────────────────────────────────────────────────────────

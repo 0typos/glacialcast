@@ -26,7 +26,7 @@ if [[ -n "${idle_heartbeat_seconds}" ]] \
 fi
 origin="http://${control_addr}"
 offline_origin="http://${offline_addr}"
-work_dir="$(mktemp -d /tmp/glacialcast-dash-e2e.XXXXXX)"
+work_dir="$(mktemp -d /tmp/glacialcast-stream-e2e.XXXXXX)"
 server_log="${work_dir}/server.log"
 client_log="${work_dir}/client.log"
 server_pid=""
@@ -59,10 +59,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cargo build -p glacialcast-server -p glacialcast-client -p glacialcast-offline
+cargo build -p gcrelay -p gcpub -p glacialcast-offline
 
 ingest_server_key="$(
-  target/debug/glacialcast-server \
+  target/debug/gcrelay \
     --no-config \
     --data-dir "${work_dir}/data" \
     --print-ingest-server-key
@@ -70,7 +70,7 @@ ingest_server_key="$(
 viewer_key="$(node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))")"
 
 start_client() {
-  RUST_LOG=glacialcast_client=debug target/debug/glacialcast-client \
+  RUST_LOG=glacialcast_publisher=debug target/debug/gcpub \
     --no-config \
     --ingest-addr "${ingest_addr}" \
     "--ingest-server-key=${ingest_server_key}" \
@@ -190,7 +190,7 @@ run_browser_with_epoch_transition() {
   sed -n '1,320p' "${browser_log}"
 }
 
-target/debug/glacialcast-server \
+target/debug/gcrelay \
   --no-config \
   --control-addr "${control_addr}" \
   --ingest-addr "${ingest_addr}" \

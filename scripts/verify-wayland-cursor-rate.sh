@@ -81,19 +81,19 @@ fi
 # picture matches, the hardware path was taken — and a debug build answers
 # those questions honestly. This gate measures a rate, and a debug build
 # encoding three 1440p outputs in software measures a binary nobody ships.
-cargo build --release -p glacialcast-server -p glacialcast-client
+cargo build --release -p gcrelay -p gcpub
 
 ingest_server_key="$(
-  target/release/glacialcast-server --no-config --data-dir "${work_dir}/data" --print-ingest-server-key
+  target/release/gcrelay --no-config --data-dir "${work_dir}/data" --print-ingest-server-key
 )"
 viewer_key="$(
-  target/release/glacialcast-client \
+  target/release/gcpub \
     --no-config \
     --viewer-key-file "${work_dir}/viewer.key" \
     --print-viewer-key
 )"
 
-target/release/glacialcast-server \
+target/release/gcrelay \
   --no-config \
   --control-addr "${control_addr}" \
   --ingest-addr "${ingest_addr}" \
@@ -135,7 +135,7 @@ else
   client_args+=(--all-monitors)
 fi
 
-RUST_LOG=glacialcast_client=debug target/release/glacialcast-client "${client_args[@]}" \
+RUST_LOG=glacialcast_publisher=debug target/release/gcpub "${client_args[@]}" \
   >"${client_log}" 2>&1 &
 client_pid="$!"
 

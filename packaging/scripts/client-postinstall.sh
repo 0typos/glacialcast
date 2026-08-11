@@ -6,18 +6,18 @@ set -e
 
 if [ "$1" = "1" ] || { [ "$1" = "configure" ] && [ -z "$2" ]; }; then
     cat <<'NOTE'
-glacialcast-client is installed and not running.
+gcpub is installed and not running.
 
 As the user whose screen is to be published, not as root:
 
   1. mkdir -p ~/.config/glacialcast && cp \
-       /usr/share/doc/glacialcast-client/client.toml.example \
+       /usr/share/doc/gcpub/client.toml.example \
        ~/.config/glacialcast/client.toml
      chmod 600 ~/.config/glacialcast/client.toml
      Then set ingest_server_key to what the relay prints.
-  2. systemctl --user enable --now glacialcast-publisher
+  2. systemctl --user enable --now gcpub
 
 Print the viewing key to share out of band:
-  glacialcast-client --print-viewer-key
+  gcpub --print-viewer-key
 NOTE
 fi

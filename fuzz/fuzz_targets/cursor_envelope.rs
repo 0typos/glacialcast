@@ -1,6 +1,6 @@
 #![no_main]
 
-use glacialcast_dash::EncryptedCursorBatch;
+use glacialcast_stream::EncryptedCursorBatch;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

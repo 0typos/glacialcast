@@ -21,7 +21,7 @@ command -v nfpm >/dev/null || {
 version="$(
   cargo metadata --locked --no-deps --format-version 1 \
     | node -e \
-      "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const m=JSON.parse(s);process.stdout.write(m.packages.find(p=>p.name==='glacialcast-server').version)})"
+      "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const m=JSON.parse(s);process.stdout.write(m.packages.find(p=>p.name==='gcrelay').version)})"
 )"
 dist_dir="${GLACIALCAST_DIST_DIR:-${repo_root}/dist}"
 staging="${repo_root}/target/package-staging"
@@ -42,9 +42,9 @@ mkdir -p "${staging}/systemd" "${dist_dir}"
 # The one substitution that separates a packaged unit from the documented
 # manual install.
 sed 's#/usr/local/bin/#/usr/bin/#g' \
-  deploy/glacialcast-server.service >"${staging}/systemd/glacialcast-server.service"
+  deploy/gcrelay.service >"${staging}/systemd/gcrelay.service"
 sed 's#/usr/local/bin/#/usr/bin/#g' \
-  deploy/glacialcast-publisher.service >"${staging}/systemd/glacialcast-publisher.service"
+  deploy/gcpub.service >"${staging}/systemd/gcpub.service"
 
 # A stale /usr/local path in a packaged unit means a service that cannot start.
 for unit in "${staging}"/systemd/*.service; do
@@ -65,7 +65,7 @@ done
 # glibc 2.39 install and then cannot start. Whatever host builds the release,
 # the dependency describes it truthfully.
 minimum_glibc="$(
-  for binary in glacialcast-server glacialcast-client glacialcast-offline; do
+  for binary in gcrelay gcpub glacialcast-offline; do
     objdump -T "target/release/${binary}" 2>/dev/null \
       | grep -o 'GLIBC_[0-9.]*' \
       | sed 's/GLIBC_//'

@@ -1,6 +1,6 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use glacialcast_dash::{DASH_FORMAT_VERSION, EpochKeys};
 use glacialcast_protocol::{DashObject, DashObjectKind, NewDashObject, PROTOCOL_VERSION};
+use glacialcast_stream::{DASH_FORMAT_VERSION, EpochKeys};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;

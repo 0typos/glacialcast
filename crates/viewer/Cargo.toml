@@ -1,0 +1,23 @@
+[package]
+name = "gcview"
+edition.workspace = true
+description = "Native GlacialCast multi-stream viewer."
+license.workspace = true
+repository.workspace = true
+publish = false
+version.workspace = true
+
+[lib]
+name = "glacialcast_viewer"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+
+[[bin]]
+name = "gcview"
+path = "src/main.rs"
+
+[lints]
+workspace = true

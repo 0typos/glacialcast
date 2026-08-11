@@ -22,7 +22,6 @@ use axum::{
 };
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
-use glacialcast_dash::{EpochDescriptor, MpdConfig, SegmentTimelineEntry, build_mpd};
 #[cfg(test)]
 use glacialcast_protocol::transfer::{LEGACY_TRANSFER_MANIFEST_VERSION, LegacyTransferManifest};
 use glacialcast_protocol::{
@@ -32,6 +31,7 @@ use glacialcast_protocol::{
         TransferManifest, TransferObject, TransferRoot, parse_transfer_chunk, parse_transfer_root,
     },
 };
+use glacialcast_stream::{EpochDescriptor, MpdConfig, SegmentTimelineEntry, build_mpd};
 use reqwest::Client;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -49,12 +49,12 @@ use tokio::{net::TcpListener, sync::RwLock};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-const VIEWER_HTML: &str = include_str!("../../server/static/dash-viewer.html");
-const VIEWER_CSS: &str = include_str!("../../server/static/dash-viewer.css");
-const VIEWER_CORE_JS: &str = include_str!("../../server/static/dash-viewer-core.js");
-const VIEWER_JS: &str = include_str!("../../server/static/dash-viewer.js");
-const VIEWER_PAGE_JS: &str = include_str!("../../server/static/dash-viewer-page.js");
-const VIEWER_KEY_JS: &str = include_str!("../../server/static/viewer-key.js");
+const VIEWER_HTML: &str = include_str!("../../relay/static/dash-viewer.html");
+const VIEWER_CSS: &str = include_str!("../../relay/static/dash-viewer.css");
+const VIEWER_CORE_JS: &str = include_str!("../../relay/static/dash-viewer-core.js");
+const VIEWER_JS: &str = include_str!("../../relay/static/dash-viewer.js");
+const VIEWER_PAGE_JS: &str = include_str!("../../relay/static/dash-viewer-page.js");
+const VIEWER_KEY_JS: &str = include_str!("../../relay/static/viewer-key.js");
 const MAX_PORTABLE_FILE_LEN: u64 = MAX_FRAME_LEN as u64 + 128 * 1024;
 const TRANSFER_MANIFEST_FILE: &str = "glacialcast-transfer.json";
 const TRANSFER_CHUNK_OBJECTS: u64 = 1024;
@@ -1258,7 +1258,7 @@ async fn get_manifest(
             segment
                 .start
                 .saturating_add(segment.duration)
-                .div_ceil(u64::from(glacialcast_dash::MEDIA_TIMESCALE))
+                .div_ceil(u64::from(glacialcast_stream::MEDIA_TIMESCALE))
         })
         .unwrap_or(1)
         .max(1);
@@ -1425,8 +1425,8 @@ impl IntoResponse for OfflineError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glacialcast_dash::{DASH_FORMAT_VERSION, EpochKeys, MEDIA_TIMESCALE};
     use glacialcast_protocol::NewDashObject;
+    use glacialcast_stream::{DASH_FORMAT_VERSION, EpochKeys, MEDIA_TIMESCALE};
 
     struct TestDirectory(PathBuf);
 

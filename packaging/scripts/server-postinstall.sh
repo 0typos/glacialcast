@@ -16,15 +16,15 @@ fi
 # no second argument.
 if [ "$1" = "1" ] || { [ "$1" = "configure" ] && [ -z "$2" ]; }; then
     cat <<'NOTE'
-glacialcast-server is installed and not running.
+gcrelay is installed and not running.
 
   1. Put a configuration at /etc/glacialcast/server.toml (mode 0600, owned by
      glacialcast). An example is in
-     /usr/share/doc/glacialcast-server/server.toml.example
-  2. sudo systemctl enable --now glacialcast-server
+     /usr/share/doc/gcrelay/server.toml.example
+  2. sudo systemctl enable --now gcrelay
 
 Print the relay's public identity for publishers to pin:
-  sudo -u glacialcast glacialcast-server \
+  sudo -u glacialcast gcrelay \
     --data-dir /var/lib/glacialcast --print-ingest-server-key
 NOTE
 fi

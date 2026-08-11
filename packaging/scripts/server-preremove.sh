@@ -7,6 +7,6 @@ set -e
 
 if [ "$1" = "0" ] || [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
     if [ -d /run/systemd/system ]; then
-        systemctl --no-reload disable --now glacialcast-server.service >/dev/null 2>&1 || true
+        systemctl --no-reload disable --now gcrelay.service >/dev/null 2>&1 || true
     fi
 fi

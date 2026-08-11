@@ -266,7 +266,7 @@ impl EpochKeys {
     /// # Examples
     ///
     /// ```
-    /// use glacialcast_dash::EpochKeys;
+    /// use glacialcast_stream::EpochKeys;
     /// use uuid::Uuid;
     ///
     /// let stream_id = Uuid::from_u128(1);
@@ -274,7 +274,7 @@ impl EpochKeys {
     /// let keys = EpochKeys::derive(&[7; 32], stream_id, epoch_id)?;
     ///
     /// assert_eq!(keys.key_id, *epoch_id.as_bytes());
-    /// # Ok::<(), glacialcast_dash::DashError>(())
+    /// # Ok::<(), glacialcast_stream::DashError>(())
     /// ```
     pub fn derive(viewer_key: &[u8; 32], stream_id: Uuid, epoch_id: Uuid) -> Result<Self> {
         let mut salt_hasher = Sha256::new();

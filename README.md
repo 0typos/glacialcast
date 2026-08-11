@@ -51,12 +51,12 @@ Download the packages for your architecture from the
 
 ```sh
 # Fedora, RHEL, openSUSE
-sudo dnf install ./glacialcast-server-*.x86_64.rpm   # the relay
-sudo dnf install ./glacialcast-client-*.x86_64.rpm   # the publisher
+sudo dnf install ./gcrelay-*.x86_64.rpm   # the relay
+sudo dnf install ./gcpub-*.x86_64.rpm   # the publisher
 
 # Debian, Ubuntu
-sudo apt install ./glacialcast-server_*_amd64.deb
-sudo apt install ./glacialcast-client_*_amd64.deb
+sudo apt install ./gcrelay_*_amd64.deb
+sudo apt install ./gcpub_*_amd64.deb
 ```
 
 The relay depends on nothing but glibc, so a headless host does not pull in a
@@ -74,15 +74,15 @@ server, or both on one machine to try it out.
 ```sh
 sudo install -d -o root -g glacialcast -m 0750 /etc/glacialcast
 sudo install -o glacialcast -g glacialcast -m 0600 \
-  /usr/share/doc/glacialcast-server/server.toml.example \
+  /usr/share/doc/gcrelay/server.toml.example \
   /etc/glacialcast/server.toml
-sudo systemctl enable --now glacialcast-server
+sudo systemctl enable --now gcrelay
 ```
 
 Then read the relay's public identity, which the publisher pins:
 
 ```sh
-sudo -u glacialcast glacialcast-server \
+sudo -u glacialcast gcrelay \
   --data-dir /var/lib/glacialcast --print-ingest-server-key
 ```
 
@@ -95,7 +95,7 @@ As the user whose screen is being published, not as root:
 
 ```sh
 mkdir -p ~/.config/glacialcast
-cp /usr/share/doc/glacialcast-client/client.toml.example \
+cp /usr/share/doc/gcpub/client.toml.example \
   ~/.config/glacialcast/client.toml
 chmod 600 ~/.config/glacialcast/client.toml
 ```
@@ -105,7 +105,7 @@ relay printed, and `ingest_token` to the token you put in the relay's config.
 Then:
 
 ```sh
-systemctl --user enable --now glacialcast-publisher
+systemctl --user enable --now gcpub
 ```
 
 Every connected monitor is published, each as its own stream, all unlocked by
@@ -132,7 +132,7 @@ it through the same channel you would send the key through.
 To hand over the key itself instead, open `http://<relay-host>:8899` and type it:
 
 ```sh
-glacialcast-client --print-viewer-key
+gcpub --print-viewer-key
 ```
 
 Either way it is asked for **once**. The browser remembers it, so a reload, a new
@@ -148,7 +148,7 @@ a deployment.
 - **Change `viewer_key_phrase`** in `~/.config/glacialcast/client.toml`. Either
   set your own seven words from the built-in list, or delete the line entirely
   to have a private one generated and stored with mode 0600 — the better choice.
-  Then `systemctl --user restart glacialcast-publisher` and share the new key.
+  Then `systemctl --user restart gcpub` and share the new key.
 - **Replace every token** in `/etc/glacialcast/server.toml` with
   `openssl rand -base64 32`.
 - **Reaching it from the Internet** needs the fail-closed profile: set
@@ -163,8 +163,8 @@ can substitute for changing that phrase.
 
 ```sh
 cargo build --workspace --release
-./target/release/glacialcast-server --data-dir ./data &
-./target/release/glacialcast-client --no-config --ingest-addr 127.0.0.1:8900
+./target/release/gcrelay --data-dir ./data &
+./target/release/gcpub --no-config --ingest-addr 127.0.0.1:8900
 ```
 
 The publisher prints a generated viewing key and the page to enter it on.
@@ -286,7 +286,7 @@ The server creates a persistent Noise identity at
 `<data-dir>/ingest-noise.key` with mode `0600`. Print its public key once:
 
 ```sh
-./target/release/glacialcast-server \
+./target/release/gcrelay \
   --data-dir data \
   --print-ingest-server-key
 ```
@@ -325,7 +325,7 @@ later run publishes under the same key and viewers keep the secret they already
 have. Print it at any time without starting a capture:
 
 ```sh
-./target/release/glacialcast-client --config client.toml --print-viewer-key
+./target/release/gcpub --config client.toml --print-viewer-key
 ```
 
 Select another location with `--viewer-key-file`, or pin an existing key with
@@ -370,7 +370,7 @@ mode `0600`. Unknown configuration keys are rejected.
 On a local network you control, `--trusted-lan` is the whole relay setup:
 
 ```sh
-./target/release/glacialcast-server --trusted-lan --data-dir ./data
+./target/release/gcrelay --trusted-lan --data-dir ./data
 ```
 
 It binds both listeners to every interface (`0.0.0.0:8899` and `0.0.0.0:8900`),
@@ -379,10 +379,10 @@ present no ingest token. A publisher then needs only the relay's Noise public
 key:
 
 ```sh
-./target/release/glacialcast-client \
+./target/release/gcpub \
   --no-config \
   --ingest-addr 192.168.1.20:8900 \
-  --ingest-server-key "$(./target/release/glacialcast-server --data-dir ./data --print-ingest-server-key)" \
+  --ingest-server-key "$(./target/release/gcrelay --data-dir ./data --print-ingest-server-key)" \
   --capture dash-wayland
 ```
 
@@ -431,7 +431,7 @@ To skip the warning entirely, pass a certificate the viewers already trust —
 from an internal CA, or one made by `mkcert` and installed on their machines:
 
 ```sh
-./target/release/glacialcast-server --trusted-lan \
+./target/release/gcrelay --trusted-lan \
   --tls-cert /etc/glacialcast/cert.pem --tls-key /etc/glacialcast/key.pem
 ```
 
@@ -460,7 +460,7 @@ FairPlay and never ClearKey. Unencrypted media played through
 ManagedMediaSource is the only path onto the device.
 
 ```sh
-glacialcast-client --no-encryption --no-viewer-key \
+gcpub --no-encryption --no-viewer-key \
   --ingest-addr relay.lan:8900 \
   --ingest-server-key "$(…)" \
   --capture dash-wayland
@@ -502,8 +502,8 @@ Start with:
 
 - `deploy/server.internet.toml.example`
 - `deploy/Caddyfile.example`
-- `deploy/glacialcast-server.service`
-- `deploy/glacialcast-publisher.service`
+- `deploy/gcrelay.service`
+- `deploy/gcpub.service`
 - `docs/internet-deployment.md`
 
 Internet mode is enabled by setting an HTTPS `security.public_origin`. It
@@ -518,7 +518,7 @@ are covered in the deployment guide.
 Start the relay:
 
 ```sh
-./target/release/glacialcast-server \
+./target/release/gcrelay \
   --config server.toml \
   --control-addr 127.0.0.1:8899 \
   --ingest-addr 127.0.0.1:8900 \
@@ -530,7 +530,7 @@ Start the relay:
 Publish a selected Wayland monitor:
 
 ```sh
-./target/release/glacialcast-client \
+./target/release/gcpub \
   --config client.toml \
   --ingest-addr 127.0.0.1:8900 \
   --capture dash-wayland \
@@ -548,7 +548,7 @@ GlacialCast publisher "Workstation"
   viewer key   dodge-pen-laugh-magic-crab-badge-hip
   key file     /home/you/.local/state/glacialcast/viewer-workstation.key
   log file     /home/you/.local/state/glacialcast/client-workstation.log
-  control      /tmp/glacialcast-client-workstation.sock
+  control      /tmp/gcpub-workstation.sock
 ```
 
 Send that key to viewers over a secure out-of-band channel; it is the only
@@ -665,7 +665,7 @@ fragment of an invitation link: browsers do not put it in a request.
 For a noninteractive transport test, publish the built-in pattern:
 
 ```sh
-./target/release/glacialcast-client \
+./target/release/gcpub \
   --config client.toml \
   --capture dash-test \
   --width 1280 \
@@ -691,7 +691,7 @@ either interface with `--screencast-backend portal` or
 `--screencast-backend mutter`:
 
 ```sh
-./target/release/glacialcast-client \
+./target/release/gcpub \
   --config client.toml \
   --capture dash-wayland \
   --screencast-backend mutter \
@@ -702,8 +702,8 @@ Cast several screens at once with a repeated `--monitor-name`, or all of them
 with `--all-monitors`:
 
 ```sh
-./target/release/glacialcast-client --config client.toml --list-monitors
-./target/release/glacialcast-client --config client.toml --all-monitors
+./target/release/gcpub --config client.toml --list-monitors
+./target/release/gcpub --config client.toml --all-monitors
 ```
 
 Each screen becomes its own stream, published over its own relay connection and
@@ -730,7 +730,7 @@ milliseconds with no prompt. Delete that file to be asked again, and use
 prompting rather than failing.
 
 The portal grants a session to a specific process, so a portal-backed publisher
-must be started from the desktop session. `deploy/glacialcast-publisher.service`
+must be started from the desktop session. `deploy/gcpub.service`
 is a user unit that starts the publisher with the graphical session.
 
 `--portal-cursor auto` prefers PipeWire `SPA_META_Cursor`. Use
@@ -768,7 +768,7 @@ samples at, independent of `--fps`. It cannot exceed what the compositor
 delivers: a screen-capture stream carries cursor metadata on its buffers, so a
 60 Hz panel yields at most 60 samples per second, and asking for 120 on a 60 Hz
 output changes nothing. Run the publisher with
-`RUST_LOG=glacialcast_client=debug` to see the measured `compositor capture
+`RUST_LOG=glacialcast_publisher=debug` to see the measured `compositor capture
 rate` line, which reports the delivered buffer rate, the rate at which the
 cursor actually moved, and the longest pause between two cursor samples.
 `--cursor-flush-ms` (default 25) bounds how long a sample waits to be batched.
@@ -893,7 +893,7 @@ with the tarball and checksums.
 
 The two packages are separate because their dependencies are: the relay and the
 offline viewer link nothing beyond glibc, so a headless host installing
-`glacialcast-server` gets no PipeWire and no GPU stack. `glacialcast-client`
+`gcrelay` gets no PipeWire and no GPU stack. `gcpub`
 depends on what it links and recommends what it loads at runtime, since VA-API,
 OpenH264, and the EGL readback path are each optional.
 
@@ -927,26 +927,26 @@ Both network processes support a local Unix control socket. The relay stays in
 the foreground unless `--daemon` is given:
 
 ```sh
-./target/release/glacialcast-server \
+./target/release/gcrelay \
   --daemon \
-  --daemon-socket /tmp/glacialcast-server.sock \
-  --log-file /var/log/glacialcast-server.log \
+  --daemon-socket /tmp/gcrelay.sock \
+  --log-file /var/log/gcrelay.log \
   --control-addr 0.0.0.0:8899 \
   --ingest-addr 0.0.0.0:8900 \
   --data-dir data
 
-./target/release/glacialcast-server \
+./target/release/gcrelay \
   --daemon-status \
-  --daemon-socket /tmp/glacialcast-server.sock
+  --daemon-socket /tmp/gcrelay.sock
 
-./target/release/glacialcast-server \
+./target/release/gcrelay \
   --daemon-stop \
-  --daemon-socket /tmp/glacialcast-server.sock
+  --daemon-socket /tmp/gcrelay.sock
 ```
 
 The publisher detaches by default and accepts the same `--daemon-status`,
 `--daemon-stop`, `--daemon-socket`, and `--log-file` flags. Its control socket
-defaults to `/tmp/glacialcast-client-<client-id>.sock` and its log to
+defaults to `/tmp/gcpub-<client-id>.sock` and its log to
 `$XDG_STATE_HOME/glacialcast/client-<client-id>.log`, both created with mode
 `0600`. Pass `--foreground` under systemd or any other supervisor; `--daemon`
 remains accepted and is now the default.

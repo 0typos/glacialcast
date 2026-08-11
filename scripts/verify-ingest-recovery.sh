@@ -35,10 +35,10 @@ name = "recovery-client"
 token = "correct-recovery-token"
 TOML
 
-cargo build -p glacialcast-server -p glacialcast-client
+cargo build -p gcrelay -p gcpub
 
 ingest_server_key="$(
-  target/debug/glacialcast-server \
+  target/debug/gcrelay \
     --no-config \
     --data-dir "${work_dir}/data" \
     --print-ingest-server-key
@@ -63,7 +63,7 @@ wait_for_server() {
 }
 
 start_server() {
-  target/debug/glacialcast-server \
+  target/debug/gcrelay \
     --config "${work_dir}/server.toml" \
     --control-addr "${control_addr}" \
     --ingest-addr "${ingest_addr}" \
@@ -157,7 +157,7 @@ NODE
 
 start_server
 
-RUST_LOG=glacialcast_client=info target/debug/glacialcast-client \
+RUST_LOG=glacialcast_publisher=info target/debug/gcpub \
   --no-config \
   --ingest-addr "${ingest_addr}" \
   "--ingest-server-key=${ingest_server_key}" \
@@ -184,7 +184,7 @@ kill "${invalid_pid}" 2>/dev/null || true
 wait "${invalid_pid}" 2>/dev/null || true
 invalid_pid=""
 
-RUST_LOG=glacialcast_client=info target/debug/glacialcast-client \
+RUST_LOG=glacialcast_publisher=info target/debug/gcpub \
   --no-config \
   --ingest-addr "${ingest_addr}" \
   "--ingest-server-key=${ingest_server_key}" \

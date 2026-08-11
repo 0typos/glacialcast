@@ -39,16 +39,16 @@ if [[ "${backend}" != "mutter" && -z "${WAYLAND_DISPLAY:-}" ]]; then
   exit 1
 fi
 
-cargo build -p glacialcast-server -p glacialcast-client
+cargo build -p gcrelay -p gcpub
 ingest_server_key="$(
-  target/debug/glacialcast-server \
+  target/debug/gcrelay \
     --no-config \
     --data-dir "${work_dir}/data" \
     --print-ingest-server-key
 )"
 viewer_key="$(node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))")"
 
-target/debug/glacialcast-server \
+target/debug/gcrelay \
   --no-config \
   --control-addr "${control_addr}" \
   --ingest-addr "${ingest_addr}" \
@@ -82,7 +82,7 @@ if [[ -n "${monitor_name}" ]]; then
   client_args+=(--monitor-name "${monitor_name}")
 fi
 
-target/debug/glacialcast-client "${client_args[@]}" >"${client_log}" 2>&1 &
+target/debug/gcpub "${client_args[@]}" >"${client_log}" 2>&1 &
 client_pid="$!"
 
 echo "If a desktop chooser appears, select the target source."

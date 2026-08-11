@@ -4,8 +4,8 @@ Documentation=https://github.com/0typos/glacialcast
 # The publisher captures the running graphical session, so it starts with that
 # session and stops with it. Install it as a user unit, not a system unit:
 #   mkdir -p ~/.config/systemd/user
-#   cp glacialcast-publisher.service ~/.config/systemd/user/
-#   systemctl --user enable --now glacialcast-publisher.service
+#   cp gcpub.service ~/.config/systemd/user/
+#   systemctl --user enable --now gcpub.service
 PartOf=graphical-session.target
 After=graphical-session.target pipewire.service
 Wants=pipewire.service
@@ -13,7 +13,7 @@ Wants=pipewire.service
 [Service]
 Type=simple
 UMask=0077
-Environment=RUST_LOG=glacialcast_client=info
+Environment=RUST_LOG=glacialcast_publisher=info
 
 # For a user unit systemd puts these under $XDG_CONFIG_HOME and
 # $XDG_STATE_HOME, which is exactly where the publisher looks for its config
@@ -28,7 +28,7 @@ StateDirectoryMode=0700
 #
 # No --config: the publisher finds $XDG_CONFIG_HOME/glacialcast/client.toml on
 # its own, falling back to /etc/glacialcast/client.toml. Point it elsewhere with
-# a drop-in under ~/.config/systemd/user/glacialcast-publisher.service.d/:
+# a drop-in under ~/.config/systemd/user/gcpub.service.d/:
 #   [Service]
 #   Environment=GLACIALCAST_CONFIG=%h/somewhere/else.toml
 #
@@ -38,7 +38,7 @@ StateDirectoryMode=0700
 # Every output is published, each as its own stream, all unlocked by the one
 # viewer key. Set all_monitors = false in client.toml to publish only the
 # primary one.
-ExecStart=/usr/local/bin/glacialcast-client \
+ExecStart=/usr/local/bin/gcpub \
     --foreground \
     --ingest-addr 127.0.0.1:8900 \
     --capture dash-wayland \
@@ -50,8 +50,8 @@ TimeoutStopSec=30s
 
 # The startup summary carries the viewer key, so it is printed to the journal
 # only when an operator asks for it:
-#   systemctl --user stop glacialcast-publisher
-#   glacialcast-client --print-viewer-key
+#   systemctl --user stop gcpub
+#   gcpub --print-viewer-key
 NoNewPrivileges=yes
 ProtectClock=yes
 ProtectHostname=yes

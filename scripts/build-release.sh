@@ -7,7 +7,7 @@ cd "${repo_root}"
 version="$(
   cargo metadata --locked --no-deps --format-version 1 \
     | node -e \
-      "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const m=JSON.parse(s);process.stdout.write(m.packages.find(p=>p.name==='glacialcast-server').version)})"
+      "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const m=JSON.parse(s);process.stdout.write(m.packages.find(p=>p.name==='gcrelay').version)})"
 )"
 target="$(rustc -vV | sed -n 's/^host: //p')"
 revision="$(git rev-parse HEAD 2>/dev/null || printf 'uncommitted')"
@@ -38,9 +38,9 @@ mkdir -p \
   "${bundle_root}/docs" \
   "${dist_dir}"
 cp -a \
-  "${target_dir}/release/glacialcast-client" \
+  "${target_dir}/release/gcpub" \
   "${target_dir}/release/glacialcast-offline" \
-  "${target_dir}/release/glacialcast-server" \
+  "${target_dir}/release/gcrelay" \
   "${bundle_root}/bin/"
 cp -a deploy/. "${bundle_root}/deploy/"
 cp -a \

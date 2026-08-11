@@ -68,7 +68,7 @@ key in the repository or CI artifact.
 Stop writes before taking a portable backup:
 
 ```sh
-sudo systemctl stop glacialcast-server
+sudo systemctl stop gcrelay
 sudo tar -C / -czf glacialcast-backup-$(date +%Y%m%d%H%M%S).tar.gz \
   etc/glacialcast \
   var/lib/glacialcast
@@ -91,7 +91,7 @@ end-to-end encrypted -- and unconditionally, if any publisher on the relay used
 After verifying the archive:
 
 1. Keep the relay stopped after the backup.
-2. Install `bin/glacialcast-server` to `/usr/local/bin` using mode `0755`.
+2. Install `bin/gcrelay` to `/usr/local/bin` using mode `0755`.
 3. Review, then install the packaged service and configuration examples; do not
    overwrite the active private configuration with the example.
 4. Run `systemctl daemon-reload`, start the relay, and request

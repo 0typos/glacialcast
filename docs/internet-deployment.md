@@ -48,14 +48,14 @@ scripts/verify-packaging.sh
 tar -xzf dist/glacialcast-v*-x86_64-unknown-linux-gnu.tar.gz
 sudo useradd --system --home-dir /var/lib/glacialcast --shell /usr/sbin/nologin glacialcast
 sudo install -D -o root -g root -m 0755 \
-  glacialcast-v*/bin/glacialcast-server /usr/local/bin/glacialcast-server
+  glacialcast-v*/bin/gcrelay /usr/local/bin/gcrelay
 # /var/lib/glacialcast is created by the unit's StateDirectory=; /etc is made
 # here because the configuration has to be in place before the first start.
 sudo install -d -o root -g glacialcast -m 0750 /etc/glacialcast
 sudo install -o glacialcast -g glacialcast -m 0600 \
   glacialcast-v*/deploy/server.internet.toml.example /etc/glacialcast/server.toml
 sudo install -o root -g root -m 0644 \
-  glacialcast-v*/deploy/glacialcast-server.service /etc/systemd/system/glacialcast-server.service
+  glacialcast-v*/deploy/gcrelay.service /etc/systemd/system/gcrelay.service
 ```
 
 Verify the archive checksum before extracting it. See the
@@ -106,7 +106,7 @@ Enable the services:
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl enable --now glacialcast-server caddy
+sudo systemctl enable --now gcrelay caddy
 curl --fail https://cast.example.com/health/ready
 ```
 
@@ -129,7 +129,7 @@ cannot be talked into serving plaintext or into accepting untokened publishers.
 Print and record the persistent relay identity:
 
 ```sh
-sudo -u glacialcast /usr/local/bin/glacialcast-server \
+sudo -u glacialcast /usr/local/bin/gcrelay \
   --config /etc/glacialcast/server.toml \
   --control-addr 127.0.0.1:8899 \
   --ingest-addr 0.0.0.0:8900 \

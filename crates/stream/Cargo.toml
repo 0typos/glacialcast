@@ -1,5 +1,5 @@
 [package]
-name = "glacialcast-dash"
+name = "glacialcast-stream"
 edition.workspace = true
 description = "CENC-encrypted fragmented MP4 and MPEG-DASH generation for GlacialCast."
 license.workspace = true
