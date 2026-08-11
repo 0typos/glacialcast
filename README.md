@@ -66,7 +66,9 @@ In signed mode the relay reloads a valid replacement CRL within one second.
 The publisher reads private `client.toml`; see
 `packaging/client.toml.example`. `history_bytes` and `history_seconds` bound the
 private group-key history used to authorize a new viewer. Defaults are 100 MiB
-and 24 hours.
+and 24 hours. One publishing process exclusively owns a state directory;
+monitor threads merge per-stream history under a private file lock. Pairing
+offers, decisions, and retained-key delivery use durable retry outboxes.
 
 Viewer approval policy lives in the publisher state directory as private
 `config.toml`; see `packaging/publisher.toml.example`. The running publisher

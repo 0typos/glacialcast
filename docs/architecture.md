@@ -208,7 +208,11 @@ version 2 store.
 
 Secret identity, approval, revocation, and retained-key state uses private
 regular files with mode `0600`, `O_NOFOLLOW`, bounded reads, atomic replacement,
-and directory fsync. Relay known-host records use the same discipline. Encrypted
+and directory fsync. Stable private advisory-lock files serialize publisher
+state transactions; only one publishing process may own a state directory.
+Multi-monitor key history is merged per stream, and pairing offers, decisions,
+and retained-key authorizations are persisted in idempotent outboxes before
+network delivery. Relay known-host records use the same discipline. Encrypted
 state export/import is deferred.
 
 The relay necessarily learns publisher and stream existence, display names,

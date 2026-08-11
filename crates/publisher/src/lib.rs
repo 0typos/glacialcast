@@ -29,7 +29,9 @@ use glacialcast_protocol::{
         sanitize_socket_component, serve_control_socket, wait_for_shutdown,
     },
     decode_key_b64, decode_noise_public_key, encode_key_b64, initiator_handshake, now_ms,
-    parse_human_bytes, viewer_key,
+    parse_human_bytes,
+    private_state::{PrivateLockMode, lock_private},
+    viewer_key,
 };
 use glacialcast_stream::{
     CursorBatch as DashCursorBatch, CursorBitmap as DashCursorBitmap,
@@ -515,6 +517,11 @@ pub fn run() -> Result<()> {
     )? {
         return Ok(());
     }
+    let _publisher_lock = lock_private(
+        &client_state_dir().join("publisher-process.lock"),
+        PrivateLockMode::TryExclusive,
+    )
+    .context("another gcpub process already owns this publisher state directory")?;
 
     tracing_subscriber::fmt()
         .with_env_filter(
