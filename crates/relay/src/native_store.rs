@@ -635,6 +635,47 @@ impl NativeStore {
         Ok(envelopes)
     }
 
+    /// Returns one viewer-addressed envelope for an exact retained key group.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid identifiers, database failure, or a stored
+    /// envelope that no longer verifies against the stream publisher.
+    pub fn get_envelope(
+        &self,
+        stream_id: Uuid,
+        epoch_id: Uuid,
+        key_group: u64,
+        recipient_id: [u8; 32],
+    ) -> Result<Option<KeyEnvelope>> {
+        if stream_id.is_nil() || epoch_id.is_nil() || key_group == 0 || recipient_id == [0; 32] {
+            anyhow::bail!("invalid native envelope lookup");
+        }
+        let connection = self.connection()?;
+        let descriptor = descriptor_in_connection(&connection, stream_id)?
+            .context("native stream has no descriptor")?;
+        let encoded: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT envelope FROM envelopes WHERE stream_id = ?1 AND epoch_id = ?2 \
+                 AND key_group = ?3 AND recipient_id = ?4",
+                params![
+                    uuid_bytes(stream_id).as_slice(),
+                    uuid_bytes(epoch_id).as_slice(),
+                    to_sql_u64(key_group, "envelope key group")?,
+                    recipient_id.as_slice(),
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("reading exact viewer envelope")?;
+        encoded
+            .map(|encoded| {
+                KeyEnvelope::decode(&encoded, &descriptor.body.publisher)
+                    .context("decoding exact viewer envelope")
+            })
+            .transpose()
+    }
+
     /// Returns a verified stream descriptor, if present.
     ///
     /// # Errors
@@ -1290,6 +1331,28 @@ mod tests {
         .unwrap();
         assert!(store.store_envelope(&envelope, 1_001).unwrap());
         assert!(!store.store_envelope(&envelope, 1_002).unwrap());
+        assert_eq!(
+            store
+                .get_envelope(
+                    fixture.stream_id,
+                    fixture.epoch_id,
+                    object.header.key_group,
+                    fixture.viewer.public().unwrap().id().unwrap(),
+                )
+                .unwrap(),
+            Some(envelope.clone())
+        );
+        assert!(
+            store
+                .get_envelope(
+                    fixture.stream_id,
+                    fixture.epoch_id,
+                    object.header.key_group,
+                    IdentitySecret::generate().public().unwrap().id().unwrap(),
+                )
+                .unwrap()
+                .is_none()
+        );
         let mut wrong_group = envelope;
         wrong_group.header.key_group_id += 1;
         assert!(store.store_envelope(&wrong_group, 1_003).is_err());

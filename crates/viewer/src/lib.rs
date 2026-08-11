@@ -10,7 +10,9 @@ use glacialcast_protocol::{
     credential::{CredentialRequest, CredentialRole, NativeCredential},
     identity::{IdentityPublic, IdentitySecret, load_or_create_identity},
     initiator_handshake_xx, load_or_create_noise_keypair,
-    native::{CodecId, LiveSequenceGuard, NativeObjectKind},
+    native::{
+        CodecId, ContentKey, H264EpochPayload, LiveSequenceGuard, NativeObject, NativeObjectKind,
+    },
     pairing::{PairOffer, PairRequest, ViewerConfirmation, authentication_string},
     private_state::{read_private, replace_private},
     trust::KnownRelays,
@@ -19,7 +21,7 @@ use glacialcast_protocol::{
 use openh264::{decoder::Decoder, formats::YUVSource, nal_units};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::IsTerminal,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -32,7 +34,28 @@ const DEFAULT_VIEWER_PORT: u16 = 8899;
 const MAX_CREDENTIAL_FILE: usize = 64 * 1024;
 const PAIRING_STATE_VERSION: u16 = 1;
 const MAX_PAIRING_STATE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PENDING_OBJECTS: usize = 256;
+const MAX_PENDING_CIPHERTEXT_BYTES: usize = 32 * 1024 * 1024;
 type PendingPairings = HashMap<[u8; 32], (PairRequest, Option<PairOffer>)>;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct GroupKey {
+    stream_id: Uuid,
+    epoch_id: Uuid,
+    key_group: u64,
+    key_id: [u8; 16],
+}
+
+impl GroupKey {
+    fn for_object(object: &NativeObject) -> Self {
+        Self {
+            stream_id: object.header.stream_id,
+            epoch_id: object.header.epoch_id,
+            key_group: object.header.key_group,
+            key_id: object.header.key_id,
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(version, about = "View GlacialCast streams from a native relay")]
@@ -743,7 +766,7 @@ async fn connect(profile: &ConnectionProfile) -> Result<NoiseSocket<TcpStream>> 
 async fn refresh(
     profile: &ConnectionProfile,
     events: &mpsc::UnboundedSender<Event>,
-    keys: &Arc<Mutex<HashMap<[u8; 16], [u8; 32]>>>,
+    keys: &Arc<Mutex<HashMap<GroupKey, [u8; 32]>>>,
 ) -> Result<()> {
     let mut socket = connect(profile).await?;
     socket.write(&ViewerMessage::Catalog).await?;
@@ -769,7 +792,15 @@ async fn refresh(
                     let content_key = envelope.open(&profile.identity, publisher)?;
                     keys.lock()
                         .map_err(|_| anyhow::anyhow!("key cache poisoned"))?
-                        .insert(envelope.header.key_id, content_key);
+                        .insert(
+                            GroupKey {
+                                stream_id: envelope.header.stream_id,
+                                epoch_id: envelope.header.epoch_id,
+                                key_group: envelope.header.key_group_id,
+                                key_id: envelope.header.key_id,
+                            },
+                            content_key,
+                        );
                 }
             }
             RelayViewerMessage::InboxComplete => break,
@@ -785,7 +816,7 @@ async fn refresh(
 async fn subscribe(
     profile: &ConnectionProfile,
     events: &mpsc::UnboundedSender<Event>,
-    keys: &Arc<Mutex<HashMap<[u8; 16], [u8; 32]>>>,
+    keys: &Arc<Mutex<HashMap<GroupKey, [u8; 32]>>>,
     stream_id: Uuid,
     publisher: IdentityPublic,
     start: SubscriptionStart,
@@ -809,42 +840,53 @@ async fn subscribe(
     let mut guard =
         LiveSequenceGuard::new(publisher_id, stream_id, first_sequence.saturating_sub(1));
     let mut decoder = Decoder::new()?;
+    let mut pending = VecDeque::new();
+    let mut pending_bytes = 0usize;
     loop {
         match socket.read::<RelayViewerMessage>().await? {
             RelayViewerMessage::Object(object) => {
                 guard.accept(&object)?;
-                if object.header.kind != NativeObjectKind::Media
-                    || object.header.codec != Some(CodecId::H264AnnexB)
+                pending_bytes = pending_bytes.saturating_add(object.ciphertext.len());
+                pending.push_back(object);
+                if pending.len() > MAX_PENDING_OBJECTS
+                    || pending_bytes > MAX_PENDING_CIPHERTEXT_BYTES
                 {
-                    continue;
+                    anyhow::bail!("publisher key envelope did not arrive within buffer limits");
                 }
-                let key = keys
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("key cache poisoned"))?
-                    .get(&object.header.key_id)
-                    .copied();
-                let Some(key) = key else {
-                    anyhow::bail!("waiting for publisher key envelope");
-                };
-                let plaintext = object.open(
+                drain_pending_objects(
+                    &mut decoder,
+                    events,
                     &publisher,
-                    &glacialcast_protocol::native::ContentKey::from_bytes(key)?,
-                    &object.header.key_id,
+                    keys,
+                    &mut pending,
+                    &mut pending_bytes,
                 )?;
-                for unit in nal_units(&plaintext) {
-                    if let Some(yuv) = decoder.decode(unit)? {
-                        let (width, height) = yuv.dimensions();
-                        let mut rgb = vec![0; yuv.rgb8_len()];
-                        yuv.write_rgb8(&mut rgb);
-                        let _ = events.send(Event::Frame(Frame {
-                            stream_id,
-                            width,
-                            height,
-                            rgb,
-                            sequence: object.header.sequence,
-                        }));
-                    }
+            }
+            RelayViewerMessage::KeyEnvelope(envelope) => {
+                if envelope.header.publisher_id != publisher_id
+                    || envelope.header.stream_id != stream_id
+                    || envelope.header.recipient_id != profile.identity.public()?.id()?
+                {
+                    anyhow::bail!("subscription delivered a misrouted key envelope");
                 }
+                let content_key = envelope.open(&profile.identity, &publisher)?;
+                let group_key = GroupKey {
+                    stream_id,
+                    epoch_id: envelope.header.epoch_id,
+                    key_group: envelope.header.key_group_id,
+                    key_id: envelope.header.key_id,
+                };
+                keys.lock()
+                    .map_err(|_| anyhow::anyhow!("key cache poisoned"))?
+                    .insert(group_key, content_key);
+                drain_pending_objects(
+                    &mut decoder,
+                    events,
+                    &publisher,
+                    keys,
+                    &mut pending,
+                    &mut pending_bytes,
+                )?;
             }
             RelayViewerMessage::Live { .. } | RelayViewerMessage::Pong { .. } => {}
             RelayViewerMessage::Error(error) => {
@@ -853,6 +895,70 @@ async fn subscribe(
             _ => anyhow::bail!("unexpected subscription message"),
         }
     }
+}
+
+fn drain_pending_objects(
+    decoder: &mut Decoder,
+    events: &mpsc::UnboundedSender<Event>,
+    publisher: &IdentityPublic,
+    keys: &Arc<Mutex<HashMap<GroupKey, [u8; 32]>>>,
+    pending: &mut VecDeque<NativeObject>,
+    pending_bytes: &mut usize,
+) -> Result<()> {
+    loop {
+        let Some(object) = pending.front() else {
+            return Ok(());
+        };
+        let key = keys
+            .lock()
+            .map_err(|_| anyhow::anyhow!("key cache poisoned"))?
+            .get(&GroupKey::for_object(object))
+            .copied();
+        let Some(key) = key else {
+            return Ok(());
+        };
+        let object = pending.pop_front().expect("pending front exists");
+        *pending_bytes = pending_bytes.saturating_sub(object.ciphertext.len());
+        decode_object(decoder, events, publisher, object, key)?;
+    }
+}
+
+fn decode_object(
+    decoder: &mut Decoder,
+    events: &mpsc::UnboundedSender<Event>,
+    publisher: &IdentityPublic,
+    object: NativeObject,
+    key: [u8; 32],
+) -> Result<()> {
+    let plaintext = object.open(
+        publisher,
+        &ContentKey::from_bytes(key)?,
+        &object.header.key_id,
+    )?;
+    let annex_b = match object.header.kind {
+        NativeObjectKind::Epoch if object.header.codec == Some(CodecId::H264AnnexB) => {
+            H264EpochPayload::decode(&plaintext)?.codec_config
+        }
+        NativeObjectKind::Media if object.header.codec == Some(CodecId::H264AnnexB) => plaintext,
+        NativeObjectKind::Cursor | NativeObjectKind::Epoch | NativeObjectKind::Media => {
+            return Ok(());
+        }
+    };
+    for unit in nal_units(&annex_b) {
+        if let Some(yuv) = decoder.decode(unit)? {
+            let (width, height) = yuv.dimensions();
+            let mut rgb = vec![0; yuv.rgb8_len()];
+            yuv.write_rgb8(&mut rgb);
+            let _ = events.send(Event::Frame(Frame {
+                stream_id: object.header.stream_id,
+                width,
+                height,
+                rgb,
+                sequence: object.header.sequence,
+            }));
+        }
+    }
+    Ok(())
 }
 
 fn parse_relay(input: &str) -> Result<(String, Option<[u8; 32]>)> {

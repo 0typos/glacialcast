@@ -320,20 +320,6 @@ pub(super) async fn run_native_client(
         }
         let group = group.as_mut().expect("group created above");
         if starts_group {
-            for viewer in &approved {
-                let envelope = KeyEnvelope::seal(
-                    &publisher,
-                    viewer,
-                    stream_id,
-                    epoch_id,
-                    group_id,
-                    group.key_id(),
-                    &group.content_key(),
-                )?;
-                socket
-                    .write(&PublisherMessage::KeyEnvelope(envelope))
-                    .await?;
-            }
             let config = encoded.config.as_ref().context("IDR omitted SPS/PPS")?;
             let mut annex_b_config = Vec::new();
             for parameter_set in [&config.sps, &config.pps] {
@@ -359,6 +345,20 @@ pub(super) async fn run_native_client(
                 .encode()?,
             )?;
             publish(&mut socket, epoch, sequence).await?;
+            for viewer in &approved {
+                let envelope = KeyEnvelope::seal(
+                    &publisher,
+                    viewer,
+                    stream_id,
+                    epoch_id,
+                    group_id,
+                    group.key_id(),
+                    &group.content_key(),
+                )?;
+                socket
+                    .write(&PublisherMessage::KeyEnvelope(envelope))
+                    .await?;
+            }
         }
         sequence = sequence.saturating_add(1);
         let media = group.seal(
