@@ -164,15 +164,14 @@ and codecs fail closed. Canonical decoders reject truncation and trailing data.
 
 ## Capture, decoding, and presentation
 
-The publisher retains the existing portal/PipeWire capture, damage-aware
-sampling, VA-API/OpenH264 encoding, cursor metadata, reconnect, and resend
-machinery. Both encoder paths already produce H.264 Annex-B access units; native
-media publication uses those bytes directly rather than wrapping each frame in
-fMP4. Video and cursor share the publisher's monotonic media clock.
+The publisher retains the portal/PipeWire capture, damage-aware sampling,
+OpenH264 encoding, and cursor metadata machinery. Native media publication uses
+H.264 Annex-B access units directly rather than wrapping frames in fMP4. Video
+and cursor share the publisher's monotonic media clock.
 
 `gcview` separates a GUI-independent session/decode/timeline core from an
 eframe/egui shell. Tokio networking and one OpenH264 decoder per active stream
-run on background workers. Bounded channels deliver copied RGBA frames and
+run on background workers. Channels deliver copied RGBA frames and
 state changes to the UI, which maintains one texture per tile and paints the
 cursor independently.
 
@@ -184,10 +183,10 @@ stream. Retained playback has a timeline and an explicit return-to-live action.
 
 ## Retention and durability
 
-The relay keeps the existing opaque object-store guarantees: immutable payload
-publication, per-stream checksummed journals, atomic snapshots, fsync before
-acknowledgement, idempotent retry, bounded regular-file reads, symlink refusal,
-startup recovery, and monotonic high-water marks. Retention is per stream and
+The relay uses SQLite WAL storage with full synchronization, atomic object and
+envelope transactions, fsync-backed acknowledgement, idempotent retry, bounded
+regular-file reads, symlink refusal, startup recovery, and monotonic high-water
+marks. Retention is per stream and
 evicts complete decodable keyframe groups when either the age or byte limit is
 exceeded. Cursor objects and key envelopes cannot outlive their media group.
 

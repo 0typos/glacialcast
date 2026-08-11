@@ -70,8 +70,8 @@ secret or random fixture is committed.
 
 Fuzz targets cover every untrusted binary or structured boundary, including
 Noise segmentation, native credentials and revocation lists, pairing messages,
-encrypted stream headers, key envelopes, cursor batches, and relay catalog
-journal records. Parsers must cover maximum sizes, truncation, trailing data,
+encrypted stream headers, key envelopes, and H.264 epoch payloads. Parsers must
+cover maximum sizes, truncation, trailing data,
 unknown versions, invalid enums, inconsistent lengths, and authentication
 failure.
 
