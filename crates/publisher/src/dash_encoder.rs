@@ -258,7 +258,7 @@ impl DashH264Encoder {
         };
         match mode {
             DashEncoderMode::Vaapi => {
-                bail!("VA-API support is unavailable; use --dash-encoder openh264")
+                bail!("VA-API support is unavailable; use --encoder openh264")
             }
             DashEncoderMode::Openh264 => {
                 let encoder = software.build()?;

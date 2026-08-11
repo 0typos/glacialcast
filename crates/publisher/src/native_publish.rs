@@ -205,7 +205,7 @@ pub(super) async fn run_native_client(
     let height = first.height();
     let group_frames = ((args.fps * 4.0).round() as u64).clamp(1, u64::from(u16::MAX)) as u16;
     let encoder = EncoderActor::spawn(EncoderConfig {
-        mode: match args.dash_encoder {
+        mode: match args.encoder {
             DashEncoderMode::Vaapi => DashEncoderMode::Openh264,
             mode => mode,
         },
