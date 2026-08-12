@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use glacialcast_protocol::{
     NoiseSocket, PROTOCOL_VERSION,
     credential::{CredentialRole, NativeCredential},
+    cursor::{CursorBatch, CursorContext, encode_cursor_batch},
     envelope::KeyEnvelope,
     identity::{IdentitySecret, load_or_create_identity},
     initiator_handshake_xx, load_or_create_noise_keypair,
@@ -15,9 +16,6 @@ use glacialcast_protocol::{
     private_state::{PrivateLockMode, lock_private, read_private, replace_private},
     trust::KnownRelays,
     wire::{PublisherMessage, PublisherResumeStream, RelayPublisherMessage, SessionHello},
-};
-use glacialcast_stream::{
-    CursorBatch as DashCursorBatch, CursorContext as DashCursorContext, encode_plain_cursor_batch,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -420,18 +418,13 @@ pub(super) async fn run_native_client(
         publish(&mut socket, media, sequence).await?;
         let mut content_bytes = u64::try_from(encoded.annex_b.len()).unwrap_or(u64::MAX);
         if let Some(cursor) = capture.cursor(frame_index).await? {
-            let cursor_event = super::cursor_to_dash_event(
-                cursor,
-                timestamp,
-                width,
-                height,
-                &mut cursor_bitmap_state,
-            )?;
+            let cursor_event =
+                super::cursor_to_event(cursor, timestamp, width, height, &mut cursor_bitmap_state)?;
             let cursor_sequence = sequence
                 .checked_add(1)
                 .context("native cursor sequence space exhausted")?;
-            let cursor_payload = encode_plain_cursor_batch(
-                DashCursorContext {
+            let cursor_payload = encode_cursor_batch(
+                CursorContext {
                     stream_id,
                     epoch_id,
                     sequence: cursor_sequence,
@@ -439,7 +432,7 @@ pub(super) async fn run_native_client(
                     source_width: width,
                     source_height: height,
                 },
-                &DashCursorBatch {
+                &CursorBatch {
                     source_width: width,
                     source_height: height,
                     events: vec![cursor_event],
