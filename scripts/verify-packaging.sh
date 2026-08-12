@@ -10,7 +10,7 @@ work_dir="$(mktemp -d /tmp/glacialcast-package.XXXXXX)"
 trap 'find "${work_dir}" -depth -delete 2>/dev/null || true' EXIT
 
 archive="$(GLACIALCAST_DIST_DIR="${work_dir}/dist" \
-  CARGO_TARGET_DIR="${work_dir}/target" scripts/build-release.sh)"
+  CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${repo_root}/target}" scripts/build-release.sh)"
 archive_name="${archive##*/}"
 (
   cd "${work_dir}/dist"
