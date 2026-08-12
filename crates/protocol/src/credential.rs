@@ -1,6 +1,7 @@
 //! GlacialCast-native role credentials and signed revocation lists.
 
 use crate::{
+    entropy,
     identity::{
         IDENTITY_KEY_LEN, IdentityError, IdentityPublic, IdentitySecret, SignatureBytes,
         signing_digest, verify,
@@ -8,7 +9,6 @@ use crate::{
     private_state::{create_private, read_private},
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{fmt, io, path::Path};
@@ -182,10 +182,7 @@ impl CertificateAuthoritySecret {
     /// Generates a random Ed25519 certificate authority.
     #[must_use]
     pub fn generate() -> Self {
-        let mut signing_secret = [0u8; IDENTITY_KEY_LEN];
-        while signing_secret == [0; IDENTITY_KEY_LEN] {
-            rand::rngs::OsRng.fill_bytes(&mut signing_secret);
-        }
+        let signing_secret = entropy::random_nonzero();
         Self { signing_secret }
     }
 
@@ -232,10 +229,7 @@ impl CertificateAuthoritySecret {
     ) -> Result<NativeCredential, CredentialError> {
         request.verify(now_ms, max_request_lifetime_ms)?;
         validate_time_range(now_ms, not_after_ms)?;
-        let mut serial = [0u8; 16];
-        while serial == [0; 16] {
-            rand::rngs::OsRng.fill_bytes(&mut serial);
-        }
+        let serial = entropy::random_nonzero();
         let body = NativeCredentialBody {
             version: CREDENTIAL_VERSION,
             issuer_id: self.public().id()?,
@@ -415,10 +409,7 @@ impl CredentialRequest {
         if noise_static_key == [0; IDENTITY_KEY_LEN] {
             return Err(CredentialError::InvalidMetadata("zero Noise static key"));
         }
-        let mut nonce = [0u8; 16];
-        while nonce == [0; 16] {
-            rand::rngs::OsRng.fill_bytes(&mut nonce);
-        }
+        let nonce = entropy::random_nonzero();
         let body = CredentialRequestBody {
             version: CREDENTIAL_VERSION,
             subject,
