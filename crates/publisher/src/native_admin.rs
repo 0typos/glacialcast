@@ -695,10 +695,16 @@ async fn publish_history_groups(
     stream_id: Uuid,
     groups: &[super::native_publish::RetainedGroupKey],
 ) -> Result<()> {
+    // Zero-byte groups are excluded rather than offered: a group only counts
+    // content after its epoch object is acknowledged, so a zero-byte entry is
+    // either mid-rotation or was abandoned before publishing anything. The
+    // relay holds no ciphertext for it and refuses its envelope, and one
+    // refusal used to wedge every grant behind it in a permanent retry loop.
+    // A mid-rotation group is delivered moments later by the live path.
     let groups: Vec<_> = groups
         .iter()
         .rev()
-        .filter(|group| group.stream_id == stream_id)
+        .filter(|group| group.stream_id == stream_id && group.has_published_content())
         .collect();
     if groups.is_empty() {
         return Ok(());
