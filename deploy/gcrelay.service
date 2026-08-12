@@ -26,7 +26,7 @@ StateDirectoryMode=0700
 #
 # The file must be a private regular file with mode 0600. A path given
 # explicitly that is not there fails startup rather than falling back to
-# defaults, which would quietly mean a relay with no ingest tokens.
+# defaults, which could quietly expose a public-admission relay.
 ExecStart=/usr/local/bin/gcrelay \
     --viewer-addr 0.0.0.0:8899 \
     --publisher-addr 0.0.0.0:8900 \

@@ -36,6 +36,7 @@ mkdir -p \
   "${bundle_root}/bin" \
   "${bundle_root}/deploy" \
   "${bundle_root}/docs" \
+  "${bundle_root}/packaging" \
   "${dist_dir}"
 cp -a \
   "${target_dir}/release/gcpub" \
@@ -43,13 +44,13 @@ cp -a \
   "${target_dir}/release/gcview" \
   "${bundle_root}/bin/"
 cp -a deploy/. "${bundle_root}/deploy/"
+cp -a docs/. "${bundle_root}/docs/"
 cp -a \
-  docs/internet-deployment.md \
-  docs/release-operations.md \
-  docs/support-matrix.md \
-  docs/testing-demo-guide.md \
-  "${bundle_root}/docs/"
-cp -a LICENSE README.md "${bundle_root}/"
+  packaging/client.toml.example \
+  packaging/publisher.toml.example \
+  packaging/server.toml.example \
+  "${bundle_root}/packaging/"
+cp -a LICENSE README.md SECURITY.md "${bundle_root}/"
 
 SOURCE_DATE_EPOCH="${source_epoch}" \
 GLACIALCAST_RELEASE_REVISION="${revision}" \

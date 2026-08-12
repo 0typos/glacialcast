@@ -14,7 +14,8 @@ As the user whose screen is to be published, not as root:
        /usr/share/doc/gcpub/client.toml.example \
        ~/.config/glacialcast/client.toml
      chmod 600 ~/.config/glacialcast/client.toml
-     Then set ingest_server_key to what the relay prints.
+     Optionally set ingest_server_key to the relay key printed by gcrelay;
+     without it, the publisher uses trust on first use and pins that key.
   2. systemctl --user enable --now gcpub
 
 View with `gcview HOST:8899`, then approve the verified request with

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Configuration under /etc and retained objects under /var/lib are left in
-# place. Removing a package is not a request to destroy the stream history or
-# the ingest tokens it was serving.
+# place. Removing a package is not a request to destroy stream history,
+# identities, credentials, or other operator state.
 set -e
 
 if [ -d /run/systemd/system ]; then
