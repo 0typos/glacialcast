@@ -16,6 +16,7 @@ anyhow.workspace = true
 clap.workspace = true
 eframe.workspace = true
 glacialcast-protocol = { path = "../protocol", version = "0.7.0" }
+glacialcast-stream = { path = "../stream", version = "0.7.0" }
 openh264 = { workspace = true, features = ["source"] }
 postcard.workspace = true
 serde.workspace = true

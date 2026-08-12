@@ -183,6 +183,14 @@ four concurrent streams, supports the six-tile layout, and imposes no protocol
 stream-count limit. Any tile can become fullscreen. Keyboard controls select a
 visible tile, enter/leave fullscreen, and move to the next or previous active
 stream. Retained playback has a timeline and an explicit return-to-live action.
+Catalog and pairing inboxes refresh periodically. A disconnected subscription
+reconnects with bounded backoff from its last decrypted sequence, while both
+ciphertext awaiting a key and the in-memory group-key cache have hard limits.
+
+After a signed publisher approval, the viewer durably pins that publisher
+identity to the exact stream. A catalog entry that later presents the same
+stream under another identity is hidden; relay TOFU and catalog metadata cannot
+silently replace the publisher-to-viewer trust decision.
 
 ## Retention and durability
 

@@ -51,7 +51,10 @@ before publishing more.
 
 The viewer exposes **History**, a retained-range slider, **Go**, and **Live**.
 Newly approved viewers receive retained key envelopes newest-first, so older
-history can become playable after live playback starts.
+history can become playable after live playback starts. Catalog and pairing
+state refresh automatically; active tiles reconnect from their last decrypted
+sequence. A publisher identity learned from a valid signed approval is pinned
+to that stream and a later mismatch is hidden rather than silently accepted.
 
 ## Configuration
 

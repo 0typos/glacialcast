@@ -14,10 +14,11 @@ use glacialcast_protocol::{
         CodecId, ContentKey, H264EpochPayload, LiveSequenceGuard, NativeObject, NativeObjectKind,
     },
     pairing::{PairOffer, PairRequest, ViewerConfirmation, authentication_string},
-    private_state::{read_private, replace_private},
+    private_state::{PrivateLockMode, lock_private, read_private, replace_private},
     trust::KnownRelays,
     wire::{CatalogEntry, RelayViewerMessage, SessionHello, SubscriptionStart, ViewerMessage},
 };
+use glacialcast_stream::{CursorContext as DashCursorContext, decode_plain_cursor_batch};
 use openh264::{decoder::Decoder, formats::YUVSource, nal_units};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -36,6 +37,10 @@ const PAIRING_STATE_VERSION: u16 = 1;
 const MAX_PAIRING_STATE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PENDING_OBJECTS: usize = 256;
 const MAX_PENDING_CIPHERTEXT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_CACHED_KEYS: usize = 8_192;
+const VERIFIED_PUBLISHERS_VERSION: u16 = 1;
+const MAX_VERIFIED_PUBLISHERS_BYTES: usize = 4 * 1024 * 1024;
+const NETWORK_TIMEOUT: Duration = Duration::from_secs(15);
 type PendingPairings = HashMap<[u8; 32], (PairRequest, Option<PairOffer>)>;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -54,6 +59,29 @@ impl GroupKey {
             key_group: object.header.key_group,
             key_id: object.header.key_id,
         }
+    }
+}
+
+#[derive(Default)]
+struct KeyCache {
+    keys: HashMap<GroupKey, [u8; 32]>,
+    order: VecDeque<GroupKey>,
+}
+
+impl KeyCache {
+    fn insert(&mut self, group: GroupKey, key: [u8; 32]) {
+        if self.keys.insert(group, key).is_none() {
+            self.order.push_back(group);
+        }
+        while self.keys.len() > MAX_CACHED_KEYS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.keys.remove(&oldest);
+            }
+        }
+    }
+
+    fn get(&self, group: &GroupKey) -> Option<[u8; 32]> {
+        self.keys.get(group).copied()
     }
 }
 
@@ -108,12 +136,23 @@ struct Frame {
     key_group: u64,
 }
 
+struct CursorUpdate {
+    stream_id: Uuid,
+    x_micropixels: i64,
+    y_micropixels: i64,
+    visible: bool,
+    bitmap: Option<glacialcast_stream::CursorBitmap>,
+}
+
 enum Event {
     Status(String),
     Catalog(Vec<CatalogEntry>),
     Frame(Frame),
+    Cursor(CursorUpdate),
+    StreamStatus(Uuid, String),
     StreamError(Uuid, String),
     PairingPrompt([u8; 32], String),
+    PairingApproved(Uuid, IdentityPublic),
 }
 
 enum Command {
@@ -126,6 +165,12 @@ enum Command {
 struct Tile {
     catalog: CatalogEntry,
     texture: Option<egui::TextureHandle>,
+    frame_size: [usize; 2],
+    cursor_texture: Option<egui::TextureHandle>,
+    cursor_size: [usize; 2],
+    cursor_hotspot: [i32; 2],
+    cursor_position: [f32; 2],
+    cursor_visible: bool,
     sequence: u64,
     status: String,
     seek_timestamp: u64,
@@ -135,6 +180,12 @@ struct Tile {
 struct PairingState {
     version: u16,
     pending: Vec<(PairRequest, Option<PairOffer>)>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct VerifiedPublishersState {
+    version: u16,
+    publishers: Vec<(Uuid, IdentityPublic)>,
 }
 
 struct ViewerApp {
@@ -171,6 +222,10 @@ impl ViewerApp {
             match event {
                 Event::Status(status) => self.status = status,
                 Event::Catalog(entries) => {
+                    let visible_ids: std::collections::HashSet<_> = entries
+                        .iter()
+                        .map(|entry| entry.descriptor.body.stream_id)
+                        .collect();
                     for entry in entries {
                         if let Some(tile) = self.tiles.iter_mut().find(|tile| {
                             tile.catalog.descriptor.body.stream_id
@@ -181,21 +236,40 @@ impl ViewerApp {
                                     .seek_timestamp
                                     .clamp(bounds.oldest_timestamp, bounds.newest_timestamp);
                             }
+                            if !entry.publisher_online {
+                                tile.status = "Retained; publisher offline".into();
+                            } else if tile.status == "Retained; publisher offline" {
+                                tile.status = "Available live".into();
+                            }
                             tile.catalog = entry;
                         } else {
                             let seek_timestamp =
                                 entry.retained.map_or(0, |bounds| bounds.newest_timestamp);
                             self.tiles.push(Tile {
+                                status: if entry.publisher_online {
+                                    "Available live".into()
+                                } else {
+                                    "Retained; publisher offline".into()
+                                },
                                 catalog: entry,
                                 texture: None,
+                                frame_size: [0, 0],
+                                cursor_texture: None,
+                                cursor_size: [0, 0],
+                                cursor_hotspot: [0, 0],
+                                cursor_position: [0.0, 0.0],
+                                cursor_visible: false,
                                 sequence: 0,
-                                status: "Available".into(),
                                 seek_timestamp,
                             });
                         }
                     }
+                    self.tiles.retain(|tile| {
+                        visible_ids.contains(&tile.catalog.descriptor.body.stream_id)
+                    });
                     self.tiles
                         .sort_by_key(|tile| tile.catalog.descriptor.body.stream_id);
+                    self.selected = self.selected.min(self.tiles.len().saturating_sub(1));
                     self.status = format!("{} stream(s) visible", self.tiles.len());
                 }
                 Event::Frame(frame) => {
@@ -212,7 +286,41 @@ impl ViewerApp {
                             egui::TextureOptions::LINEAR,
                         ));
                         tile.sequence = frame.sequence;
-                        tile.status = "Live".into();
+                        tile.frame_size = [frame.width, frame.height];
+                    }
+                }
+                Event::Cursor(cursor) => {
+                    if let Some(tile) = self
+                        .tiles
+                        .iter_mut()
+                        .find(|tile| tile.catalog.descriptor.body.stream_id == cursor.stream_id)
+                    {
+                        tile.cursor_position = [
+                            cursor.x_micropixels as f32 / 1_000_000.0,
+                            cursor.y_micropixels as f32 / 1_000_000.0,
+                        ];
+                        tile.cursor_visible = cursor.visible;
+                        if let Some(bitmap) = cursor.bitmap {
+                            let size = [bitmap.width as usize, bitmap.height as usize];
+                            let image =
+                                egui::ColorImage::from_rgba_unmultiplied(size, &bitmap.rgba);
+                            tile.cursor_texture = Some(context.load_texture(
+                                format!("{}-cursor", cursor.stream_id),
+                                image,
+                                egui::TextureOptions::LINEAR,
+                            ));
+                            tile.cursor_size = size;
+                            tile.cursor_hotspot = [bitmap.hotspot_x, bitmap.hotspot_y];
+                        }
+                    }
+                }
+                Event::StreamStatus(stream_id, status) => {
+                    if let Some(tile) = self
+                        .tiles
+                        .iter_mut()
+                        .find(|tile| tile.catalog.descriptor.body.stream_id == stream_id)
+                    {
+                        tile.status = status;
                     }
                 }
                 Event::StreamError(stream_id, error) => {
@@ -226,6 +334,19 @@ impl ViewerApp {
                 }
                 Event::PairingPrompt(request_id, authentication) => {
                     self.pairing_prompt = Some((request_id, authentication));
+                    context.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                        egui::UserAttentionType::Informational,
+                    ));
+                }
+                Event::PairingApproved(stream_id, publisher) => {
+                    let _ = self.commands.send(Command::Subscribe(
+                        stream_id,
+                        publisher,
+                        SubscriptionStart::Live,
+                    ));
+                    context.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                        egui::UserAttentionType::Informational,
+                    ));
                 }
             }
         }
@@ -287,8 +408,17 @@ impl eframe::App for ViewerApp {
             let columns = match visible.len() {
                 0 | 1 => 1,
                 2 => 2,
-                _ => 2,
+                3 | 4 => 2,
+                _ => 3,
             };
+            let rows = visible.len().div_ceil(columns).max(1);
+            let available = ui.available_size_before_wrap();
+            let tile_size = egui::vec2(
+                ((available.x - 8.0 * (columns.saturating_sub(1) as f32)) / columns as f32)
+                    .max(240.0),
+                ((available.y - 8.0 * (rows.saturating_sub(1) as f32)) / rows as f32 - 70.0)
+                    .max(120.0),
+            );
             egui::Grid::new("streams")
                 .num_columns(columns)
                 .spacing([8.0, 8.0])
@@ -347,12 +477,42 @@ impl eframe::App for ViewerApp {
                                     }
                                 });
                             }
-                            let available = ui.available_size_before_wrap();
-                            let size = egui::vec2(available.x.max(240.0), (available.y / 2.0).max(160.0));
                             if let Some(texture) = &tile.texture {
-                                ui.add(egui::Image::new(texture).fit_to_exact_size(size));
+                                let (rect, _) = ui.allocate_exact_size(tile_size, egui::Sense::hover());
+                                ui.painter().image(
+                                    texture.id(),
+                                    rect,
+                                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                                    egui::Color32::WHITE,
+                                );
+                                if tile.cursor_visible
+                                    && let Some(cursor) = &tile.cursor_texture
+                                    && tile.frame_size[0] > 0
+                                    && tile.frame_size[1] > 0
+                                {
+                                    let scale_x = rect.width() / tile.frame_size[0] as f32;
+                                    let scale_y = rect.height() / tile.frame_size[1] as f32;
+                                    let position = rect.min
+                                        + egui::vec2(
+                                            (tile.cursor_position[0] - tile.cursor_hotspot[0] as f32) * scale_x,
+                                            (tile.cursor_position[1] - tile.cursor_hotspot[1] as f32) * scale_y,
+                                        );
+                                    let cursor_rect = egui::Rect::from_min_size(
+                                        position,
+                                        egui::vec2(
+                                            tile.cursor_size[0] as f32 * scale_x,
+                                            tile.cursor_size[1] as f32 * scale_y,
+                                        ),
+                                    );
+                                    ui.painter().image(
+                                        cursor.id(),
+                                        cursor_rect,
+                                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                                        egui::Color32::WHITE,
+                                    );
+                                }
                             } else {
-                                ui.allocate_ui(size, |ui| { ui.centered_and_justified(|ui| { ui.label("Encrypted stream — approve this viewer on the publisher if playback stays locked"); }); });
+                                ui.allocate_ui(tile_size, |ui| { ui.centered_and_justified(|ui| { ui.label("Encrypted stream — approve this viewer on the publisher if playback stays locked"); }); });
                             }
                         });
                         if (position + 1) % columns == 0 {
@@ -444,6 +604,11 @@ pub fn run() -> Result<()> {
         credential,
         explicit_pin,
     };
+    let _viewer_lock = lock_private(
+        &profile.state_dir.join("viewer-process.lock"),
+        PrivateLockMode::TryExclusive,
+    )
+    .context("another gcview process already owns this viewer state directory")?;
     if let Some(stream_id) = args.verify_stream {
         let runtime = Runtime::new()?;
         return runtime.block_on(headless_verify_stream(&profile, stream_id));
@@ -473,8 +638,8 @@ pub fn run() -> Result<()> {
 
 async fn headless_verify_stream(profile: &ConnectionProfile, stream_id: Uuid) -> Result<()> {
     let mut catalog_socket = connect(profile).await?;
-    catalog_socket.write(&ViewerMessage::Catalog).await?;
-    let catalog = match catalog_socket.read::<RelayViewerMessage>().await? {
+    write_viewer(&mut catalog_socket, &ViewerMessage::Catalog).await?;
+    let catalog = match read_viewer(&mut catalog_socket).await? {
         RelayViewerMessage::Catalog(catalog) => catalog,
         RelayViewerMessage::Error(error) => anyhow::bail!("catalog rejected: {}", error.detail),
         _ => anyhow::bail!("unexpected catalog response"),
@@ -489,10 +654,10 @@ async fn headless_verify_stream(profile: &ConnectionProfile, stream_id: Uuid) ->
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let mut socket = connect(profile).await?;
-            socket.write(&ViewerMessage::FetchInbox).await?;
+            write_viewer(&mut socket, &ViewerMessage::FetchInbox).await?;
             let mut approved = false;
             loop {
-                match socket.read::<RelayViewerMessage>().await? {
+                match read_viewer(&mut socket).await? {
                     RelayViewerMessage::PairDecision(decision)
                         if decision.body.request_id == request_id =>
                     {
@@ -500,6 +665,7 @@ async fn headless_verify_stream(profile: &ConnectionProfile, stream_id: Uuid) ->
                         if !decision.body.approved || decision.body.stream_id != stream_id {
                             anyhow::bail!("publisher rejected stream verification request");
                         }
+                        remember_verified_publisher(profile, stream_id, publisher)?;
                         approved = true;
                     }
                     RelayViewerMessage::PairOffer(_)
@@ -521,7 +687,7 @@ async fn headless_verify_stream(profile: &ConnectionProfile, stream_id: Uuid) ->
     .await
     .context("timed out waiting for automatic publisher approval")??;
 
-    let keys = Arc::new(Mutex::new(HashMap::new()));
+    let keys = Arc::new(Mutex::new(KeyCache::default()));
     let (events, mut received) = mpsc::unbounded_channel();
     tokio::time::timeout(Duration::from_secs(15), async {
         let subscription = subscribe(
@@ -568,8 +734,8 @@ async fn headless_verify_stream(profile: &ConnectionProfile, stream_id: Uuid) ->
 
 async fn headless_catalog(profile: &ConnectionProfile) -> Result<()> {
     let mut socket = connect(profile).await?;
-    socket.write(&ViewerMessage::Catalog).await?;
-    match socket.read::<RelayViewerMessage>().await? {
+    write_viewer(&mut socket, &ViewerMessage::Catalog).await?;
+    match read_viewer(&mut socket).await? {
         RelayViewerMessage::Catalog(catalog) => {
             for entry in catalog {
                 println!(
@@ -597,7 +763,7 @@ async fn command_worker(
     events: mpsc::UnboundedSender<Event>,
     mut commands: mpsc::UnboundedReceiver<Command>,
 ) {
-    let keys = Arc::new(Mutex::new(HashMap::new()));
+    let keys = Arc::new(Mutex::new(KeyCache::default()));
     let pairing_path = profile.state_dir.join("pending-pairings.bin");
     let mut pending = match load_pairing_state(&pairing_path) {
         Ok(pending) => pending,
@@ -609,16 +775,22 @@ async fn command_worker(
         }
     };
     let mut subscriptions: HashMap<Uuid, tokio::task::JoinHandle<()>> = HashMap::new();
-    while let Some(command) = commands.recv().await {
+    let mut refresh_interval = tokio::time::interval(Duration::from_secs(5));
+    refresh_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let command = tokio::select! {
+            command = commands.recv() => {
+                let Some(command) = command else { return; };
+                command
+            }
+            _ = refresh_interval.tick() => {
+                refresh_all(&profile, &events, &keys, &mut pending).await;
+                continue;
+            }
+        };
         match command {
             Command::Refresh => {
-                if let Err(error) = refresh(&profile, &events, &keys).await {
-                    let _ = events.send(Event::Status(format!("Connection failed: {error:#}")));
-                }
-                if let Err(error) = refresh_pairing(&profile, &events, &mut pending).await {
-                    let _ =
-                        events.send(Event::Status(format!("Pairing refresh failed: {error:#}")));
-                }
+                refresh_all(&profile, &events, &keys, &mut pending).await;
             }
             Command::Subscribe(stream_id, publisher, start) => {
                 if let Some(previous) = subscriptions.remove(&stream_id) {
@@ -687,11 +859,30 @@ async fn command_worker(
     }
 }
 
+async fn refresh_all(
+    profile: &ConnectionProfile,
+    events: &mpsc::UnboundedSender<Event>,
+    keys: &Arc<Mutex<KeyCache>>,
+    pending: &mut PendingPairings,
+) {
+    if let Err(error) = refresh(profile, events, keys).await {
+        let _ = events.send(Event::Status(format!("Connection failed: {error:#}")));
+    }
+    if let Err(error) = refresh_pairing(profile, events, pending).await {
+        let _ = events.send(Event::Status(format!("Pairing refresh failed: {error:#}")));
+    }
+}
+
 async fn begin_pairing(
     profile: &ConnectionProfile,
     stream_id: Uuid,
     publisher: IdentityPublic,
 ) -> Result<PairRequest> {
+    if let Some(expected) = verified_publishers(profile)?.get(&stream_id)
+        && expected.id()? != publisher.id()?
+    {
+        anyhow::bail!("refusing to pair with a changed publisher identity");
+    }
     let now = glacialcast_protocol::now_ms();
     let request = PairRequest::new_with_credential(
         &profile.identity,
@@ -703,10 +894,12 @@ async fn begin_pairing(
         now.saturating_add(24 * 60 * 60 * 1_000),
     )?;
     let mut socket = connect(profile).await?;
-    socket
-        .write(&ViewerMessage::PairRequest(Box::new(request.clone())))
-        .await?;
-    match socket.read::<RelayViewerMessage>().await? {
+    write_viewer(
+        &mut socket,
+        &ViewerMessage::PairRequest(Box::new(request.clone())),
+    )
+    .await?;
+    match read_viewer(&mut socket).await? {
         RelayViewerMessage::PairingQueued { request_id } if request_id == request.id()? => {
             Ok(request)
         }
@@ -723,9 +916,9 @@ async fn refresh_pairing(
     pending: &mut HashMap<[u8; 32], (PairRequest, Option<PairOffer>)>,
 ) -> Result<()> {
     let mut socket = connect(profile).await?;
-    socket.write(&ViewerMessage::FetchInbox).await?;
+    write_viewer(&mut socket, &ViewerMessage::FetchInbox).await?;
     loop {
-        match socket.read::<RelayViewerMessage>().await? {
+        match read_viewer(&mut socket).await? {
             RelayViewerMessage::PairOffer(offer) => {
                 let prompt =
                     if let Some((request, stored)) = pending.get_mut(&offer.body.request_id) {
@@ -748,12 +941,25 @@ async fn refresh_pairing(
             RelayViewerMessage::PairDecision(decision) => {
                 if let Some((request, _)) = pending.get(&decision.body.request_id) {
                     decision.verify(request, &request.body.publisher)?;
+                    if decision.body.approved {
+                        remember_verified_publisher(
+                            profile,
+                            request.body.stream_id,
+                            request.body.publisher,
+                        )?;
+                    }
                     let status = if decision.body.approved {
                         "Publisher approved this viewer"
                     } else {
                         "Publisher rejected this viewer"
                     };
                     let _ = events.send(Event::Status(status.into()));
+                    if decision.body.approved {
+                        let _ = events.send(Event::PairingApproved(
+                            request.body.stream_id,
+                            request.body.publisher,
+                        ));
+                    }
                 }
                 pending.remove(&decision.body.request_id);
                 save_pairing_state(&profile.state_dir.join("pending-pairings.bin"), pending)?;
@@ -802,6 +1008,71 @@ fn save_pairing_state(path: &Path, pending: &PendingPairings) -> Result<()> {
     Ok(())
 }
 
+fn verified_publishers(profile: &ConnectionProfile) -> Result<HashMap<Uuid, IdentityPublic>> {
+    let _lock = lock_private(
+        &profile.state_dir.join(".verified-publishers.lock"),
+        PrivateLockMode::Shared,
+    )?;
+    load_verified_publishers_unlocked(&profile.state_dir.join("verified-publishers.bin"))
+}
+
+fn remember_verified_publisher(
+    profile: &ConnectionProfile,
+    stream_id: Uuid,
+    publisher: IdentityPublic,
+) -> Result<()> {
+    let _lock = lock_private(
+        &profile.state_dir.join(".verified-publishers.lock"),
+        PrivateLockMode::Exclusive,
+    )?;
+    let path = profile.state_dir.join("verified-publishers.bin");
+    let mut publishers = load_verified_publishers_unlocked(&path)?;
+    if let Some(existing) = publishers.get(&stream_id)
+        && existing.id()? != publisher.id()?
+    {
+        anyhow::bail!("verified publisher identity changed for stream {stream_id}");
+    }
+    publishers.insert(stream_id, publisher);
+    let mut entries: Vec<_> = publishers.into_iter().collect();
+    entries.sort_by_key(|(stream_id, _)| *stream_id);
+    let encoded = postcard::to_stdvec(&VerifiedPublishersState {
+        version: VERIFIED_PUBLISHERS_VERSION,
+        publishers: entries,
+    })?;
+    if encoded.len() > MAX_VERIFIED_PUBLISHERS_BYTES {
+        anyhow::bail!("verified publisher state exceeds its file bound");
+    }
+    replace_private(&path, &encoded, MAX_VERIFIED_PUBLISHERS_BYTES)?;
+    Ok(())
+}
+
+fn load_verified_publishers_unlocked(path: &Path) -> Result<HashMap<Uuid, IdentityPublic>> {
+    let bytes = match read_private(path, MAX_VERIFIED_PUBLISHERS_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let (state, remainder) = postcard::take_from_bytes::<VerifiedPublishersState>(&bytes)?;
+    if !remainder.is_empty()
+        || state.version != VERIFIED_PUBLISHERS_VERSION
+        || state.publishers.len() > 65_536
+        || postcard::to_stdvec(&state)? != bytes
+    {
+        anyhow::bail!("verified publisher state is invalid or non-canonical");
+    }
+    let mut publishers = HashMap::new();
+    let mut previous = None;
+    for (stream_id, publisher) in state.publishers {
+        if previous.is_some_and(|previous| previous >= stream_id)
+            || publishers.insert(stream_id, publisher).is_some()
+        {
+            anyhow::bail!("verified publisher state is not strictly ordered");
+        }
+        previous = Some(stream_id);
+    }
+    Ok(publishers)
+}
+
 async fn confirm_pairing(
     profile: &ConnectionProfile,
     request: &PairRequest,
@@ -814,10 +1085,8 @@ async fn confirm_pairing(
         glacialcast_protocol::now_ms(),
     )?;
     let mut socket = connect(profile).await?;
-    socket
-        .write(&ViewerMessage::PairConfirmation(confirmation))
-        .await?;
-    match socket.read::<RelayViewerMessage>().await? {
+    write_viewer(&mut socket, &ViewerMessage::PairConfirmation(confirmation)).await?;
+    match read_viewer(&mut socket).await? {
         RelayViewerMessage::PairingQueued { request_id } if request_id == request.id()? => Ok(()),
         RelayViewerMessage::Error(error) => {
             anyhow::bail!("relay rejected confirmation: {}", error.detail)
@@ -827,41 +1096,48 @@ async fn confirm_pairing(
 }
 
 async fn connect(profile: &ConnectionProfile) -> Result<NoiseSocket<TcpStream>> {
-    let mut stream = TcpStream::connect(&profile.endpoint)
+    let mut stream = tokio::time::timeout(NETWORK_TIMEOUT, TcpStream::connect(&profile.endpoint))
         .await
+        .context("viewer relay connection timed out")?
         .with_context(|| format!("connecting to {}", profile.endpoint))?;
     let expected = if let Some(pin) = profile.explicit_pin {
         Some(pin)
     } else {
         KnownRelays::open(profile.state_dir.join("known-relays.bin"))?.get(&profile.endpoint)?
     };
-    let (transport, remote) = initiator_handshake_xx(
-        &mut stream,
-        &profile.noise.private,
-        |actual| match expected {
-            Some(expected) if actual != &expected => {
-                Err(glacialcast_protocol::ProtocolError::Noise(
-                    "relay identity does not match its pin".into(),
-                ))
-            }
-            _ => Ok(()),
-        },
+    let (transport, remote) = tokio::time::timeout(
+        NETWORK_TIMEOUT,
+        initiator_handshake_xx(
+            &mut stream,
+            &profile.noise.private,
+            |actual| match expected {
+                Some(expected) if actual != &expected => {
+                    Err(glacialcast_protocol::ProtocolError::Noise(
+                        "relay identity does not match its pin".into(),
+                    ))
+                }
+                _ => Ok(()),
+            },
+        ),
     )
-    .await?;
+    .await
+    .context("viewer relay handshake timed out")??;
     if profile.explicit_pin.is_none() {
         KnownRelays::open(profile.state_dir.join("known-relays.bin"))?
             .verify_or_learn(&profile.endpoint, remote)?;
     }
     let mut socket = NoiseSocket::new(stream, transport);
-    socket
-        .write(&ViewerMessage::Hello(SessionHello {
+    write_viewer(
+        &mut socket,
+        &ViewerMessage::Hello(SessionHello {
             protocol_version: PROTOCOL_VERSION,
             role: CredentialRole::Viewer,
             identity: profile.identity.public()?,
             credential: profile.credential.clone(),
-        }))
-        .await?;
-    match socket.read::<RelayViewerMessage>().await? {
+        }),
+    )
+    .await?;
+    match read_viewer(&mut socket).await? {
         RelayViewerMessage::Welcome(_) => Ok(socket),
         RelayViewerMessage::Error(error) => {
             anyhow::bail!("relay rejected viewer: {:?}: {}", error.code, error.detail)
@@ -870,18 +1146,44 @@ async fn connect(profile: &ConnectionProfile) -> Result<NoiseSocket<TcpStream>> 
     }
 }
 
+async fn write_viewer(socket: &mut NoiseSocket<TcpStream>, message: &ViewerMessage) -> Result<()> {
+    tokio::time::timeout(NETWORK_TIMEOUT, socket.write(message))
+        .await
+        .context("viewer relay write timed out")??;
+    Ok(())
+}
+
+async fn read_viewer(socket: &mut NoiseSocket<TcpStream>) -> Result<RelayViewerMessage> {
+    tokio::time::timeout(NETWORK_TIMEOUT, socket.read::<RelayViewerMessage>())
+        .await
+        .context("viewer relay response timed out")?
+        .map_err(Into::into)
+}
+
 async fn refresh(
     profile: &ConnectionProfile,
     events: &mpsc::UnboundedSender<Event>,
-    keys: &Arc<Mutex<HashMap<GroupKey, [u8; 32]>>>,
+    keys: &Arc<Mutex<KeyCache>>,
 ) -> Result<()> {
     let mut socket = connect(profile).await?;
-    socket.write(&ViewerMessage::Catalog).await?;
-    let catalog = match socket.read::<RelayViewerMessage>().await? {
+    write_viewer(&mut socket, &ViewerMessage::Catalog).await?;
+    let mut catalog = match read_viewer(&mut socket).await? {
         RelayViewerMessage::Catalog(catalog) => catalog,
         RelayViewerMessage::Error(error) => anyhow::bail!("catalog rejected: {}", error.detail),
         _ => anyhow::bail!("unexpected catalog response"),
     };
+    let verified = verified_publishers(profile)?;
+    let mut hidden_mismatches = 0usize;
+    catalog.retain(|entry| {
+        let stream_id = entry.descriptor.body.stream_id;
+        let matches = verified
+            .get(&stream_id)
+            .is_none_or(|expected| expected.id().ok() == entry.descriptor.body.publisher.id().ok());
+        if !matches {
+            hidden_mismatches = hidden_mismatches.saturating_add(1);
+        }
+        matches
+    });
     let publishers: HashMap<[u8; 32], IdentityPublic> = catalog
         .iter()
         .map(|entry| {
@@ -891,9 +1193,9 @@ async fn refresh(
             ))
         })
         .collect::<Result<_>>()?;
-    socket.write(&ViewerMessage::FetchInbox).await?;
+    write_viewer(&mut socket, &ViewerMessage::FetchInbox).await?;
     loop {
-        match socket.read::<RelayViewerMessage>().await? {
+        match read_viewer(&mut socket).await? {
             RelayViewerMessage::KeyEnvelope(envelope) => {
                 if let Some(publisher) = publishers.get(&envelope.header.publisher_id) {
                     let content_key = envelope.open(&profile.identity, publisher)?;
@@ -917,40 +1219,119 @@ async fn refresh(
         }
     }
     let _ = events.send(Event::Catalog(catalog));
+    if hidden_mismatches > 0 {
+        let _ = events.send(Event::Status(format!(
+            "Hidden {hidden_mismatches} stream(s) whose publisher identity changed"
+        )));
+    }
     Ok(())
 }
 
 async fn subscribe(
     profile: &ConnectionProfile,
     events: &mpsc::UnboundedSender<Event>,
-    keys: &Arc<Mutex<HashMap<GroupKey, [u8; 32]>>>,
+    keys: &Arc<Mutex<KeyCache>>,
     stream_id: Uuid,
     publisher: IdentityPublic,
     start: SubscriptionStart,
 ) -> Result<()> {
+    let mut last_decrypted = 0u64;
+    let mut attempt = 0u32;
+    loop {
+        let before = last_decrypted;
+        let resume = if last_decrypted == 0 {
+            start
+        } else {
+            SubscriptionStart::Sequence(last_decrypted.saturating_add(1))
+        };
+        match subscribe_once(
+            profile,
+            events,
+            keys,
+            stream_id,
+            publisher,
+            resume,
+            &mut last_decrypted,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if last_decrypted > before {
+                    attempt = 0;
+                }
+                let delay = reconnect_delay(attempt);
+                attempt = attempt.saturating_add(1);
+                let _ = events.send(Event::StreamError(
+                    stream_id,
+                    format!(
+                        "Disconnected; retrying in {:.1}s ({error:#})",
+                        delay.as_secs_f32()
+                    ),
+                ));
+                let _ = refresh(profile, events, keys).await;
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
+fn reconnect_delay(attempt: u32) -> Duration {
+    Duration::from_millis(250u64.saturating_mul(1u64 << attempt.min(5)))
+}
+
+async fn subscribe_once(
+    profile: &ConnectionProfile,
+    events: &mpsc::UnboundedSender<Event>,
+    keys: &Arc<Mutex<KeyCache>>,
+    stream_id: Uuid,
+    publisher: IdentityPublic,
+    start: SubscriptionStart,
+    last_decrypted: &mut u64,
+) -> Result<()> {
+    if let Some(expected) = verified_publishers(profile)?.get(&stream_id)
+        && expected.id()? != publisher.id()?
+    {
+        anyhow::bail!("catalog publisher does not match the verified stream identity");
+    }
     let mut socket = connect(profile).await?;
     let publisher_id = publisher.id()?;
-    socket
-        .write(&ViewerMessage::Subscribe {
+    write_viewer(
+        &mut socket,
+        &ViewerMessage::Subscribe {
             publisher_id,
             stream_id,
             start,
-        })
-        .await?;
-    let first_sequence = match socket.read::<RelayViewerMessage>().await? {
-        RelayViewerMessage::SubscriptionStarted { first_sequence, .. } => first_sequence,
+        },
+    )
+    .await?;
+    let (first_sequence, starts_live) = match read_viewer(&mut socket).await? {
+        RelayViewerMessage::SubscriptionStarted {
+            first_sequence,
+            live,
+            ..
+        } => (first_sequence, live),
         RelayViewerMessage::Error(error) => {
             anyhow::bail!("subscription rejected: {}", error.detail)
         }
         _ => anyhow::bail!("unexpected subscription response"),
     };
+    let _ = events.send(Event::StreamStatus(
+        stream_id,
+        if starts_live {
+            "Waiting for live media".into()
+        } else {
+            "Playing retained history".into()
+        },
+    ));
     let mut guard =
         LiveSequenceGuard::new(publisher_id, stream_id, first_sequence.saturating_sub(1));
     let mut decoder = Decoder::new()?;
+    let mut source_size = None;
     let mut pending = VecDeque::new();
     let mut pending_bytes = 0usize;
     loop {
-        match socket.read::<RelayViewerMessage>().await? {
+        match read_viewer(&mut socket).await? {
             RelayViewerMessage::Object(object) => {
                 guard.accept(&object)?;
                 pending_bytes = pending_bytes.saturating_add(object.ciphertext.len());
@@ -960,14 +1341,17 @@ async fn subscribe(
                 {
                     anyhow::bail!("publisher key envelope did not arrive within buffer limits");
                 }
-                drain_pending_objects(
+                if let Some(sequence) = drain_pending_objects(
                     &mut decoder,
                     events,
                     &publisher,
                     keys,
                     &mut pending,
                     &mut pending_bytes,
-                )?;
+                    &mut source_size,
+                )? {
+                    *last_decrypted = sequence;
+                }
             }
             RelayViewerMessage::KeyEnvelope(envelope) => {
                 if envelope.header.publisher_id != publisher_id
@@ -986,16 +1370,22 @@ async fn subscribe(
                 keys.lock()
                     .map_err(|_| anyhow::anyhow!("key cache poisoned"))?
                     .insert(group_key, content_key);
-                drain_pending_objects(
+                if let Some(sequence) = drain_pending_objects(
                     &mut decoder,
                     events,
                     &publisher,
                     keys,
                     &mut pending,
                     &mut pending_bytes,
-                )?;
+                    &mut source_size,
+                )? {
+                    *last_decrypted = sequence;
+                }
             }
-            RelayViewerMessage::Live { .. } | RelayViewerMessage::Pong { .. } => {}
+            RelayViewerMessage::Live { .. } => {
+                let _ = events.send(Event::StreamStatus(stream_id, "Live".into()));
+            }
+            RelayViewerMessage::Pong { .. } => {}
             RelayViewerMessage::Error(error) => {
                 anyhow::bail!("relay stream error: {}", error.detail)
             }
@@ -1008,25 +1398,28 @@ fn drain_pending_objects(
     decoder: &mut Decoder,
     events: &mpsc::UnboundedSender<Event>,
     publisher: &IdentityPublic,
-    keys: &Arc<Mutex<HashMap<GroupKey, [u8; 32]>>>,
+    keys: &Arc<Mutex<KeyCache>>,
     pending: &mut VecDeque<NativeObject>,
     pending_bytes: &mut usize,
-) -> Result<()> {
+    source_size: &mut Option<(u32, u32)>,
+) -> Result<Option<u64>> {
+    let mut last_decrypted = None;
     loop {
         let Some(object) = pending.front() else {
-            return Ok(());
+            return Ok(last_decrypted);
         };
         let key = keys
             .lock()
             .map_err(|_| anyhow::anyhow!("key cache poisoned"))?
-            .get(&GroupKey::for_object(object))
-            .copied();
+            .get(&GroupKey::for_object(object));
         let Some(key) = key else {
-            return Ok(());
+            return Ok(last_decrypted);
         };
         let object = pending.pop_front().expect("pending front exists");
         *pending_bytes = pending_bytes.saturating_sub(object.ciphertext.len());
-        decode_object(decoder, events, publisher, object, key)?;
+        let sequence = object.header.sequence;
+        decode_object(decoder, events, publisher, object, key, source_size)?;
+        last_decrypted = Some(sequence);
     }
 }
 
@@ -1036,15 +1429,45 @@ fn decode_object(
     publisher: &IdentityPublic,
     object: NativeObject,
     key: [u8; 32],
+    source_size: &mut Option<(u32, u32)>,
 ) -> Result<()> {
     let plaintext = object.open(
         publisher,
         &ContentKey::from_bytes(key)?,
         &object.header.key_id,
     )?;
+    if object.header.kind == NativeObjectKind::Cursor {
+        let (source_width, source_height) = source_size
+            .as_ref()
+            .copied()
+            .context("cursor arrived before epoch")?;
+        let batch = decode_plain_cursor_batch(
+            DashCursorContext {
+                stream_id: object.header.stream_id,
+                epoch_id: object.header.epoch_id,
+                sequence: object.header.sequence,
+                start_timestamp: object.header.timestamp,
+                source_width,
+                source_height,
+            },
+            &plaintext,
+        )?;
+        for cursor in batch.events {
+            let _ = events.send(Event::Cursor(CursorUpdate {
+                stream_id: object.header.stream_id,
+                x_micropixels: cursor.x_micropixels,
+                y_micropixels: cursor.y_micropixels,
+                visible: cursor.visible,
+                bitmap: cursor.bitmap,
+            }));
+        }
+        return Ok(());
+    }
     let annex_b = match object.header.kind {
         NativeObjectKind::Epoch if object.header.codec == Some(CodecId::H264AnnexB) => {
-            H264EpochPayload::decode(&plaintext)?.codec_config
+            let epoch = H264EpochPayload::decode(&plaintext)?;
+            *source_size = Some((epoch.width, epoch.height));
+            epoch.codec_config
         }
         NativeObjectKind::Media if object.header.codec == Some(CodecId::H264AnnexB) => plaintext,
         NativeObjectKind::Cursor | NativeObjectKind::Epoch | NativeObjectKind::Media => {
@@ -1098,6 +1521,17 @@ fn default_state_dir() -> PathBuf {
 mod tests {
     use super::*;
 
+    fn test_profile(root: PathBuf) -> ConnectionProfile {
+        ConnectionProfile {
+            endpoint: "127.0.0.1:1".into(),
+            state_dir: root,
+            identity: Arc::new(IdentitySecret::generate()),
+            noise: glacialcast_protocol::generate_noise_keypair().unwrap(),
+            credential: None,
+            explicit_pin: None,
+        }
+    }
+
     #[test]
     fn relay_argument_accepts_host_port_and_invite_pin() {
         assert_eq!(
@@ -1108,5 +1542,126 @@ mod tests {
         let (_, pin) = parse_relay(&format!("glacialcast://relay.example:99?key={key}")).unwrap();
         assert_eq!(pin, Some([7; 32]));
         assert!(parse_relay("bad host").is_err());
+    }
+
+    #[test]
+    fn verified_publishers_persist_and_identity_changes_fail_closed() {
+        let root = std::env::temp_dir().join(format!("gcview-trust-{}", Uuid::new_v4()));
+        let profile = test_profile(root.clone());
+        let stream_id = Uuid::from_u128(1);
+        let first = IdentitySecret::generate().public().unwrap();
+        let second = IdentitySecret::generate().public().unwrap();
+        remember_verified_publisher(&profile, stream_id, first).unwrap();
+        assert_eq!(
+            verified_publishers(&profile)
+                .unwrap()
+                .get(&stream_id)
+                .unwrap()
+                .id()
+                .unwrap(),
+            first.id().unwrap()
+        );
+        assert!(remember_verified_publisher(&profile, stream_id, second).is_err());
+        assert_eq!(
+            verified_publishers(&profile)
+                .unwrap()
+                .get(&stream_id)
+                .unwrap()
+                .id()
+                .unwrap(),
+            first.id().unwrap()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn key_cache_and_reconnect_backoff_are_bounded() {
+        let mut cache = KeyCache::default();
+        for index in 0..=MAX_CACHED_KEYS {
+            cache.insert(
+                GroupKey {
+                    stream_id: Uuid::from_u128(1),
+                    epoch_id: Uuid::from_u128(2),
+                    key_group: u64::try_from(index).unwrap(),
+                    key_id: [u8::try_from(index % 256).unwrap(); 16],
+                },
+                [u8::try_from(index % 256).unwrap(); 32],
+            );
+        }
+        assert_eq!(cache.keys.len(), MAX_CACHED_KEYS);
+        assert!(cache.keys.keys().all(|group| group.key_group != 0));
+        assert_eq!(reconnect_delay(0), Duration::from_millis(250));
+        assert_eq!(reconnect_delay(99), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn native_cursor_object_decodes_into_a_render_update() {
+        use glacialcast_protocol::native::{GroupEncryptor, NewNativeObject};
+        use glacialcast_stream::{
+            CursorBatch, CursorContext, CursorEvent, encode_plain_cursor_batch,
+        };
+
+        let publisher = IdentitySecret::generate();
+        let publisher_public = publisher.public().unwrap();
+        let stream_id = Uuid::from_u128(1);
+        let epoch_id = Uuid::from_u128(2);
+        let mut group =
+            GroupEncryptor::generate(&publisher_public, stream_id, epoch_id, 1, 0).unwrap();
+        let payload = encode_plain_cursor_batch(
+            CursorContext {
+                stream_id,
+                epoch_id,
+                sequence: 1,
+                start_timestamp: 90,
+                source_width: 640,
+                source_height: 480,
+            },
+            &CursorBatch {
+                source_width: 640,
+                source_height: 480,
+                events: vec![CursorEvent {
+                    timestamp: 90,
+                    x_micropixels: 12_000_000,
+                    y_micropixels: 34_000_000,
+                    visible: true,
+                    bitmap_id: 0,
+                    bitmap: None,
+                }],
+            },
+        )
+        .unwrap();
+        let key = group.content_key();
+        let object = group
+            .seal(
+                &publisher,
+                NewNativeObject {
+                    sequence: 1,
+                    timestamp: 90,
+                    duration: 1,
+                    kind: NativeObjectKind::Cursor,
+                    random_access: false,
+                    codec: None,
+                },
+                &payload,
+            )
+            .unwrap();
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        decode_object(
+            &mut Decoder::new().unwrap(),
+            &events,
+            &publisher_public,
+            object,
+            key,
+            &mut Some((640, 480)),
+        )
+        .unwrap();
+        match receiver.try_recv().unwrap() {
+            Event::Cursor(cursor) => {
+                assert!(cursor.visible);
+                assert_eq!(cursor.x_micropixels, 12_000_000);
+                assert_eq!(cursor.y_micropixels, 34_000_000);
+            }
+            _ => panic!("expected cursor update"),
+        }
     }
 }

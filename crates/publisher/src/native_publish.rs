@@ -16,6 +16,9 @@ use glacialcast_protocol::{
     trust::KnownRelays,
     wire::{PublisherMessage, PublisherResumeStream, RelayPublisherMessage, SessionHello},
 };
+use glacialcast_stream::{
+    CursorBatch as DashCursorBatch, CursorContext as DashCursorContext, encode_plain_cursor_batch,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, path::Path, time::Duration};
@@ -278,6 +281,7 @@ pub(super) async fn run_native_client(
     let mut next_frame = Some(first);
     let mut group_id = 0u64;
     let mut group: Option<GroupEncryptor> = None;
+    let mut cursor_bitmap_state = super::DashCursorBitmapState::default();
 
     loop {
         if *shutdown.borrow() {
@@ -414,14 +418,56 @@ pub(super) async fn run_native_client(
             &encoded.annex_b,
         )?;
         publish(&mut socket, media, sequence).await?;
+        let mut content_bytes = u64::try_from(encoded.annex_b.len()).unwrap_or(u64::MAX);
+        if let Some(cursor) = capture.cursor(frame_index).await? {
+            let cursor_event = super::cursor_to_dash_event(
+                cursor,
+                timestamp,
+                width,
+                height,
+                &mut cursor_bitmap_state,
+            )?;
+            let cursor_sequence = sequence
+                .checked_add(1)
+                .context("native cursor sequence space exhausted")?;
+            let cursor_payload = encode_plain_cursor_batch(
+                DashCursorContext {
+                    stream_id,
+                    epoch_id,
+                    sequence: cursor_sequence,
+                    start_timestamp: timestamp,
+                    source_width: width,
+                    source_height: height,
+                },
+                &DashCursorBatch {
+                    source_width: width,
+                    source_height: height,
+                    events: vec![cursor_event],
+                },
+            )?;
+            content_bytes = content_bytes
+                .saturating_add(u64::try_from(cursor_payload.len()).unwrap_or(u64::MAX));
+            sequence = cursor_sequence;
+            let cursor_object = group.seal(
+                &publisher,
+                NewNativeObject {
+                    sequence,
+                    timestamp,
+                    duration: 1,
+                    kind: NativeObjectKind::Cursor,
+                    random_access: false,
+                    codec: None,
+                },
+                &cursor_payload,
+            )?;
+            publish(&mut socket, cursor_object, sequence).await?;
+        }
         if let Some(retained) = key_history.last_mut()
             && retained.stream_id == stream_id
             && retained.epoch_id == epoch_id
             && retained.key_group_id == group_id
         {
-            retained.content_bytes = retained
-                .content_bytes
-                .saturating_add(u64::try_from(encoded.annex_b.len()).unwrap_or(u64::MAX));
+            retained.content_bytes = retained.content_bytes.saturating_add(content_bytes);
         }
         prune_key_history(
             &mut key_history,
