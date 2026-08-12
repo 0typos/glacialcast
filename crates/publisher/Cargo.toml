@@ -25,7 +25,6 @@ libloading.workspace = true
 openh264.workspace = true
 pipewire.workspace = true
 postcard.workspace = true
-rand.workspace = true
 serde.workspace = true
 sha2.workspace = true
 tokio.workspace = true
