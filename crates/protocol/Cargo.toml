@@ -10,11 +10,8 @@ version.workspace = true
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true
-bytes.workspace = true
 chacha20poly1305.workspace = true
 ed25519-dalek.workspace = true
-glacialcast-stream = { path = "../stream", version = "0.7.0" }
-hmac.workspace = true
 hpke.workspace = true
 libc.workspace = true
 postcard.workspace = true

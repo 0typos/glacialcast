@@ -17,7 +17,6 @@ use async_trait::async_trait;
 use clap::{Parser, ValueEnum};
 use futures_util::StreamExt;
 use glacialcast_protocol::{
-    CaptureSource,
     config_path::{self, ConfigSource},
     cursor::{CursorBitmap as NativeCursorBitmap, CursorEvent as NativeCursorEvent},
     daemon::{
@@ -106,6 +105,11 @@ struct CursorMessage {
     source_width: u32,
     source_height: u32,
     bitmap: Option<Arc<CursorBitmap>>,
+}
+
+#[derive(Debug, Clone)]
+struct CaptureSource {
+    backend: String,
 }
 
 #[derive(Debug, Parser)]
@@ -1295,9 +1299,6 @@ impl Capture for TestPatternCapture {
     async fn source(&mut self) -> Result<CaptureSource> {
         Ok(CaptureSource {
             backend: "test-pattern".to_string(),
-            description: format!("Generated {:?} low-bandwidth profile", self.mode),
-            width: self.width,
-            height: self.height,
         })
     }
 
@@ -1587,9 +1588,6 @@ impl NativePipewireCapture {
                     }
                 }
                 .to_string(),
-                description: capture.description,
-                width: capture.width,
-                height: capture.height,
             },
             latest,
             cursor_latest: cursor_rx,
@@ -2310,7 +2308,6 @@ struct ScreenCastCapture {
     node_id: u32,
     width: u32,
     height: u32,
-    description: String,
     /// The interface that actually opened the session, which differs from the
     /// requested value when the operator asked for automatic selection.
     backend: ScreenCastBackend,
@@ -2649,9 +2646,6 @@ async fn open_mutter_screencast(
         node_id,
         width,
         height,
-        description: format!(
-            "PipeWire node {node_id} via Mutter ScreenCast connector {connector} ({prop_summary})"
-        ),
         backend: ScreenCastBackend::Mutter,
         remote: PipewireRemote::Default,
         session: ScreenCastSession::Mutter {
@@ -2849,6 +2843,7 @@ async fn open_screencast_portal_sources(
             node_id,
             width,
             height,
+            cursor = cursor_description,
             props = %prop_summary,
             "opened PipeWire remote from portal"
         );
@@ -2856,9 +2851,6 @@ async fn open_screencast_portal_sources(
             node_id,
             width,
             height,
-            description: format!(
-                "PipeWire node {node_id} via raw XDG Desktop Portal                  ({cursor_description}; {prop_summary})"
-            ),
             backend: ScreenCastBackend::Portal,
             remote: PipewireRemote::PortalFd(fd.try_clone()?),
             session: ScreenCastSession::Portal(Arc::clone(&session)),

@@ -2,11 +2,11 @@
 
 use crate::{
     PROTOCOL_VERSION,
+    auth_words::wordlist,
     credential::{CredentialRole, NativeCredential},
     identity::{
         IDENTITY_ID_LEN, IdentityError, IdentityPublic, IdentitySecret, SignatureBytes, verify,
     },
-    viewer_key::wordlist,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
