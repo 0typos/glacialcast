@@ -543,9 +543,15 @@ impl NativeStore {
             .optional()
             .context("checking envelope retry")?;
         if let Some(existing) = existing {
-            if existing != encoded {
-                anyhow::bail!("viewer envelope already exists with different content");
-            }
+            // HPKE sealing is randomized, so a publisher retrying a
+            // half-acknowledged delivery — or a second publisher process
+            // honoring the same grant — re-seals the same content key into
+            // different bytes for the same slot. Either copy opens to the
+            // same key for the same recipient, so the slot is already
+            // served: keep the stored envelope and report success. Refusing
+            // the retry turned one dropped connection into a permanent
+            // redelivery livelock.
+            let _ = existing;
             transaction.commit().context("committing envelope retry")?;
             return Ok(false);
         }
@@ -903,7 +909,27 @@ impl NativeStore {
             .checked_add(1)
             .context("native sequence space exhausted")?;
         if start == SubscriptionStart::Live {
-            return Ok(next_live);
+            // Joining at `high_water + 1` made a live viewer blind until the
+            // next rotation: everything it received needed the current
+            // group's epoch object and IDR, which sit just before that
+            // anchor. Join at the current group's start instead — the
+            // ordinary last-keyframe live join — and let replay deliver the
+            // epoch, the IDR, and the group envelope. The newest group is
+            // still in progress, so this query must not require completion.
+            // A stream with no retained group anchors at the live edge.
+            let current: Option<i64> = connection
+                .query_row(
+                    "SELECT first_sequence FROM groups WHERE stream_id = ?1 \
+                     ORDER BY first_sequence DESC LIMIT 1",
+                    params![uuid_bytes(stream_id).as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("finding the current retained group")?;
+            return match current {
+                Some(first) => from_sql_u64(first, "current group first sequence"),
+                None => Ok(next_live),
+            };
         }
         let selected: Option<i64> = match start {
             SubscriptionStart::Live => unreachable!("live returned above"),
@@ -1588,9 +1614,76 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        // A publisher retrying a half-acknowledged delivery re-seals the same
+        // content key with fresh HPKE randomness, so the same slot arrives
+        // with different bytes. The slot is already served — either copy opens
+        // to the same key — so the retry succeeds without storing anything,
+        // and the original envelope is what remains. Refusing it turned one
+        // dropped connection into a permanent redelivery livelock.
+        let resealed = KeyEnvelope::seal(
+            &fixture.publisher,
+            &fixture.viewer.public().unwrap(),
+            fixture.stream_id,
+            fixture.epoch_id,
+            object.header.key_group,
+            object.header.key_id,
+            &group.content_key(),
+        )
+        .unwrap();
+        assert!(!store.store_envelope(&resealed, 1_003).unwrap());
+        assert_eq!(
+            store
+                .get_envelope(
+                    fixture.stream_id,
+                    fixture.epoch_id,
+                    object.header.key_group,
+                    fixture.viewer.public().unwrap().id().unwrap(),
+                )
+                .unwrap(),
+            Some(envelope.clone())
+        );
         let mut wrong_group = envelope;
         wrong_group.header.key_group_id += 1;
-        assert!(store.store_envelope(&wrong_group, 1_003).is_err());
+        assert!(store.store_envelope(&wrong_group, 1_004).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn live_subscriptions_anchor_at_the_current_group_start() {
+        let root = root();
+        let mut fixture = Fixture::new();
+        let store = NativeStore::open(root.clone(), None, None).unwrap();
+        store.put_descriptor(&fixture.descriptor).unwrap();
+
+        // No retained group yet: the live edge is the only place to anchor.
+        assert_eq!(
+            store
+                .subscription_anchor(fixture.stream_id, SubscriptionStart::Live)
+                .unwrap(),
+            1
+        );
+
+        let mut first_group = fixture.group(0);
+        store
+            .store_object(&fixture.media(&mut first_group, 20), 1_000)
+            .unwrap();
+        store
+            .store_object(&fixture.media(&mut first_group, 20), 1_001)
+            .unwrap();
+        let mut second_group = fixture.group(2);
+        store
+            .store_object(&fixture.media(&mut second_group, 20), 1_002)
+            .unwrap();
+
+        // A live join lands on the newest group's first object — its epoch
+        // and keyframe — not past them: joining at high_water + 1 left the
+        // viewer unable to decode anything until the next rotation.
+        assert_eq!(
+            store
+                .subscription_anchor(fixture.stream_id, SubscriptionStart::Live)
+                .unwrap(),
+            3
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
