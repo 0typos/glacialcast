@@ -217,7 +217,8 @@ impl PairingStore {
     /// # Errors
     ///
     /// Returns an error for a missing/expired request, transcript/signature
-    /// mismatch, conflicting retry, or durable commit failure.
+    /// mismatch, or durable commit failure. A verified resubmission with
+    /// different bytes keeps the first stored artifact and reports success.
     pub fn store_offer(
         &self,
         offer: &PairOffer,
@@ -235,13 +236,7 @@ impl PairingStore {
             .verify(&request, now_ms, max_lifetime_ms)
             .context("verifying pair offer")?;
         let encoded = encode_pair(offer)?;
-        let changed = store_once(
-            &transaction,
-            "offer",
-            &offer.body.request_id,
-            &encoded,
-            "pair offer conflicts with existing content",
-        )?;
+        let changed = store_once(&transaction, "offer", &offer.body.request_id, &encoded)?;
         transaction.commit().context("committing pair offer")?;
         Ok(changed)
     }
@@ -251,7 +246,8 @@ impl PairingStore {
     /// # Errors
     ///
     /// Returns an error for missing request/offer, transcript/signature
-    /// mismatch, conflicting retry, or durable commit failure.
+    /// mismatch, or durable commit failure. A verified resubmission with
+    /// different bytes keeps the first stored artifact and reports success.
     pub fn store_confirmation(
         &self,
         confirmation: &ViewerConfirmation,
@@ -275,7 +271,6 @@ impl PairingStore {
             "confirmation",
             &confirmation.body.request_id,
             &encoded,
-            "viewer confirmation conflicts with existing content",
         )?;
         transaction
             .commit()
@@ -326,9 +321,11 @@ impl PairingStore {
             .context("checking publisher decision retry")?
             .flatten();
         if let Some(existing) = existing {
-            if existing != encoded {
-                anyhow::bail!("publisher decision conflicts with existing content");
-            }
+            // A publisher retrying its decision after a restart re-signs it
+            // with a fresh timestamp. The stored decision was verified against
+            // the same ceremony, so keep it — it is the one the viewer may
+            // already have acted on — and report the retry as already served.
+            let _ = existing;
             transaction.commit().context("committing decision retry")?;
             return Ok(false);
         }
@@ -576,7 +573,6 @@ fn store_once(
     column: &str,
     request_id: &[u8; 32],
     encoded: &[u8],
-    conflict: &str,
 ) -> Result<bool> {
     let sql = match column {
         "offer" => "SELECT offer FROM pair_requests WHERE request_id = ?1",
@@ -588,9 +584,14 @@ fn store_once(
         .optional()
         .context("checking queued pairing record")?;
     if let Some(Some(existing)) = existing {
-        if existing != encoded {
-            anyhow::bail!(conflict.to_string());
-        }
+        // A peer that restarts mid-ceremony re-creates its artifact with a
+        // fresh timestamp and signature, so a resubmission for the same
+        // request arrives with different bytes. It was verified against the
+        // same signed ceremony before this point, so the slot is already
+        // served: keep the first artifact — the one the other side's
+        // transcript may already reference. Refusing the retry wedged the
+        // ceremony permanently.
+        let _ = existing;
         return Ok(false);
     }
     if existing.is_none() {
@@ -661,6 +662,61 @@ mod tests {
             "glacialcast-pairing-store-{}",
             uuid::Uuid::new_v4()
         ))
+    }
+
+    #[test]
+    fn resigned_ceremony_resubmissions_keep_the_first_artifact() {
+        let root = root();
+        let publisher = IdentitySecret::generate();
+        let viewer = IdentitySecret::generate();
+        let source = "127.0.0.1:4321".parse().unwrap();
+        let store = PairingStore::open(root.clone()).unwrap();
+        let request = PairRequest::new(
+            &viewer,
+            publisher.public().unwrap(),
+            uuid::Uuid::from_u128(1),
+            "viewer".into(),
+            1_000,
+            1_000 + DAY_MS,
+        )
+        .unwrap();
+        store
+            .enqueue_request(&request, source, 1_500, DAY_MS)
+            .unwrap();
+
+        // Each artifact is re-signed with a fresh timestamp when a restarted
+        // peer resubmits it, so the same ceremony arrives with different
+        // bytes. Every resubmission must succeed without replacing what the
+        // other side may already have acted on; refusing it wedged the
+        // ceremony permanently.
+        let offer =
+            PairOffer::new(&publisher, &request, [7; 32], 2_000, 2_000 + DAY_MS, DAY_MS).unwrap();
+        assert!(store.store_offer(&offer, 2_100, DAY_MS).unwrap());
+        let reoffer =
+            PairOffer::new(&publisher, &request, [7; 32], 2_200, 2_200 + DAY_MS, DAY_MS).unwrap();
+        assert!(!store.store_offer(&reoffer, 2_300, DAY_MS).unwrap());
+
+        let confirmation = ViewerConfirmation::approve(&viewer, &request, &offer, 3_000).unwrap();
+        assert!(store.store_confirmation(&confirmation, 3_100).unwrap());
+        let reconfirmation = ViewerConfirmation::approve(&viewer, &request, &offer, 3_200).unwrap();
+        assert!(!store.store_confirmation(&reconfirmation, 3_300).unwrap());
+
+        let decision =
+            PublisherDecision::approve_manual(&publisher, &request, &offer, &confirmation, 4_000)
+                .unwrap();
+        assert!(store.store_decision(&decision, 4_100).unwrap());
+        let redecision =
+            PublisherDecision::approve_manual(&publisher, &request, &offer, &confirmation, 4_200)
+                .unwrap();
+        assert!(!store.store_decision(&redecision, 4_300).unwrap());
+
+        // The first artifacts are what remain: the viewer's inbox delivers
+        // the original offer's ceremony and the original decision.
+        let inbox = store
+            .viewer_inbox(&viewer.public().unwrap(), 4_400)
+            .unwrap();
+        assert_eq!(inbox.decisions, vec![decision]);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
