@@ -14,11 +14,9 @@ if (( ${#missing_commands[@]} > 0 )); then
 fi
 
 missing_modules=()
-for module_name in libpipewire-0.3; do
-  if ! pkg-config --exists "${module_name}"; then
-    missing_modules+=("${module_name}")
-  fi
-done
+if ! pkg-config --exists libpipewire-0.3; then
+  missing_modules+=("libpipewire-0.3")
+fi
 
 if (( ${#missing_modules[@]} > 0 )); then
   echo "missing pkg-config modules: ${missing_modules[*]}" >&2

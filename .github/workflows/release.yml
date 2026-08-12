@@ -1,24 +1,78 @@
 name: Release archive
 
 on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   archive:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libclang-dev libpipewire-0.3-dev libexpat1-dev
-      - run: scripts/build-release.sh
-      - uses: actions/upload-artifact@v4
+          sudo apt-get install -y libclang-dev libpipewire-0.3-dev libexpat1-dev minisign nodejs shellcheck
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
         with:
-          name: glacialcast-native
+          tool: cargo-deny@0.20.2
+          fallback: none
+      - name: Verify release tag and quality gates
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: |
+          version="$(cargo metadata --locked --no-deps --format-version 1 | node -e \
+            "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const m=JSON.parse(s);process.stdout.write(m.packages.find(p=>p.name==='gcrelay').version)})")"
+          if [[ -n "${RELEASE_TAG}" && "${RELEASE_TAG}" != "v${version}" ]]; then
+            echo "tag ${RELEASE_TAG} does not match Cargo version v${version}" >&2
+            exit 1
+          fi
+          scripts/verify-quality.sh full
+      - name: Prepare optional Minisign key
+        id: minisign
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.GLACIALCAST_MINISIGN_SECRET_KEY }}
+        run: |
+          if [[ -n "${MINISIGN_SECRET_KEY}" ]]; then
+            key_path="${RUNNER_TEMP}/glacialcast.minisign.key"
+            install -m 600 /dev/null "${key_path}"
+            printf '%s' "${MINISIGN_SECRET_KEY}" >"${key_path}"
+            echo "key_path=${key_path}" >>"${GITHUB_OUTPUT}"
+          fi
+      - name: Build release archive
+        env:
+          GLACIALCAST_REQUIRE_CLEAN: "1"
+          GLACIALCAST_MINISIGN_SECRET_KEY: ${{ steps.minisign.outputs.key_path }}
+        run: scripts/build-release.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: glacialcast-${{ github.ref_name }}
           path: dist/*
+          if-no-files-found: error
+      - name: Attest release archives
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: dist/*.tar.gz
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --verify-tag --generate-notes

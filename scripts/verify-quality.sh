@@ -18,6 +18,7 @@ run() {
 standard_checks() {
   run cargo fmt --all -- --check
   run cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+  run cargo check --manifest-path fuzz/Cargo.toml --bins --locked
   run cargo test --workspace --all-features
   run cargo clippy --workspace --all-targets --all-features -- \
     -D warnings \
@@ -28,6 +29,7 @@ standard_checks() {
   # reported "ok" while the graph grew forks nobody saw.
   run cargo deny check
   run bash -n scripts/*.sh packaging/*.sh
+  run shellcheck scripts/*.sh packaging/*.sh
 }
 
 full_checks() {
