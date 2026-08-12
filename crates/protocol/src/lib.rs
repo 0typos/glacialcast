@@ -20,6 +20,7 @@ pub mod config_path;
 pub mod credential;
 pub mod cursor;
 pub mod daemon;
+mod entropy;
 pub mod envelope;
 pub mod identity;
 pub mod native;
