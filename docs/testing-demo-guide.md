@@ -15,8 +15,9 @@ scripts/verify-quality.sh full
 ```
 
 The standard profile checks formatting, workspace tests, strict Clippy,
-rustdoc, dependency policy, and shell syntax. The full profile adds the native
-process/protocol E2E gate and release packaging. Parser changes also run:
+rustdoc, dependency policy, shell syntax and lint, and that every fuzz target
+still compiles. The full profile adds the native process/protocol E2E gate and
+release archive validation. Parser changes also run:
 
 ```sh
 GLACIALCAST_FUZZ_SECONDS=30 scripts/verify-fuzz.sh
