@@ -8,7 +8,7 @@ work_dir="$(mktemp -d /tmp/glacialcast-native-e2e.XXXXXX)"
 relay_pid=""
 publisher_pid=""
 # Invoked indirectly by the EXIT trap below.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 cleanup() {
   [[ -z "${publisher_pid}" ]] || kill "${publisher_pid}" 2>/dev/null || true
   [[ -z "${relay_pid}" ]] || kill "${relay_pid}" 2>/dev/null || true
