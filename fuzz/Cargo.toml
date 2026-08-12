@@ -8,23 +8,9 @@ edition = "2024"
 cargo-fuzz = true
 
 [dependencies]
-glacialcast-stream = { path = "../crates/stream" }
 glacialcast-protocol = { path = "../crates/protocol" }
 libfuzzer-sys = "0.4"
-
-[[bin]]
-name = "portable_object"
-path = "fuzz_targets/portable_object.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "cursor_envelope"
-path = "fuzz_targets/cursor_envelope.rs"
-test = false
-doc = false
-bench = false
+uuid = "1"
 
 [[bin]]
 name = "noise_segment"
@@ -34,15 +20,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "epoch_descriptor"
-path = "fuzz_targets/epoch_descriptor.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "transfer_index"
-path = "fuzz_targets/transfer_index.rs"
+name = "cursor_batch"
+path = "fuzz_targets/cursor_batch.rs"
 test = false
 doc = false
 bench = false

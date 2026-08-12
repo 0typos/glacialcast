@@ -35,6 +35,7 @@ ephemeral="${GLACIALCAST_FUZZ_EPHEMERAL:-0}"
 
 for target in \
   noise_segment \
+  cursor_batch \
   native_wire \
   pair_request \
   h264_epoch; do
