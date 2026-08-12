@@ -524,8 +524,19 @@ impl NativeStore {
             )
             .optional()
             .context("reading envelope group")?;
-        if group_key_id.as_deref() != Some(envelope.header.key_id.as_slice()) {
-            anyhow::bail!("key envelope does not match a retained ciphertext group");
+        let Some(group_key_id) = group_key_id else {
+            // The publisher's key history is bounded by its own limits, and
+            // this store's retention is bounded by the operator's — the two
+            // drift, so retained-key delivery legitimately offers envelopes
+            // for groups this relay has already evicted. Such an envelope
+            // authorizes nothing here; dropping it without storing lets the
+            // rest of the delivery batch land. Treating it as a fault killed
+            // the connection ahead of every valid envelope behind it, and
+            // wedged each grant behind whichever group aged out first.
+            return Ok(false);
+        };
+        if group_key_id != envelope.header.key_id.as_slice() {
+            anyhow::bail!("key envelope contradicts the retained ciphertext group key");
         }
 
         let existing: Option<Vec<u8>> = transaction
@@ -1642,9 +1653,49 @@ mod tests {
                 .unwrap(),
             Some(envelope.clone())
         );
-        let mut wrong_group = envelope;
-        wrong_group.header.key_group_id += 1;
-        assert!(store.store_envelope(&wrong_group, 1_004).is_err());
+        // Publisher key history and relay retention drift, so a validly
+        // signed envelope may name a group this relay evicted or never held.
+        // It authorizes nothing here and is dropped without storing, so the
+        // rest of a delivery batch can land.
+        let unretained_group = KeyEnvelope::seal(
+            &fixture.publisher,
+            &fixture.viewer.public().unwrap(),
+            fixture.stream_id,
+            fixture.epoch_id,
+            object.header.key_group + 1,
+            object.header.key_id,
+            &group.content_key(),
+        )
+        .unwrap();
+        assert!(!store.store_envelope(&unretained_group, 1_004).unwrap());
+        assert!(
+            store
+                .get_envelope(
+                    fixture.stream_id,
+                    fixture.epoch_id,
+                    object.header.key_group + 1,
+                    fixture.viewer.public().unwrap().id().unwrap(),
+                )
+                .unwrap()
+                .is_none()
+        );
+        // A group the relay does hold, claimed under a contradicting key,
+        // stays a hard error.
+        let contradicting = KeyEnvelope::seal(
+            &fixture.publisher,
+            &fixture.viewer.public().unwrap(),
+            fixture.stream_id,
+            fixture.epoch_id,
+            object.header.key_group,
+            [9u8; 16],
+            &group.content_key(),
+        )
+        .unwrap();
+        assert!(store.store_envelope(&contradicting, 1_005).is_err());
+        // Tampering with a stored artifact still dies at the signature.
+        let mut tampered = envelope;
+        tampered.header.key_group_id += 1;
+        assert!(store.store_envelope(&tampered, 1_006).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
