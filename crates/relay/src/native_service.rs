@@ -2089,17 +2089,35 @@ mod tests {
             })
             .await
             .unwrap();
+        // A live join anchors at the current group's start — its epoch and
+        // keyframe — so the joiner can decode immediately instead of waiting
+        // blind for the next rotation. The group envelope precedes the
+        // replayed objects, and the live marker closes the replay.
         assert!(matches!(
             live_joiner.read::<RelayViewerMessage>().await.unwrap(),
             RelayViewerMessage::SubscriptionStarted {
-                first_sequence: 5,
-                live: true,
+                first_sequence: 3,
+                live: false,
                 ..
             }
         ));
         assert_eq!(
             live_joiner.read::<RelayViewerMessage>().await.unwrap(),
             RelayViewerMessage::KeyEnvelope(second_envelope)
+        );
+        assert!(matches!(
+            live_joiner.read::<RelayViewerMessage>().await.unwrap(),
+            RelayViewerMessage::Object(object) if object.header.sequence == 3
+        ));
+        assert!(matches!(
+            live_joiner.read::<RelayViewerMessage>().await.unwrap(),
+            RelayViewerMessage::Object(object) if object.header.sequence == 4
+        ));
+        assert_eq!(
+            live_joiner.read::<RelayViewerMessage>().await.unwrap(),
+            RelayViewerMessage::Live {
+                through_sequence: 4
+            }
         );
         drop(live_joiner);
         drop(viewer_connection);
