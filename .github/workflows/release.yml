@@ -33,8 +33,10 @@ jobs:
       - name: Install release tools
         uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
         with:
-          tool: cargo-deny@0.20.2,nfpm@2.47.0
+          tool: cargo-deny@0.20.2
           fallback: none
+      - name: Install package builder
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.47.0
       - name: Verify release tag and quality gates
         env:
           RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
