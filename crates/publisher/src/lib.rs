@@ -360,6 +360,19 @@ pub fn run() -> Result<()> {
         .log_file
         .clone()
         .unwrap_or_else(|| default_log_file(&identity.client_id));
+    // Ownership of the state directory is probed before daemonizing, so a
+    // start against a running publisher fails in the caller's terminal
+    // instead of printing a started daemon and dying in the log file nobody
+    // is watching. The daemon re-execs, so this fd does not survive into the
+    // child; the parent's lock releases at exit and the child re-acquires it
+    // here on its own pass. The moment between the two is the re-exec
+    // design's window, and losing it still fails safe: whoever wins the
+    // flock owns the directory, and the loser's log says so.
+    let _publisher_lock = lock_private(
+        &client_state_dir().join("publisher-process.lock"),
+        PrivateLockMode::TryExclusive,
+    )
+    .context("another gcpub process already owns this publisher state directory")?;
     if detach {
         print_sharing_summary(&identity, &daemon_socket, &log_file, false);
     }
@@ -373,11 +386,6 @@ pub fn run() -> Result<()> {
     )? {
         return Ok(());
     }
-    let _publisher_lock = lock_private(
-        &client_state_dir().join("publisher-process.lock"),
-        PrivateLockMode::TryExclusive,
-    )
-    .context("another gcpub process already owns this publisher state directory")?;
 
     tracing_subscriber::fmt()
         .with_env_filter(
