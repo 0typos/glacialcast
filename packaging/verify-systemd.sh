@@ -7,8 +7,11 @@ cd "${repo_root}"
 grep -Fq -- '--foreground' deploy/gcpub.service
 grep -Fq -- '--publisher-addr' deploy/gcrelay.service
 grep -Fq -- '--viewer-addr' deploy/gcrelay.service
-! grep -Eq -- 'control-addr|retention-bytes-per-stream|print-viewer-key' \
-  deploy/gcrelay.service deploy/gcpub.service
+if grep -Eq -- 'control-addr|retention-bytes-per-stream|print-viewer-key' \
+  deploy/gcrelay.service deploy/gcpub.service; then
+  echo "systemd units contain removed command-line options" >&2
+  exit 1
+fi
 
 if command -v systemd-analyze >/dev/null; then
   for binary in gcrelay gcpub; do

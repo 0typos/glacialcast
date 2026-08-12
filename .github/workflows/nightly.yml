@@ -8,19 +8,43 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: nightly-native-gates
+  cancel-in-progress: true
+
 jobs:
   full:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libclang-dev libpipewire-0.3-dev libexpat1-dev python3
+          sudo apt-get install -y libclang-dev libpipewire-0.3-dev libexpat1-dev python3 shellcheck
       - name: Install cargo-deny
-        uses: taiki-e/install-action@cargo-deny
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          tool: cargo-deny@0.20.2
+          fallback: none
       - run: scripts/verify-quality.sh full
+
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - run: rustup toolchain install nightly-2026-07-03 --profile minimal
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev libpipewire-0.3-dev libexpat1-dev
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          tool: cargo-fuzz@0.13.2
+          fallback: none
+      - run: GLACIALCAST_FUZZ_SECONDS=60 scripts/verify-fuzz.sh

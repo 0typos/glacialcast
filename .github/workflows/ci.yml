@@ -7,31 +7,52 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   quality:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libclang-dev libpipewire-0.3-dev libexpat1-dev
-      - name: Install cargo-deny
-        uses: taiki-e/install-action@cargo-deny
+          sudo apt-get install -y libclang-dev libpipewire-0.3-dev libexpat1-dev shellcheck
+      - name: Install quality tools
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          tool: cargo-deny@0.20.2,actionlint@1.7.7
+          fallback: none
+      - run: actionlint
       - run: scripts/verify-quality.sh standard
 
   native-e2e:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
       - name: Install native build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libclang-dev libpipewire-0.3-dev libexpat1-dev python3
       - run: scripts/verify-native-e2e.sh
+
+  packaging:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev libpipewire-0.3-dev libexpat1-dev nodejs
+      - run: scripts/verify-packaging.sh
