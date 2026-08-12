@@ -55,6 +55,8 @@ history can become playable after live playback starts. Catalog and pairing
 state refresh automatically; active tiles reconnect from their last decrypted
 sequence. A publisher identity learned from a valid signed approval is pinned
 to that stream and a later mismatch is hidden rather than silently accepted.
+Intentional publisher replacement requires
+`gcview RELAY --forget-publisher STREAM_UUID` followed by a new pairing.
 
 ## Configuration
 

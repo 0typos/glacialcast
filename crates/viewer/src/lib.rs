@@ -102,6 +102,9 @@ struct Args {
     /// Forget this relay's learned key and exit.
     #[arg(long)]
     forget_relay: bool,
+    /// Forget the verified publisher identity for one stream and exit.
+    #[arg(long, value_name = "STREAM_UUID")]
+    forget_publisher: Option<Uuid>,
     /// Verify the relay, print its catalog, and exit without opening a window.
     #[arg(long)]
     headless: bool,
@@ -604,6 +607,10 @@ pub fn run() -> Result<()> {
         credential,
         explicit_pin,
     };
+    if let Some(stream_id) = args.forget_publisher {
+        forget_verified_publisher(&profile, stream_id)?;
+        return Ok(());
+    }
     let _viewer_lock = lock_private(
         &profile.state_dir.join("viewer-process.lock"),
         PrivateLockMode::TryExclusive,
@@ -1042,6 +1049,24 @@ fn remember_verified_publisher(
     if encoded.len() > MAX_VERIFIED_PUBLISHERS_BYTES {
         anyhow::bail!("verified publisher state exceeds its file bound");
     }
+    replace_private(&path, &encoded, MAX_VERIFIED_PUBLISHERS_BYTES)?;
+    Ok(())
+}
+
+fn forget_verified_publisher(profile: &ConnectionProfile, stream_id: Uuid) -> Result<()> {
+    let _lock = lock_private(
+        &profile.state_dir.join(".verified-publishers.lock"),
+        PrivateLockMode::Exclusive,
+    )?;
+    let path = profile.state_dir.join("verified-publishers.bin");
+    let mut publishers = load_verified_publishers_unlocked(&path)?;
+    publishers.remove(&stream_id);
+    let mut entries: Vec<_> = publishers.into_iter().collect();
+    entries.sort_by_key(|(stream_id, _)| *stream_id);
+    let encoded = postcard::to_stdvec(&VerifiedPublishersState {
+        version: VERIFIED_PUBLISHERS_VERSION,
+        publishers: entries,
+    })?;
     replace_private(&path, &encoded, MAX_VERIFIED_PUBLISHERS_BYTES)?;
     Ok(())
 }
@@ -1571,6 +1596,8 @@ mod tests {
                 .unwrap(),
             first.id().unwrap()
         );
+        forget_verified_publisher(&profile, stream_id).unwrap();
+        assert!(verified_publishers(&profile).unwrap().is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 
