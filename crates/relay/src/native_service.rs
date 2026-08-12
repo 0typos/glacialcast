@@ -83,6 +83,25 @@ enum LiveItem {
     Envelope(KeyEnvelope),
 }
 
+/// True when an error chain bottoms out in the peer closing the connection.
+///
+/// Viewers poll their inbox on short-lived connections and hang up without a
+/// goodbye, so this is the ordinary end of a healthy conversation rather than
+/// an operational signal: logging it as an error buried the warnings that
+/// mean something under one line per poll.
+fn is_peer_disconnect(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+            )
+        })
+    })
+}
+
 impl NativeRelayService {
     /// Creates a native relay around one durable store and one shared Noise identity.
     ///
@@ -1027,6 +1046,10 @@ impl NativeRelayService {
                     tokio::spawn(async move {
                         let _permit = permit;
                         if let Err(error) = handler(service, stream, peer).await {
+                            if is_peer_disconnect(&error) {
+                                tracing::debug!(?error, %peer, "native relay peer disconnected");
+                                return;
+                            }
                             tracing::warn!(?error, %peer, "native relay connection ended with error");
                         }
                     });
