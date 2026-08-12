@@ -8,6 +8,7 @@ use eframe::egui;
 use glacialcast_protocol::{
     NoiseKeypair, NoiseSocket, PROTOCOL_VERSION,
     credential::{CredentialRequest, CredentialRole, NativeCredential},
+    cursor::{CursorContext, decode_cursor_batch},
     identity::{IdentityPublic, IdentitySecret, load_or_create_identity},
     initiator_handshake_xx, load_or_create_noise_keypair,
     native::{
@@ -18,7 +19,6 @@ use glacialcast_protocol::{
     trust::KnownRelays,
     wire::{CatalogEntry, RelayViewerMessage, SessionHello, SubscriptionStart, ViewerMessage},
 };
-use glacialcast_stream::{CursorContext as DashCursorContext, decode_plain_cursor_batch};
 use openh264::{decoder::Decoder, formats::YUVSource, nal_units};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -144,7 +144,7 @@ struct CursorUpdate {
     x_micropixels: i64,
     y_micropixels: i64,
     visible: bool,
-    bitmap: Option<glacialcast_stream::CursorBitmap>,
+    bitmap: Option<glacialcast_protocol::cursor::CursorBitmap>,
 }
 
 enum Event {
@@ -1466,8 +1466,8 @@ fn decode_object(
             .as_ref()
             .copied()
             .context("cursor arrived before epoch")?;
-        let batch = decode_plain_cursor_batch(
-            DashCursorContext {
+        let batch = decode_cursor_batch(
+            CursorContext {
                 stream_id: object.header.stream_id,
                 epoch_id: object.header.epoch_id,
                 sequence: object.header.sequence,
@@ -1623,9 +1623,9 @@ mod tests {
 
     #[test]
     fn native_cursor_object_decodes_into_a_render_update() {
-        use glacialcast_protocol::native::{GroupEncryptor, NewNativeObject};
-        use glacialcast_stream::{
-            CursorBatch, CursorContext, CursorEvent, encode_plain_cursor_batch,
+        use glacialcast_protocol::{
+            cursor::{CursorBatch, CursorContext, CursorEvent, encode_cursor_batch},
+            native::{GroupEncryptor, NewNativeObject},
         };
 
         let publisher = IdentitySecret::generate();
@@ -1634,7 +1634,7 @@ mod tests {
         let epoch_id = Uuid::from_u128(2);
         let mut group =
             GroupEncryptor::generate(&publisher_public, stream_id, epoch_id, 1, 0).unwrap();
-        let payload = encode_plain_cursor_batch(
+        let payload = encode_cursor_batch(
             CursorContext {
                 stream_id,
                 epoch_id,

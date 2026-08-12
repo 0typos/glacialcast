@@ -31,7 +31,6 @@ use cros_codecs::{
         gbm_video_frame::{GbmDevice, GbmExternalBufferDescriptor, GbmUsage, GbmVideoFrame},
     },
 };
-use glacialcast_stream::AvcConfig;
 use image::{ImageBuffer, Rgb};
 use openh264::{
     OpenH264API,
@@ -47,6 +46,31 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+/// H.264 decoder configuration discovered in an encoded Annex-B stream.
+#[derive(Debug, Clone)]
+pub struct AvcConfig {
+    /// Encoded width in pixels.
+    pub width: u16,
+    /// Encoded height in pixels.
+    pub height: u16,
+    /// Sequence parameter set without an Annex-B start code.
+    pub sps: Vec<u8>,
+    /// Picture parameter set without an Annex-B start code.
+    pub pps: Vec<u8>,
+}
+
+impl AvcConfig {
+    pub(crate) fn codec_string(&self) -> Result<String> {
+        if self.sps.len() < 4 {
+            bail!("H.264 SPS must contain at least four bytes");
+        }
+        Ok(format!(
+            "avc1.{:02x}{:02x}{:02x}",
+            self.sps[1], self.sps[2], self.sps[3]
+        ))
+    }
+}
 use tracing::info;
 
 const OPENH264_ABI_MAJOR: &str = "8";

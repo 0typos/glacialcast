@@ -29,6 +29,7 @@ use uuid::Uuid;
 /// Helpers shared by the client and server daemon-control implementations.
 pub mod config_path;
 pub mod credential;
+pub mod cursor;
 pub mod daemon;
 pub mod envelope;
 pub mod identity;

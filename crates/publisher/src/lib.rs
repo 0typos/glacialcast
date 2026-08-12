@@ -24,6 +24,7 @@ use glacialcast_protocol::{
     CaptureSource, ClientMessage, DashObject, DashObjectKind, NewDashObject, NoiseSocket,
     PROTOCOL_VERSION, ServerMessage, StreamHello,
     config_path::{self, ConfigSource},
+    cursor::{CursorBitmap as NativeCursorBitmap, CursorEvent as NativeCursorEvent},
     daemon::{
         daemonize_if_requested, install_signal_handlers, manager_command,
         sanitize_socket_component, serve_control_socket, wait_for_shutdown,
@@ -1317,8 +1318,16 @@ async fn run_dash_connection(
                 duration: 0,
                 random_access: true,
                 mime: "video/mp4",
-                payload: build_init_segment(&avc_config, epoch_keys.map(|keys| keys.key_id))
-                    .context("building the DASH initialization segment")?,
+                payload: build_init_segment(
+                    &glacialcast_stream::AvcConfig {
+                        width: avc_config.width,
+                        height: avc_config.height,
+                        sps: avc_config.sps.clone(),
+                        pps: avc_config.pps.clone(),
+                    },
+                    epoch_keys.map(|keys| keys.key_id),
+                )
+                .context("building the DASH initialization segment")?,
             },
         )?,
     )
@@ -2098,6 +2107,30 @@ fn cursor_to_dash_event(
     output_height: u32,
     bitmap_state: &mut DashCursorBitmapState,
 ) -> Result<DashCursorEvent> {
+    let event = cursor_to_event(cursor, timestamp, output_width, output_height, bitmap_state)?;
+    Ok(DashCursorEvent {
+        timestamp: event.timestamp,
+        x_micropixels: event.x_micropixels,
+        y_micropixels: event.y_micropixels,
+        visible: event.visible,
+        bitmap_id: event.bitmap_id,
+        bitmap: event.bitmap.map(|bitmap| DashCursorBitmap {
+            width: bitmap.width,
+            height: bitmap.height,
+            hotspot_x: bitmap.hotspot_x,
+            hotspot_y: bitmap.hotspot_y,
+            rgba: bitmap.rgba,
+        }),
+    })
+}
+
+fn cursor_to_event(
+    cursor: CursorMessage,
+    timestamp: u64,
+    output_width: u32,
+    output_height: u32,
+    bitmap_state: &mut DashCursorBitmapState,
+) -> Result<NativeCursorEvent> {
     let source_width = cursor.source_width.max(1);
     let source_height = cursor.source_height.max(1);
     let x_micropixels =
@@ -2111,7 +2144,7 @@ fn cursor_to_dash_event(
                 .is_none_or(|last| timestamp.saturating_sub(last) >= CURSOR_BITMAP_REFRESH_TICKS);
             if refresh_due {
                 bitmap_state.last_sent_timestamp = Some(timestamp);
-                (bitmap_state.current_id, Some(dash_cursor_bitmap(&bitmap)?))
+                (bitmap_state.current_id, Some(cursor_bitmap(&bitmap)?))
             } else {
                 (bitmap_state.current_id, None)
             }
@@ -2120,11 +2153,11 @@ fn cursor_to_dash_event(
             bitmap_state.current_id = bitmap_state.current_id.wrapping_add(1).max(1);
             bitmap_state.last = Some(Arc::clone(&bitmap));
             bitmap_state.last_sent_timestamp = Some(timestamp);
-            (bitmap_state.current_id, Some(dash_cursor_bitmap(&bitmap)?))
+            (bitmap_state.current_id, Some(cursor_bitmap(&bitmap)?))
         }
         None => (bitmap_state.current_id, None),
     };
-    Ok(DashCursorEvent {
+    Ok(NativeCursorEvent {
         timestamp,
         x_micropixels,
         y_micropixels,
@@ -2147,7 +2180,7 @@ fn scaled_cursor_coordinate(
     (scaled.clamp(0.0, f64::from(output_extent)) * 1_000_000.0).round() as i64
 }
 
-fn dash_cursor_bitmap(bitmap: &CursorBitmap) -> Result<DashCursorBitmap> {
+fn cursor_bitmap(bitmap: &CursorBitmap) -> Result<NativeCursorBitmap> {
     let expected_len = usize::try_from(bitmap.width)
         .ok()
         .and_then(|width| {
@@ -2160,7 +2193,7 @@ fn dash_cursor_bitmap(bitmap: &CursorBitmap) -> Result<DashCursorBitmap> {
     if bitmap.rgba.len() != expected_len {
         bail!("PipeWire cursor bitmap dimensions do not match its RGBA payload");
     }
-    Ok(DashCursorBitmap {
+    Ok(NativeCursorBitmap {
         width: bitmap.width,
         height: bitmap.height,
         hotspot_x: bitmap.hotspot_x,
