@@ -239,7 +239,7 @@ pub(super) async fn run_native_client(
     write_publisher(&mut socket, &PublisherMessage::Descriptor(descriptor)).await?;
 
     let first = capture
-        .capture_dash_frame(args.max_frame_width, args.max_frame_height)
+        .capture_frame(args.max_frame_width, args.max_frame_height)
         .await?
         .frame;
     let width = first.width();
@@ -279,7 +279,7 @@ pub(super) async fn run_native_client(
     let mut next_frame = Some(first);
     let mut group_id = 0u64;
     let mut group: Option<GroupEncryptor> = None;
-    let mut cursor_bitmap_state = super::DashCursorBitmapState::default();
+    let mut cursor_bitmap_state = super::CursorBitmapState::default();
 
     loop {
         if *shutdown.borrow() {
@@ -334,7 +334,7 @@ pub(super) async fn run_native_client(
             Some(frame) => frame,
             None => {
                 tokio::select! {
-                    frame = capture.capture_dash_frame(args.max_frame_width, args.max_frame_height) => frame?.frame,
+                    frame = capture.capture_frame(args.max_frame_width, args.max_frame_height) => frame?.frame,
                     changed = shutdown.changed() => {
                         let _ = changed;
                         return Ok(());

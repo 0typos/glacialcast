@@ -1,10 +1,10 @@
-//! Focused H.264 encoders for the constrained GlacialCast DASH profile.
+//! Focused H.264 encoders for native GlacialCast streams.
 //!
 //! The hardware path uses VA-API directly and can import compatible compositor
 //! DMA-BUFs through video processing into an owned NV12 surface. The software
 //! path dynamically loads OpenH264. Both produce Annex-B access units with the
-//! keyframe and parameter-set behavior required by the in-process fMP4
-//! packager; neither path invokes FFmpeg or GStreamer.
+//! keyframe and parameter-set behavior required by the native object stream;
+//! neither path invokes FFmpeg or GStreamer.
 
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
@@ -40,7 +40,6 @@ use openh264::{
     },
     formats::{RgbSliceU8, YUVBuffer},
 };
-use sha2::{Digest, Sha256};
 use std::{
     os::fd::OwnedFd,
     path::{Path, PathBuf},
@@ -50,27 +49,12 @@ use std::{
 /// H.264 decoder configuration discovered in an encoded Annex-B stream.
 #[derive(Debug, Clone)]
 pub struct AvcConfig {
-    /// Encoded width in pixels.
-    pub width: u16,
-    /// Encoded height in pixels.
-    pub height: u16,
     /// Sequence parameter set without an Annex-B start code.
     pub sps: Vec<u8>,
     /// Picture parameter set without an Annex-B start code.
     pub pps: Vec<u8>,
 }
 
-impl AvcConfig {
-    pub(crate) fn codec_string(&self) -> Result<String> {
-        if self.sps.len() < 4 {
-            bail!("H.264 SPS must contain at least four bytes");
-        }
-        Ok(format!(
-            "avc1.{:02x}{:02x}{:02x}",
-            self.sps[1], self.sps[2], self.sps[3]
-        ))
-    }
-}
 use tracing::info;
 
 const OPENH264_ABI_MAJOR: &str = "8";
@@ -81,16 +65,16 @@ const VAAPI_CODED_ALIGNMENT: u32 = 16;
 const VAAPI_PREDICTION_LIMIT: u16 = 2048;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum DashEncoderMode {
+pub enum EncoderMode {
     Auto,
     Vaapi,
     Openh264,
 }
 
 #[derive(Clone)]
-pub enum DashInputFrame {
+pub enum EncoderInputFrame {
     Rgb(ImageBuffer<Rgb<u8>, Vec<u8>>),
-    DmaBuf(DashDmaBufFrame),
+    DmaBuf(DmaBufInputFrame),
 }
 
 #[derive(Clone)]
@@ -98,9 +82,9 @@ pub enum DashInputFrame {
     dead_code,
     reason = "DMA-BUF metadata is retained for a future runtime-loaded VA-API backend"
 )]
-pub struct DashDmaBufFrame {
+pub struct DmaBufInputFrame {
     pub fd: Arc<OwnedFd>,
-    pub release: DashFrameRelease,
+    pub release: FrameRelease,
     pub offset: usize,
     pub size: usize,
     pub stride: usize,
@@ -113,11 +97,11 @@ pub struct DashDmaBufFrame {
 }
 
 #[derive(Clone)]
-pub struct DashFrameRelease {
+pub struct FrameRelease {
     callback: Arc<dyn Fn() + Send + Sync>,
 }
 
-impl DashFrameRelease {
+impl FrameRelease {
     pub fn new(callback: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
             callback: Arc::new(callback),
@@ -129,7 +113,7 @@ impl DashFrameRelease {
     }
 }
 
-pub struct DashH264Encoder {
+pub struct H264Encoder {
     backend: EncoderBackend,
 }
 
@@ -201,7 +185,7 @@ struct PipewireDmaDescriptor {
     height: u32,
 }
 
-impl DashInputFrame {
+impl EncoderInputFrame {
     pub fn width(&self) -> u32 {
         match self {
             Self::Rgb(image) => image.width(),
@@ -215,54 +199,17 @@ impl DashInputFrame {
             Self::DmaBuf(frame) => frame.output_height,
         }
     }
-
-    pub fn with_output_size(mut self, width: u32, height: u32) -> Self {
-        match &mut self {
-            Self::Rgb(image) => {
-                if image.width() != width || image.height() != height {
-                    *image = image::imageops::resize(
-                        image,
-                        width,
-                        height,
-                        image::imageops::FilterType::Triangle,
-                    );
-                }
-            }
-            Self::DmaBuf(frame) => {
-                frame.output_width = width;
-                frame.output_height = height;
-            }
-        }
-        self
-    }
-
-    pub fn content_fingerprint(&self) -> Option<[u8; 32]> {
-        let Self::Rgb(image) = self else {
-            return None;
-        };
-        let mut hasher = Sha256::new();
-        hasher.update(image.width().to_be_bytes());
-        hasher.update(image.height().to_be_bytes());
-        hasher.update(image.as_raw());
-        Some(hasher.finalize().into())
-    }
-
-    pub fn discard(self) {
-        if let Self::DmaBuf(frame) = self {
-            frame.release.release();
-        }
-    }
 }
 
-pub fn should_capture_dmabuf(mode: DashEncoderMode, device_path: &Path) -> bool {
+pub fn should_capture_dmabuf(mode: EncoderMode, device_path: &Path) -> bool {
     let _ = (mode, device_path);
     false
 }
 
-impl DashH264Encoder {
+impl H264Encoder {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        mode: DashEncoderMode,
+        mode: EncoderMode,
         vaapi_device: &Path,
         openh264_library: Option<&Path>,
         width: u32,
@@ -281,17 +228,17 @@ impl DashH264Encoder {
             keyframe_interval,
         };
         match mode {
-            DashEncoderMode::Vaapi => {
+            EncoderMode::Vaapi => {
                 bail!("VA-API support is unavailable; use --encoder openh264")
             }
-            DashEncoderMode::Openh264 => {
+            EncoderMode::Openh264 => {
                 let encoder = software.build()?;
                 info!("using OpenH264 software encoder");
                 Ok(Self {
                     backend: EncoderBackend::Openh264(Box::new(encoder)),
                 })
             }
-            DashEncoderMode::Auto => {
+            EncoderMode::Auto => {
                 let _ = vaapi_device;
                 let encoder = software.build()?;
                 info!("using OpenH264 software encoder");
@@ -310,18 +257,18 @@ impl DashH264Encoder {
 
     pub fn encode(
         &mut self,
-        input: &DashInputFrame,
+        input: &EncoderInputFrame,
         force_keyframe: bool,
     ) -> Result<EncodedH264Frame> {
         let output = match &mut self.backend {
             EncoderBackend::Openh264(encoder) => match input {
-                DashInputFrame::Rgb(image) => encoder.encode(image, force_keyframe),
-                DashInputFrame::DmaBuf(_) => {
+                EncoderInputFrame::Rgb(image) => encoder.encode(image, force_keyframe),
+                EncoderInputFrame::DmaBuf(_) => {
                     bail!("OpenH264 requires a CPU-readable PipeWire frame")
                 }
             },
         };
-        if let DashInputFrame::DmaBuf(input) = input {
+        if let EncoderInputFrame::DmaBuf(input) = input {
             input.release.release();
         }
         output
@@ -454,7 +401,11 @@ impl VaapiH264Encoder {
         })
     }
 
-    fn encode(&mut self, input: &DashInputFrame, force_keyframe: bool) -> Result<EncodedH264Frame> {
+    fn encode(
+        &mut self,
+        input: &EncoderInputFrame,
+        force_keyframe: bool,
+    ) -> Result<EncodedH264Frame> {
         if input.width() != u32::from(self.width) || input.height() != u32::from(self.height) {
             bail!(
                 "encoder dimensions changed from {}x{} to {}x{}",
@@ -474,7 +425,7 @@ impl VaapiH264Encoder {
                 self.bitrate,
                 self.low_power,
             )
-            .context("restarting VA-API encoder for a DASH random-access segment")?;
+            .context("restarting VA-API encoder for a random-access boundary")?;
             self.frames_encoded = 0;
         }
 
@@ -492,7 +443,7 @@ impl VaapiH264Encoder {
             .context("allocating VA-API NV12 input frame")?;
         let pitches = frame.get_plane_pitch();
         match input {
-            DashInputFrame::Rgb(image) => {
+            EncoderInputFrame::Rgb(image) => {
                 let mapping = frame
                     .map_mut()
                     .map_err(anyhow::Error::msg)
@@ -505,7 +456,7 @@ impl VaapiH264Encoder {
                 let mut uv_plane = planes[1].borrow_mut();
                 rgb_to_nv12(image, &mut y_plane, pitches[0], &mut uv_plane, pitches[1])?;
             }
-            DashInputFrame::DmaBuf(input) => self
+            EncoderInputFrame::DmaBuf(input) => self
                 .vpp
                 .as_ref()
                 .context("VA-API video processing is unavailable for PipeWire DMA-BUF import")?
@@ -580,7 +531,7 @@ impl VaapiVpp {
     fn convert(
         &self,
         display: &Rc<Display>,
-        input: &DashDmaBufFrame,
+        input: &DmaBufInputFrame,
         output: &GbmVideoFrame,
     ) -> Result<()> {
         let va_fourcc = va_fourcc_for_drm(input.drm_format)
@@ -677,7 +628,7 @@ fn vaapi_has_entrypoint(display: &Display, profile: i32, accepted: &[VAEntrypoin
 }
 
 #[cfg(any())]
-fn dmabuf_object_size(frame: &DashDmaBufFrame) -> Option<u32> {
+fn dmabuf_object_size(frame: &DmaBufInputFrame) -> Option<u32> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
     // SAFETY: `stat` is writable storage for one `libc::stat`, and the
     // `OwnedFd` in `frame` remains open for this call.
@@ -756,8 +707,8 @@ fn build_vaapi_encoder(
 
 fn inspect_encoded_frame(
     annex_b: Vec<u8>,
-    width: u16,
-    height: u16,
+    _width: u16,
+    _height: u16,
     parameter_sets: &mut Option<AvcConfig>,
     keyframe_hint: bool,
     backend: &str,
@@ -777,12 +728,7 @@ fn inspect_encoded_frame(
         .map(|nal| nal.to_vec());
     let config = match (sps, pps) {
         (Some(sps), Some(pps)) => {
-            let config = AvcConfig {
-                width,
-                height,
-                sps,
-                pps,
-            };
+            let config = AvcConfig { sps, pps };
             *parameter_sets = Some(config.clone());
             Some(config)
         }
@@ -1023,15 +969,15 @@ mod tests {
     #[test]
     fn openh264_mode_never_requests_dmabuf_capture() {
         assert!(!should_capture_dmabuf(
-            DashEncoderMode::Openh264,
+            EncoderMode::Openh264,
             Path::new("/device/is/not/probed")
         ));
     }
 
     #[test]
     fn explicit_vaapi_mode_fails_instead_of_silently_using_software() {
-        let error = DashH264Encoder::new(
-            DashEncoderMode::Vaapi,
+        let error = H264Encoder::new(
+            EncoderMode::Vaapi,
             Path::new("/dev/dri/renderD128"),
             None,
             1280,
@@ -1043,12 +989,5 @@ mod tests {
         .err()
         .expect("explicit VA-API must fail when the backend is unavailable");
         assert!(error.to_string().contains("VA-API support is unavailable"));
-    }
-
-    #[test]
-    fn rgb_dash_input_resizes_to_encoder_dimensions() {
-        let input = DashInputFrame::Rgb(ImageBuffer::from_pixel(5, 3, Rgb([10, 20, 30])))
-            .with_output_size(4, 2);
-        assert_eq!((input.width(), input.height()), (4, 2));
     }
 }

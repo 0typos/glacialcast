@@ -1,54 +1,39 @@
-//! GlacialCast Wayland capture and DASH publisher.
+//! GlacialCast native Wayland capture publisher.
 //!
 //! The client captures a portal/PipeWire or deterministic test source, samples
 //! video at a deliberately low cadence, and processes cursor metadata on an
-//! independent higher-rate timeline. It packages H.264 into CENC fragmented
-//! MP4, encrypts cursor batches, authenticates complete stream objects, and
-//! publishes them through a relay-pinned Noise NK connection.
+//! independent higher-rate timeline. It encrypts and signs native H.264 and
+//! cursor objects before publishing them through a mutually authenticated
+//! Noise XX connection.
 //!
 //! Capture buffers remain leased until CPU or DMA-BUF conversion is complete.
-//! The relay receives neither the viewer key nor plaintext pixels or cursor
+//! The relay receives neither content keys nor plaintext pixels or cursor
 //! contents.
 
 #![deny(missing_docs)]
-#![allow(
-    dead_code,
-    reason = "legacy DASH helpers remain temporarily while native capture parity is verified"
-)]
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use clap::{Parser, ValueEnum};
 use futures_util::StreamExt;
 use glacialcast_protocol::{
-    CaptureSource, ClientMessage, DashObject, DashObjectKind, NewDashObject, NoiseSocket,
-    PROTOCOL_VERSION, ServerMessage, StreamHello,
+    CaptureSource,
     config_path::{self, ConfigSource},
     cursor::{CursorBitmap as NativeCursorBitmap, CursorEvent as NativeCursorEvent},
     daemon::{
         daemonize_if_requested, install_signal_handlers, manager_command,
-        sanitize_socket_component, serve_control_socket, wait_for_shutdown,
+        sanitize_socket_component, serve_control_socket,
     },
-    decode_key_b64, decode_noise_public_key, encode_key_b64, initiator_handshake, now_ms,
-    parse_human_bytes,
+    now_ms, parse_human_bytes,
     private_state::{PrivateLockMode, lock_private},
-    viewer_key,
-};
-use glacialcast_stream::{
-    CursorBatch as DashCursorBatch, CursorBitmap as DashCursorBitmap,
-    CursorContext as DashCursorContext, CursorEvent as DashCursorEvent, DASH_FORMAT_VERSION,
-    EpochDescriptor, EpochKeys, FragmentInput, MEDIA_TIMESCALE, build_fragment, build_init_segment,
-    encode_plain_cursor_batch, encrypt_cursor_batch,
 };
 use image::{ImageBuffer, Rgb, imageops::FilterType};
 use pipewire as pw;
 use pw::{properties::properties, spa};
-use rand::{RngCore, rngs::OsRng};
 use serde::Deserialize;
 #[cfg(any())]
 use std::os::fd::BorrowedFd;
 use std::{
-    collections::VecDeque,
     io::{IsTerminal, Read, Write},
     os::fd::{FromRawFd, OwnedFd, RawFd},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -60,31 +45,26 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::{
-    net::TcpStream,
-    sync::watch,
-    time::{MissedTickBehavior, timeout},
-};
+use tokio::{sync::watch, time::timeout};
 use tracing::{debug, info, warn};
-use uuid::Uuid;
 use zbus::{
     Connection, Proxy,
     proxy::SignalStream,
     zvariant::{OwnedFd as ZbusOwnedFd, OwnedObjectPath, OwnedValue, Value},
 };
 
-mod dash_encoder;
 #[cfg(any())]
 mod egl_readback;
+mod encoder;
 mod native_admin;
 mod native_publish;
 
-use dash_encoder::{
-    DashDmaBufFrame, DashEncoderMode, DashFrameRelease, DashH264Encoder, DashInputFrame,
-    should_capture_dmabuf,
-};
 #[cfg(any())]
 use egl_readback::{DmaBufPlane, EglReadback, ReadbackLayout};
+use encoder::{
+    DmaBufInputFrame, EncoderInputFrame, EncoderMode, FrameRelease, H264Encoder,
+    should_capture_dmabuf,
+};
 
 const PORTAL_SOURCE_MONITOR: u32 = 1;
 const PORTAL_SOURCE_WINDOW: u32 = 2;
@@ -106,9 +86,8 @@ const PIPEWIRE_CURSOR_DEFAULT_BITMAP_SIDE: usize = 64;
 // lets producers that reserve the full capacity negotiate with this consumer.
 const PIPEWIRE_CURSOR_NEGOTIATED_MAX_BITMAP_SIDE: usize = 384;
 const PIPEWIRE_CURSOR_MAX_BITMAP_SIDE: usize = 512;
-const CURSOR_BITMAP_REFRESH_TICKS: u64 = MEDIA_TIMESCALE as u64 * 60;
+const CURSOR_BITMAP_REFRESH_TICKS: u64 = glacialcast_protocol::native::STREAM_TIMESCALE as u64 * 60;
 const PIPEWIRE_CURSOR_METADATA_GRACE: Duration = Duration::from_secs(5);
-const MAX_SERVER_CONTROL_MESSAGE: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CursorBitmap {
@@ -145,8 +124,6 @@ struct Args {
     no_config: bool,
     #[arg(long, default_value = "127.0.0.1:8900")]
     ingest_addr: String,
-    #[arg(long, allow_hyphen_values = true, hide = true)]
-    ingest_token: Option<String>,
     #[arg(
         long,
         env = "GLACIALCAST_INGEST_SERVER_KEY",
@@ -162,33 +139,6 @@ struct Args {
     /// Publisher key history age bound in seconds (default 24 hours).
     #[arg(long)]
     history_seconds: Option<u64>,
-    #[arg(long, allow_hyphen_values = true, hide = true)]
-    viewer_key: Option<String>,
-    /// Viewer key as a word phrase, instead of letting one be generated.
-    #[arg(
-        long,
-        allow_hyphen_values = true,
-        conflicts_with = "viewer_key",
-        hide = true
-    )]
-    viewer_key_phrase: Option<String>,
-    #[arg(long, conflicts_with = "viewer_key", hide = true)]
-    no_viewer_key: bool,
-    #[arg(long, hide = true)]
-    viewer_key_file: Option<PathBuf>,
-    /// Replaces the stored viewer key with a fresh key phrase.
-    ///
-    /// Every key already shared for this publisher stops working.
-    #[arg(
-        long,
-        conflicts_with_all = ["viewer_key", "no_viewer_key"],
-        hide = true
-    )]
-    new_viewer_key: bool,
-    #[arg(long, hide = true)]
-    print_viewer_key: bool,
-    #[arg(long, hide = true)]
-    viewer_url: Option<String>,
     #[arg(long)]
     client_id: Option<String>,
     #[arg(long)]
@@ -230,44 +180,18 @@ struct Args {
     /// This bounds latency after an unchanged picture and limits idle traffic.
     #[arg(long, value_parser = parse_idle_heartbeat_seconds, default_value_t = 0.5)]
     idle_heartbeat_seconds: f64,
-    /// Publishes without encryption, so no viewing key is needed to watch.
-    ///
-    /// The relay refuses these streams unless it is serving a trusted local
-    /// network, and every host that can reach it can then watch, and can inject
-    /// frames a viewer cannot tell from yours. Media and cursor data leave this
-    /// machine readable by the relay and by anything between.
-    ///
-    /// It exists because Apple's browsers cannot play encrypted streams at all:
-    /// WebKit offers only FairPlay, never the Clear Key scheme this uses, so an
-    /// iPhone or iPad has no way to decrypt one. Unencrypted is the only form
-    /// they can play.
-    #[arg(long, hide = true)]
-    no_encryption: bool,
     #[arg(long, default_value_t = 60)]
     cursor_hz: u64,
-    #[arg(long, value_parser = parse_cursor_flush_ms, default_value_t = 25)]
-    cursor_flush_ms: u64,
     #[arg(long, default_value_t = 2_500_000)]
     video_bitrate: u32,
-    #[arg(long, hide = true)]
-    segment_frames: Option<u16>,
-    #[arg(long = "encoder", alias = "dash-encoder", value_enum, default_value_t = DashEncoderMode::Auto)]
-    encoder: DashEncoderMode,
+    #[arg(long, value_enum, default_value_t = EncoderMode::Auto)]
+    encoder: EncoderMode,
     #[arg(long, default_value = "/dev/dri/renderD128")]
     vaapi_device: PathBuf,
     #[arg(long)]
     openh264_library: Option<PathBuf>,
-    #[arg(
-        long,
-        value_parser = parse_human_bytes,
-        default_value = "128MiB",
-        hide = true
-    )]
-    resend_bytes: u64,
     #[arg(long)]
     foreground: bool,
-    #[arg(long)]
-    daemon: bool,
     #[arg(long, hide = true)]
     daemon_child: bool,
     #[arg(long)]
@@ -280,45 +204,12 @@ struct Args {
     log_file: Option<PathBuf>,
 }
 
-impl Args {
-    /// Frames per media segment, holding segment duration near four seconds.
-    ///
-    /// Segment boundaries force an IDR, and an IDR costs far more than a
-    /// predicted frame. Holding the frame count fixed while the frame rate
-    /// rises therefore multiplies keyframes and with them the bitrate: at five
-    /// frames per second the shipped four-frame segment measured 13 MB/min
-    /// across three screens against 2.4 MB/min once the duration was restored.
-    fn segment_frames(&self) -> u16 {
-        self.segment_frames.unwrap_or_else(|| {
-            let frames = (self.fps * f64::from(SEGMENT_TARGET_SECONDS)).round();
-            (frames as u16).clamp(1, MAX_SEGMENT_FRAMES)
-        })
-    }
-}
-
-/// Segment duration the publisher aims for, in seconds.
-const SEGMENT_TARGET_SECONDS: u16 = 4;
-/// Upper bound on frames per segment, so a high frame rate cannot produce a
-/// segment the viewer must buffer for an unreasonable time before it decodes.
-const MAX_SEGMENT_FRAMES: u16 = 120;
-
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ClientConfig {
     client_id: Option<String>,
-    ingest_token: Option<String>,
     ingest_server_key: Option<String>,
-    viewer_key_b64: Option<String>,
-    /// Viewer key as a word phrase, which is what a person is given.
-    ///
-    /// Takes the place of a generated one, so several publishers can share a
-    /// key deliberately and an operator can choose a memorable one. The salt is
-    /// still generated per publisher and published as stream metadata, so a
-    /// phrase reused across deployments does not produce the same key material
-    /// in each.
-    viewer_key_phrase: Option<String>,
     display_name: Option<String>,
-    viewer_url: Option<String>,
     /// Publishes every connected output rather than the primary one.
     all_monitors: Option<bool>,
     /// Maximum encoded content whose group keys remain available to newly approved viewers.
@@ -326,22 +217,6 @@ struct ClientConfig {
     /// Maximum age in seconds of group keys offered to newly approved viewers.
     history_seconds: Option<u64>,
 }
-
-/// Salt used when a phrase is supplied but no key file is kept.
-///
-/// Deterministic on purpose: with `--no-viewer-key` there is nowhere to persist
-/// a random salt, and a phrase that derived a different key on every start
-/// would be unusable. A publisher that keeps a key file gets a random salt
-/// instead, which is the normal case.
-const DERIVED_PHRASE_FALLBACK_SALT: [u8; viewer_key::SALT_LEN] = *b"glacialcast-derv";
-
-/// The phrase shipped in the example configuration.
-///
-/// Present so an install works immediately, and therefore public: anyone who
-/// can reach the relay and has read the documentation can decrypt a stream
-/// published under it. The publisher warns on every start until it is changed,
-/// because a default secret that is never mentioned again is one that stays.
-const EXAMPLE_VIEWER_KEY_PHRASE: &str = "demo-only-weak-amend-now-open-free";
 
 /// Identifies one published stream to the relay.
 ///
@@ -356,21 +231,8 @@ struct StreamIdentity<'a> {
 
 struct ClientIdentity {
     client_id: String,
-    auth_token: Option<String>,
     ingest_server_key: Option<[u8; 32]>,
-    viewer_key_b64: Option<String>,
-    /// The viewer key in the form shared with people, which is a key phrase
-    /// unless the key was supplied directly as base64.
-    viewer_key_shareable: Option<String>,
-    /// Public salt the relay republishes so a viewer can derive the key from
-    /// the phrase. `None` for a raw key, which needs no derivation.
-    viewer_key_salt_b64: Option<String>,
     display_name: String,
-    /// Where a generated viewer key is kept so restarts republish the same
-    /// key, or `None` when the key came from configuration or the command line.
-    viewer_key_file: Option<PathBuf>,
-    /// Operator-supplied viewer page address, printed with the sharing summary.
-    viewer_url: Option<String>,
     /// Configuration actually read, so the summary and the log can say which
     /// file a detached publisher is running on.
     config_path: Option<PathBuf>,
@@ -439,8 +301,7 @@ impl PortalCursorMode {
 /// Parses the process configuration and runs the capture publisher.
 ///
 /// This is the installed binary's entry point. The publisher detaches into the
-/// background unless `--foreground` is given, after printing the viewer key
-/// that the operator shares out of band. It returns after a requested
+/// background unless `--foreground` is given. It returns after a requested
 /// daemon-management action, clean shutdown, or a fatal configuration,
 /// capture, encoding, or transport error.
 pub fn run() -> Result<()> {
@@ -467,13 +328,6 @@ pub fn run() -> Result<()> {
     if args.history_bytes == Some(0) || args.history_seconds == Some(0) {
         bail!("history byte and time limits must be positive");
     }
-    if args.no_encryption {
-        bail!("native GlacialCast streams are always end-to-end encrypted");
-    }
-    if args.print_viewer_key {
-        bail!("native viewers pair by identity; there is no shared viewer key to print");
-    }
-    args.no_viewer_key = true;
     let identity = resolve_client_identity(&args)?;
     let daemon_socket = client_daemon_socket(&args, &identity);
 
@@ -544,10 +398,7 @@ pub fn run() -> Result<()> {
     runtime.block_on(run_client(args, identity, daemon_socket))
 }
 
-/// Prints everything an operator needs to invite viewers, before detaching.
-///
-/// The viewer key is written to standard output only, never to the log file or
-/// to the relay, because the relay must not be able to decrypt the stream.
+/// Prints the publisher control locations before detaching.
 fn print_sharing_summary(
     identity: &ClientIdentity,
     daemon_socket: &std::path::Path,
@@ -555,15 +406,9 @@ fn print_sharing_summary(
     _unencrypted: bool,
 ) {
     println!("GlacialCast publisher \"{}\"", identity.display_name);
-    if let Some(viewer_url) = &identity.viewer_url {
-        println!("  viewer page  {viewer_url}");
-    }
     println!("  viewer access  identity pairing (no shared passphrase)");
     if let Some(path) = &identity.config_path {
         println!("  config       {}", path.display());
-    }
-    if let Some(path) = &identity.viewer_key_file {
-        println!("  key file     {}", path.display());
     }
     println!("  log file     {}", log_file.display());
     println!("  control      {}", daemon_socket.display());
@@ -573,37 +418,6 @@ fn print_sharing_summary(
          authentication string with the viewer, then approve it; the relay never receives\n\
          a content key. `gcpub approve-all` accepts every currently confirmed request."
     );
-}
-
-/// Builds the one-click invitation link for this publisher's viewer key.
-///
-/// The key goes in the URL fragment, after the `#`. Browsers do not send the
-/// fragment to the server, so the relay never receives the key even though the
-/// link points at the relay; a query parameter would arrive and be logged.
-///
-/// Anyone holding the link can watch, exactly as anyone holding the key can, so
-/// it belongs in the same secure channel as the key itself.
-fn invite_link(identity: &ClientIdentity) -> Option<String> {
-    let base = identity.viewer_url.as_deref()?.trim_end_matches('/');
-    let key = identity.viewer_key_shareable.as_deref()?;
-    Some(format!("{base}/#k={}", url_encode_fragment(key)))
-}
-
-/// Percent-encodes the characters that would end a URL fragment or be read as
-/// structure inside it. A generated key phrase is words and hyphens, and a raw
-/// viewer key is URL-safe base64, so this normally changes nothing — but a
-/// hand-chosen phrase is arbitrary text and must not be able to break the link.
-fn url_encode_fragment(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(byte as char);
-            }
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    encoded
 }
 
 fn client_daemon_socket(args: &Args, identity: &ClientIdentity) -> PathBuf {
@@ -617,8 +431,6 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
     let serve_control = args.daemon_child || args.daemon_socket.is_some();
     info!(
         client_id = %identity.client_id,
-        // The identity holds a viewer key whether or not this run uses one, so
-        // the flag is what says whether anything is encrypted end to end.
         e2e_encrypted = true,
         config = identity
             .config_path
@@ -627,11 +439,6 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
         "stream credentials ready"
     );
 
-    // A stream published in the clear has no viewer key, so requiring one was a
-    // contradiction: `--no-encryption --no-viewer-key` printed a summary saying
-    // the key was not used, daemonized looking healthy, and then died here --
-    // in the child's log, where nobody was looking. The flag decides; a key
-    // that happens to be configured is simply left unused.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(install_signal_handlers(shutdown_tx.clone()));
     let _approval_worker = tokio::spawn(native_admin::run_live_approvals(
@@ -650,20 +457,6 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
         });
     }
 
-    if update_rate_outlasts_firefox(args.fps) {
-        // The idle heartbeat bounds coalesced samples, but nothing can shorten
-        // the frame period itself: at this rate every sample approaches or
-        // exceeds the roughly one-second duration that stalls in Firefox
-        // (measured: 0.95s plays, 1.0s stalls). Warn rather than refuse --
-        // capture validation and Chromium-only deployments legitimately run
-        // this slow -- but say it here, at startup, not as a stalled tile.
-        warn!(
-            fps = args.fps,
-            "at this update rate every media sample lasts close to a second or more, \
-             which Firefox will not decode; viewers there will see a stalled tile. \
-             Use --fps 1.25 or higher if Firefox playback matters"
-        );
-    }
     let targets = resolve_publish_targets(&args, &identity).await?;
     info!(
         streams = targets.len(),
@@ -731,6 +524,9 @@ async fn run_client(args: Args, identity: ClientIdentity, daemon_socket: PathBuf
                         Ok(()) => break Ok(()),
                         Err(_) if *shutdown_rx.borrow() => break Ok(()),
                         Err(error) => {
+                            if is_fatal_publisher_error(&error) {
+                                break Err(error.context("fatal publisher error"));
+                            }
                             let delay = reconnect_delay(reconnect_attempt);
                             reconnect_attempt = reconnect_attempt.saturating_add(1);
                             warn!(
@@ -897,7 +693,7 @@ async fn resolve_publish_targets(
 /// A portal grant this publisher may reuse instead of prompting again.
 ///
 /// The portal issues an opaque token when it agrees to remember a selection.
-/// It is stored with mode 0600 next to the viewer key: it is not a content
+/// It is stored with mode 0600 in publisher state: it is not a content
 /// secret, but anyone holding it can resume this publisher's screen-capture
 /// grant, so it does not belong in a world-readable file.
 struct PortalRestoreToken {
@@ -1008,821 +804,6 @@ fn sanitize_source_label(connector: &str) -> String {
     }
 }
 
-/// Stops the cursor sampling task when its connection ends.
-struct CursorTaskGuard(Option<tokio::task::JoinHandle<()>>);
-
-impl Drop for CursorTaskGuard {
-    fn drop(&mut self) {
-        if let Some(handle) = self.0.take() {
-            handle.abort();
-        }
-    }
-}
-
-async fn sleep_or_shutdown(duration: Duration, shutdown_rx: &mut watch::Receiver<bool>) -> bool {
-    tokio::select! {
-        _ = tokio::time::sleep(duration) => false,
-        _ = wait_for_shutdown(shutdown_rx) => true,
-    }
-}
-
-async fn run_dash_client(
-    args: &Args,
-    identity: StreamIdentity<'_>,
-    viewer_key: Option<&[u8; 32]>,
-    capture: &mut dyn Capture,
-    resend: &mut DashResendBuffer,
-    shutdown_rx: watch::Receiver<bool>,
-) -> Result<()> {
-    let mut retry_delay = Duration::from_secs(1);
-    loop {
-        // Opening a source can block indefinitely on a desktop chooser that
-        // nobody answers, so shutdown has to win the race. Otherwise SIGTERM
-        // and `--daemon-stop` are ignored for as long as the dialog is open.
-        let opened = {
-            let mut source_shutdown = shutdown_rx.clone();
-            tokio::select! {
-                opened = capture.source() => opened,
-                _ = wait_for_shutdown(&mut source_shutdown) => {
-                    info!("shutdown requested while opening the capture source");
-                    return Ok(());
-                }
-            }
-        };
-        let source = match opened {
-            Ok(source) => source,
-            Err(err) => {
-                if is_fatal_capture_error(&err) {
-                    return Err(err.context("fatal DASH capture setup error"));
-                }
-                warn!(?err, "DASH capture source unavailable; retrying in 1s");
-                let mut retry_shutdown = shutdown_rx.clone();
-                if sleep_or_shutdown(Duration::from_secs(1), &mut retry_shutdown).await {
-                    return Ok(());
-                }
-                continue;
-            }
-        };
-        let connection_started = Instant::now();
-        match run_dash_connection(
-            args,
-            identity,
-            viewer_key,
-            &source,
-            capture,
-            resend,
-            shutdown_rx.clone(),
-        )
-        .await
-        {
-            Ok(()) => return Ok(()),
-            Err(err) => {
-                if is_fatal_capture_error(&err) || is_fatal_dash_error(&err) {
-                    return Err(err.context("fatal DASH publisher error"));
-                }
-                if connection_started.elapsed() >= Duration::from_secs(60) {
-                    retry_delay = Duration::from_secs(1);
-                }
-                let jitter = Duration::from_millis(u64::from(OsRng.next_u32() % 500));
-                let wait = retry_delay.saturating_add(jitter);
-                warn!(?err, retry_ms = wait.as_millis(), "DASH connection dropped");
-                let mut retry_shutdown = shutdown_rx.clone();
-                if sleep_or_shutdown(wait, &mut retry_shutdown).await {
-                    return Ok(());
-                }
-                retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(30));
-            }
-        }
-    }
-}
-
-fn is_fatal_dash_error(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        let message = cause.to_string();
-        message.contains("OpenH264")
-            || message.contains("openh264")
-            || message.contains("VA-API H.264")
-            || message.contains("required VA-API")
-            || message.contains("encoder dimensions changed")
-            || message.contains("requires non-zero, even dimensions")
-            || message.contains("segment-frames")
-            || message.contains("does not fit MPEG-DASH")
-            || message.contains("server rejected hello")
-    })
-    // A policy refusal is decided per object and will be decided the same way
-    // next time. Retrying it forever hides the reason behind a generic
-    // "connection dropped" and leaves the stream flapping. Matched by type
-    // rather than by text: the entries above are messages from foreign
-    // libraries, where a substring is the only handle there is, but this one is
-    // ours -- and rewording it must not quietly restore the retry loop.
-    || err.chain().any(|cause| cause.is::<RelayRefused>())
-}
-
-/// Marks an error as the relay declining an object on policy.
-///
-/// Carries no detail of its own: the operator-facing sentence is the relay's,
-/// attached as context. This exists so the retry loop can recognise the
-/// refusal without matching on that sentence.
-#[derive(Debug)]
-struct RelayRefused;
-
-impl std::fmt::Display for RelayRefused {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("the relay refused this object")
-    }
-}
-
-impl std::error::Error for RelayRefused {}
-
-async fn run_dash_connection(
-    args: &Args,
-    identity: StreamIdentity<'_>,
-    viewer_key: Option<&[u8; 32]>,
-    source: &CaptureSource,
-    capture: &mut dyn Capture,
-    resend: &mut DashResendBuffer,
-    mut shutdown_rx: watch::Receiver<bool>,
-) -> Result<()> {
-    if args.segment_frames() == 0 {
-        bail!("--segment-frames must be at least 1");
-    }
-    let ingest_server_key = identity.client.ingest_server_key.as_ref().context(
-        "ingest server key is required; pass --ingest-server-key or set ingest_server_key in client.toml",
-    )?;
-    let mut stream = timeout(
-        Duration::from_secs(15),
-        TcpStream::connect(args.ingest_addr.as_str()),
-    )
-    .await
-    .context("ingest connection timed out")??;
-    stream.set_nodelay(true)?;
-    let transport = timeout(
-        Duration::from_secs(10),
-        initiator_handshake(&mut stream, ingest_server_key),
-    )
-    .await
-    .context("Noise handshake timed out")??;
-    let mut socket = NoiseSocket::new(stream, transport);
-    let (low, high) = resend.range();
-    socket
-        .write(&ClientMessage::Hello(StreamHello {
-            protocol_version: PROTOCOL_VERSION,
-            client_id: identity.client.client_id.clone(),
-            auth_token: identity.client.auth_token.clone(),
-            // A publisher casting several screens shows one entry per screen
-            // in the viewer, so the label has to reach the name a viewer reads.
-            display_name: match identity.label {
-                Some(label) => format!("{} ({label})", identity.client.display_name),
-                None => identity.client.display_name.clone(),
-            },
-            source: source.clone(),
-            source_label: identity.label.map(str::to_string),
-            viewer_key_salt: identity.client.viewer_key_salt_b64.clone(),
-            resend_low: low,
-            resend_high: high,
-        }))
-        .await?;
-    let (stream_id, server_last_sequence) = match socket
-        .read_limited::<ServerMessage>(MAX_SERVER_CONTROL_MESSAGE)
-        .await?
-    {
-        ServerMessage::HelloAck {
-            accepted: true,
-            stream_id: Some(stream_id),
-            last_sequence,
-            ..
-        } => (stream_id, last_sequence),
-        ServerMessage::HelloAck { reason, .. } => bail!("server rejected hello: {reason:?}"),
-        other => bail!("server sent unexpected first response: {other:?}"),
-    };
-    resend.drop_other_streams(stream_id);
-    resend.ack(server_last_sequence);
-    let mut sequence = server_last_sequence;
-    if let Some(highest) = resend.range().1
-        && highest > server_last_sequence
-    {
-        let pending = resend.objects(server_last_sequence + 1, highest);
-        for object in pending {
-            let expected_sequence = object.header.sequence;
-            socket
-                .write(&ClientMessage::DashObject(object))
-                .await
-                .context("resending unacknowledged DASH object")?;
-            sequence = wait_for_dash_ack(&mut socket, resend, expected_sequence)
-                .await?
-                .max(sequence);
-        }
-    }
-    sequence = sequence.max(resend.range().1.unwrap_or(0));
-
-    let first_capture = normalize_captured_dash_frame(
-        capture
-            .capture_dash_frame(args.max_frame_width, args.max_frame_height)
-            .await?,
-        None,
-    );
-    let first_frame = first_capture.frame;
-    let width = first_frame.width();
-    let height = first_frame.height();
-    let frame_duration = ((f64::from(MEDIA_TIMESCALE) / args.fps).round() as u64)
-        .clamp(1, u64::from(u32::MAX)) as u32;
-    let epoch_id = Uuid::new_v4();
-    // One place decides, and everything downstream reads it from the absence of
-    // a key rather than from a flag it could disagree with. There may be no key
-    // to derive from at all: an unencrypted publisher is not required to have
-    // one configured.
-    let keys = viewer_key
-        .map(|key| {
-            EpochKeys::derive(key, stream_id, epoch_id)
-                .context("deriving encrypted DASH epoch keys")
-        })
-        .transpose()?;
-    let epoch_keys = keys.as_ref();
-    let encoder = EncoderActor::spawn(EncoderConfig {
-        mode: args.encoder,
-        vaapi_device: args.vaapi_device.clone(),
-        openh264_library: args.openh264_library.clone(),
-        width,
-        height,
-        fps: args.fps,
-        bitrate: args.video_bitrate,
-        segment_frames: args.segment_frames(),
-    })?;
-    let mut last_frame_fingerprint = first_frame.content_fingerprint();
-    let first_encoded = encoder.encode(first_frame.clone(), false).await?;
-    if !first_encoded.keyframe {
-        bail!("H.264 encoder did not begin the epoch with a random-access frame");
-    }
-    let avc_config = first_encoded
-        .config
-        .clone()
-        .context("H.264 encoder did not provide an AVC decoder configuration")?;
-    let codec = avc_config
-        .codec_string()
-        .context("building AVC codec string")?;
-    let descriptor = EpochDescriptor {
-        format_version: DASH_FORMAT_VERSION,
-        stream_id,
-        epoch_id,
-        // Always the epoch's own bytes, which is what EpochKeys derives it from
-        // and what the descriptor's validation requires. An unencrypted epoch
-        // has no key to identify, and carries the same shape rather than a
-        // second one for readers to handle.
-        key_id: *epoch_id.as_bytes(),
-        width: u16::try_from(width).context("video width does not fit MPEG-DASH metadata")?,
-        height: u16::try_from(height).context("video height does not fit MPEG-DASH metadata")?,
-        codec,
-        timescale: MEDIA_TIMESCALE,
-        segment_frames: args.segment_frames(),
-        availability_start_time: chrono::Utc::now()
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        encrypted: epoch_keys.is_some(),
-    };
-    let epoch_started = Instant::now();
-    send_new_dash_object(
-        &mut socket,
-        resend,
-        next_dash_object(
-            &mut sequence,
-            epoch_keys,
-            DashObjectSpec {
-                stream_id,
-                epoch_id,
-                kind: DashObjectKind::Epoch,
-                segment_number: 0,
-                chunk_index: 0,
-                timestamp: 0,
-                duration: 0,
-                random_access: true,
-                mime: "application/vnd.glacialcast.epoch+json",
-                payload: descriptor
-                    .to_json()
-                    .context("serializing DASH epoch descriptor")?,
-            },
-        )?,
-    )
-    .await?;
-    send_new_dash_object(
-        &mut socket,
-        resend,
-        next_dash_object(
-            &mut sequence,
-            epoch_keys,
-            DashObjectSpec {
-                stream_id,
-                epoch_id,
-                kind: DashObjectKind::Initialization,
-                segment_number: 0,
-                chunk_index: 0,
-                timestamp: 0,
-                duration: 0,
-                random_access: true,
-                mime: "video/mp4",
-                payload: build_init_segment(
-                    &glacialcast_stream::AvcConfig {
-                        width: avc_config.width,
-                        height: avc_config.height,
-                        sps: avc_config.sps.clone(),
-                        pps: avc_config.pps.clone(),
-                    },
-                    epoch_keys.map(|keys| keys.key_id),
-                )
-                .context("building the DASH initialization segment")?,
-            },
-        )?,
-    )
-    .await?;
-    let first_media = build_dash_media_object(
-        &mut sequence,
-        epoch_keys,
-        stream_id,
-        epoch_id,
-        0,
-        0,
-        frame_duration,
-        args.segment_frames(),
-        &first_encoded,
-    )?;
-    let first_bytes = first_media.payload.len();
-    send_new_dash_object(&mut socket, resend, first_media).await?;
-    info!(
-        %stream_id,
-        %epoch_id,
-        width,
-        height,
-        fps = args.fps,
-        bitrate = args.video_bitrate,
-        encoder = encoder.backend_name(),
-        bytes = first_bytes,
-        encrypted = epoch_keys.is_some(),
-        "MPEG-DASH publisher started"
-    );
-
-    let frame_interval = Duration::from_secs_f64(1.0 / args.fps);
-    let mut frame_tick =
-        tokio::time::interval_at(tokio::time::Instant::now() + frame_interval, frame_interval);
-    frame_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let cursor_interval = Duration::from_secs_f64(1.0 / args.cursor_hz.max(1) as f64);
-    let mut cursor_tick = tokio::time::interval(cursor_interval);
-    cursor_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut cursor_ticks: u64 = 0;
-    let mut cursor_samples: u64 = 0;
-    let mut cursor_reported = Instant::now();
-    let cursor_flush_interval = Duration::from_millis(args.cursor_flush_ms.max(1));
-    let mut last_cursor_flush = Instant::now();
-    let mut media_index = 1u64;
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "the parser bounds the heartbeat to [0.2, 300] seconds"
-    )]
-    let heartbeat_ticks = (args.idle_heartbeat_seconds * f64::from(MEDIA_TIMESCALE)).round() as u64;
-    let mut media_cadence = AdaptiveMediaCadence::new(u64::from(frame_duration), heartbeat_ticks);
-    let mut pending_media: Option<PendingEncodedMedia> = None;
-    let mut cursor_sequence = 0u64;
-    let mut pending_cursor_events = Vec::new();
-    let mut cursor_bitmap_state = DashCursorBitmapState::default();
-
-    // Sample the cursor on its own task when the capture can supply a feed.
-    // Video work holds this loop for as long as it takes to unpack, scale and
-    // encode a frame; sampling from here would inherit every one of those
-    // stalls and stamp the samples late as well. The task only ever produces
-    // finished batches, which this loop forwards as soon as it is free, and
-    // the viewer's play-out buffer absorbs that delivery jitter.
-    let (cursor_batch_tx, mut cursor_batch_rx) = tokio::sync::mpsc::channel(64);
-    let cursor_task = match capture.cursor_source().await? {
-        Some(mut source) => {
-            let interval = cursor_interval;
-            let flush_every = cursor_flush_interval;
-            Some(tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(interval);
-                ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-                let mut bitmap_state = DashCursorBitmapState::default();
-                let mut pending: Vec<DashCursorEvent> = Vec::new();
-                let mut last_flush = Instant::now();
-                // How late this task's ticks actually fire. The whole point of
-                // running the cursor on its own task is that video work cannot
-                // delay it; lateness here is the direct measurement of whether
-                // that holds, and it is reported rather than assumed.
-                let mut last_tick = Instant::now();
-                let mut worst_lateness = Duration::ZERO;
-                let mut lateness_reported = Instant::now();
-                loop {
-                    ticker.tick().await;
-                    let now = Instant::now();
-                    worst_lateness = worst_lateness.max(
-                        now.saturating_duration_since(last_tick)
-                            .saturating_sub(interval),
-                    );
-                    last_tick = now;
-                    if lateness_reported.elapsed() >= CAPTURE_RATE_WINDOW {
-                        debug!(
-                            worst_tick_lateness_ms = worst_lateness.as_millis(),
-                            "cursor timeline scheduling"
-                        );
-                        worst_lateness = Duration::ZERO;
-                        lateness_reported = now;
-                    }
-                    if let Some(cursor) = source.next() {
-                        let timestamp = duration_to_media_ticks(epoch_started.elapsed());
-                        match cursor_to_dash_event(
-                            cursor,
-                            timestamp,
-                            width,
-                            height,
-                            &mut bitmap_state,
-                        ) {
-                            Ok(event) => pending.push(event),
-                            Err(err) => {
-                                warn!(?err, "dropping an unrepresentable cursor sample");
-                            }
-                        }
-                    }
-                    if last_flush.elapsed() >= flush_every && !pending.is_empty() {
-                        last_flush = Instant::now();
-                        if cursor_batch_tx
-                            .send(std::mem::take(&mut pending))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                }
-            }))
-        }
-        None => None,
-    };
-    let sampling_cursor_inline = cursor_task.is_none();
-    let _cursor_task = CursorTaskGuard(cursor_task);
-
-    loop {
-        tokio::select! {
-            _ = wait_for_shutdown(&mut shutdown_rx) => {
-                if let Some(duration) =
-                    media_cadence.finish(duration_to_media_ticks(epoch_started.elapsed()))
-                    && let Some(pending) = pending_media.take()
-                {
-                    publish_encoded_media(
-                        &mut socket,
-                        resend,
-                        &mut sequence,
-                        epoch_keys,
-                        stream_id,
-                        epoch_id,
-                        &mut media_index,
-                        pending.timestamp,
-                        duration,
-                        args.segment_frames(),
-                        pending.encoded,
-                    ).await?;
-                }
-                flush_dash_cursor_batch(
-                    &mut socket,
-                    resend,
-                    &mut sequence,
-                    epoch_keys,
-                    stream_id,
-                    epoch_id,
-                    width,
-                    height,
-                    frame_duration,
-                    args.segment_frames(),
-                    &mut pending_cursor_events,
-                ).await?;
-                info!(%stream_id, "shutdown requested; closing DASH stream");
-                return Ok(());
-            }
-            _ = frame_tick.tick() => {
-                let publish_started = Instant::now();
-                // Waiting for a new frame here is fine now that the cursor
-                // samples on its own task: this await no longer holds the
-                // cursor timeline, only the delivery of already-timestamped
-                // batches, which the viewer's play-out buffer absorbs.
-                //
-                // It must be an unbounded wait. The cadence is a state machine
-                // driven by actual frames, so a tick that gives up without one
-                // either corrupts it or, if skipped outright, stops the
-                // heartbeat and lets a still screen go silent entirely.
-                // Waiting for a frame can take most of a second on a screen
-                // with nothing moving on it. Cursor batches are already
-                // timestamped by then and only need putting on the wire, so
-                // service them while waiting rather than letting them queue
-                // behind the video timeline -- that queueing is what a viewer
-                // sees as a pointer trailing well behind the real one.
-                let raw = loop {
-                    tokio::select! {
-                        biased;
-                        Some(events) = cursor_batch_rx.recv() => {
-                            pending_cursor_events.extend(events);
-                            flush_dash_cursor_batch(
-                                &mut socket,
-                                resend,
-                                &mut sequence,
-                                epoch_keys,
-                                stream_id,
-                                epoch_id,
-                                width,
-                                height,
-                                frame_duration,
-                                args.segment_frames(),
-                                &mut pending_cursor_events,
-                            ).await?;
-                        }
-                        frame = capture
-                            .capture_dash_frame(args.max_frame_width, args.max_frame_height) => {
-                            break frame?;
-                        }
-                    }
-                };
-                let dequeued_at = Instant::now();
-                let capture = normalize_captured_dash_frame(raw, Some((width, height)));
-                let normalized_at = Instant::now();
-                let fingerprint = capture.frame.content_fingerprint();
-                let fingerprinted_at = Instant::now();
-                let changed = frame_changed(
-                    capture.change,
-                    last_frame_fingerprint.as_ref(),
-                    fingerprint.as_ref(),
-                );
-                let decision = media_cadence.observe(
-                    duration_to_media_ticks(epoch_started.elapsed()),
-                    changed,
-                );
-                if let Some(duration) = decision.flush_pending_duration {
-                    let pending = pending_media
-                        .take()
-                        .context("adaptive cadence lost its pending encoded frame")?;
-                    publish_encoded_media(
-                        &mut socket,
-                        resend,
-                        &mut sequence,
-                        epoch_keys,
-                        stream_id,
-                        epoch_id,
-                        &mut media_index,
-                        pending.timestamp,
-                        duration,
-                        args.segment_frames(),
-                        pending.encoded,
-                    ).await?;
-                }
-                if let Some(timestamp) = decision.publish_current_timestamp {
-                    let encoded = encode_media_frame(
-                        &encoder,
-                        capture.frame,
-                        media_index,
-                        args.segment_frames(),
-                    ).await?;
-                    publish_encoded_media(
-                        &mut socket,
-                        resend,
-                        &mut sequence,
-                        epoch_keys,
-                        stream_id,
-                        epoch_id,
-                        &mut media_index,
-                        timestamp,
-                        frame_duration,
-                        args.segment_frames(),
-                        encoded,
-                    ).await?;
-                    last_frame_fingerprint = fingerprint;
-                } else if let Some(timestamp) = decision.encode_pending_timestamp {
-                    let encoded = encode_media_frame(
-                        &encoder,
-                        capture.frame,
-                        media_index,
-                        args.segment_frames(),
-                    ).await?;
-                    pending_media = Some(PendingEncodedMedia { timestamp, encoded });
-                } else {
-                    capture.frame.discard();
-                }
-                debug!(
-                    %stream_id,
-                    changed,
-                    media_index,
-                    capture_to_ack_ms = publish_started.elapsed().as_millis(),
-                    // Everything after the dequeue runs on the same task as the
-                    // cursor timeline, so these are the windows in which cursor
-                    // samples cannot be forwarded.
-                    wait_ms = dequeued_at.duration_since(publish_started).as_millis(),
-                    resize_ms = normalized_at.duration_since(dequeued_at).as_millis(),
-                    fingerprint_ms = fingerprinted_at.duration_since(normalized_at).as_millis(),
-                    encode_publish_ms = fingerprinted_at.elapsed().as_millis(),
-                    pending = pending_media.is_some(),
-                    "processed adaptive DASH media cadence"
-                );
-            }
-            Some(events) = cursor_batch_rx.recv() => {
-                pending_cursor_events.extend(events);
-                flush_dash_cursor_batch(
-                    &mut socket,
-                    resend,
-                    &mut sequence,
-                    epoch_keys,
-                    stream_id,
-                    epoch_id,
-                    width,
-                    height,
-                    frame_duration,
-                    args.segment_frames(),
-                    &mut pending_cursor_events,
-                ).await?;
-            }
-            _ = cursor_tick.tick(), if sampling_cursor_inline => {
-                cursor_sequence = cursor_sequence.saturating_add(1);
-                cursor_ticks += 1;
-                if cursor_reported.elapsed() >= Duration::from_secs(5) {
-                    debug!(
-                        %stream_id,
-                        ticks_per_second = cursor_ticks / 5,
-                        samples_per_second = cursor_samples / 5,
-                        "cursor timeline throughput"
-                    );
-                    cursor_ticks = 0;
-                    cursor_samples = 0;
-                    cursor_reported = Instant::now();
-                }
-                if let Some(cursor) = capture.cursor(cursor_sequence).await? {
-                    cursor_samples += 1;
-                    let timestamp = duration_to_media_ticks(epoch_started.elapsed());
-                    pending_cursor_events.push(cursor_to_dash_event(
-                        cursor,
-                        timestamp,
-                        width,
-                        height,
-                        &mut cursor_bitmap_state,
-                    )?);
-                }
-                // Flushing here rather than from its own timer is deliberate.
-                // `select!` completes one branch per iteration, so a separate
-                // flush tick competes with this sampler for iterations and, at
-                // 60 Hz against a loop that also encodes video, loses almost
-                // every time: samples pile up and ship in rare huge batches,
-                // which the viewer can only render as a frozen cursor.
-                if last_cursor_flush.elapsed() >= cursor_flush_interval {
-                    last_cursor_flush = Instant::now();
-                    flush_dash_cursor_batch(
-                        &mut socket,
-                        resend,
-                        &mut sequence,
-                        epoch_keys,
-                        stream_id,
-                        epoch_id,
-                        width,
-                        height,
-                        frame_duration,
-                        args.segment_frames(),
-                        &mut pending_cursor_events,
-                    ).await?;
-                }
-            }
-        }
-    }
-}
-
-struct DashObjectSpec<'a> {
-    stream_id: Uuid,
-    epoch_id: Uuid,
-    kind: DashObjectKind,
-    segment_number: u64,
-    chunk_index: u16,
-    timestamp: u64,
-    duration: u64,
-    random_access: bool,
-    mime: &'a str,
-    payload: Vec<u8>,
-}
-
-struct PendingEncodedMedia {
-    timestamp: u64,
-    encoded: dash_encoder::EncodedH264Frame,
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct MediaCadenceDecision {
-    flush_pending_duration: Option<u32>,
-    publish_current_timestamp: Option<u64>,
-    encode_pending_timestamp: Option<u64>,
-}
-
-#[derive(Debug)]
-struct AdaptiveMediaCadence {
-    frame_duration: u64,
-    heartbeat_ticks: u64,
-    media_end: u64,
-    pending_timestamp: Option<u64>,
-}
-
-impl AdaptiveMediaCadence {
-    fn new(frame_duration: u64, heartbeat_ticks: u64) -> Self {
-        Self {
-            frame_duration,
-            heartbeat_ticks: heartbeat_ticks.max(frame_duration).min(u64::from(u32::MAX)),
-            media_end: frame_duration,
-            pending_timestamp: None,
-        }
-    }
-
-    fn observe(&mut self, timestamp: u64, changed: bool) -> MediaCadenceDecision {
-        if changed {
-            let mut decision = MediaCadenceDecision::default();
-            if let Some(pending_timestamp) = self.pending_timestamp.take() {
-                let duration = timestamp
-                    .saturating_sub(pending_timestamp)
-                    .clamp(1, u64::from(u32::MAX)) as u32;
-                decision.flush_pending_duration = Some(duration);
-                self.media_end = pending_timestamp.saturating_add(u64::from(duration));
-            }
-            let current_timestamp = timestamp.max(self.media_end);
-            decision.publish_current_timestamp = Some(current_timestamp);
-            self.media_end = current_timestamp.saturating_add(self.frame_duration);
-            return decision;
-        }
-
-        if self.pending_timestamp.is_none() && timestamp >= self.media_end {
-            self.pending_timestamp = Some(self.media_end);
-            return MediaCadenceDecision {
-                encode_pending_timestamp: self.pending_timestamp,
-                ..MediaCadenceDecision::default()
-            };
-        }
-        let Some(pending_timestamp) = self.pending_timestamp else {
-            return MediaCadenceDecision::default();
-        };
-        if timestamp.saturating_sub(pending_timestamp) < self.heartbeat_ticks {
-            return MediaCadenceDecision::default();
-        }
-        let duration = timestamp
-            .saturating_sub(pending_timestamp)
-            .clamp(1, u64::from(u32::MAX)) as u32;
-        self.media_end = pending_timestamp.saturating_add(u64::from(duration));
-        self.pending_timestamp = Some(self.media_end);
-        MediaCadenceDecision {
-            flush_pending_duration: Some(duration),
-            encode_pending_timestamp: self.pending_timestamp,
-            ..MediaCadenceDecision::default()
-        }
-    }
-
-    fn finish(&mut self, timestamp: u64) -> Option<u32> {
-        let pending_timestamp = self.pending_timestamp.take()?;
-        let duration = timestamp
-            .max(pending_timestamp.saturating_add(1))
-            .saturating_sub(pending_timestamp)
-            .clamp(1, u64::from(u32::MAX)) as u32;
-        self.media_end = pending_timestamp.saturating_add(u64::from(duration));
-        Some(duration)
-    }
-}
-
-fn frame_changed(
-    change: FrameChange,
-    previous_fingerprint: Option<&[u8; 32]>,
-    current_fingerprint: Option<&[u8; 32]>,
-) -> bool {
-    if let (Some(previous), Some(current)) = (previous_fingerprint, current_fingerprint) {
-        return previous != current;
-    }
-    match change {
-        FrameChange::Changed => true,
-        FrameChange::Unchanged => false,
-        FrameChange::Unknown => true,
-    }
-}
-
-/// Builds the next object in sequence, authenticated when the epoch has a key.
-///
-/// `keys` is `None` for an epoch published without encryption: there is no
-/// viewer key, so there is nothing to authenticate with. The payload hash is
-/// still written and still checked on the way out.
-fn next_dash_object(
-    sequence: &mut u64,
-    keys: Option<&EpochKeys>,
-    spec: DashObjectSpec<'_>,
-) -> Result<DashObject> {
-    *sequence = sequence.checked_add(1).context("DASH sequence exhausted")?;
-    let input = NewDashObject {
-        stream_id: spec.stream_id,
-        epoch_id: spec.epoch_id,
-        kind: spec.kind,
-        sequence: *sequence,
-        segment_number: spec.segment_number,
-        chunk_index: spec.chunk_index,
-        timestamp: spec.timestamp,
-        duration: spec.duration,
-        random_access: spec.random_access,
-        mime: spec.mime,
-        payload: spec.payload,
-    };
-    match keys {
-        Some(keys) => DashObject::authenticated(input, keys).context("authenticating DASH object"),
-        None => DashObject::unauthenticated(input).context("building unauthenticated DASH object"),
-    }
-}
-
 /// Runs the H.264 encoder on a thread of its own.
 ///
 /// The VA-API encoder holds thread-affine handles and is deliberately not
@@ -1833,21 +814,13 @@ fn next_dash_object(
 struct EncoderActor {
     requests: std::sync::mpsc::Sender<EncodeRequest>,
     thread: Option<std::thread::JoinHandle<()>>,
-    backend_name: &'static str,
-}
-
-impl EncoderActor {
-    /// Names the encoder backend the thread actually built.
-    fn backend_name(&self) -> &'static str {
-        self.backend_name
-    }
 }
 
 /// One frame to encode, with the channel its result comes back on.
 struct EncodeRequest {
-    frame: DashInputFrame,
+    frame: EncoderInputFrame,
     segment_start: bool,
-    reply: tokio::sync::oneshot::Sender<Result<dash_encoder::EncodedH264Frame>>,
+    reply: tokio::sync::oneshot::Sender<Result<encoder::EncodedH264Frame>>,
 }
 
 impl EncoderActor {
@@ -1861,7 +834,7 @@ impl EncoderActor {
         let thread = std::thread::Builder::new()
             .name("glacialcast-encode".to_string())
             .spawn(move || {
-                let mut encoder = match DashH264Encoder::new(
+                let mut encoder = match H264Encoder::new(
                     config.mode,
                     &config.vaapi_device,
                     config.openh264_library.as_deref(),
@@ -1899,19 +872,19 @@ impl EncoderActor {
         let backend_name = ready_rx
             .recv()
             .context("encoder thread stopped before reporting readiness")??;
+        info!(backend = backend_name, "H.264 encoder ready");
         Ok(Self {
             requests,
             thread: Some(thread),
-            backend_name,
         })
     }
 
     /// Encodes one frame, awaiting the dedicated thread rather than blocking.
     async fn encode(
         &self,
-        frame: DashInputFrame,
+        frame: EncoderInputFrame,
         segment_start: bool,
-    ) -> Result<dash_encoder::EncodedH264Frame> {
+    ) -> Result<encoder::EncodedH264Frame> {
         let (reply, response) = tokio::sync::oneshot::channel();
         self.requests
             .send(EncodeRequest {
@@ -1940,7 +913,7 @@ impl Drop for EncoderActor {
 
 /// Everything the encoder thread needs to build its encoder.
 struct EncoderConfig {
-    mode: DashEncoderMode,
+    mode: EncoderMode,
     vaapi_device: PathBuf,
     openh264_library: Option<PathBuf>,
     width: u32,
@@ -1948,131 +921,6 @@ struct EncoderConfig {
     fps: f64,
     bitrate: u32,
     segment_frames: u16,
-}
-
-async fn encode_media_frame(
-    encoder: &EncoderActor,
-    frame: DashInputFrame,
-    media_index: u64,
-    segment_frames: u16,
-) -> Result<dash_encoder::EncodedH264Frame> {
-    let segment_start = media_index.is_multiple_of(u64::from(segment_frames));
-    encoder.encode(frame, segment_start).await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn publish_encoded_media(
-    socket: &mut NoiseSocket<TcpStream>,
-    resend: &mut DashResendBuffer,
-    sequence: &mut u64,
-    keys: Option<&EpochKeys>,
-    stream_id: Uuid,
-    epoch_id: Uuid,
-    media_index: &mut u64,
-    timestamp: u64,
-    duration: u32,
-    segment_frames: u16,
-    encoded: dash_encoder::EncodedH264Frame,
-) -> Result<()> {
-    let object = build_dash_media_object(
-        sequence,
-        keys,
-        stream_id,
-        epoch_id,
-        *media_index,
-        timestamp,
-        duration,
-        segment_frames,
-        &encoded,
-    )?;
-    let bytes = object.payload.len();
-    let sent_sequence = object.header.sequence;
-    send_new_dash_object(socket, resend, object).await?;
-    debug!(
-        %stream_id,
-        sequence = sent_sequence,
-        media_index = *media_index,
-        timestamp,
-        duration,
-        keyframe = encoded.keyframe,
-        bytes,
-        "sent DASH media fragment"
-    );
-    *media_index = media_index.saturating_add(1);
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_dash_media_object(
-    sequence: &mut u64,
-    keys: Option<&EpochKeys>,
-    stream_id: Uuid,
-    epoch_id: Uuid,
-    media_index: u64,
-    timestamp: u64,
-    frame_duration: u32,
-    segment_frames: u16,
-    encoded: &dash_encoder::EncodedH264Frame,
-) -> Result<DashObject> {
-    let mut iv = [0u8; 16];
-    OsRng.fill_bytes(&mut iv);
-    let fragment = build_fragment(
-        keys.map(|keys| &keys.cenc_key),
-        FragmentInput {
-            sequence: u32::try_from(media_index.saturating_add(1))
-                .context("DASH epoch has too many media fragments")?,
-            decode_time: timestamp,
-            duration: frame_duration,
-            keyframe: encoded.keyframe,
-            annex_b: &encoded.annex_b,
-            iv,
-        },
-    )
-    .context("building the DASH media fragment")?;
-    let segment_frames = u64::from(segment_frames);
-    next_dash_object(
-        sequence,
-        keys,
-        DashObjectSpec {
-            stream_id,
-            epoch_id,
-            kind: DashObjectKind::Media,
-            segment_number: media_index / segment_frames + 1,
-            chunk_index: (media_index % segment_frames) as u16,
-            timestamp,
-            duration: u64::from(frame_duration),
-            random_access: encoded.keyframe,
-            mime: "video/iso.segment",
-            payload: fragment.bytes,
-        },
-    )
-}
-
-fn normalize_captured_dash_frame(
-    capture: CapturedDashFrame,
-    target: Option<(u32, u32)>,
-) -> CapturedDashFrame {
-    CapturedDashFrame {
-        frame: normalize_dash_input(capture.frame, target),
-        change: capture.change,
-    }
-}
-
-fn normalize_dash_input(input: DashInputFrame, target: Option<(u32, u32)>) -> DashInputFrame {
-    let (width, height) = target.unwrap_or_else(|| {
-        let even_width = if input.width() < 2 {
-            2
-        } else {
-            input.width() & !1
-        };
-        let even_height = if input.height() < 2 {
-            2
-        } else {
-            input.height() & !1
-        };
-        (even_width, even_height)
-    });
-    input.with_output_size(width, height)
 }
 
 fn fit_even_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
@@ -2092,44 +940,12 @@ fn fit_even_dimensions(width: u32, height: u32, max_width: u32, max_height: u32)
     (width.max(2), height.max(2))
 }
 
-fn duration_to_media_ticks(duration: Duration) -> u64 {
-    let ticks = duration
-        .as_nanos()
-        .saturating_mul(u128::from(MEDIA_TIMESCALE))
-        / 1_000_000_000;
-    ticks.min(u128::from(u64::MAX)) as u64
-}
-
-fn cursor_to_dash_event(
-    cursor: CursorMessage,
-    timestamp: u64,
-    output_width: u32,
-    output_height: u32,
-    bitmap_state: &mut DashCursorBitmapState,
-) -> Result<DashCursorEvent> {
-    let event = cursor_to_event(cursor, timestamp, output_width, output_height, bitmap_state)?;
-    Ok(DashCursorEvent {
-        timestamp: event.timestamp,
-        x_micropixels: event.x_micropixels,
-        y_micropixels: event.y_micropixels,
-        visible: event.visible,
-        bitmap_id: event.bitmap_id,
-        bitmap: event.bitmap.map(|bitmap| DashCursorBitmap {
-            width: bitmap.width,
-            height: bitmap.height,
-            hotspot_x: bitmap.hotspot_x,
-            hotspot_y: bitmap.hotspot_y,
-            rgba: bitmap.rgba,
-        }),
-    })
-}
-
 fn cursor_to_event(
     cursor: CursorMessage,
     timestamp: u64,
     output_width: u32,
     output_height: u32,
-    bitmap_state: &mut DashCursorBitmapState,
+    bitmap_state: &mut CursorBitmapState,
 ) -> Result<NativeCursorEvent> {
     let source_width = cursor.source_width.max(1);
     let source_height = cursor.source_height.max(1);
@@ -2203,140 +1019,13 @@ fn cursor_bitmap(bitmap: &CursorBitmap) -> Result<NativeCursorBitmap> {
 }
 
 #[derive(Default)]
-struct DashCursorBitmapState {
+struct CursorBitmapState {
     current_id: u64,
     last: Option<Arc<CursorBitmap>>,
     last_sent_timestamp: Option<u64>,
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn flush_dash_cursor_batch(
-    socket: &mut NoiseSocket<TcpStream>,
-    resend: &mut DashResendBuffer,
-    sequence: &mut u64,
-    keys: Option<&EpochKeys>,
-    stream_id: Uuid,
-    epoch_id: Uuid,
-    width: u32,
-    height: u32,
-    frame_duration: u32,
-    segment_frames: u16,
-    events: &mut Vec<DashCursorEvent>,
-) -> Result<()> {
-    if events.is_empty() {
-        return Ok(());
-    }
-    let start_timestamp = events.first().map_or(0, |event| event.timestamp);
-    let end_timestamp = events
-        .last()
-        .map_or(start_timestamp, |event| event.timestamp);
-    let next_sequence = sequence.checked_add(1).context("DASH sequence exhausted")?;
-    let batch = DashCursorBatch {
-        source_width: width,
-        source_height: height,
-        events: std::mem::take(events),
-    };
-    let context = DashCursorContext {
-        stream_id,
-        epoch_id,
-        sequence: next_sequence,
-        start_timestamp,
-        source_width: width,
-        source_height: height,
-    };
-    // Same validation either way; an epoch with no key simply has nothing to
-    // seal the batch with, so it carries the encoded form directly.
-    let payload = match keys {
-        Some(keys) => encrypt_cursor_batch(keys, context, &batch)
-            .context("encrypting cursor batch")?
-            .to_bytes()
-            .context("serializing encrypted cursor batch")?,
-        None => encode_plain_cursor_batch(context, &batch).context("encoding cursor batch")?,
-    };
-    let segment_duration = u64::from(frame_duration).saturating_mul(u64::from(segment_frames));
-    let object = next_dash_object(
-        sequence,
-        keys,
-        DashObjectSpec {
-            stream_id,
-            epoch_id,
-            kind: DashObjectKind::Cursor,
-            segment_number: start_timestamp / segment_duration.max(1) + 1,
-            chunk_index: 0,
-            timestamp: start_timestamp,
-            duration: end_timestamp.saturating_sub(start_timestamp).max(1),
-            random_access: true,
-            mime: "application/vnd.glacialcast.cursor",
-            payload,
-        },
-    )?;
-    send_new_dash_object(socket, resend, object).await
-}
-
-async fn send_new_dash_object(
-    socket: &mut NoiseSocket<TcpStream>,
-    resend: &mut DashResendBuffer,
-    object: DashObject,
-) -> Result<()> {
-    let stream_id = object.header.stream_id;
-    let expected_sequence = object.header.sequence;
-    resend.push(object.clone());
-    socket.write(&ClientMessage::DashObject(object)).await?;
-    debug!(%stream_id, buffered_bytes = resend.bytes, "DASH object queued for acknowledgement");
-    wait_for_dash_ack(socket, resend, expected_sequence).await?;
-    Ok(())
-}
-
-async fn wait_for_dash_ack(
-    socket: &mut NoiseSocket<TcpStream>,
-    resend: &mut DashResendBuffer,
-    expected_sequence: u64,
-) -> Result<u64> {
-    loop {
-        match socket
-            .read_limited::<ServerMessage>(MAX_SERVER_CONTROL_MESSAGE)
-            .await?
-        {
-            ServerMessage::Ack { through_seq } => {
-                resend.ack(through_seq);
-                if through_seq >= expected_sequence {
-                    return Ok(through_seq);
-                }
-                debug!(
-                    through_seq,
-                    expected_sequence, "ignoring stale DASH acknowledgement"
-                );
-            }
-            ServerMessage::ResendRequest { from_seq, to_seq } => {
-                let objects = resend.objects(from_seq, to_seq);
-                let expected = to_seq.saturating_sub(from_seq).saturating_add(1);
-                if objects.len() as u64 != expected {
-                    bail!(
-                        "server requested DASH objects {from_seq}..={to_seq}, but the resend buffer no longer contains all of them"
-                    );
-                }
-                for object in objects {
-                    socket.write(&ClientMessage::DashObject(object)).await?;
-                }
-            }
-            ServerMessage::Backpressure { pause_ms, reason } => {
-                warn!(pause_ms, %reason, "server requested DASH publisher backpressure");
-                tokio::time::sleep(Duration::from_millis(pause_ms)).await;
-            }
-            ServerMessage::Refused { sequence, reason } => {
-                // The relay has declined this object on policy, not on
-                // capacity, so every reconnect would produce the same refusal.
-                // Carrying the relay's own sentence out to the operator is the
-                // entire point of the message.
-                return Err(anyhow::Error::new(RelayRefused)
-                    .context(format!("relay refused object {sequence}: {reason}")));
-            }
-            ServerMessage::Pong { .. } | ServerMessage::HelloAck { .. } => {}
-        }
-    }
-}
-
-fn is_fatal_capture_error(err: &anyhow::Error) -> bool {
+fn is_fatal_publisher_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         let message = cause.to_string();
         message.contains("non-mappable DMA-BUF")
@@ -2346,6 +1035,12 @@ fn is_fatal_capture_error(err: &anyhow::Error) -> bool {
             || message.contains("CPU-readable PipeWire buffers")
             || message.contains("no more input formats")
             || message.contains("error alloc buffers: Invalid argument")
+            || message.contains("OpenH264")
+            || message.contains("openh264")
+            || message.contains("VA-API H.264")
+            || message.contains("required VA-API")
+            || message.contains("encoder dimensions changed")
+            || message.contains("requires non-zero, even dimensions")
             || message.contains("requested portal cursor mode Metadata is not available")
             || message
                 .contains("does not include SPA_META_Cursor while --require-cursor-metadata is set")
@@ -2359,114 +1054,36 @@ fn resolve_client_identity(args: &Args) -> Result<ClientIdentity> {
         config_path::resolve(args.config.clone(), "client.toml")
     };
     let config = load_client_config_from(&config_source)?;
-    let client_id = args
-        .client_id
-        .clone()
-        .or(config.client_id)
-        .unwrap_or_else(hostname);
-    let client_id = non_empty_trimmed("client_id", client_id)?;
-    let auth_token = args
-        .ingest_token
-        .clone()
-        .or(config.ingest_token)
-        .map(|token| token.trim().to_string())
-        .filter(|token| !token.is_empty());
+    let client_id = non_empty_trimmed(
+        "client_id",
+        args.client_id
+            .clone()
+            .or(config.client_id)
+            .unwrap_or_else(hostname),
+    )?;
     let ingest_server_key = args
         .ingest_server_key
         .clone()
         .or(config.ingest_server_key)
-        .map(|key| decode_noise_public_key(&key))
+        .map(|key| glacialcast_protocol::decode_noise_public_key(&key))
         .transpose()
         .context("ingest_server_key must be URL-safe base64 for a 32-byte Noise public key")?;
-    let configured_viewer_key = args
-        .viewer_key
-        .clone()
-        .or(config.viewer_key_b64)
-        .map(|key| non_empty_trimmed("viewer_key_b64", key))
-        .transpose()?;
-    let viewer_key_file = if args.no_viewer_key || configured_viewer_key.is_some() {
-        None
-    } else {
-        Some(
-            args.viewer_key_file
-                .clone()
-                .unwrap_or_else(|| default_viewer_key_file(&client_id)),
-        )
-    };
-    let configured_phrase = args
-        .viewer_key_phrase
-        .clone()
-        .or(config.viewer_key_phrase)
-        .map(|phrase| non_empty_trimmed("viewer_key_phrase", phrase))
-        .transpose()?;
-    let viewer_key = match (&configured_viewer_key, &configured_phrase, &viewer_key_file) {
-        (Some(key), _, _) => Some(ViewerKeyMaterial::from_raw_b64(key.clone())),
-        // A chosen phrase still needs a salt, and it must be the same one on
-        // every restart or viewers would have to be told the key again. The
-        // salt file serves that purpose; only the phrase within it is replaced.
-        (None, Some(phrase), path) => {
-            let salt = match path {
-                Some(path) => load_or_create_viewer_key(path, args.new_viewer_key)?
-                    .salt_b64
-                    .and_then(|encoded| viewer_key::decode_salt(&encoded)),
-                None => None,
-            }
-            .unwrap_or(DERIVED_PHRASE_FALLBACK_SALT);
-            Some(ViewerKeyMaterial::from_phrase(phrase, &salt)?)
-        }
-        (None, None, Some(path)) => Some(load_or_create_viewer_key(path, args.new_viewer_key)?),
-        (None, None, None) => None,
-    };
-    if let Some(phrase) = &configured_phrase
-        && viewer_key::normalize_phrase(phrase).ok().as_deref()
-            == viewer_key::normalize_phrase(EXAMPLE_VIEWER_KEY_PHRASE)
-                .ok()
-                .as_deref()
-    {
-        // Printed rather than logged, so it reaches an operator running this by
-        // hand as well as one reading a journal.
-        eprintln!(
-            "WARNING: publishing under the example viewer key phrase. It is in the \n\
-             shipped configuration and the documentation, so anyone who can reach \n\
-             the relay can decrypt this stream. Set viewer_key_phrase in \n\
-             client.toml, or remove it to have a private one generated."
-        );
-    }
-    let viewer_key_b64 = viewer_key.as_ref().map(|key| key.key_b64.clone());
-    let viewer_key_shareable = viewer_key.as_ref().map(|key| key.shareable.clone());
-    let viewer_key_salt_b64 = viewer_key.as_ref().and_then(|key| key.salt_b64.clone());
-    let display_name = args
-        .display_name
-        .clone()
-        .or(config.display_name)
-        .unwrap_or_else(|| "Glacialcast client".to_string());
-    let display_name = non_empty_trimmed("display_name", display_name)?;
-    let viewer_url = args
-        .viewer_url
-        .clone()
-        .or(config.viewer_url)
-        .map(|url| non_empty_trimmed("viewer_url", url))
-        .transpose()?;
+    let display_name = non_empty_trimmed(
+        "display_name",
+        args.display_name
+            .clone()
+            .or(config.display_name)
+            .unwrap_or_else(|| "GlacialCast publisher".to_string()),
+    )?;
 
     Ok(ClientIdentity {
         client_id,
-        auth_token,
         ingest_server_key,
-        viewer_key_b64,
-        viewer_key_shareable,
-        viewer_key_salt_b64,
         display_name,
-        viewer_key_file,
-        viewer_url,
         config_path: config_source.path().map(std::path::Path::to_path_buf),
         all_monitors: config.all_monitors.unwrap_or(false),
     })
 }
-
-/// Returns the per-user directory that holds generated client state.
-///
-/// Generated material is kept out of the working directory because the
-/// publisher detaches by default and may be started from anywhere.
 fn client_state_dir() -> PathBuf {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -2481,18 +1098,6 @@ fn client_state_dir() -> PathBuf {
     base.join("glacialcast")
 }
 
-/// Returns the default persisted viewer-key path for `client_id`.
-fn default_viewer_key_file(client_id: &str) -> PathBuf {
-    let component = sanitize_socket_component(client_id);
-    let component = if component.is_empty() {
-        "client".to_string()
-    } else {
-        component
-    };
-    client_state_dir().join(format!("viewer-{component}.key"))
-}
-
-/// Returns the default detached-publisher log path for `client_id`.
 fn default_log_file(client_id: &str) -> PathBuf {
     let component = sanitize_socket_component(client_id);
     let component = if component.is_empty() {
@@ -2501,187 +1106,6 @@ fn default_log_file(client_id: &str) -> PathBuf {
         component
     };
     client_state_dir().join(format!("client-{component}.log"))
-}
-
-/// Reads the persisted viewer key, creating a fresh one when absent.
-///
-/// The key is 32 random bytes rendered as URL-safe base64 without padding.
-/// Persisting it is what makes the published key stable: restarting the
-/// publisher, or reconnecting after a relay outage, republishes under the same
-/// key so viewers do not need a new secret. The file must be a private regular
-/// file with mode 0600 and is created that way.
-///
-/// # Errors
-///
-/// Returns an error when the file exists but is group- or world-accessible, is
-/// not a regular file, or does not contain exactly one 32-byte key.
-/// A viewer key, in both the form shared with people and the form used as key
-/// material.
-///
-/// These differ because a key phrase is what someone can actually retype from a
-/// message, while the 32 bytes derived from it are what the media is encrypted
-/// under. Keeping both together means the summary can never print a phrase that
-/// does not produce the key in use.
-#[derive(Debug, Clone)]
-struct ViewerKeyMaterial {
-    /// The form handed to viewers: a key phrase, or raw base64 for a key that
-    /// predates phrases or was supplied on the command line.
-    shareable: String,
-    /// URL-safe base64 of the 32 key bytes.
-    key_b64: String,
-    /// Public per-publisher salt, present only for a derived key.
-    salt_b64: Option<String>,
-}
-
-impl ViewerKeyMaterial {
-    /// Wraps a raw 32-byte key given as URL-safe base64.
-    fn from_raw_b64(key_b64: String) -> Self {
-        Self {
-            shareable: key_b64.clone(),
-            key_b64,
-            salt_b64: None,
-        }
-    }
-
-    /// Derives key material from a phrase and its salt.
-    fn from_phrase(phrase: &str, salt: &[u8; viewer_key::SALT_LEN]) -> Result<Self> {
-        let canonical =
-            viewer_key::normalize_phrase(phrase).map_err(|error| anyhow::anyhow!("{error}"))?;
-        let key = viewer_key::derive_viewer_key_normalized(&canonical, salt);
-        Ok(Self {
-            shareable: canonical,
-            key_b64: encode_key_b64(&key),
-            salt_b64: Some(viewer_key::encode_salt(salt)),
-        })
-    }
-}
-
-/// Loads the persisted viewer key, creating a fresh key phrase if there is none.
-///
-/// `regenerate` replaces an existing key, which invalidates every key already
-/// shared for this publisher.
-fn load_or_create_viewer_key(
-    path: &std::path::Path,
-    regenerate: bool,
-) -> Result<ViewerKeyMaterial> {
-    if !regenerate {
-        match read_viewer_key(path) {
-            Ok(material) => return Ok(material),
-            Err(err) if path.exists() => return Err(err),
-            Err(_) => {}
-        }
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating viewer key directory {}", parent.display()))?;
-    }
-    let phrase = viewer_key::generate_phrase().context("generating a viewer key phrase")?;
-    let salt = viewer_key::generate_salt().context("generating a viewer key salt")?;
-    let material = ViewerKeyMaterial::from_phrase(&phrase, &salt)?;
-    let contents = format!(
-        "{VIEWER_KEY_PHRASE_PREFIX}{}\n{VIEWER_KEY_SALT_PREFIX}{}\n",
-        material.shareable,
-        material.salt_b64.as_deref().unwrap_or_default(),
-    );
-
-    let mut options = std::fs::OpenOptions::new();
-    options
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW);
-    if regenerate {
-        options.create(true).truncate(true);
-    } else {
-        options.create_new(true);
-    }
-    let mut file = match options.open(path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Another publisher for the same client id won the race; its key is
-            // the one to publish under.
-            return read_viewer_key(path);
-        }
-        Err(err) => {
-            return Err(err).with_context(|| format!("creating viewer key {}", path.display()));
-        }
-    };
-    file.write_all(contents.as_bytes())
-        .and_then(|()| file.sync_all())
-        .with_context(|| format!("writing viewer key {}", path.display()))?;
-    Ok(material)
-}
-
-/// Marks the key-phrase line of a viewer key file.
-const VIEWER_KEY_PHRASE_PREFIX: &str = "phrase ";
-/// Marks the salt line of a viewer key file.
-const VIEWER_KEY_SALT_PREFIX: &str = "salt ";
-
-/// Reads and validates a persisted viewer key.
-///
-/// Two formats are accepted: the current phrase-and-salt pair, and a bare
-/// base64 key from before phrases existed. The older form keeps working
-/// untouched, because rewriting it would silently change the key every viewer
-/// already holds.
-fn read_viewer_key(path: &std::path::Path) -> Result<ViewerKeyMaterial> {
-    let raw = read_viewer_key_file(path)?;
-    let mut phrase = None;
-    let mut salt = None;
-    for line in raw.lines() {
-        let line = line.trim();
-        if let Some(value) = line.strip_prefix(VIEWER_KEY_PHRASE_PREFIX) {
-            phrase = Some(value.trim().to_string());
-        } else if let Some(value) = line.strip_prefix(VIEWER_KEY_SALT_PREFIX) {
-            salt = Some(value.trim().to_string());
-        }
-    }
-
-    match (phrase, salt) {
-        (Some(phrase), Some(salt_b64)) => {
-            let salt = viewer_key::decode_salt(&salt_b64).with_context(|| {
-                format!(
-                    "viewer key {} salt must be URL-safe base64 for {} bytes",
-                    path.display(),
-                    viewer_key::SALT_LEN
-                )
-            })?;
-            ViewerKeyMaterial::from_phrase(&phrase, &salt)
-                .with_context(|| format!("viewer key {} has an invalid phrase", path.display()))
-        }
-        (None, None) => {
-            let key = non_empty_trimmed("viewer key", raw)?;
-            decode_key_b64(&key).with_context(|| {
-                format!(
-                    "viewer key {} must be URL-safe base64 for 32 bytes",
-                    path.display()
-                )
-            })?;
-            Ok(ViewerKeyMaterial::from_raw_b64(key))
-        }
-        _ => bail!(
-            "viewer key {} must contain both a phrase and a salt",
-            path.display()
-        ),
-    }
-}
-
-/// Opens a viewer key file, enforcing that it is private and regular.
-fn read_viewer_key_file(path: &std::path::Path) -> Result<String> {
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .with_context(|| format!("opening viewer key {}", path.display()))?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
-        bail!(
-            "viewer key {} must be a private regular file with mode 0600",
-            path.display()
-        );
-    }
-    let mut raw = String::new();
-    file.read_to_string(&mut raw)
-        .with_context(|| format!("reading viewer key {}", path.display()))?;
-    Ok(raw)
 }
 
 fn non_empty_trimmed(field: &str, value: String) -> Result<String> {
@@ -2745,15 +1169,6 @@ fn load_client_config(path: &PathBuf) -> Result<ClientConfig> {
     toml::from_str(&raw).with_context(|| format!("parsing client config {}", path.display()))
 }
 
-/// Whether the frame period alone reaches the sample duration that stalls Firefox.
-///
-/// The cliff sits at roughly one second (0.95s plays, 1.0s stalls, and the
-/// boundary drifts between runs), so this warns from 0.8s nominal -- capture
-/// jitter stretches real inter-frame gaps past the nominal period.
-fn update_rate_outlasts_firefox(fps: f64) -> bool {
-    fps.recip() > 0.8
-}
-
 fn parse_update_rate(value: &str) -> std::result::Result<f64, String> {
     let fps = value
         .trim()
@@ -2763,21 +1178,6 @@ fn parse_update_rate(value: &str) -> std::result::Result<f64, String> {
         return Err("update rate must be between 0.5 and 15 updates per second".to_string());
     }
     Ok(fps)
-}
-
-/// Parses the cursor batch flush interval in milliseconds.
-///
-/// The lower bound keeps a publisher from turning every cursor sample into its
-/// own relay object, and the upper bound keeps live cursor latency bounded.
-fn parse_cursor_flush_ms(value: &str) -> std::result::Result<u64, String> {
-    let milliseconds = value
-        .trim()
-        .parse::<u64>()
-        .map_err(|_| format!("invalid cursor flush interval {value:?}"))?;
-    if !(20..=1000).contains(&milliseconds) {
-        return Err("cursor flush interval must be between 20 and 1000 milliseconds".to_string());
-    }
-    Ok(milliseconds)
 }
 
 fn parse_idle_heartbeat_seconds(value: &str) -> std::result::Result<f64, String> {
@@ -2851,38 +1251,16 @@ trait Capture: Send {
         max_width: u32,
         max_height: u32,
     ) -> Result<ImageBuffer<Rgb<u8>, Vec<u8>>>;
-    async fn capture_dash_frame(
-        &mut self,
-        max_width: u32,
-        max_height: u32,
-    ) -> Result<CapturedDashFrame> {
-        Ok(CapturedDashFrame {
-            frame: DashInputFrame::Rgb(self.capture_rgb(max_width, max_height).await?),
-            change: FrameChange::Unknown,
+    async fn capture_frame(&mut self, max_width: u32, max_height: u32) -> Result<CapturedFrame> {
+        Ok(CapturedFrame {
+            frame: EncoderInputFrame::Rgb(self.capture_rgb(max_width, max_height).await?),
         })
     }
     async fn cursor(&mut self, seq: u64) -> Result<Option<CursorMessage>>;
-
-    /// Returns a cursor feed that can be polled from another task.
-    ///
-    /// `None` keeps the caller sampling inline, which is what the synthetic
-    /// test source does because it derives the cursor from its own frame
-    /// counter rather than from capture metadata.
-    async fn cursor_source(&mut self) -> Result<Option<PipewireCursorSource>> {
-        Ok(None)
-    }
 }
 
-struct CapturedDashFrame {
-    frame: DashInputFrame,
-    change: FrameChange,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FrameChange {
-    Changed,
-    Unchanged,
-    Unknown,
+struct CapturedFrame {
+    frame: EncoderInputFrame,
 }
 
 struct TestPatternCapture {
@@ -2910,14 +1288,6 @@ impl TestPatternCapture {
         }
         image
     }
-
-    fn frame_changed(&self) -> bool {
-        match self.mode {
-            TestPatternMode::Static => self.tick == 1,
-            TestPatternMode::Typing => self.tick == 1 || self.tick.is_multiple_of(4),
-            TestPatternMode::Scroll | TestPatternMode::Motion => true,
-        }
-    }
 }
 
 #[async_trait]
@@ -2943,19 +1313,10 @@ impl Capture for TestPatternCapture {
         ))
     }
 
-    async fn capture_dash_frame(
-        &mut self,
-        max_width: u32,
-        max_height: u32,
-    ) -> Result<CapturedDashFrame> {
+    async fn capture_frame(&mut self, max_width: u32, max_height: u32) -> Result<CapturedFrame> {
         let image = resize_rgb_image_to_fit(self.next_rgb(), max_width, max_height);
-        Ok(CapturedDashFrame {
-            frame: DashInputFrame::Rgb(image),
-            change: if self.frame_changed() {
-                FrameChange::Changed
-            } else {
-                FrameChange::Unchanged
-            },
+        Ok(CapturedFrame {
+            frame: EncoderInputFrame::Rgb(image),
         })
     }
 
@@ -3098,13 +1459,9 @@ impl Capture for WaylandPipewireCapture {
         }
     }
 
-    async fn capture_dash_frame(
-        &mut self,
-        max_width: u32,
-        max_height: u32,
-    ) -> Result<CapturedDashFrame> {
+    async fn capture_frame(&mut self, max_width: u32, max_height: u32) -> Result<CapturedFrame> {
         let capture = self.ensure_started().await?;
-        match capture.next_dash_frame(max_width, max_height).await {
+        match capture.next_encoded_frame(max_width, max_height).await {
             Ok(frame) => Ok(frame),
             Err(err) => {
                 self.inner = None;
@@ -3119,37 +1476,6 @@ impl Capture for WaylandPipewireCapture {
             .await?
             .next_cursor_sample()
             .map(|sample| sample.to_message()))
-    }
-
-    async fn cursor_source(&mut self) -> Result<Option<PipewireCursorSource>> {
-        let inner = self.ensure_started().await?;
-        Ok(Some(PipewireCursorSource {
-            latest: inner.cursor_latest.clone(),
-            last_serial: inner.last_cursor_serial,
-        }))
-    }
-}
-
-/// A cursor feed that can be driven independently of video capture.
-///
-/// Cursor metadata rides on capture buffers, but reading it needs nothing from
-/// the capture object itself: the PipeWire thread publishes each sample to a
-/// watch channel. Handing a receiver to its own task is what keeps cursor
-/// sampling off the timeline that unpacks, scales, and encodes video.
-struct PipewireCursorSource {
-    latest: watch::Receiver<Option<PipewireCursorSample>>,
-    last_serial: u64,
-}
-
-impl PipewireCursorSource {
-    /// Returns the newest sample if it has not been returned already.
-    fn next(&mut self) -> Option<CursorMessage> {
-        let sample = self.latest.borrow().clone()?;
-        if sample.serial == self.last_serial {
-            return None;
-        }
-        self.last_serial = sample.serial;
-        Some(sample.to_message())
     }
 }
 
@@ -3335,21 +1661,19 @@ impl NativePipewireCapture {
         }
     }
 
-    async fn next_dash_frame(
+    async fn next_encoded_frame(
         &mut self,
         max_width: u32,
         max_height: u32,
-    ) -> Result<CapturedDashFrame> {
+    ) -> Result<CapturedFrame> {
         if matches!(&self.latest, NativePipewireFrames::Cpu(_)) {
             let frame = self.next_frame().await?;
-            let change = frame_change_from_damage(frame.damage);
-            return Ok(CapturedDashFrame {
-                frame: DashInputFrame::Rgb(resize_rgb_image_to_fit(
+            return Ok(CapturedFrame {
+                frame: EncoderInputFrame::Rgb(resize_rgb_image_to_fit(
                     raw_frame_to_rgb_image(&frame)?,
                     max_width,
                     max_height,
                 )),
-                change,
             });
         }
         let NativePipewireFrames::DmaBuf(latest) = &mut self.latest else {
@@ -3370,9 +1694,8 @@ impl NativePipewireCapture {
             {
                 self.last_encoded_serial = frame.serial();
                 return match frame {
-                    PipewireVideoFrame::Cpu(frame) => Ok(CapturedDashFrame {
-                        change: frame_change_from_damage(frame.damage),
-                        frame: DashInputFrame::Rgb(resize_rgb_image_to_fit(
+                    PipewireVideoFrame::Cpu(frame) => Ok(CapturedFrame {
+                        frame: EncoderInputFrame::Rgb(resize_rgb_image_to_fit(
                             raw_frame_to_rgb_image(&frame)?,
                             max_width,
                             max_height,
@@ -3381,9 +1704,8 @@ impl NativePipewireCapture {
                     PipewireVideoFrame::DmaBuf(frame) => {
                         let (output_width, output_height) =
                             fit_even_dimensions(frame.width, frame.height, max_width, max_height);
-                        Ok(CapturedDashFrame {
-                            change: frame_change_from_damage(frame.damage),
-                            frame: DashInputFrame::DmaBuf(DashDmaBufFrame {
+                        Ok(CapturedFrame {
+                            frame: EncoderInputFrame::DmaBuf(DmaBufInputFrame {
                                 fd: Arc::clone(&frame.fd),
                                 release: frame.release.clone(),
                                 offset: frame.offset,
@@ -3413,7 +1735,6 @@ impl NativePipewireCapture {
 #[derive(Clone)]
 struct RawFrame {
     serial: u64,
-    damage: Option<bool>,
     width: u32,
     height: u32,
     stride: usize,
@@ -3699,75 +2020,6 @@ fn clamped_cursor_position(position: i32, extent: u32) -> f32 {
     position.clamp(0, extent.min(i32::MAX as u32) as i32) as f32
 }
 
-fn frame_change_from_damage(damage: Option<bool>) -> FrameChange {
-    match damage {
-        Some(true) => FrameChange::Changed,
-        Some(false) => FrameChange::Unchanged,
-        None => FrameChange::Unknown,
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum AccumulatedFrameDamage {
-    #[default]
-    Empty,
-    Unchanged,
-    Unknown,
-    Changed,
-}
-
-impl AccumulatedFrameDamage {
-    fn observe(&mut self, damage: Option<bool>) {
-        *self = match (*self, damage) {
-            (Self::Changed, _) | (_, Some(true)) => Self::Changed,
-            (Self::Unknown, _) | (_, None) => Self::Unknown,
-            (Self::Empty | Self::Unchanged, Some(false)) => Self::Unchanged,
-        };
-    }
-
-    fn take(&mut self) -> Option<bool> {
-        match std::mem::take(self) {
-            Self::Changed => Some(true),
-            Self::Unchanged => Some(false),
-            Self::Empty | Self::Unknown => None,
-        }
-    }
-}
-
-fn pipewire_video_damage(buffer: *const spa::sys::spa_buffer) -> Option<bool> {
-    if buffer.is_null() {
-        return None;
-    }
-    // SAFETY: PipeWire owns `buffer` for the active process callback. Metadata
-    // pointers and byte lengths are validated before constructing a bounded
-    // array of `spa_meta_region` values.
-    unsafe {
-        if (*buffer).n_metas == 0 || (*buffer).metas.is_null() {
-            return None;
-        }
-        let metas = std::slice::from_raw_parts((*buffer).metas, (*buffer).n_metas as usize);
-        let meta = metas
-            .iter()
-            .find(|meta| meta.type_ == spa::sys::SPA_META_VideoDamage)?;
-        let region_size = std::mem::size_of::<spa::sys::spa_meta_region>();
-        if meta.data.is_null()
-            || region_size == 0
-            || !(meta.size as usize).is_multiple_of(region_size)
-        {
-            return None;
-        }
-        let regions = std::slice::from_raw_parts(
-            meta.data.cast::<spa::sys::spa_meta_region>(),
-            meta.size as usize / region_size,
-        );
-        Some(
-            regions.first().is_some_and(|region| {
-                region.region.size.width != 0 && region.region.size.height != 0
-            }),
-        )
-    }
-}
-
 fn pipewire_cursor_update(buffer: *const spa::sys::spa_buffer) -> PipewireCursorUpdate {
     if buffer.is_null() {
         return PipewireCursorUpdate::Unchanged;
@@ -3999,11 +2251,10 @@ impl PipewireVideoFrame {
 #[derive(Clone)]
 struct DmaBufFrame {
     serial: u64,
-    damage: Option<bool>,
     width: u32,
     height: u32,
     fd: Arc<OwnedFd>,
-    release: DashFrameRelease,
+    release: FrameRelease,
     offset: usize,
     size: usize,
     stride: i32,
@@ -4853,7 +3104,6 @@ fn run_pipewire_loop(
         last_cursor_state: None,
         cursor_meta_missing_since: None,
         cursor_meta_verified: false,
-        pending_video_damage: AccumulatedFrameDamage::default(),
         mainloop_ptr,
         gpu_readback: GpuReadback::new(gpu_device),
         unmapped_buffer_logged: false,
@@ -4966,9 +3216,6 @@ fn run_pipewire_loop(
             ) {
                 return;
             }
-            user_data
-                .pending_video_damage
-                .observe(pipewire_video_damage(buffer.spa_buffer_ptr()));
             let datas = buffer.datas_mut();
             if datas.is_empty() {
                 return;
@@ -5155,7 +3402,6 @@ fn run_pipewire_loop(
             user_data.serial = user_data.serial.wrapping_add(1);
             let frame = RawFrame {
                 serial: user_data.serial,
-                damage: user_data.pending_video_damage.take(),
                 width: frame_width,
                 height: frame_height,
                 stride: frame_stride,
@@ -5265,7 +3511,6 @@ fn run_pipewire_video_loop(
         last_cursor_state: None,
         cursor_meta_missing_since: None,
         cursor_meta_verified: false,
-        pending_video_damage: AccumulatedFrameDamage::default(),
         mainloop_ptr,
         first_frame_logged: false,
         cursor_meta_logged: false,
@@ -5390,9 +3635,6 @@ fn run_pipewire_video_loop(
             ) {
                 return;
             }
-            user_data
-                .pending_video_damage
-                .observe(pipewire_video_damage(buffer.spa_buffer_ptr()));
             let datas = buffer.datas_mut();
             if datas.is_empty() {
                 return;
@@ -5463,13 +3705,12 @@ fn run_pipewire_video_loop(
                     buffer_release_for_process.clone(),
                     buffer_ptr,
                 ));
-                let release = DashFrameRelease::new({
+                let release = FrameRelease::new({
                     let lease = Arc::clone(&lease);
                     move || lease.release()
                 });
                 let frame = DmaBufFrame {
                     serial: user_data.serial,
-                    damage: user_data.pending_video_damage.take(),
                     width: video_size.width,
                     height: video_size.height,
                     fd: Arc::new(owned_fd),
@@ -5517,7 +3758,6 @@ fn run_pipewire_video_loop(
             }
             let frame = RawFrame {
                 serial: user_data.serial,
-                damage: user_data.pending_video_damage.take(),
                 width: video_size.width,
                 height: video_size.height,
                 stride,
@@ -5891,10 +4131,6 @@ fn update_pipewire_buffer_params_with_metadata(
         Ok(bytes) => param_bytes.push(bytes),
         Err(err) => warn!(?err, %label, "failed to serialize PipeWire cursor metadata params"),
     }
-    match build_pipewire_damage_meta_param_pod() {
-        Ok(bytes) => param_bytes.push(bytes),
-        Err(err) => warn!(?err, %label, "failed to serialize PipeWire damage metadata params"),
-    }
     let mut params = Vec::with_capacity(param_bytes.len());
     for bytes in &param_bytes {
         if let Some(param) = spa::pod::Pod::from_bytes(bytes) {
@@ -5906,25 +4142,6 @@ fn update_pipewire_buffer_params_with_metadata(
     if let Err(err) = stream.update_params(&mut params) {
         warn!(?err, %label, "failed to update PipeWire buffer params");
     }
-}
-
-fn build_pipewire_damage_meta_param_pod() -> Result<Vec<u8>> {
-    const DAMAGE_REGION_CAPACITY: usize = 16;
-    let size = std::mem::size_of::<spa::sys::spa_meta_region>()
-        .saturating_mul(DAMAGE_REGION_CAPACITY)
-        .min(i32::MAX as usize) as i32;
-    let obj = spa::pod::Object {
-        type_: spa::utils::SpaTypes::ObjectParamMeta.as_raw(),
-        id: spa::param::ParamType::Meta.as_raw(),
-        properties: vec![
-            spa::pod::Property::new(
-                spa::sys::SPA_PARAM_META_type,
-                spa::pod::Value::Id(spa::utils::Id(spa::sys::SPA_META_VideoDamage)),
-            ),
-            spa::pod::Property::new(spa::sys::SPA_PARAM_META_size, spa::pod::Value::Int(size)),
-        ],
-    };
-    serialize_pod_object(obj)
 }
 
 fn build_pipewire_cursor_meta_param_pod() -> Result<Vec<u8>> {
@@ -6908,7 +5125,6 @@ struct PipewireUserData {
     last_cursor_state: Option<PipewireCursorState>,
     cursor_meta_missing_since: Option<Instant>,
     cursor_meta_verified: bool,
-    pending_video_damage: AccumulatedFrameDamage,
     mainloop_ptr: usize,
     gpu_readback: GpuReadback,
     unmapped_buffer_logged: bool,
@@ -7006,7 +5222,6 @@ struct PipewireVideoUserData {
     last_cursor_state: Option<PipewireCursorState>,
     cursor_meta_missing_since: Option<Instant>,
     cursor_meta_verified: bool,
-    pending_video_damage: AccumulatedFrameDamage,
     mainloop_ptr: usize,
     first_frame_logged: bool,
     cursor_meta_logged: bool,
@@ -7219,69 +5434,6 @@ fn clamp_u8(value: i32) -> u8 {
     value.clamp(0, 255) as u8
 }
 
-struct DashResendBuffer {
-    max_bytes: u64,
-    bytes: u64,
-    objects: VecDeque<DashObject>,
-}
-
-impl DashResendBuffer {
-    fn new(max_bytes: u64) -> Self {
-        Self {
-            max_bytes,
-            bytes: 0,
-            objects: VecDeque::new(),
-        }
-    }
-
-    fn push(&mut self, object: DashObject) {
-        self.bytes = self.bytes.saturating_add(object.payload.len() as u64);
-        self.objects.push_back(object);
-        while self.bytes > self.max_bytes && self.objects.len() > 1 {
-            if let Some(old) = self.objects.pop_front() {
-                self.bytes = self.bytes.saturating_sub(old.payload.len() as u64);
-            }
-        }
-    }
-
-    fn ack(&mut self, through_seq: u64) {
-        while self
-            .objects
-            .front()
-            .is_some_and(|object| object.header.sequence <= through_seq)
-        {
-            if let Some(old) = self.objects.pop_front() {
-                self.bytes = self.bytes.saturating_sub(old.payload.len() as u64);
-            }
-        }
-    }
-
-    fn drop_other_streams(&mut self, stream_id: Uuid) {
-        self.objects
-            .retain(|object| object.header.stream_id == stream_id);
-        self.bytes = self
-            .objects
-            .iter()
-            .map(|object| object.payload.len() as u64)
-            .sum();
-    }
-
-    fn objects(&self, from_seq: u64, to_seq: u64) -> Vec<DashObject> {
-        self.objects
-            .iter()
-            .filter(|object| object.header.sequence >= from_seq && object.header.sequence <= to_seq)
-            .cloned()
-            .collect()
-    }
-
-    fn range(&self) -> (Option<u64>, Option<u64>) {
-        (
-            self.objects.front().map(|object| object.header.sequence),
-            self.objects.back().map(|object| object.header.sequence),
-        )
-    }
-}
-
 fn hostname() -> String {
     std::env::var("HOSTNAME").unwrap_or_else(|_| "gcpub".to_string())
 }
@@ -7289,117 +5441,13 @@ fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     #[test]
     fn native_reconnect_backoff_is_fast_then_bounded() {
         assert_eq!(reconnect_delay(0), Duration::from_millis(250));
         assert_eq!(reconnect_delay(5), Duration::from_secs(8));
         assert_eq!(reconnect_delay(u32::MAX), Duration::from_secs(8));
-    }
-
-    fn invite_identity(viewer_url: Option<&str>, key: Option<&str>) -> ClientIdentity {
-        ClientIdentity {
-            client_id: "invite".to_string(),
-            auth_token: None,
-            ingest_server_key: None,
-            viewer_key_b64: None,
-            viewer_key_shareable: key.map(str::to_string),
-            viewer_key_salt_b64: None,
-            display_name: "Invite".to_string(),
-            viewer_key_file: None,
-            viewer_url: viewer_url.map(str::to_string),
-            config_path: None,
-            all_monitors: false,
-        }
-    }
-
-    #[test]
-    fn invite_link_carries_the_key_in_the_fragment() {
-        // After the '#', so browsers never send the key to the relay.
-        let identity = invite_identity(Some("https://cast.example.com"), Some("tomb-bold-egg"));
-        assert_eq!(
-            invite_link(&identity).as_deref(),
-            Some("https://cast.example.com/#k=tomb-bold-egg"),
-        );
-    }
-
-    #[test]
-    fn invite_link_does_not_double_the_separator() {
-        let identity = invite_identity(Some("https://cast.example.com/"), Some("tomb-bold-egg"));
-        assert_eq!(
-            invite_link(&identity).as_deref(),
-            Some("https://cast.example.com/#k=tomb-bold-egg"),
-        );
-    }
-
-    #[test]
-    fn invite_link_needs_both_a_url_and_a_key() {
-        assert_eq!(invite_link(&invite_identity(None, Some("phrase"))), None);
-        assert_eq!(
-            invite_link(&invite_identity(Some("https://cast.example.com"), None)),
-            None,
-        );
-    }
-
-    #[test]
-    fn invite_link_encodes_a_hand_chosen_phrase() {
-        // A configured phrase is arbitrary text and must not be able to break out
-        // of the fragment or introduce another parameter.
-        let identity = invite_identity(Some("https://cast.example.com"), Some("two words&k=x #y"));
-        assert_eq!(
-            invite_link(&identity).as_deref(),
-            Some("https://cast.example.com/#k=two%20words%26k%3Dx%20%23y"),
-        );
-    }
-
-    #[test]
-    fn invite_link_leaves_generated_keys_untouched() {
-        // Generated phrases are words and hyphens, and raw viewer keys are
-        // URL-safe base64: encoding must be a no-op for both.
-        assert_eq!(
-            url_encode_fragment("tomb-bold-egg-inch-fuse-man-eager"),
-            "tomb-bold-egg-inch-fuse-man-eager"
-        );
-        assert_eq!(
-            url_encode_fragment("QCOivvKXAHqxDo6Wogi8d81yx14wCM-2NkaXvJjOSiM"),
-            "QCOivvKXAHqxDo6Wogi8d81yx14wCM-2NkaXvJjOSiM",
-        );
-    }
-
-    fn resend_object(stream_id: Uuid, sequence: u64, payload_len: usize) -> DashObject {
-        let epoch_id = Uuid::from_u128(1);
-        let keys = EpochKeys::derive(&[7; 32], stream_id, epoch_id).unwrap();
-        DashObject::authenticated(
-            NewDashObject {
-                stream_id,
-                epoch_id,
-                kind: DashObjectKind::Media,
-                sequence,
-                segment_number: sequence,
-                chunk_index: 0,
-                timestamp: sequence,
-                duration: 1,
-                random_access: true,
-                mime: "video/iso.segment",
-                payload: vec![sequence as u8; payload_len],
-            },
-            &keys,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn resend_buffer_bounds_history_but_always_keeps_latest_object() {
-        let stream_id = Uuid::from_u128(2);
-        let mut resend = DashResendBuffer::new(5);
-        resend.push(resend_object(stream_id, 1, 3));
-        resend.push(resend_object(stream_id, 2, 3));
-        assert_eq!(resend.range(), (Some(2), Some(2)));
-        assert_eq!(resend.bytes, 3);
-
-        resend.push(resend_object(stream_id, 3, 10));
-        assert_eq!(resend.range(), (Some(3), Some(3)));
-        assert_eq!(resend.bytes, 10);
     }
 
     #[test]
@@ -7448,59 +5496,9 @@ mod tests {
     }
 
     #[test]
-    fn resend_buffer_ack_and_range_selection_are_inclusive() {
-        let stream_id = Uuid::from_u128(3);
-        let mut resend = DashResendBuffer::new(1024);
-        for sequence in 1..=4 {
-            resend.push(resend_object(stream_id, sequence, sequence as usize));
-        }
-        assert_eq!(
-            resend
-                .objects(2, 3)
-                .into_iter()
-                .map(|object| object.header.sequence)
-                .collect::<Vec<_>>(),
-            vec![2, 3]
-        );
-        resend.ack(0);
-        assert_eq!(resend.range(), (Some(1), Some(4)));
-        resend.ack(2);
-        assert_eq!(resend.range(), (Some(3), Some(4)));
-        assert_eq!(resend.bytes, 7);
-        resend.ack(u64::MAX);
-        assert_eq!(resend.range(), (None, None));
-        assert_eq!(resend.bytes, 0);
-    }
-
-    #[test]
-    fn resend_buffer_drops_objects_assigned_to_a_previous_stream() {
-        let retained_stream = Uuid::from_u128(4);
-        let old_stream = Uuid::from_u128(5);
-        let mut resend = DashResendBuffer::new(1024);
-        resend.push(resend_object(old_stream, 1, 4));
-        resend.push(resend_object(retained_stream, 2, 5));
-        resend.push(resend_object(old_stream, 3, 6));
-
-        resend.drop_other_streams(retained_stream);
-        assert_eq!(resend.range(), (Some(2), Some(2)));
-        assert_eq!(resend.bytes, 5);
-    }
-
-    #[test]
-    fn command_line_accepts_url_safe_keys_that_begin_with_hyphens() {
-        let args = Args::try_parse_from([
-            "gcpub",
-            "--ingest-token",
-            "-token",
-            "--ingest-server-key",
-            "-server-key",
-            "--viewer-key",
-            "-viewer-key",
-        ])
-        .unwrap();
-        assert_eq!(args.ingest_token.as_deref(), Some("-token"));
+    fn command_line_accepts_server_keys_that_begin_with_hyphens() {
+        let args = Args::try_parse_from(["gcpub", "--ingest-server-key", "-server-key"]).unwrap();
         assert_eq!(args.ingest_server_key.as_deref(), Some("-server-key"));
-        assert_eq!(args.viewer_key.as_deref(), Some("-viewer-key"));
     }
 
     #[test]
@@ -7540,185 +5538,12 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// A capture whose source never opens, standing in for a desktop chooser
-    /// that nobody answers.
-    struct NeverOpeningCapture;
-
-    #[async_trait]
-    impl Capture for NeverOpeningCapture {
-        async fn source(&mut self) -> Result<CaptureSource> {
-            std::future::pending::<()>().await;
-            unreachable!("pending future never resolves")
-        }
-
-        async fn capture_rgb(
-            &mut self,
-            _max_width: u32,
-            _max_height: u32,
-        ) -> Result<ImageBuffer<Rgb<u8>, Vec<u8>>> {
-            unreachable!("the source never opens")
-        }
-
-        async fn cursor(&mut self, _seq: u64) -> Result<Option<CursorMessage>> {
-            unreachable!("the source never opens")
-        }
-    }
-
     #[test]
-    fn shutdown_interrupts_a_capture_source_waiting_on_a_desktop_chooser() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            let args = Args::parse_from(["gcpub"]);
-            let identity = ClientIdentity {
-                client_id: "chooser".to_string(),
-                auth_token: None,
-                ingest_server_key: None,
-                viewer_key_b64: None,
-                viewer_key_shareable: None,
-                viewer_key_salt_b64: None,
-                display_name: "Chooser".to_string(),
-                viewer_key_file: None,
-                viewer_url: None,
-                config_path: None,
-                all_monitors: false,
-            };
-            let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            let mut capture = NeverOpeningCapture;
-            let mut resend = DashResendBuffer::new(1024);
-            let publisher = run_dash_client(
-                &args,
-                StreamIdentity {
-                    client: &identity,
-                    label: None,
-                },
-                Some(&[7u8; 32]),
-                &mut capture,
-                &mut resend,
-                shutdown_rx,
-            );
-            tokio::pin!(publisher);
-            tokio::select! {
-                result = &mut publisher => panic!("publisher returned early: {result:?}"),
-                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-            }
-            shutdown_tx.send(true).unwrap();
-            timeout(Duration::from_secs(5), publisher)
-                .await
-                .expect("shutdown must interrupt an unanswered chooser")
-                .expect("interrupted startup is a clean exit");
-        });
-    }
-
-    #[test]
-    fn generated_viewer_key_is_private_and_stable_across_restarts() {
-        let root = std::env::temp_dir().join(format!("glacialcast-viewer-key-{}", Uuid::new_v4()));
-        let path = root.join("viewer.key");
-
-        let created = load_or_create_viewer_key(&path, false).unwrap();
-        assert_eq!(decode_key_b64(&created.key_b64).unwrap().len(), 32);
-        assert_eq!(
-            created.shareable.split('-').count(),
-            viewer_key::PHRASE_WORDS,
-            "a fresh key is shared as a phrase, not as raw base64"
-        );
-        assert!(created.salt_b64.is_some());
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600,
-            "a generated viewer key must not be readable by other users"
-        );
-        // Restarting the publisher must republish under the same key so the
-        // secret already shared with viewers keeps working.
-        let reloaded = load_or_create_viewer_key(&path, false).unwrap();
-        assert_eq!(reloaded.key_b64, created.key_b64);
-        assert_eq!(reloaded.shareable, created.shareable);
-        assert_eq!(reloaded.salt_b64, created.salt_b64);
-
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(
-            load_or_create_viewer_key(&path, false).is_err(),
-            "a group- or world-readable viewer key must be rejected, not reused"
-        );
-
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        std::fs::write(&path, "not-a-32-byte-key\n").unwrap();
-        assert!(
-            load_or_create_viewer_key(&path, false).is_err(),
-            "a malformed viewer key must be rejected, not silently replaced"
-        );
-
-        std::fs::write(&path, "").unwrap();
-        assert!(load_or_create_viewer_key(&path, false).is_err());
-
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    /// A publisher that has already shared a raw base64 key must keep using it.
-    /// Rewriting it into a phrase would silently invalidate every key already
-    /// handed out.
-    #[test]
-    fn a_pre_phrase_viewer_key_file_keeps_working_untouched() {
-        let root = std::env::temp_dir().join(format!("glacialcast-legacy-key-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("viewer.key");
-        let legacy = encode_key_b64(&[9u8; 32]);
-        std::fs::write(&path, format!("{legacy}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-
-        let loaded = load_or_create_viewer_key(&path, false).unwrap();
-        assert_eq!(loaded.key_b64, legacy);
-        assert_eq!(loaded.shareable, legacy);
-        assert_eq!(
-            loaded.salt_b64, None,
-            "a raw key needs no salt, because nothing is derived from it"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap().trim(),
-            legacy,
-            "loading must not rewrite an existing key file"
-        );
-
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn regenerating_replaces_the_shared_key() {
-        let root = std::env::temp_dir().join(format!("glacialcast-rotate-key-{}", Uuid::new_v4()));
-        let path = root.join("viewer.key");
-
-        let first = load_or_create_viewer_key(&path, false).unwrap();
-        let second = load_or_create_viewer_key(&path, true).unwrap();
-        assert_ne!(first.shareable, second.shareable);
-        assert_ne!(first.key_b64, second.key_b64);
-        // The replacement must survive, or the next start would go back to the
-        // key the operator just retired.
-        assert_eq!(
-            load_or_create_viewer_key(&path, false).unwrap().key_b64,
-            second.key_b64
-        );
-
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn generated_state_paths_sanitize_the_client_identity() {
-        let key = default_viewer_key_file("desk/../../etc");
+    fn generated_log_path_sanitizes_the_client_identity() {
         let log = default_log_file("desk/../../etc");
-        assert_eq!(
-            key.file_name().unwrap().to_string_lossy(),
-            "viewer-desk-------etc.key"
-        );
         assert_eq!(
             log.file_name().unwrap().to_string_lossy(),
             "client-desk-------etc.log"
-        );
-        assert_eq!(key.parent(), log.parent());
-        assert_eq!(
-            default_viewer_key_file("///").file_name().unwrap(),
-            "viewer-client.key"
         );
     }
 
@@ -7757,7 +5582,7 @@ mod tests {
         let err = anyhow::anyhow!(
             "requested portal cursor mode Metadata is not available; portal advertised cursor mode mask 3"
         );
-        assert!(is_fatal_capture_error(&err));
+        assert!(is_fatal_publisher_error(&err));
     }
 
     #[test]
@@ -7765,19 +5590,12 @@ mod tests {
         let err = anyhow::anyhow!(
             "PipeWire buffer does not include SPA_META_Cursor while --require-cursor-metadata is set"
         );
-        assert!(is_fatal_capture_error(&err));
+        assert!(is_fatal_publisher_error(&err));
     }
 
     #[test]
     fn fractional_update_rate_accepts_half_to_fifteen() {
         assert_eq!(parse_update_rate("0.5").unwrap(), 0.5);
-        // Low rates stay allowed for capture validation, but the frame period
-        // they imply is one Firefox cannot decode, and the warning keys off
-        // this predicate.
-        assert!(update_rate_outlasts_firefox(0.5));
-        assert!(update_rate_outlasts_firefox(1.0));
-        assert!(!update_rate_outlasts_firefox(1.3));
-        assert!(!update_rate_outlasts_firefox(5.0));
         assert_eq!(parse_update_rate("15").unwrap(), 15.0);
         assert!(parse_update_rate("0.25").is_err());
         assert!(parse_update_rate("16").is_err());
@@ -7785,8 +5603,6 @@ mod tests {
 
     #[test]
     fn idle_heartbeat_is_bounded() {
-        // Fractions matter: the default must sit under the one-second sample
-        // duration that stalls in Firefox.
         assert!((parse_idle_heartbeat_seconds("0.5").unwrap() - 0.5).abs() < f64::EPSILON);
         assert!((parse_idle_heartbeat_seconds("1").unwrap() - 1.0).abs() < f64::EPSILON);
         assert!((parse_idle_heartbeat_seconds("300").unwrap() - 300.0).abs() < f64::EPSILON);
@@ -7797,104 +5613,11 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_media_cadence_coalesces_idle_time_and_flushes_before_changes() {
-        let mut cadence = AdaptiveMediaCadence::new(90_000, 900_000);
-        assert_eq!(
-            cadence.observe(90_000, false),
-            MediaCadenceDecision {
-                encode_pending_timestamp: Some(90_000),
-                ..MediaCadenceDecision::default()
-            }
-        );
-        assert_eq!(
-            cadence.observe(540_000, false),
-            MediaCadenceDecision::default()
-        );
-        assert_eq!(
-            cadence.observe(990_000, false),
-            MediaCadenceDecision {
-                flush_pending_duration: Some(900_000),
-                encode_pending_timestamp: Some(990_000),
-                ..MediaCadenceDecision::default()
-            }
-        );
-        assert_eq!(
-            cadence.observe(1_080_000, true),
-            MediaCadenceDecision {
-                flush_pending_duration: Some(90_000),
-                publish_current_timestamp: Some(1_080_000),
-                ..MediaCadenceDecision::default()
-            }
-        );
-        assert_eq!(cadence.finish(1_170_000), None);
-    }
-
-    #[test]
-    fn adaptive_media_cadence_never_overlaps_a_previous_sample() {
-        let mut cadence = AdaptiveMediaCadence::new(90_000, 900_000);
-        assert_eq!(
-            cadence.observe(89_000, true).publish_current_timestamp,
-            Some(90_000)
-        );
-        assert_eq!(
-            cadence.observe(150_000, true).publish_current_timestamp,
-            Some(180_000)
-        );
-    }
-
-    #[test]
-    fn rgb_fingerprint_defends_against_incorrect_change_hints() {
-        let first = [1; 32];
-        let second = [2; 32];
-        assert!(!frame_changed(
-            FrameChange::Unknown,
-            Some(&first),
-            Some(&first)
-        ));
-        assert!(frame_changed(
-            FrameChange::Unknown,
-            Some(&first),
-            Some(&second)
-        ));
-        assert!(frame_changed(
-            FrameChange::Unchanged,
-            Some(&first),
-            Some(&second)
-        ));
-        assert!(!frame_changed(
-            FrameChange::Changed,
-            Some(&first),
-            Some(&first)
-        ));
-        assert!(frame_changed(FrameChange::Changed, None, None));
-        assert!(frame_changed(FrameChange::Unknown, None, None));
-    }
-
-    #[test]
-    fn pipewire_damage_accumulates_across_video_throttling() {
-        let mut damage = AccumulatedFrameDamage::default();
-
-        damage.observe(Some(false));
-        assert_eq!(damage.take(), Some(false));
-
-        damage.observe(Some(false));
-        damage.observe(Some(true));
-        damage.observe(Some(false));
-        assert_eq!(damage.take(), Some(true));
-
-        damage.observe(None);
-        damage.observe(Some(false));
-        assert_eq!(damage.take(), None);
-        assert_eq!(damage.take(), None);
-    }
-
-    #[test]
     fn test_patterns_model_static_typing_scroll_and_motion_damage() {
         let mut static_pattern = TestPatternCapture::new(96, 96, TestPatternMode::Static);
         let static_first = static_pattern.next_rgb();
         let static_second = static_pattern.next_rgb();
         assert_eq!(static_first, static_second);
-        assert!(!static_pattern.frame_changed());
 
         let mut typing = TestPatternCapture::new(96, 96, TestPatternMode::Typing);
         let first = typing.next_rgb();
@@ -7903,14 +5626,12 @@ mod tests {
         typing.next_rgb();
         let fourth = typing.next_rgb();
         assert_ne!(second, fourth);
-        assert!(typing.frame_changed());
 
         for mode in [TestPatternMode::Scroll, TestPatternMode::Motion] {
             let mut pattern = TestPatternCapture::new(96, 96, mode);
             let first = pattern.next_rgb();
             let second = pattern.next_rgb();
             assert_ne!(first, second);
-            assert!(pattern.frame_changed());
         }
     }
 
@@ -8053,32 +5774,7 @@ mod tests {
     }
 
     #[test]
-    fn segment_length_tracks_the_frame_rate() {
-        let args_at = |fps: f64| Args::parse_from(["gcpub", "--fps", &fps.to_string()]);
-        // Segment boundaries force an IDR, so the frame count has to rise with
-        // the frame rate or the keyframe rate rises instead and takes the
-        // bitrate with it.
-        assert_eq!(args_at(1.0).segment_frames(), 4);
-        assert_eq!(args_at(5.0).segment_frames(), 20);
-        assert_eq!(args_at(15.0).segment_frames(), 60);
-        assert_eq!(args_at(0.5).segment_frames(), 2);
-
-        // An explicit choice still wins.
-        let explicit = Args::parse_from(["gcpub", "--fps", "5", "--segment-frames", "4"]);
-        assert_eq!(explicit.segment_frames(), 4);
-    }
-
-    #[test]
-    fn cursor_flush_interval_is_bounded() {
-        assert_eq!(parse_cursor_flush_ms("100"), Ok(100));
-        assert_eq!(parse_cursor_flush_ms(" 20 "), Ok(20));
-        assert!(parse_cursor_flush_ms("19").is_err());
-        assert!(parse_cursor_flush_ms("1001").is_err());
-        assert!(parse_cursor_flush_ms("soon").is_err());
-    }
-
-    #[test]
-    fn dash_dmabuf_dimensions_preserve_aspect_ratio_and_encoder_constraints() {
+    fn dmabuf_dimensions_preserve_aspect_ratio_and_encoder_constraints() {
         assert_eq!(fit_even_dimensions(3840, 2160, 1280, 720), (1280, 720));
         assert_eq!(fit_even_dimensions(1920, 1200, 1280, 720), (1152, 720));
         assert_eq!(fit_even_dimensions(1279, 719, 1280, 720), (1278, 718));
@@ -8170,55 +5866,6 @@ mod tests {
                 max: pipewire_cursor_meta_size(PIPEWIRE_CURSOR_NEGOTIATED_MAX_BITMAP_SIDE),
             }
         );
-    }
-
-    #[test]
-    fn pipewire_damage_meta_request_has_type_and_capacity() {
-        let bytes = build_pipewire_damage_meta_param_pod().unwrap();
-        let pod = spa::pod::Pod::from_bytes(&bytes).unwrap();
-        let object = <&spa::pod::PodObject>::try_from(pod).unwrap();
-        let meta_type = object
-            .find_prop(spa::utils::Id(spa::sys::SPA_PARAM_META_type))
-            .expect("damage meta request type property");
-        assert_eq!(
-            meta_type.value().get_id().unwrap(),
-            spa::utils::Id(spa::sys::SPA_META_VideoDamage)
-        );
-        assert!(
-            object
-                .find_prop(spa::utils::Id(spa::sys::SPA_PARAM_META_size))
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn pipewire_damage_metadata_distinguishes_idle_changed_and_unknown_buffers() {
-        let damage = |width, height, complete: bool| {
-            let mut region = spa::sys::spa_meta_region {
-                region: spa::sys::spa_region {
-                    position: spa::sys::spa_point { x: 0, y: 0 },
-                    size: spa::sys::spa_rectangle { width, height },
-                },
-            };
-            let mut meta = spa::sys::spa_meta {
-                type_: spa::sys::SPA_META_VideoDamage,
-                size: std::mem::size_of::<spa::sys::spa_meta_region>() as u32
-                    - u32::from(!complete),
-                data: (&mut region as *mut spa::sys::spa_meta_region).cast(),
-            };
-            let buffer = spa::sys::spa_buffer {
-                n_metas: 1,
-                n_datas: 0,
-                metas: &mut meta,
-                datas: ptr::null_mut(),
-            };
-            pipewire_video_damage(&buffer)
-        };
-
-        assert_eq!(damage(0, 0, true), Some(false));
-        assert_eq!(damage(12, 8, true), Some(true));
-        assert_eq!(damage(12, 8, false), None);
-        assert_eq!(pipewire_video_damage(ptr::null()), None);
     }
 
     #[test]
@@ -8337,7 +5984,7 @@ mod tests {
     }
 
     #[test]
-    fn dash_cursor_sends_bitmap_pixels_on_change_and_periodic_refresh() {
+    fn cursor_sends_bitmap_pixels_on_change_and_periodic_refresh() {
         let rgba = [255, 0, 0, 255, 0, 255, 0, 255];
         let bitmap = Arc::new(CursorBitmap {
             width: 2,
@@ -8354,14 +6001,12 @@ mod tests {
             source_height: 100,
             bitmap,
         };
-        let mut state = DashCursorBitmapState::default();
+        let mut state = CursorBitmapState::default();
         let first =
-            cursor_to_dash_event(message(Some(Arc::clone(&bitmap))), 10, 100, 100, &mut state)
-                .unwrap();
+            cursor_to_event(message(Some(Arc::clone(&bitmap))), 10, 100, 100, &mut state).unwrap();
         let repeated =
-            cursor_to_dash_event(message(Some(Arc::clone(&bitmap))), 20, 100, 100, &mut state)
-                .unwrap();
-        let refreshed = cursor_to_dash_event(
+            cursor_to_event(message(Some(Arc::clone(&bitmap))), 20, 100, 100, &mut state).unwrap();
+        let refreshed = cursor_to_event(
             message(Some(bitmap)),
             CURSOR_BITMAP_REFRESH_TICKS + 10,
             100,
@@ -8369,7 +6014,7 @@ mod tests {
             &mut state,
         )
         .unwrap();
-        let position_only = cursor_to_dash_event(
+        let position_only = cursor_to_event(
             message(None),
             CURSOR_BITMAP_REFRESH_TICKS + 20,
             100,
@@ -8387,7 +6032,7 @@ mod tests {
     }
 
     #[test]
-    fn dash_cursor_scales_clamps_and_hides_coordinates() {
+    fn cursor_scales_clamps_and_hides_coordinates() {
         let message = |x, y, visible| CursorMessage {
             x,
             y,
@@ -8396,22 +6041,19 @@ mod tests {
             source_height: 100,
             bitmap: None,
         };
-        let mut state = DashCursorBitmapState::default();
+        let mut state = CursorBitmapState::default();
 
-        let scaled =
-            cursor_to_dash_event(message(50.0, 25.0, true), 1, 100, 200, &mut state).unwrap();
+        let scaled = cursor_to_event(message(50.0, 25.0, true), 1, 100, 200, &mut state).unwrap();
         assert_eq!(scaled.x_micropixels, 25_000_000);
         assert_eq!(scaled.y_micropixels, 50_000_000);
         assert!(scaled.visible);
 
         let clamped =
-            cursor_to_dash_event(message(-10.0, f32::INFINITY, true), 2, 100, 200, &mut state)
-                .unwrap();
+            cursor_to_event(message(-10.0, f32::INFINITY, true), 2, 100, 200, &mut state).unwrap();
         assert_eq!(clamped.x_micropixels, 0);
         assert_eq!(clamped.y_micropixels, 0);
 
-        let hidden =
-            cursor_to_dash_event(message(50.0, 25.0, false), 3, 100, 200, &mut state).unwrap();
+        let hidden = cursor_to_event(message(50.0, 25.0, false), 3, 100, 200, &mut state).unwrap();
         assert_eq!(hidden.x_micropixels, 0);
         assert_eq!(hidden.y_micropixels, 0);
         assert!(!hidden.visible);
@@ -8427,7 +6069,7 @@ mod tests {
     }
 
     #[test]
-    fn dash_cursor_rejects_inconsistent_bitmap_dimensions() {
+    fn cursor_rejects_inconsistent_bitmap_dimensions() {
         let cursor = CursorMessage {
             x: 0.0,
             y: 0.0,
@@ -8442,9 +6084,7 @@ mod tests {
                 rgba: Arc::from([0u8; 15]),
             })),
         };
-        assert!(
-            cursor_to_dash_event(cursor, 0, 1, 1, &mut DashCursorBitmapState::default()).is_err()
-        );
+        assert!(cursor_to_event(cursor, 0, 1, 1, &mut CursorBitmapState::default()).is_err());
     }
 
     #[test]
