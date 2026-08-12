@@ -23,7 +23,7 @@ pub const MAX_ERROR_DETAIL_LEN: usize = 512;
 /// Errors produced by bounded native wire-message parsing and validation.
 #[derive(Debug, Error)]
 pub enum WireError {
-    /// A message used a protocol version other than v8.
+    /// A message used a protocol version other than v9.
     #[error("unsupported native protocol version {0}")]
     UnsupportedVersion(u16),
     /// A message exceeded [`MAX_FRAME_LEN`].
@@ -524,7 +524,7 @@ impl RelayError {
     }
 }
 
-/// Trait implemented by each top-level native v8 message family.
+/// Trait implemented by each top-level native v9 message family.
 pub trait NativeWireMessage: Serialize + for<'de> Deserialize<'de> {
     /// Validates all structural and bounded invariants available without state.
     ///

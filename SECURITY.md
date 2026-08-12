@@ -14,13 +14,15 @@ integrity.
 Include the version or commit, platform and compositor, and enough detail to
 reproduce. A failing test or script under `scripts/` is the most useful report.
 
-This is a pre-1.0 project maintained on a best-effort basis. There is no paid
-bounty and no guaranteed response time.
+There is no paid bounty or guaranteed response time. Maintainers will
+acknowledge actionable reports as capacity permits and coordinate disclosure
+before publishing a fix.
 
 ## Supported versions
 
-Only the tip of `main` is supported. Fixes land there; there are no maintained
-release branches before 1.0.
+The latest 1.x release and the tip of `main` are supported. Security fixes ship
+as patch releases on the current minor line; older minor lines are unsupported
+after a newer minor release is available.
 
 ## Security boundary
 
@@ -96,7 +98,7 @@ These are design limits rather than vulnerabilities:
   keys, or decoded content as the application.
 - **Viewer identity is per device.** Copying private identity state copies the
   device's authority. Automated identity synchronization and encrypted backup
-  are not part of 0.6.
+  are not part of 1.0.
 - **Audio, remote input, and offline recordings are absent.** Findings premised
   on those unsupported features are outside the current boundary.
 

@@ -1,9 +1,11 @@
 # Compatibility Policy
 
-GlacialCast is pre-1.0 software. Its supported compatibility unit is the whole
-release: `gcpub`, `gcrelay`, and `gcview` use the same minor version unless a
-release note explicitly says otherwise. Rolling upgrades and mixed-minor
-operation are not yet compatibility promises.
+GlacialCast follows Semantic Versioning beginning with 1.0. Its supported
+compatibility unit is the whole release: `gcpub`, `gcrelay`, and `gcview` use
+the same major and minor version unless a release note explicitly says
+otherwise. Patch releases preserve wire and retained-data compatibility.
+Rolling upgrades across minor or major versions require an explicit release
+note stating that the combination is supported.
 
 ## Versioned boundaries
 
@@ -28,9 +30,9 @@ the opaque relay.
 ## Change rules
 
 An incompatible wire, stream-object, credential, identity, or retained-storage
-change below 1.0 requires:
+change requires:
 
-1. a minor Semantic Versioning increment and the applicable format constant
+1. a major Semantic Versioning increment and the applicable format constant
    increment;
 2. a clear error for the prior version—silent reinterpretation is forbidden;
 3. updated architecture, security, deployment, and retained-data documentation;
@@ -55,10 +57,10 @@ than being silently ignored.
 | --- | --- |
 | 0.5 / v7 | Browser DASH/CENC format, publisher viewer-key salt, portable `GCO1` objects, and Noise NK publisher ingest. |
 | 0.6 / v8 | Native `gcpub`/`gcrelay`/`gcview`; Noise XX relay transports; persistent device identities; native credentials; verified pairing; publisher-signed AEAD stream format v2; HPKE viewer envelopes; H.264 Annex-B payloads. Browser and portable formats are removed. |
-| 0.7 / v9 | Pairing requests, publisher decisions, durable approvals, and revocations are bound to one exact stream; running publishers apply and reload automatic approval policy. |
+| 1.0 / v9 | Production native release. Pairing requests, publisher decisions, durable approvals, and revocations are bound to one exact stream; running publishers apply and reload automatic approval policy. |
 
 Version 9 is a clean break. Earlier peers are rejected before normal traffic.
-The relay does not migrate version 1 DASH history. On first 0.6 startup it moves
+The relay does not migrate version 1 DASH history. On first v9 startup it moves
 the old store to an explicitly named incompatible quarantine path without
 deleting it, creates an empty version 2 store, and logs the rollback consequence.
 
