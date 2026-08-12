@@ -30,7 +30,6 @@ use image::{ImageBuffer, Rgb, imageops::FilterType};
 use pipewire as pw;
 use pw::{properties::properties, spa};
 use serde::Deserialize;
-#[cfg(any())]
 use std::os::fd::BorrowedFd;
 use std::{
     io::{IsTerminal, Read, Write},
@@ -52,13 +51,11 @@ use zbus::{
     zvariant::{OwnedFd as ZbusOwnedFd, OwnedObjectPath, OwnedValue, Value},
 };
 
-#[cfg(any())]
 mod egl_readback;
 mod encoder;
 mod native_admin;
 mod native_publish;
 
-#[cfg(any())]
 use egl_readback::{DmaBufPlane, EglReadback, ReadbackLayout};
 use encoder::{
     DmaBufInputFrame, EncoderInputFrame, EncoderMode, FrameRelease, H264Encoder,
@@ -4345,7 +4342,6 @@ struct DmaBufReadback {
 /// indefinitely — are served by importing the descriptor as an `EGLImage` and
 /// reading a framebuffer instead. Whichever path fails first is latched off so
 /// a permanently unsupported path is not retried once per frame.
-#[cfg(any())]
 struct GpuReadback {
     // Declared before `device` so the EGL context is torn down while the GBM
     // device it was created from is still alive.
@@ -4356,7 +4352,6 @@ struct GpuReadback {
     egl_unusable: bool,
 }
 
-#[cfg(any())]
 impl GpuReadback {
     fn new(device_path: PathBuf) -> Self {
         Self {
@@ -4647,31 +4642,6 @@ impl GpuReadback {
                 Err(err) => return Err(err).context("mapping imported DMA-BUF through GBM"),
             }
         }
-    }
-}
-
-/// CPU-only build placeholder for compositor DMA-BUFs that are not mappable.
-struct GpuReadback;
-
-impl GpuReadback {
-    fn new(_device_path: PathBuf) -> Self {
-        Self
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn copy_dmabuf_scaled(
-        &mut self,
-        _fd: RawFd,
-        _offset: usize,
-        _width: u32,
-        _height: u32,
-        _stride: usize,
-        _video_format: spa::param::video::VideoFormat,
-        _modifier: u64,
-        _target_width: u32,
-        _target_height: u32,
-    ) -> Result<DmaBufReadback> {
-        bail!("non-mappable DMA-BUF capture requires a runtime GPU readback backend")
     }
 }
 
