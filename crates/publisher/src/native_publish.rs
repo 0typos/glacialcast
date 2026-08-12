@@ -40,6 +40,15 @@ pub(super) struct RetainedGroupKey {
     content_bytes: u64,
 }
 
+impl RetainedGroupKey {
+    /// True once at least one acknowledged ciphertext byte exists under this
+    /// group, which is what makes an envelope for it worth sending: the relay
+    /// refuses envelopes for groups it holds no ciphertext for.
+    pub(super) fn has_published_content(&self) -> bool {
+        self.content_bytes > 0
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct KeyHistory {
     version: u16,
