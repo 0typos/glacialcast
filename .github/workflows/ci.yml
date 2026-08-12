@@ -41,7 +41,8 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libclang-dev libpipewire-0.3-dev libexpat1-dev python3
+          sudo apt-get install -y libclang-dev libpipewire-0.3-dev libexpat1-dev nasm python3
+          sudo scripts/ci-install-openh264.sh
       - run: scripts/verify-native-e2e.sh
 
   packaging:

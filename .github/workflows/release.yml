@@ -29,7 +29,8 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libclang-dev libpipewire-0.3-dev libexpat1-dev minisign nodejs rpm shellcheck
+          sudo apt-get install -y libclang-dev libpipewire-0.3-dev libexpat1-dev minisign nasm nodejs rpm shellcheck
+          sudo scripts/ci-install-openh264.sh
       - name: Install release tools
         uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
         with:
