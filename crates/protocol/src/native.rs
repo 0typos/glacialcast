@@ -1,5 +1,6 @@
 //! Signed, end-to-end encrypted native stream objects.
 
+use crate::entropy;
 use crate::identity::{
     IDENTITY_ID_LEN, IdentityError, IdentityPublic, IdentitySecret, SignatureBytes, verify,
 };
@@ -7,7 +8,6 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Key, KeyInit, Nonce,
     aead::{Aead, Payload},
 };
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -611,11 +611,7 @@ impl ContentKey {
     /// Generates an independent nonzero content key.
     #[must_use]
     pub fn generate() -> Self {
-        let mut key = [0u8; CONTENT_KEY_LEN];
-        while key == [0; CONTENT_KEY_LEN] {
-            rand::rngs::OsRng.fill_bytes(&mut key);
-        }
-        Self(key)
+        Self(entropy::random_nonzero())
     }
 
     /// Imports a content key obtained from an authenticated viewer envelope.
@@ -673,12 +669,9 @@ impl GroupEncryptor {
                 "nil group stream or epoch identifier",
             ));
         }
-        let mut key_id = [0u8; 16];
-        while key_id == [0; 16] {
-            rand::rngs::OsRng.fill_bytes(&mut key_id);
-        }
+        let key_id = entropy::random_nonzero();
         let mut nonce_prefix = [0u8; 4];
-        rand::rngs::OsRng.fill_bytes(&mut nonce_prefix);
+        entropy::fill(&mut nonce_prefix);
         Self::restore(
             publisher,
             stream_id,

@@ -4,11 +4,11 @@ use crate::{
     PROTOCOL_VERSION,
     auth_words::wordlist,
     credential::{CredentialRole, NativeCredential},
+    entropy::random_nonzero,
     identity::{
         IDENTITY_ID_LEN, IdentityError, IdentityPublic, IdentitySecret, SignatureBytes, verify,
     },
 };
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -92,14 +92,6 @@ fn validate_device_label(label: &str) -> Result<(), PairingError> {
         return Err(PairingError::InvalidMetadata("invalid device label"));
     }
     Ok(())
-}
-
-fn random_nonzero<const N: usize>() -> [u8; N] {
-    let mut bytes = [0u8; N];
-    while bytes == [0; N] {
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
-    }
-    bytes
 }
 
 fn map_signature(error: IdentityError) -> PairingError {

@@ -1,9 +1,9 @@
 //! Persistent publisher and viewer application identities.
 
+use crate::entropy;
 use crate::private_state::{create_private, read_private};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hpke::{Deserializable, Kem as _, Serializable, kem::X25519HkdfSha256};
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{fmt, io, path::Path};
@@ -190,10 +190,7 @@ impl IdentitySecret {
     /// Generates independent random Ed25519 signing and X25519 HPKE keys.
     #[must_use]
     pub fn generate() -> Self {
-        let mut signing_secret = [0u8; IDENTITY_KEY_LEN];
-        while signing_secret == [0; IDENTITY_KEY_LEN] {
-            rand::rngs::OsRng.fill_bytes(&mut signing_secret);
-        }
+        let signing_secret = entropy::random_nonzero();
         let (kem_secret, _) = Kem::gen_keypair();
         let kem_secret = kem_secret
             .to_bytes()
