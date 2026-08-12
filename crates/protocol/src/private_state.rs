@@ -91,26 +91,78 @@ fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
-/// Creates a new private file and durably publishes its bytes.
+/// Writes bytes into a synchronized unique dot-temporary next to the state
+/// file, removing it again on failure.
+fn stage_private(parent: &Path, name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+    let temporary = parent.join(format!(".{name}.{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    })();
+    match result {
+        Ok(()) => Ok(temporary),
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
+}
+
+/// Renames without replacing an existing destination, so staged bytes become
+/// visible atomically while a concurrent creation still loses cleanly.
+fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let from = std::ffi::CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| invalid("private state path contains a NUL byte"))?;
+    let to = std::ffi::CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| invalid("private state path contains a NUL byte"))?;
+    // SAFETY: both pointers reference NUL-terminated strings that outlive the
+    // call, which reads them without taking ownership.
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Creates a private state file that only ever appears fully written.
 ///
-/// The destination is opened with `create_new`, mode `0600`, and
-/// `O_NOFOLLOW`. Existing destinations are never replaced.
+/// Bytes are synchronized in a unique same-directory temporary file with mode
+/// `0600` and renamed into place without replacement, so a concurrent reader
+/// observes either absence or the complete record. Existing destinations are
+/// never replaced.
 ///
 /// # Errors
 ///
 /// Returns an error if the parent cannot be prepared, the destination already
-/// exists, or writing or synchronizing the file or its parent fails.
+/// exists, or writing, synchronizing, or publishing the file fails.
 pub fn create_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = prepare_parent(path)?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    sync_directory(&parent)
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| invalid("private state path has no UTF-8 file name"))?;
+    let temporary = stage_private(&parent, name, bytes)?;
+    let result = rename_noreplace(&temporary, path).and_then(|()| sync_directory(&parent));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 /// Atomically replaces or creates a private state file.
@@ -135,19 +187,8 @@ pub fn replace_private(path: &Path, bytes: &[u8], max_existing_len: usize) -> io
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| invalid("private state path has no UTF-8 file name"))?;
-    let temporary = parent.join(format!(".{name}.{}.tmp", Uuid::new_v4()));
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        fs::rename(&temporary, path)?;
-        sync_directory(&parent)
-    })();
+    let temporary = stage_private(&parent, name, bytes)?;
+    let result = fs::rename(&temporary, path).and_then(|()| sync_directory(&parent));
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
@@ -244,6 +285,20 @@ mod tests {
         );
         replace_private(&path, b"two", 3).unwrap();
         assert_eq!(read_private(&path, 3).unwrap(), b"two");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_state_creation_never_replaces_and_leaves_no_temporary() {
+        let root = temporary_root();
+        let path = root.join("state.bin");
+        create_private(&path, b"one").unwrap();
+        assert_eq!(
+            create_private(&path, b"two").unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(read_private(&path, 3).unwrap(), b"one");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
         fs::remove_dir_all(root).unwrap();
     }
 
