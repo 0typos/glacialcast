@@ -53,7 +53,8 @@ Public admission is a supported policy. It reveals stream names and lets any
 Noise peer connect, but does not reveal media keys. Publisher approval remains
 separate. With publisher policy `required`, a malicious relay cannot substitute
 a viewer because both endpoints must confirm the same signed transcript. With
-publisher policy `open`, the relay can request a viewer key by design.
+publisher policy `open`, the relay can request a content-key envelope by
+design.
 
 Firewall each listener to the populations that need it. The relay also enforces
 configured connection, timeout, stream, group, envelope, per-publisher, and
