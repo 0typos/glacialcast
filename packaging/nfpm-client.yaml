@@ -63,6 +63,9 @@ overrides:
       - ${GLACIALCAST_LIBC_DEB}
       - libpipewire-0.3-0
       - libexpat1
+      # The GPU DMA-BUF readback links libgbm; the EGL fallback it drives is
+      # what makes NVIDIA compositor buffers publishable at all.
+      - libgbm1
     recommends:
       # OpenH264 is used by both publication and playback.
       - libopenh264-7
@@ -72,6 +75,7 @@ overrides:
       - ${GLACIALCAST_LIBC_RPM}
       - pipewire-libs
       - expat
+      - mesa-libgbm
     recommends:
       - openh264
       - xdg-desktop-portal

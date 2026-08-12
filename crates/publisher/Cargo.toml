@@ -17,6 +17,7 @@ async-trait.workspace = true
 chrono.workspace = true
 clap.workspace = true
 futures-util.workspace = true
+gbm.workspace = true
 glacialcast-protocol = { path = "../protocol", version = "1.0.0" }
 image.workspace = true
 libc.workspace = true

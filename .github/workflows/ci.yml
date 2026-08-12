@@ -22,7 +22,7 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libclang-dev libpipewire-0.3-dev libexpat1-dev shellcheck
+          sudo apt-get install -y libclang-dev libgbm-dev libpipewire-0.3-dev libexpat1-dev shellcheck
       - name: Install cargo-deny
         uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
         with:
@@ -41,7 +41,7 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libclang-dev libpipewire-0.3-dev libexpat1-dev nasm python3
+          sudo apt-get install -y libclang-dev libgbm-dev libpipewire-0.3-dev libexpat1-dev nasm python3
           sudo scripts/ci-install-openh264.sh
       - run: scripts/verify-native-e2e.sh
 
@@ -55,7 +55,7 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libclang-dev libpipewire-0.3-dev libexpat1-dev nodejs rpm
+          sudo apt-get install -y libclang-dev libgbm-dev libpipewire-0.3-dev libexpat1-dev nodejs rpm
       - name: Install package builder
         run: |
           go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.47.0

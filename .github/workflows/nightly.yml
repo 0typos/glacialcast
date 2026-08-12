@@ -23,7 +23,7 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libclang-dev libpipewire-0.3-dev libexpat1-dev nasm python3 shellcheck
+          sudo apt-get install -y libclang-dev libgbm-dev libpipewire-0.3-dev libexpat1-dev nasm python3 shellcheck
           sudo scripts/ci-install-openh264.sh
       - name: Install cargo-deny
         uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
@@ -42,7 +42,7 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libclang-dev libpipewire-0.3-dev libexpat1-dev
+          sudo apt-get install -y libclang-dev libgbm-dev libpipewire-0.3-dev libexpat1-dev
       - name: Install cargo-fuzz
         run: cargo +nightly-2026-07-03 install cargo-fuzz --version 0.13.2 --locked
       - run: GLACIALCAST_FUZZ_SECONDS=60 scripts/verify-fuzz.sh
