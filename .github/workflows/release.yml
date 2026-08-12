@@ -37,7 +37,9 @@ jobs:
           tool: cargo-deny@0.20.2
           fallback: none
       - name: Install package builder
-        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.47.0
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.47.0
+          echo "$(go env GOPATH)/bin" >>"${GITHUB_PATH}"
       - name: Verify release tag and quality gates
         env:
           RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
