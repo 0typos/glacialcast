@@ -28,7 +28,7 @@ contents:
     file_info:
       mode: 0644
   # Shipped as an example rather than as the live config: the real one holds
-  # ingest tokens, and a package upgrade must never overwrite those.
+  # identity and admission policy, and an upgrade must never overwrite those.
   - src: ./packaging/server.toml.example
     dst: /usr/share/doc/gcrelay/relay.toml.example
     file_info:

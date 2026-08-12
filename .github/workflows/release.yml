@@ -29,11 +29,11 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libclang-dev libpipewire-0.3-dev libexpat1-dev minisign nodejs shellcheck
-      - name: Install cargo-deny
+          sudo apt-get install -y libclang-dev libpipewire-0.3-dev libexpat1-dev minisign nodejs rpm shellcheck
+      - name: Install release tools
         uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
         with:
-          tool: cargo-deny@0.20.2
+          tool: cargo-deny@0.20.2,nfpm@2.47.0
           fallback: none
       - name: Verify release tag and quality gates
         env:
@@ -61,7 +61,10 @@ jobs:
         env:
           GLACIALCAST_REQUIRE_CLEAN: "1"
           GLACIALCAST_MINISIGN_SECRET_KEY: ${{ steps.minisign.outputs.key_path }}
-        run: scripts/build-release.sh
+        run: |
+          scripts/build-release.sh
+          scripts/build-packages.sh
+          packaging/verify-packages.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: glacialcast-${{ github.ref_name }}
@@ -70,7 +73,10 @@ jobs:
       - name: Attest release archives
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
         with:
-          subject-path: dist/*.tar.gz
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.deb
+            dist/*.rpm
       - name: Publish GitHub release
         if: github.ref_type == 'tag'
         env:

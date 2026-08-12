@@ -1,7 +1,9 @@
 # Release operations
 
 Run `scripts/verify-quality.sh full` from a clean checkout, then build the
-reproducible archive with `scripts/build-release.sh`. The archive contains
+reproducible archive with `scripts/build-release.sh`. Build installable Debian
+and RPM packages with `scripts/build-packages.sh` and inspect them with
+`packaging/verify-packages.sh`. The archive contains
 `gcpub`, `gcrelay`, `gcview`, configuration examples, operator documentation,
 and an SPDX SBOM. It does not contain browser assets or an offline viewer.
 

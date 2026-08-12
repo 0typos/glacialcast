@@ -49,8 +49,12 @@ if (!document.relationships.some(item => item.relationshipType === 'DEPENDS_ON')
 }
 NODE
 
-for expected in LICENSE README.md SBOM.spdx.json deploy/gcrelay.service \
-  docs/release-operations.md; do
+for expected in LICENSE README.md SECURITY.md SBOM.spdx.json \
+  deploy/gcpub.service deploy/gcrelay.service \
+  docs/architecture.md docs/compatibility.md docs/internet-deployment.md \
+  docs/release-operations.md docs/support-matrix.md docs/testing-demo-guide.md \
+  packaging/client.toml.example packaging/publisher.toml.example \
+  packaging/server.toml.example; do
   [[ -f "${bundle_root}/${expected}" ]] || {
     echo "release archive is missing ${expected}" >&2
     exit 1

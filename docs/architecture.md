@@ -12,7 +12,7 @@ ships three native Linux programs:
 The first native release is video-only and view-only. It targets Wayland first,
 supports X11 viewing where the host stack permits it, and carries H.264 Annex-B
 access units. Audio, remote input, browser playback, portable/offline playback,
-relay clustering, and federation are outside the 0.6 contract.
+relay clustering, and federation are outside the 1.0 contract.
 
 The publisher uses the XDG Desktop Portal and PipeWire, samples changed video
 at a low rate, encodes H.264, and publishes cursor state independently at a
@@ -143,7 +143,7 @@ Protocol version 9 uses bounded Postcard control messages over segmented Noise
 records. Stream-object format version 2 replaces MPEG-DASH and fMP4 packaging.
 The outer media profile has an explicit codec identifier so a later codec does
 not require redesigning routing, history, or subscriptions; H.264 Annex-B is
-the only 0.6 codec.
+the only 1.0 codec.
 
 Initial object roles are:
 
@@ -208,7 +208,7 @@ Pairing queues and envelope indexes are also durable, bounded, expiring, and
 safe under crash/replay. Acknowledgement means the corresponding object and
 catalog transaction are durable, not merely queued in memory.
 
-Version 1 DASH history is not migrated. A 0.6 relay detects it, moves it to an
+Version 1 DASH history is not migrated. A v9 relay detects it, moves it to an
 explicit incompatible quarantine path without deleting it, and starts a new
 version 2 store.
 

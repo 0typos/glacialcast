@@ -105,8 +105,8 @@ if [[ -n "${rpm_package}" ]] && command -v rpm >/dev/null; then
   expect_paths "${listing}" \
     /usr/bin/gcrelay \
     /usr/lib/systemd/system/gcrelay.service
-  # A package that ships a live configuration would overwrite ingest tokens on
-  # upgrade. Only the example belongs here.
+  # A live configuration would overwrite admission policy on upgrade. Only the
+  # example belongs here.
   ! grep -q '^/etc/glacialcast/relay.toml$' <<<"${listing}" || {
     echo "the relay package ships a live /etc/glacialcast/relay.toml" >&2
     exit 1
