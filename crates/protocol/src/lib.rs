@@ -289,7 +289,7 @@ pub fn decode_noise_public_key(encoded: &str) -> Result<[u8; NOISE_KEY_LEN]> {
 pub fn build_noise_xx_initiator(local_private_key: &[u8; NOISE_KEY_LEN]) -> Result<HandshakeState> {
     Builder::new(noise_xx_params()?)
         .local_private_key(local_private_key)
-        .build_initiator()
+        .and_then(|builder| builder.build_initiator())
         .map_err(|err| ProtocolError::Noise(format!("{err:?}")))
 }
 
@@ -297,7 +297,7 @@ pub fn build_noise_xx_initiator(local_private_key: &[u8; NOISE_KEY_LEN]) -> Resu
 pub fn build_noise_xx_responder(local_private_key: &[u8; NOISE_KEY_LEN]) -> Result<HandshakeState> {
     Builder::new(noise_xx_params()?)
         .local_private_key(local_private_key)
-        .build_responder()
+        .and_then(|builder| builder.build_responder())
         .map_err(|err| ProtocolError::Noise(format!("{err:?}")))
 }
 
