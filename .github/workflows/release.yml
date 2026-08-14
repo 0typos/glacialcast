@@ -32,7 +32,7 @@ jobs:
           sudo apt-get install -y libclang-dev libgbm-dev libpipewire-0.3-dev libexpat1-dev minisign nasm nodejs rpm shellcheck
           sudo scripts/ci-install-openh264.sh
       - name: Install release tools
-        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
         with:
           tool: cargo-deny@0.20.2
           fallback: none
