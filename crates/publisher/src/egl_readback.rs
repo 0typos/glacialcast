@@ -244,11 +244,9 @@ struct ScaleEntrypoints {
 /// The caller asserts that `name` names a function in `library` whose ABI
 /// matches `T`, and that `library` outlives every call through the result.
 unsafe fn symbol<T: Copy>(library: &Library, name: &str) -> Result<T> {
-    let mut bytes = name.as_bytes().to_vec();
-    bytes.push(0);
-    // SAFETY: the caller guarantees the ABI, `bytes` is NUL terminated, and the
-    // copied function pointer is only used while `library` is alive.
-    let found = unsafe { library.get::<T>(&bytes) }
+    // SAFETY: the caller guarantees the ABI, and the copied function pointer is
+    // only used while `library` is alive.
+    let found = unsafe { library.get::<T>(name) }
         .with_context(|| format!("{name} is missing from the loaded GL stack"))?;
     Ok(*found)
 }
