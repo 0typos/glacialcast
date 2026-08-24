@@ -4634,11 +4634,9 @@ impl GpuReadback {
         };
         let deadline = Instant::now() + Duration::from_millis(100);
         loop {
-            let mapped = buffer
-                .map(device, 0, 0, width, height, |mapped| {
-                    (mapped.buffer().to_vec(), mapped.stride() as usize)
-                })
-                .map_err(|_| anyhow::anyhow!("GBM buffer belongs to a different device"))?;
+            let mapped = buffer.map(0, 0, width, height, |mapped| {
+                (mapped.buffer().to_vec(), mapped.stride() as usize)
+            });
             match mapped {
                 Ok(readback) => return Ok(readback),
                 Err(err)
